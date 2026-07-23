@@ -1,0 +1,53 @@
+mode: PAPER
+live_trading_enabled: false
+
+# Live paper sessions require real Webull market data (no mock/replay).
+data:
+  default_provider: webull
+  quote_poll_interval_seconds: 1.0
+
+# Auto-selects Webull paper account when WEBULL_PAPER_TRADING_ENABLED=true
+# and WEBULL_PAPER_ACCOUNT_ID is set; otherwise local PaperBroker.
+broker:
+  provider: paper
+  require_explicit_confirmation: true
+  webull_paper_trading_enabled: false
+
+risk:
+  allow_delayed_quotes: true
+  feed_max_silence_seconds: 60
+  delayed_quote_max_age_seconds: 900
+  # Agent-approved entries execute; soft caps are advisory only.
+  policy: agent_led
+  # Raise soft caps so advisory context is not tiny (still not vetoes).
+  max_trades_per_day: 5
+  max_premium_usd: 500.0
+  max_daily_loss_usd: 500.0
+
+agents:
+  mock_agents: false
+  execution_mode: agent_led
+  intraday_enabled: true
+  # Legacy council interval (unused as primary path in agent_led)
+  intraday_interval_seconds: 300.0
+  # Primary realtime AI decision cadence
+  decision_interval_seconds: 45.0
+  max_decision_calls_per_session: 40
+  max_proposals_per_session: 20
+  min_proposal_confidence: 0.45
+  require_propose_before_enter: true
+  confirm_ttl_seconds: 120.0
+  max_confirm_spy_drift_pct: 0.20
+  max_confirm_option_mid_worsen_pct: 15.0
+  postmarket_learner_enabled: true
+  memory_lookback_days: 5
+
+# Daily authorized capital + profit goal (confirmed at session start)
+capital:
+  authorized_usd: 500.0
+  target_profit_pct: 20.0
+  max_concurrent_positions: 1
+  max_contracts_per_trade: 20
+  min_contracts_per_trade: 1
+  require_session_confirm: true
+  pause_entries_when_goal_met: true

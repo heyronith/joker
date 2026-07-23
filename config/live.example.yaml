@@ -1,0 +1,8 @@
+# EXAMPLE ONLY — live trading is disabled by default and requires explicit opt-in.
+# Copy to live.yaml and set live_trading_enabled: true only after full verification.
+mode: LIVE_GATED
+live_trading_enabled: false
+
+broker:
+  provider: webull
+  require_explicit_confirmation: true

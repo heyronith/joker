@@ -1,0 +1,73 @@
+mode: PAPER
+live_trading_enabled: false
+
+data_dir: data
+db_path: data/joker.db
+event_log_dir: data/logs/jsonl
+reports_dir: data/reports
+
+risk:
+  max_daily_loss_usd: 100.0
+  max_trades_per_day: 1
+  max_open_positions: 1
+  max_premium_usd: 100.0
+  max_spread_pct: 15.0
+  quote_max_age_seconds: 30
+  allowed_symbol: SPY
+  kill_switch: false
+  allow_delayed_quotes: true
+  feed_max_silence_seconds: 60
+  delayed_quote_max_age_seconds: 900
+  policy: strict
+
+paper:
+  initial_balance_usd: 25000.0
+  slippage_pct: 2.0
+  default_spread_pct: 5.0
+
+agents:
+  mock_agents: false
+  council_timeout_seconds: 120
+  max_retries: 2
+  execution_mode: rules_hybrid
+  intraday_enabled: true
+  intraday_interval_seconds: 300.0
+  decision_interval_seconds: 45.0
+  max_intraday_calls_per_session: 12
+  max_decision_calls_per_session: 40
+  max_proposals_per_session: 3
+  min_proposal_confidence: 0.55
+  require_propose_before_enter: true
+  confirm_ttl_seconds: 120.0
+  max_confirm_spy_drift_pct: 0.20
+  max_confirm_option_mid_worsen_pct: 15.0
+  memory_lookback_days: 5
+  postmarket_learner_enabled: true
+
+capital:
+  authorized_usd: 500.0
+  target_profit_pct: 20.0
+  max_concurrent_positions: 1
+  max_contracts_per_trade: 20
+  min_contracts_per_trade: 1
+  require_session_confirm: true
+  pause_entries_when_goal_met: true
+
+logging:
+  level: INFO
+  redact_env_keys:
+    - OPENAI_API_KEY
+    - WEBULL_APP_KEY
+    - WEBULL_APP_SECRET
+    - WEBULL_TRADE_PIN
+    - WEBULL_ACCESS_TOKEN
+    - WEBULL_PAPER_ACCOUNT_ID
+
+broker:
+  provider: paper
+  require_explicit_confirmation: true
+  webull_paper_trading_enabled: false
+
+data:
+  default_provider: webull
+  quote_poll_interval_seconds: 1.0
