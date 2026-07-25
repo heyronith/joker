@@ -1,4 +1,17 @@
-"""Exchange-aligned bar aggregation from typed observations."""
+"""Exchange-aligned bar aggregation from typed observations.
+
+Volume policy (exactly one volume contribution per observation):
+1. If ``cumulative_volume`` is present and the delta vs the prior value for the
+   symbol is non-negative, use that delta.
+2. Otherwise, for trade observations only, use the explicit ``size``.
+3. Never add both trade size and cumulative-volume delta for the same observation.
+4. Quote / underlying observations never contribute volume except via a valid
+   cumulative-volume delta.
+
+Interval assignment uses ``source_timestamp``. Late acceptance uses
+``received_timestamp`` (or ingestion time). Intervals stay open until
+``interval_end + late_tolerance`` so in-tolerance late ticks can still apply.
+"""
 
 from __future__ import annotations
 
@@ -21,6 +34,7 @@ from joker.time.clock import ExchangeClock
 
 __all__ = [
     "BarBuilder",
+    "BarIngestFinding",
     "BarTimeframe",
     "FeatureFrameError",
     "FeatureTimeframeError",
@@ -77,6 +91,17 @@ class MarketBar(BaseModel):
         if value < 0:
             raise ValueError("Bar volume cannot be negative")
         return value
+
+
+@dataclass(frozen=True)
+class BarIngestFinding:
+    """Observable quality finding produced during bar ingestion."""
+
+    code: str
+    symbol: str
+    timeframe: str | None
+    message: str
+    observation_id: UUID | None = None
 
 
 def require_timeframe(
@@ -143,7 +168,8 @@ class _OpenBar:
                 self.low = price
             self.close = price
         self.tick_count += 1
-        self.observation_ids.append(observation_id)
+        if observation_id not in self.observation_ids:
+            self.observation_ids.append(observation_id)
         if late:
             self.late_data = True
             self.quality_flags.add("late_data")
@@ -184,12 +210,10 @@ class _OpenBar:
 
 @dataclass
 class BarBuilder:
-    """
-    Aggregate quotes/trades/underlying ticks into exchange-aligned 1m/5m bars.
+    """Aggregate quotes/trades into exchange-aligned 1m/5m bars.
 
-    Quotes never contribute volume by themselves. Trades contribute ``size``.
-    Positive cumulative-volume deltas contribute volume. Completed bars are
-    emitted exactly once via ``close_ready_bars``.
+    See module docstring for the volume policy. Completed bars emit exactly once
+    via ``close_ready_bars`` after ``interval_end + late_tolerance``.
     """
 
     clock: ExchangeClock
@@ -200,47 +224,71 @@ class BarBuilder:
     _emitted: set[tuple[str, BarTimeframe, datetime]] = field(default_factory=set, init=False)
     _last_cum_vol: dict[str, int] = field(default_factory=dict, init=False)
     _closed_bars: list[MarketBar] = field(default_factory=list, init=False)
+    _findings: list[BarIngestFinding] = field(default_factory=list, init=False)
+    _assigned_obs: set[tuple[UUID, BarTimeframe]] = field(default_factory=set, init=False)
+
+    @property
+    def findings(self) -> tuple[BarIngestFinding, ...]:
+        """Observable ingestion findings (drops, regressions, etc.)."""
+        return tuple(self._findings)
+
+    def clear_findings(self) -> None:
+        self._findings.clear()
 
     def ingest_quote(self, obs: QuoteObservation) -> None:
-        """Update OHLC from quote mid/last; never add volume from the quote itself."""
+        """Update OHLC from quote mid/last; volume only via valid cum-vol delta."""
         price = self._quote_price(obs.bid, obs.ask, obs.last)
-        if price is None:
-            return
-        for tf in (BarTimeframe.M1, BarTimeframe.M5):
-            bar = self._bar_for(obs.symbol, tf, obs.source_timestamp)
-            if bar is None:
-                continue
-            late = self._is_late(bar, obs.source_timestamp)
-            bar.apply_price(price, obs.observation_id, late=late)
-            self._apply_cum_vol_delta(bar, obs.symbol, obs.cumulative_volume)
+        volume = self._resolve_volume(
+            symbol=obs.symbol,
+            cumulative_volume=obs.cumulative_volume,
+            trade_size=None,
+        )
+        self._apply_observation(
+            symbol=obs.symbol,
+            observation_id=obs.observation_id,
+            source_timestamp=obs.source_timestamp,
+            received_timestamp=obs.received_timestamp,
+            price=price,
+            volume=volume,
+        )
 
     def ingest_trade(self, obs: TradeObservation) -> None:
-        """Update OHLC and add trade size to volume."""
-        for tf in (BarTimeframe.M1, BarTimeframe.M5):
-            bar = self._bar_for(obs.symbol, tf, obs.source_timestamp)
-            if bar is None:
-                continue
-            late = self._is_late(bar, obs.source_timestamp)
-            bar.apply_price(obs.price, obs.observation_id, late=late)
-            bar.add_volume(obs.size)
-            self._apply_cum_vol_delta(bar, obs.symbol, obs.cumulative_volume)
+        """Update OHLC; volume from cum-vol delta when valid else trade size."""
+        volume = self._resolve_volume(
+            symbol=obs.symbol,
+            cumulative_volume=obs.cumulative_volume,
+            trade_size=obs.size,
+        )
+        self._apply_observation(
+            symbol=obs.symbol,
+            observation_id=obs.observation_id,
+            source_timestamp=obs.source_timestamp,
+            received_timestamp=obs.received_timestamp,
+            price=obs.price,
+            volume=volume,
+        )
 
     def ingest_underlying(self, obs: UnderlyingObservation) -> None:
-        """Update OHLC from underlying last/mid; volume only via cum-vol delta."""
+        """Update OHLC from underlying; volume only via valid cum-vol delta."""
         price = self._quote_price(obs.bid, obs.ask, obs.last)
-        if price is None:
-            return
-        for tf in (BarTimeframe.M1, BarTimeframe.M5):
-            bar = self._bar_for(obs.symbol, tf, obs.source_timestamp)
-            if bar is None:
-                continue
-            late = self._is_late(bar, obs.source_timestamp)
-            bar.apply_price(price, obs.observation_id, late=late)
-            self._apply_cum_vol_delta(bar, obs.symbol, obs.cumulative_volume)
+        volume = self._resolve_volume(
+            symbol=obs.symbol,
+            cumulative_volume=obs.cumulative_volume,
+            trade_size=None,
+        )
+        self._apply_observation(
+            symbol=obs.symbol,
+            observation_id=obs.observation_id,
+            source_timestamp=obs.source_timestamp,
+            received_timestamp=obs.received_timestamp,
+            price=price,
+            volume=volume,
+        )
 
     def close_ready_bars(self, now: datetime | None = None) -> list[MarketBar]:
-        """Emit completed bars whose interval end is at or before ``now`` (once each)."""
+        """Emit completed bars after ``end + late_tolerance`` (once each)."""
         reference = _ensure_aware(now if now is not None else self.clock.now())
+        tolerance = timedelta(seconds=self.late_tolerance_seconds)
         ready: list[MarketBar] = []
         to_remove: list[tuple[str, BarTimeframe, datetime]] = []
 
@@ -249,7 +297,8 @@ class BarBuilder:
             if emit_key in self._emitted:
                 to_remove.append(key)
                 continue
-            if reference < open_bar.end:
+            # Hold open through late tolerance window.
+            if reference < open_bar.end + tolerance:
                 continue
             incomplete = open_bar.tick_count == 0 or open_bar.incomplete
             if open_bar.late_data:
@@ -276,38 +325,121 @@ class BarBuilder:
     def closed_bars(self) -> tuple[MarketBar, ...]:
         return tuple(self._closed_bars)
 
+    def _resolve_volume(
+        self,
+        *,
+        symbol: str,
+        cumulative_volume: int | None,
+        trade_size: int | None,
+    ) -> int:
+        """Compute volume once per observation; update last cum-vol for symbol."""
+        if cumulative_volume is not None:
+            prev = self._last_cum_vol.get(symbol)
+            self._last_cum_vol[symbol] = cumulative_volume
+            if prev is not None:
+                delta = cumulative_volume - prev
+                if delta >= 0:
+                    # Valid cum-vol delta (including zero) wins over trade size.
+                    return delta
+                self._findings.append(
+                    BarIngestFinding(
+                        code="cumulative_volume_regression",
+                        symbol=symbol,
+                        timeframe=None,
+                        message=f"Cumulative volume fell from {prev} to {cumulative_volume}",
+                    )
+                )
+                # Invalid delta → fall through to explicit trade size.
+        if trade_size is not None and trade_size > 0:
+            return trade_size
+        return 0
+
+    def _apply_observation(
+        self,
+        *,
+        symbol: str,
+        observation_id: UUID,
+        source_timestamp: datetime,
+        received_timestamp: datetime,
+        price: Decimal | None,
+        volume: int,
+    ) -> None:
+        if price is None and volume <= 0:
+            return
+        for tf in (BarTimeframe.M1, BarTimeframe.M5):
+            bar = self._bar_for(
+                symbol,
+                tf,
+                source_timestamp=source_timestamp,
+                received_timestamp=received_timestamp,
+                observation_id=observation_id,
+            )
+            if bar is None:
+                continue
+            assign_key = (observation_id, tf)
+            if assign_key in self._assigned_obs:
+                continue
+            self._assigned_obs.add(assign_key)
+            late = _ensure_aware(received_timestamp) >= bar.end
+            if price is not None:
+                bar.apply_price(price, observation_id, late=late)
+            elif late:
+                bar.late_data = True
+                bar.quality_flags.add("late_data")
+            if volume > 0:
+                bar.add_volume(volume)
+
     def _bar_for(
         self,
         symbol: str,
         timeframe: BarTimeframe,
-        ts: datetime,
+        *,
+        source_timestamp: datetime,
+        received_timestamp: datetime,
+        observation_id: UUID,
     ) -> _OpenBar | None:
-        start = floor_to_interval(ts, timeframe)
+        start = floor_to_interval(source_timestamp, timeframe)
         end = interval_end(start, timeframe)
         key = (symbol, timeframe, start)
         emit_key = (symbol, timeframe, start)
+        received = _ensure_aware(received_timestamp)
+        tolerance = timedelta(seconds=self.late_tolerance_seconds)
 
         if emit_key in self._emitted:
-            # Already closed — accept only within late tolerance.
-            local = _ensure_aware(ts)
-            if local <= end + timedelta(seconds=self.late_tolerance_seconds):
-                # Re-open transiently is not allowed; late updates after emit are dropped.
-                return None
+            self._findings.append(
+                BarIngestFinding(
+                    code="dropped_after_close",
+                    symbol=symbol,
+                    timeframe=timeframe.value,
+                    message="Observation arrived after bar was already emitted",
+                    observation_id=observation_id,
+                )
+            )
+            return None
+
+        if received > end + tolerance:
+            self._findings.append(
+                BarIngestFinding(
+                    code="dropped_too_late",
+                    symbol=symbol,
+                    timeframe=timeframe.value,
+                    message=(
+                        f"Observation received after tolerance "
+                        f"({self.late_tolerance_seconds}s past {end.isoformat()})"
+                    ),
+                    observation_id=observation_id,
+                )
+            )
             return None
 
         existing = self._open.get(key)
         if existing is not None:
-            local = _ensure_aware(ts)
-            if local >= end:
-                if local <= end + timedelta(seconds=self.late_tolerance_seconds):
-                    existing.late_data = True
-                    existing.quality_flags.add("late_data")
-                    return existing
-                existing.quality_flags.add("dropped_too_late")
-                return None
+            if received >= end:
+                existing.late_data = True
+                existing.quality_flags.add("late_data")
             return existing
 
-        # Detect gap vs prior open interval for same symbol/timeframe.
+        # Mark prior open intervals incomplete when a newer interval starts.
         prior_keys = [
             k for k in self._open if k[0] == symbol and k[1] == timeframe and k[2] < start
         ]
@@ -326,31 +458,11 @@ class BarBuilder:
             low=Decimal("0"),
             close=Decimal("0"),
         )
+        if received >= end:
+            bar.late_data = True
+            bar.quality_flags.add("late_data")
         self._open[key] = bar
         return bar
-
-    def _is_late(self, bar: _OpenBar, ts: datetime) -> bool:
-        return _ensure_aware(ts) >= bar.end
-
-    def _apply_cum_vol_delta(
-        self,
-        bar: _OpenBar,
-        symbol: str,
-        cumulative_volume: int | None,
-    ) -> None:
-        if cumulative_volume is None:
-            return
-        prev = self._last_cum_vol.get(symbol)
-        self._last_cum_vol[symbol] = cumulative_volume
-        if prev is None:
-            return
-        delta = cumulative_volume - prev
-        if delta < 0:
-            bar.quality_flags.add("cumulative_volume_regression")
-            return
-        if delta == 0:
-            return
-        bar.add_volume(delta)
 
     @staticmethod
     def _quote_price(

@@ -1,7 +1,8 @@
 """Execution runtime — explicit broker commands, ledger, reconciliation.
 
 Must not decide whether a trade is desirable. Only executes commanded actions
-and records broker truth.
+and records broker truth. Position quantity and realised P&L come only from
+verified PARTIAL_FILL / FINAL_FILL ledger events.
 """
 
 from __future__ import annotations
@@ -48,6 +49,14 @@ class DailyPnlView:
     value: float | None
 
 
+@dataclass(frozen=True)
+class UnresolvedReconciliation:
+    """Typed unresolved recovery state — system must not claim recovery."""
+
+    report: ReconciliationReport
+    prevents_recovery_claim: bool = True
+
+
 def contract_id_for(contract: OptionContract) -> str:
     """Stable contract id for ledger / reconciliation keys."""
     return (
@@ -58,6 +67,21 @@ def contract_id_for(contract: OptionContract) -> str:
 
 def _position_contract_id(position: Position) -> str:
     return contract_id_for(position.contract)
+
+
+def _verified_fill_price(broker: BrokerClient, order: BrokerOrder) -> Decimal | None:
+    """Extract a verified fill price from broker state when available."""
+    getter = getattr(broker, "get_fill_price", None)
+    if callable(getter):
+        price = getter(order.order_id)
+        if price is not None:
+            return Decimal(str(price))
+    fills = getattr(broker, "_fills", None)
+    if isinstance(fills, dict):
+        for fill in fills.values():
+            if getattr(fill, "order_id", None) == order.order_id:
+                return Decimal(str(fill.price))
+    return None
 
 
 class ExecutionRuntime:
@@ -85,17 +109,33 @@ class ExecutionRuntime:
         self._broker_account_id = broker_account_id
         self._correlation_id = uuid4()
         self._client_to_broker: dict[str, str] = {}
+        self._unresolved: UnresolvedReconciliation | None = None
+
+    @property
+    def client_to_broker_map(self) -> dict[str, str]:
+        return dict(self._client_to_broker)
+
+    @property
+    def unresolved_reconciliation(self) -> UnresolvedReconciliation | None:
+        return self._unresolved
 
     def _now(self) -> datetime:
         if self._clock is not None:
             return self._clock.now()
         return datetime.now(timezone.utc)
 
-    async def submit_execution_command(self, command: ExecutionCommand) -> BrokerOrder:
-        """Submit an explicit command through the broker and append ledger events.
+    async def restore_order_mappings(self) -> dict[str, str]:
+        """Rebuild client-order → broker-order map from persisted ledger events."""
+        events = await self._ledger.get_by_session(self._session_id)
+        mapping: dict[str, str] = {}
+        for event in events:
+            if event.broker_order_id:
+                mapping[event.client_order_id] = event.broker_order_id
+        self._client_to_broker = mapping
+        return dict(mapping)
 
-        Does not evaluate whether the trade is desirable.
-        """
+    async def submit_execution_command(self, command: ExecutionCommand) -> BrokerOrder:
+        """Submit an explicit command through the broker and append ledger events."""
         now = self._now()
         intent = command.intent
         cid = contract_id_for(intent.contract)
@@ -161,14 +201,25 @@ class ExecutionRuntime:
             extra={"broker_order_id": order.order_id, "status": order.status},
         )
 
-        # Paper broker may fill immediately — record fill without inventing price.
         if order.status == "filled":
-            await self._record_fill_from_order(order, command.client_order_id, final=True)
+            fill_price = _verified_fill_price(self._broker, order)
+            if fill_price is not None:
+                await self.record_verified_fill(
+                    order,
+                    client_order_id=command.client_order_id,
+                    fill_price=fill_price,
+                    fill_qty=Decimal(order.quantity),
+                    final=True,
+                )
         return order
 
     async def poll_order_status(self, client_order_id: str) -> BrokerOrder | None:
         """Poll broker for order status and write ledger events on transitions."""
         broker_order_id = self._client_to_broker.get(client_order_id)
+        if broker_order_id is None:
+            # Attempt reconstruction from ledger if map was lost (e.g. after restart).
+            await self.restore_order_mappings()
+            broker_order_id = self._client_to_broker.get(client_order_id)
         if broker_order_id is None:
             return None
         order = self._broker.get_order(broker_order_id)
@@ -223,108 +274,23 @@ class ExecutionRuntime:
                 written.append(event)
                 await self._publish_order_event(EventType.ORDER_REJECTED, client_id, now)
         elif order.status == "filled":
-            fill_events = await self._record_fill_from_order(order, client_id, final=True)
-            written.extend(fill_events)
-        return written
-
-    async def _record_fill_from_order(
-        self,
-        order: BrokerOrder,
-        client_order_id: str,
-        *,
-        final: bool,
-        fill_price: Decimal | None = None,
-        fill_qty: Decimal | None = None,
-    ) -> list[LedgerEvent]:
-        """Record fill(s) only when a concrete fill price is known.
-
-        Never treats limit_price as a fill. If fill_price is omitted and the
-        broker order does not expose a fill, no FINAL_FILL is written (caller
-        must supply price from a verified fill record).
-        """
-        # PaperBroker fills immediately but BrokerOrder has no fill price field.
-        # Prefer explicit fill_price; otherwise refuse to invent from limit.
-        if fill_price is None:
-            logger.warning(
-                "fill_price_unavailable",
-                extra={
-                    "session_id": self._session_id,
-                    "client_order_id": client_order_id,
-                    "broker_order_id": order.order_id,
-                    "status": order.status,
-                },
-            )
-            # Still publish ORDER_FILLED domain event for status visibility, but
-            # do not invent ledger fill economics from limit_price.
-            await self._publish_order_event(
-                EventType.ORDER_FILLED if final else EventType.ORDER_PARTIALLY_FILLED,
-                client_order_id,
-                self._now(),
-                extra={"broker_order_id": order.order_id, "fill_price_available": False},
-            )
-            return []
-
-        qty = fill_qty if fill_qty is not None else Decimal(order.quantity)
-        event_type = LedgerEventType.FINAL_FILL if final else LedgerEventType.PARTIAL_FILL
-        domain_type = EventType.ORDER_FILLED if final else EventType.ORDER_PARTIALLY_FILLED
-        now = self._now()
-        cid = contract_id_for(order.contract)
-        event = make_ledger_event(
-            event_type,
-            broker_account_id=self._broker_account_id,
-            client_order_id=client_order_id,
-            contract_id=cid,
-            side=order.side,
-            quantity=qty,
-            exchange_timestamp=now,
-            idempotency_key=f"fill:{client_order_id}:{order.order_id}:{event_type.value}:{qty}",
-            session_id=self._session_id,
-            broker_order_id=order.order_id,
-            price=fill_price,
-        )
-        written: list[LedgerEvent] = []
-        if await self._ledger.append(event):
-            written.append(event)
-            await self._publish_order_event(
-                domain_type,
-                client_order_id,
-                now,
-                extra={"broker_order_id": order.order_id, "price": str(fill_price), "qty": str(qty)},
-            )
-            if final and order.side == "buy":
-                pos_event = make_ledger_event(
-                    LedgerEventType.POSITION_OPENED,
-                    broker_account_id=self._broker_account_id,
-                    client_order_id=client_order_id,
-                    contract_id=cid,
-                    side=order.side,
-                    quantity=qty,
-                    exchange_timestamp=now,
-                    idempotency_key=f"pos-open:{client_order_id}:{order.order_id}",
-                    session_id=self._session_id,
-                    broker_order_id=order.order_id,
-                    price=fill_price,
+            fill_price = _verified_fill_price(self._broker, order)
+            if fill_price is not None:
+                fill_events = await self.record_verified_fill(
+                    order,
+                    client_order_id=client_id,
+                    fill_price=fill_price,
+                    fill_qty=Decimal(order.quantity),
+                    final=True,
                 )
-                if await self._ledger.append(pos_event):
-                    written.append(pos_event)
-                    await self._publish_order_event(EventType.POSITION_OPENED, client_order_id, now)
-            elif final and order.side == "sell":
-                pos_event = make_ledger_event(
-                    LedgerEventType.POSITION_CLOSED,
-                    broker_account_id=self._broker_account_id,
-                    client_order_id=client_order_id,
-                    contract_id=cid,
-                    side=order.side,
-                    quantity=qty,
-                    exchange_timestamp=now,
-                    idempotency_key=f"pos-close:{client_order_id}:{order.order_id}",
-                    session_id=self._session_id,
-                    broker_order_id=order.order_id,
-                    price=fill_price,
+                written.extend(fill_events)
+            else:
+                await self._publish_order_event(
+                    EventType.ORDER_FILLED,
+                    client_id,
+                    now,
+                    extra={"broker_order_id": order.order_id, "fill_price_available": False},
                 )
-                if await self._ledger.append(pos_event):
-                    written.append(pos_event)
-                    await self._publish_order_event(EventType.POSITION_CLOSED, client_order_id, now)
         return written
 
     async def record_verified_fill(
@@ -336,14 +302,98 @@ class ExecutionRuntime:
         fill_qty: Decimal | None = None,
         final: bool = True,
     ) -> list[LedgerEvent]:
-        """Record a fill with a verified price (never derived from limit)."""
-        return await self._record_fill_from_order(
-            order,
-            client_order_id,
-            final=final,
-            fill_price=fill_price,
-            fill_qty=fill_qty,
+        """Record a fill with a verified price (never derived from limit).
+
+        Position domain events are published by comparing projection before/after.
+        No separate POSITION_* ledger events are appended for fill quantities.
+        """
+        before = await self.project_session()
+        qty = fill_qty if fill_qty is not None else Decimal(order.quantity)
+        event_type = LedgerEventType.FINAL_FILL if final else LedgerEventType.PARTIAL_FILL
+        domain_type = EventType.ORDER_FILLED if final else EventType.ORDER_PARTIALLY_FILLED
+        now = self._now()
+        cid = contract_id_for(order.contract)
+        self._client_to_broker.setdefault(client_order_id, order.order_id)
+        event = make_ledger_event(
+            event_type,
+            broker_account_id=self._broker_account_id,
+            client_order_id=client_order_id,
+            contract_id=cid,
+            side=order.side,
+            quantity=qty,
+            exchange_timestamp=now,
+            idempotency_key=(
+                f"fill:{client_order_id}:{order.order_id}:{event_type.value}:{qty}:{fill_price}"
+            ),
+            session_id=self._session_id,
+            broker_order_id=order.order_id,
+            price=fill_price,
         )
+        written: list[LedgerEvent] = []
+        if await self._ledger.append(event):
+            written.append(event)
+            await self._publish_order_event(
+                domain_type,
+                client_order_id,
+                now,
+                extra={
+                    "broker_order_id": order.order_id,
+                    "price": str(fill_price),
+                    "qty": str(qty),
+                },
+            )
+            after = await self.project_session()
+            await self._publish_position_transitions(
+                before=before,
+                after=after,
+                client_order_id=client_order_id,
+                exchange_timestamp=now,
+            )
+        return written
+
+    async def _publish_position_transitions(
+        self,
+        *,
+        before: ProjectionState,
+        after: ProjectionState,
+        client_order_id: str,
+        exchange_timestamp: datetime,
+    ) -> None:
+        """Publish domain POSITION_* events from projection deltas (not ledger)."""
+        all_ids = set(before.positions) | set(after.positions)
+        for contract_id in all_ids:
+            prev = before.positions.get(contract_id)
+            curr = after.positions.get(contract_id)
+            prev_qty = prev.quantity if prev is not None else Decimal("0")
+            curr_qty = curr.quantity if curr is not None else Decimal("0")
+            if prev_qty == 0 and curr_qty != 0:
+                await self._publish_order_event(
+                    EventType.POSITION_OPENED,
+                    client_order_id,
+                    exchange_timestamp,
+                    extra={"contract_id": contract_id, "quantity": str(curr_qty)},
+                )
+            elif prev_qty != 0 and curr_qty == 0:
+                await self._publish_order_event(
+                    EventType.POSITION_CLOSED,
+                    client_order_id,
+                    exchange_timestamp,
+                    extra={
+                        "contract_id": contract_id,
+                        "realized_pnl": str(curr.realized_pnl if curr else "0"),
+                    },
+                )
+            elif prev_qty != curr_qty:
+                await self._publish_order_event(
+                    EventType.POSITION_CHANGED,
+                    client_order_id,
+                    exchange_timestamp,
+                    extra={
+                        "contract_id": contract_id,
+                        "quantity": str(curr_qty),
+                        "prior_quantity": str(prev_qty),
+                    },
+                )
 
     async def project_session(self) -> ProjectionState:
         events = await self._ledger.get_by_session(self._session_id)
@@ -359,10 +409,32 @@ class ExecutionRuntime:
                 contract_id=contract_id_for(o.contract),
                 side=o.side,
                 quantity=Decimal(o.quantity),
+                filled_qty=Decimal(o.quantity) if o.status == "filled" else Decimal("0"),
                 status=o.status,
             )
             for o in self._broker.list_open_orders()
         ]
+        # Include recently known non-open orders that still matter for fill mismatch.
+        for client_id, broker_id in self._client_to_broker.items():
+            order = self._broker.get_order(broker_id)
+            if order is None:
+                continue
+            if any(b.broker_order_id == broker_id for b in broker_orders):
+                continue
+            if order.status in {"open", "partially_filled"}:
+                broker_orders.append(
+                    BrokerOpenOrderView(
+                        broker_order_id=order.order_id,
+                        client_order_id=client_id,
+                        contract_id=contract_id_for(order.contract),
+                        side=order.side,
+                        quantity=Decimal(order.quantity),
+                        filled_qty=(
+                            Decimal(order.quantity) if order.status == "filled" else Decimal("0")
+                        ),
+                        status=order.status,
+                    )
+                )
         broker_positions = [
             BrokerPositionView(
                 contract_id=_position_contract_id(p),
@@ -403,6 +475,7 @@ class ExecutionRuntime:
                 },
             )
         else:
+            self._unresolved = None
             logger.info(
                 "reconciliation_consistent",
                 extra={
@@ -412,10 +485,34 @@ class ExecutionRuntime:
             )
         return report
 
+    async def apply_reconciliation_corrections(
+        self,
+        report: ReconciliationReport,
+        *,
+        mark_unresolved_if_still_mismatched: bool = True,
+    ) -> list[LedgerEvent]:
+        """Append approved reconciliation corrections to the ledger (append-only)."""
+        corrections = report.correction_events(broker_account_id=self._broker_account_id)
+        written: list[LedgerEvent] = []
+        for event in corrections:
+            if await self._ledger.append(event):
+                written.append(event)
+        if mark_unresolved_if_still_mismatched:
+            follow_up = await self.run_reconciliation()
+            if not follow_up.is_consistent:
+                self._unresolved = UnresolvedReconciliation(report=follow_up)
+            else:
+                self._unresolved = None
+        return written
+
     def get_daily_pnl(self) -> DailyPnlView:
         """Return broker daily P&L with availability — never invent zeros."""
         available, value = self._broker.get_daily_pnl_available()
         return DailyPnlView(available=available, value=value)
+
+    def claims_recovery(self) -> bool:
+        """False when an unresolved reconciliation blocks recovery claims."""
+        return self._unresolved is None or not self._unresolved.prevents_recovery_claim
 
     async def _publish_order_event(
         self,

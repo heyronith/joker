@@ -104,7 +104,7 @@ class ReconciliationReport(BaseModel):
             )
             contract_id = finding.entity_id
             meta: dict = {
-                "correction_kind": _correction_kind(finding.outcome),
+                "correction_kind": _correction_kind(finding),
                 "outcome": finding.outcome.value,
                 "entity_type": finding.entity_type,
                 "entity_id": finding.entity_id,
@@ -134,15 +134,23 @@ class ReconciliationReport(BaseModel):
         return corrections
 
 
-def _correction_kind(outcome: ReconciliationOutcome) -> str:
-    if outcome in {
+def _correction_kind(finding: ReconciliationFinding) -> str:
+    """Classify corrections using both entity_type and mismatch outcome."""
+    if finding.entity_type == "position":
+        return "position_quantity"
+    if finding.entity_type == "order":
+        if finding.outcome == ReconciliationOutcome.QUANTITY_MISMATCH:
+            return "order_fill_qty"
+        return "order_status"
+    # Fallback for unexpected entity types.
+    if finding.outcome == ReconciliationOutcome.QUANTITY_MISMATCH:
+        return "order_fill_qty"
+    if finding.outcome in {
         ReconciliationOutcome.STATUS_MISMATCH,
         ReconciliationOutcome.MISSING_BROKER_ORDER,
         ReconciliationOutcome.UNKNOWN_BROKER_ORDER,
     }:
         return "order_status"
-    if outcome == ReconciliationOutcome.QUANTITY_MISMATCH:
-        return "order_fill_qty"
     return "position_quantity"
 
 

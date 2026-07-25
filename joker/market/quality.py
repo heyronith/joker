@@ -112,6 +112,11 @@ def _max_severity(findings: list[DataQualityFinding]) -> DataQualitySeverity:
     return max(findings, key=lambda f: _SEVERITY_RANK[f.severity]).severity
 
 
+def max_severity(findings: list[DataQualityFinding]) -> DataQualitySeverity:
+    """Return the highest severity among findings (OK when empty)."""
+    return _max_severity(findings)
+
+
 def _age_seconds(ts: datetime, now: datetime) -> float:
     if ts.tzinfo is None or now.tzinfo is None:
         raise ValueError("Naive datetimes are not allowed in quality evaluation")

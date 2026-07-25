@@ -12,6 +12,7 @@ from joker.data.webull_api import HttpWebullMarketApi, WebullApiError
 from joker.data.webull_errors import OptionEndpointUnverified
 from joker.data.webull_options_provider import WebullOptionsDataProvider, create_webull_options_provider
 from joker.compliance.opra_sanitizer import capture_field_summary, snapshot_to_safe_metadata
+from joker.schemas.options_data import OptionSnapshot
 
 
 def resolve_expiration(expiration: str, provider: WebullOptionsDataProvider) -> date:

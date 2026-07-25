@@ -29,6 +29,7 @@ from joker.schemas.replay import (
 )
 
 if TYPE_CHECKING:
+    from joker.agents.intraday import IntradayDecision, TradeProposal
     from joker.data.webull_options_provider import WebullOptionsDataProvider
 
 

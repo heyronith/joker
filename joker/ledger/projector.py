@@ -164,14 +164,28 @@ class LedgerProjector:
             order = self._ensure_order(event, orders)
             if event.broker_order_id:
                 order.broker_order_id = event.broker_order_id
-            self._accumulate_fill(order, qty=event.quantity, price=event.price)
+            allow_overfill = bool(event.metadata.get("allow_overfill"))
+            applied_qty = self._accumulate_fill(
+                order,
+                qty=event.quantity,
+                price=event.price,
+                allow_overfill=allow_overfill,
+            )
+            if applied_qty <= 0:
+                self._add_fees(order=order, event=event, positions=positions)
+                return
             if et == LedgerEventType.FINAL_FILL or (
                 order.submitted_qty > 0 and order.filled_qty >= order.submitted_qty
             ):
                 order.status = OrderStatus.FILLED
             else:
                 order.status = OrderStatus.PARTIALLY_FILLED
-            self._apply_fill_to_position(event, positions)
+            # Fills are the sole source of position quantity / realised P&L.
+            self._apply_fill_to_position(
+                event,
+                positions,
+                applied_qty=applied_qty,
+            )
             self._add_fees(order=order, event=event, positions=positions)
             return
 
@@ -197,50 +211,16 @@ class LedgerProjector:
             )
             return
 
-        if et == LedgerEventType.POSITION_OPENED:
-            if event.quantity <= 0 or event.price is None:
-                return
-            pos = self._ensure_position(event.contract_id, positions)
-            if pos.quantity == 0:
-                pos.quantity = event.quantity if event.side == "buy" else -event.quantity
-                pos.avg_price = event.price
-                pos.open = pos.quantity != 0
-                if event.position_id:
-                    pos.position_id = event.position_id
-            self._add_fees(order=None, event=event, positions=positions)
-            return
-
-        if et == LedgerEventType.POSITION_RESIZED:
-            if event.price is None:
-                return
-            pos = self._ensure_position(event.contract_id, positions)
-            if not pos.open and pos.quantity == 0:
-                return
-            signed = event.quantity if event.side == "buy" else -event.quantity
-            self._resize_position(pos, delta_qty=signed, price=event.price)
-            if event.position_id:
-                pos.position_id = event.position_id
-            self._add_fees(order=None, event=event, positions=positions)
-            return
-
-        if et == LedgerEventType.POSITION_CLOSED:
-            if event.quantity <= 0:
-                return
-            pos = positions.get(event.contract_id)
-            if pos is None or pos.quantity == 0:
-                return
-            close_qty = min(abs(pos.quantity), event.quantity)
-            price = event.price if event.price is not None else pos.avg_price
-            if price is None or pos.avg_price is None or close_qty <= 0:
-                return
-            direction = Decimal("1") if pos.quantity > 0 else Decimal("-1")
-            self._realize(pos, close_qty=close_qty, exit_price=price)
-            pos.quantity += -direction * close_qty
-            if pos.quantity == 0:
-                pos.open = False
-                pos.avg_price = None
-            else:
-                pos.open = True
+        # POSITION_OPENED / RESIZED / CLOSED ledger events are legacy/compat only.
+        # Authoritative quantity and realised P&L come from PARTIAL_FILL / FINAL_FILL.
+        # Explicit reconciliation corrections may still adjust state below.
+        if et in {
+            LedgerEventType.POSITION_OPENED,
+            LedgerEventType.POSITION_RESIZED,
+            LedgerEventType.POSITION_CLOSED,
+        }:
+            # Ignore quantity mutation from position lifecycle events to prevent
+            # double-counting fills. Fees may still be recorded.
             self._add_fees(order=None, event=event, positions=positions)
             return
 
@@ -328,33 +308,40 @@ class LedgerProjector:
         qty: Decimal,
         price: Decimal,
         allow_overfill: bool = False,
-    ) -> None:
+    ) -> Decimal:
+        """Accumulate fill on the order; return quantity actually applied after clamp."""
         prior_qty = order.filled_qty
+        applied = qty
         # Hard rule: filled quantity never exceeds submitted unless explicit correction.
         if not allow_overfill and order.submitted_qty > 0:
             remaining = order.submitted_qty - prior_qty
             if remaining <= 0:
-                return
-            qty = min(qty, remaining)
-        if qty <= 0:
-            return
-        new_qty = prior_qty + qty
+                return Decimal("0")
+            applied = min(qty, remaining)
+        if applied <= 0:
+            return Decimal("0")
+        new_qty = prior_qty + applied
         if prior_qty <= 0 or order.avg_fill_price is None:
             order.avg_fill_price = price
         else:
-            order.avg_fill_price = ((order.avg_fill_price * prior_qty) + (price * qty)) / new_qty
+            order.avg_fill_price = (
+                (order.avg_fill_price * prior_qty) + (price * applied)
+            ) / new_qty
         order.filled_qty = new_qty
+        return applied
 
     def _apply_fill_to_position(
         self,
         event: LedgerEvent,
         positions: dict[str, _MutablePosition],
+        *,
+        applied_qty: Decimal,
     ) -> None:
         assert event.price is not None
-        if event.quantity <= 0:
+        if applied_qty <= 0:
             return
         pos = self._ensure_position(event.contract_id, positions)
-        signed = event.quantity if event.side == "buy" else -event.quantity
+        signed = applied_qty if event.side == "buy" else -applied_qty
 
         if pos.quantity == 0:
             pos.quantity = signed
@@ -372,15 +359,16 @@ class LedgerProjector:
         close_qty = min(abs(pos.quantity), abs(signed))
         if close_qty > 0 and pos.avg_price is not None:
             self._realize(pos, close_qty=close_qty, exit_price=event.price)
-        pos.quantity += signed
+        # Closing fills cannot drive quantity past zero without an explicit correction.
+        if pos.quantity > 0:
+            pos.quantity = pos.quantity - close_qty
+        else:
+            pos.quantity = pos.quantity + close_qty
         if pos.quantity == 0:
             pos.open = False
             pos.avg_price = None
-        elif abs(signed) > close_qty:
-            pos.avg_price = event.price
-            pos.open = True
         else:
-            pos.open = pos.quantity != 0
+            pos.open = True
 
     @staticmethod
     def _resize_position(pos: _MutablePosition, *, delta_qty: Decimal, price: Decimal) -> None:

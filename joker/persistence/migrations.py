@@ -20,54 +20,45 @@ from joker.storage.database import Database
 
 _TASK1_SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS market_snapshots (
-    snapshot_id TEXT PRIMARY KEY NOT NULL,
+    snapshot_id TEXT PRIMARY KEY,
     trading_date TEXT NOT NULL,
     exchange_time TEXT NOT NULL,
-    session_id TEXT,
-    payload TEXT NOT NULL,
-    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+    payload_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_task1_market_snapshots_date
-    ON market_snapshots (trading_date, exchange_time);
+CREATE INDEX IF NOT EXISTS idx_market_snapshots_trading_date
+    ON market_snapshots(trading_date);
 
 CREATE TABLE IF NOT EXISTS option_surfaces (
-    surface_id TEXT PRIMARY KEY NOT NULL,
+    surface_id TEXT PRIMARY KEY,
     trading_date TEXT NOT NULL,
     exchange_time TEXT NOT NULL,
-    session_id TEXT,
-    payload TEXT NOT NULL,
-    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+    underlying_symbol TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_task1_option_surfaces_date
-    ON option_surfaces (trading_date, exchange_time);
+CREATE INDEX IF NOT EXISTS idx_option_surfaces_trading_date
+    ON option_surfaces(trading_date);
 
 CREATE TABLE IF NOT EXISTS ledger_events (
     ledger_event_id TEXT PRIMARY KEY NOT NULL,
-    broker_account_id TEXT NOT NULL,
-    client_order_id TEXT NOT NULL,
-    broker_order_id TEXT,
-    contract_id TEXT NOT NULL,
-    side TEXT NOT NULL,
-    quantity TEXT NOT NULL,
-    price TEXT,
-    exchange_timestamp TEXT NOT NULL,
-    source_event_id TEXT,
     idempotency_key TEXT NOT NULL UNIQUE,
-    event_type TEXT NOT NULL,
-    fees TEXT,
-    metadata_json TEXT NOT NULL,
     session_id TEXT NOT NULL,
+    client_order_id TEXT NOT NULL,
+    contract_id TEXT NOT NULL,
+    position_id TEXT,
+    exchange_timestamp TEXT NOT NULL,
     created_at TEXT NOT NULL,
-    position_id TEXT
+    payload TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_task1_ledger_session
-    ON ledger_events (session_id, exchange_timestamp, created_at);
+    ON ledger_events (session_id, exchange_timestamp, ledger_event_id);
 CREATE INDEX IF NOT EXISTS idx_task1_ledger_order
-    ON ledger_events (client_order_id, exchange_timestamp, created_at);
+    ON ledger_events (client_order_id, exchange_timestamp, ledger_event_id);
 CREATE INDEX IF NOT EXISTS idx_task1_ledger_contract
-    ON ledger_events (contract_id, exchange_timestamp, created_at);
+    ON ledger_events (contract_id, exchange_timestamp, ledger_event_id);
 CREATE INDEX IF NOT EXISTS idx_task1_ledger_position
-    ON ledger_events (position_id, exchange_timestamp, created_at);
+    ON ledger_events (position_id, exchange_timestamp, ledger_event_id);
 
 CREATE TABLE IF NOT EXISTS domain_events_seen (
     event_id TEXT PRIMARY KEY NOT NULL,

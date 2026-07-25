@@ -25,8 +25,9 @@ from joker.market.option_surface import (
     OptionSurfaceBuilder,
     OptionSurfaceRepository,
     OptionSurfaceSnapshot,
+    compute_mid,
 )
-from joker.market.quality import DataQualityReport, evaluate_data_quality
+from joker.market.quality import DataQualityConfig, DataQualityReport, evaluate_data_quality
 from joker.market.snapshots import (
     DataQualitySnapshot,
     MarketSnapshot,
@@ -50,6 +51,15 @@ class MarketRuntimeConfig:
     bars_1m_window: int = 60
     bars_5m_window: int = 24
 
+    def to_quality_config(self) -> DataQualityConfig:
+        """Map runtime thresholds into ``DataQualityConfig``."""
+        return DataQualityConfig(
+            underlying_max_age_seconds=self.underlying_stale_seconds,
+            option_max_age_seconds=self.option_stale_seconds,
+            max_relative_spread=self.maximum_relative_spread,
+            min_option_contracts=self.min_option_contracts,
+        )
+
 
 @dataclass
 class MarketTickResult:
@@ -60,6 +70,25 @@ class MarketTickResult:
     surface: OptionSurfaceSnapshot | None = None
     quality: DataQualityReport | None = None
     events_published: int = 0
+
+
+def _underlying_snapshot_from_observation(
+    observation: UnderlyingObservation | QuoteObservation,
+) -> UnderlyingSnapshot:
+    """Build ``UnderlyingSnapshot`` using its actual schema fields."""
+    mid = compute_mid(observation.bid, observation.ask)
+    return UnderlyingSnapshot(
+        symbol=observation.symbol,
+        exchange_time=observation.source_timestamp,
+        last=observation.last,
+        bid=observation.bid,
+        ask=observation.ask,
+        mid=mid,
+        bid_size=observation.bid_size,
+        ask_size=observation.ask_size,
+        cumulative_volume=observation.cumulative_volume,
+        source=observation.source,
+    )
 
 
 class MarketRuntime:
@@ -78,7 +107,6 @@ class MarketRuntime:
         snapshot_repo: SnapshotRepository,
         surface_builder: OptionSurfaceBuilder | None = None,
         surface_repo: OptionSurfaceRepository | None = None,
-        quality_evaluator: Any = evaluate_data_quality,
         session_id: str,
         config: MarketRuntimeConfig | None = None,
     ) -> None:
@@ -88,15 +116,17 @@ class MarketRuntime:
         self._snapshots = snapshot_repo
         self._surface_builder = surface_builder or OptionSurfaceBuilder()
         self._surfaces = surface_repo
-        self._evaluate_quality = quality_evaluator
         self._session_id = session_id
         self._config = config or MarketRuntimeConfig()
+        self._quality_config = self._config.to_quality_config()
 
         self._latest_underlying: UnderlyingSnapshot | None = None
         self._pending_option_rows: list[dict[str, Any]] = []
         self._latest_surface: OptionSurfaceSnapshot | None = None
+        self._latest_quality: DataQualityReport | None = None
         self._source_event_ids: list[UUID] = []
         self._correlation_id = uuid4()
+        self._prior_cumulative_volume: int | None = None
 
     @property
     def session_id(self) -> str:
@@ -109,6 +139,10 @@ class MarketRuntime:
     @property
     def latest_surface(self) -> OptionSurfaceSnapshot | None:
         return self._latest_surface
+
+    @property
+    def latest_quality(self) -> DataQualityReport | None:
+        return self._latest_quality
 
     async def ingest_underlying_quote(
         self,
@@ -145,22 +179,12 @@ class MarketRuntime:
 
         if isinstance(observation, UnderlyingObservation):
             self._bars.ingest_underlying(observation)
-            self._latest_underlying = UnderlyingSnapshot(
-                symbol=observation.symbol,
-                bid=observation.bid,
-                ask=observation.ask,
-                last=observation.last,
-                quote_timestamp=observation.source_timestamp,
-            )
         else:
             self._bars.ingest_quote(observation)
-            self._latest_underlying = UnderlyingSnapshot(
-                symbol=observation.symbol,
-                bid=observation.bid,
-                ask=observation.ask,
-                last=observation.last,
-                quote_timestamp=observation.source_timestamp,
-            )
+
+        self._latest_underlying = _underlying_snapshot_from_observation(observation)
+        if observation.cumulative_volume is not None:
+            self._prior_cumulative_volume = observation.cumulative_volume
 
         event = make_event(
             EventType.QUOTE_RECEIVED,
@@ -204,6 +228,8 @@ class MarketRuntime:
                 source=source,
             )
         self._bars.ingest_trade(observation)
+        if observation.cumulative_volume is not None:
+            self._prior_cumulative_volume = observation.cumulative_volume
         event = make_event(
             EventType.TRADE_RECEIVED,
             session_id=self._session_id,
@@ -303,17 +329,17 @@ class MarketRuntime:
             underlying_px = None
             if self._latest_underlying is not None:
                 underlying_px = (
-                    self._latest_underlying.last
+                    self._latest_underlying.mid
+                    or self._latest_underlying.last
                     or self._latest_underlying.bid
                     or self._latest_underlying.ask
                 )
-            surface = self._surface_builder.build(
+            surface = OptionSurfaceBuilder.from_provider_rows(
                 underlying_symbol=self._config.symbol,
                 exchange_time=reference,
                 trading_date=trading_day,
                 rows=self._pending_option_rows,
                 underlying_price=underlying_px,
-                now=reference,
             )
             self._latest_surface = surface
             self._pending_option_rows = []
@@ -335,39 +361,82 @@ class MarketRuntime:
             result.events_published += 1
             result.surface = surface
 
-        # Build snapshot when we have an underlying and at least one closed bar
-        # this tick, or when a surface was produced.
         if self._latest_underlying is None:
             return result
         if not closed and surface is None:
             return result
 
         bars_1m = tuple(
-            b
-            for b in self._bars.closed_bars()
-            if b.timeframe == BarTimeframe.M1
+            b for b in self._bars.closed_bars() if b.timeframe == BarTimeframe.M1
         )[-self._config.bars_1m_window :]
         bars_5m = tuple(
-            b
-            for b in self._bars.closed_bars()
-            if b.timeframe == BarTimeframe.M5
+            b for b in self._bars.closed_bars() if b.timeframe == BarTimeframe.M5
         )[-self._config.bars_5m_window :]
 
-        quality: DataQualityReport = self._evaluate_quality(
+        quality = evaluate_data_quality(
             underlying=self._latest_underlying,
             bars_1m=bars_1m,
+            bars_5m=bars_5m,
             option_surface=self._latest_surface,
             now=reference,
-            underlying_stale_seconds=self._config.underlying_stale_seconds,
-            option_stale_seconds=self._config.option_stale_seconds,
-            maximum_relative_spread=self._config.maximum_relative_spread,
-            min_contracts=self._config.min_option_contracts,
+            config=self._quality_config,
+            current_cumulative_volume=self._latest_underlying.cumulative_volume,
+            prior_cumulative_volume=None,
         )
+        # Surface bar-builder findings into the quality report as INFO/WARNING codes.
+        if self._bars.findings:
+            from joker.market.quality import (
+                DataQualityCode,
+                DataQualityFinding,
+                DataQualitySeverity,
+            )
+
+            extra = list(quality.findings)
+            for finding in self._bars.findings:
+                code = (
+                    DataQualityCode.CUMULATIVE_VOLUME_REGRESSION
+                    if finding.code == "cumulative_volume_regression"
+                    else DataQualityCode.INCOMPLETE_BAR
+                )
+                severity = (
+                    DataQualitySeverity.ERROR
+                    if finding.code == "cumulative_volume_regression"
+                    else DataQualitySeverity.WARNING
+                )
+                if finding.code.startswith("dropped"):
+                    code = DataQualityCode.INCOMPLETE_BAR
+                    severity = DataQualitySeverity.WARNING
+                extra.append(
+                    DataQualityFinding(
+                        code=code,
+                        severity=severity,
+                        message=finding.message,
+                        symbol=finding.symbol,
+                        details={"bar_finding_code": finding.code},
+                    )
+                )
+            from joker.market.quality import max_severity
+
+            merged = tuple(extra)
+            severity = max_severity(list(merged))
+            usable_for_execution = severity.value not in {"error", "critical"}
+            usable_for_reasoning = severity.value != "critical"
+            quality = DataQualityReport(
+                report_id=quality.report_id,
+                snapshot_id=quality.snapshot_id,
+                severity=severity,
+                findings=merged,
+                usable_for_reasoning=usable_for_reasoning,
+                usable_for_execution=usable_for_execution,
+            )
+            self._bars.clear_findings()
+
         result.quality = quality
+        self._latest_quality = quality
         dq_snap = DataQualitySnapshot(
             data_quality_id=quality.report_id,
             severity=quality.severity.value,
-            finding_codes=tuple(f.code for f in quality.findings),
+            finding_codes=tuple(f.code.value for f in quality.findings),
             usable_for_reasoning=quality.usable_for_reasoning,
             usable_for_execution=quality.usable_for_execution,
         )

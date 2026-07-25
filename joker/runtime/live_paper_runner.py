@@ -9,7 +9,8 @@ Compatibility façade (Task 1):
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, datetime, timezone
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, Callable
 
@@ -39,6 +40,10 @@ from joker.risk.capital import CapitalBudget, CapitalPlan
 from joker.risk.governor import RiskGovernor
 from joker.runtime.live_cli import should_stream_event
 from joker.runtime.market_handler import MarketEventHandler
+from joker.runtime.compatibility import (
+    CompatibilityLivePaperBridge,
+    ExecutionDelegatingBroker,
+)
 from joker.runtime.premarket import PremarketWorkflow
 from joker.runtime.reactive_engine import ReactiveEngine, StateMachineError
 from joker.runtime.run_manager import RunManager
@@ -52,7 +57,6 @@ from joker.storage.models import (
     TradeCandidateRecord,
 )
 from joker.strategy.playbook_quality import PlaybookQualityValidator, PlaybookValidationResult, trim_playbook_enabled_setups
-
 
 class LivePaperError(RuntimeError):
     """Fail-closed error for live paper session setup."""
@@ -166,6 +170,12 @@ class LivePaperRunner:
             app_settings.event_log_dir,
             redact_keys=app_settings.logging.redact_env_keys,
         )
+        self._task1_bridge: CompatibilityLivePaperBridge | None = None
+
+    @property
+    def task1_bridge(self) -> CompatibilityLivePaperBridge | None:
+        """Active Task 1 SessionSupervisor bridge when a paper session is running."""
+        return self._task1_bridge
 
     def _log(
         self,
@@ -236,6 +246,31 @@ class LivePaperRunner:
         result.broker_kind = selection.kind
         result.broker_label = selection.label
 
+        # Task 1 cutover: SessionSupervisor owns market/execution truth.
+        task1_db = Path(self.app_settings.db_path).parent / "joker_task1.db"
+        task1_bridge = CompatibilityLivePaperBridge(
+            broker=broker,
+            db_path=task1_db,
+            session_id=run_id,
+            run_id=run_id,
+            broker_account_id=selection.kind,
+        )
+        task1_bridge.start()
+        self._task1_bridge = task1_bridge
+        execution_broker = ExecutionDelegatingBroker(
+            inner=broker,
+            bridge=task1_bridge,
+            broker_account_id=selection.kind,
+        )
+
+        def shutdown_task1() -> None:
+            if self._task1_bridge is not None:
+                try:
+                    self._task1_bridge.shutdown()
+                except Exception:
+                    pass
+                self._task1_bridge = None
+
         def log(event_type: str, payload: dict) -> None:
             self._log(run_id, event_type, payload, on_event=on_event)
             if event_type == "risk.decision" and not payload.get("approved"):
@@ -282,6 +317,8 @@ class LivePaperRunner:
                 "live_money_orders": False,
                 "is_synthetic": False,
                 "capital": capital_budget.prompt_dict(),
+                "task1_session_supervisor": True,
+                "task1_session_id": task1_bridge.session_id,
             },
         )
 
@@ -318,6 +355,7 @@ class LivePaperRunner:
                 failures=[msg],
             )
             run_manager.end_run(run_id)
+            shutdown_task1()
             return result
 
         options_provider: WebullOptionsDataProvider | None = None
@@ -344,9 +382,11 @@ class LivePaperRunner:
                 result.errors.append(msg)
                 result.failures.append(msg)
                 run_manager.end_run(run_id)
+                shutdown_task1()
                 return result
 
-        # Warm snapshot from real Webull. Candles are best-effort (stock_bars may be unverified).
+        # Warm snapshot from real Webull. Feature candles remain for FeatureEngine;
+        # Task 1 market truth is owned by MarketRuntime (see poll loop ingest).
         try:
             try:
                 candle_events = provider.fetch_candle_events("1m")
@@ -357,12 +397,12 @@ class LivePaperRunner:
                 log("market.candles_unavailable",
                     {
                         "reason": str(candle_exc),
-                        "fallback": "quote_derived_candles",
+                        "fallback": "quote_derived_candles_for_features_only",
                     },
                 )
 
             snapshot_event = provider.fetch_snapshot_event()
-            # Seed at least one candle from the live quote so features can evolve.
+            # Seed feature candles only; MarketRuntime owns exchange-aligned bars.
             snap0 = provider.get_latest_snapshot()
             if snap0 is not None and not snap0.candles:
                 provider.append_quote_as_candle(snapshot_event)
@@ -370,6 +410,19 @@ class LivePaperRunner:
             snapshot = provider.get_latest_snapshot()
             if snapshot is None:
                 raise LivePaperError("No SPY snapshot from Webull")
+            # Seed Task 1 MarketRuntime with the warmup quote.
+            try:
+                task1_bridge.ingest_underlying_quote(
+                    symbol=snapshot.symbol,
+                    last=Decimal(str(snapshot.price)),
+                    bid=Decimal(str(snapshot.bid)) if snapshot.bid is not None else None,
+                    ask=Decimal(str(snapshot.ask)) if snapshot.ask is not None else None,
+                    source_timestamp=snapshot.timestamp,
+                    received_timestamp=datetime.now(timezone.utc),
+                    source="live_paper_warmup",
+                )
+            except Exception as ingest_exc:
+                log("task1.market_ingest_failed", {"reason": str(ingest_exc)})
             log("market.warmup",
                 {
                     "candles": len(snapshot.candles),
@@ -379,6 +432,7 @@ class LivePaperRunner:
                     "candle_source": getattr(provider, "candle_source", "unknown"),
                     "has_volume_bars": bool(getattr(provider, "has_volume_bars", False)),
                     "snapshot_event_id": snapshot_event.event_id,
+                    "task1_market_runtime": True,
                 },
             )
         except Exception as exc:
@@ -400,6 +454,7 @@ class LivePaperRunner:
                 failures=list(result.failures),
             )
             run_manager.end_run(run_id)
+            shutdown_task1()
             return result
 
         risk_config = _risk_config_from_settings(self.app_settings, capital_budget)
@@ -502,7 +557,7 @@ class LivePaperRunner:
 
         reactive = ReactiveEngine(
             RiskGovernor(risk_config, mode, live_enabled=False),
-            broker,
+            execution_broker,
         )
 
         if playbook and playbook.approved and (
@@ -558,7 +613,7 @@ class LivePaperRunner:
             provider=provider,
             reactive_engine=reactive,
             risk_governor=reactive.risk_governor,
-            broker=broker,
+            broker=execution_broker,
             feature_engine=FeatureEngine(
                 max_age_seconds=self.app_settings.risk.feed_max_silence_seconds
             ),
@@ -664,6 +719,32 @@ class LivePaperRunner:
 
                     events_processed += 1
                     if isinstance(event, SpyQuoteEvent):
+                        # FeatureEngine still uses provider candles; Task 1 truth
+                        # is ingested into MarketRuntime (not LivePaperRunner bars).
+                        try:
+                            task1_bridge.ingest_underlying_quote(
+                                symbol=getattr(event, "symbol", None) or "SPY",
+                                last=Decimal(str(event.price)),
+                                bid=(
+                                    Decimal(str(event.bid))
+                                    if getattr(event, "bid", None) is not None
+                                    else None
+                                ),
+                                ask=(
+                                    Decimal(str(event.ask))
+                                    if getattr(event, "ask", None) is not None
+                                    else None
+                                ),
+                                source_timestamp=event.timestamp,
+                                received_timestamp=datetime.now(timezone.utc),
+                                source="live_paper_poll",
+                            )
+                            task1_bridge.tick()
+                        except Exception as ingest_exc:
+                            log(
+                                "task1.market_ingest_failed",
+                                {"reason": str(ingest_exc)},
+                            )
                         provider.append_quote_as_candle(event)
                     handler.handle_event(event)
 
@@ -1305,4 +1386,5 @@ class LivePaperRunner:
         result.playbook_validation = playbook_validation
         result.events_processed = events_processed
         result.paper_pnl_usd = broker.get_daily_pnl()
+        shutdown_task1()
         return result

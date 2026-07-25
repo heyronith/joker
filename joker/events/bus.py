@@ -29,6 +29,7 @@ class InProcessAsyncEventBus:
         self._queues: dict[UUID, asyncio.Queue[DomainEvent | None]] = {}
         self._workers: dict[UUID, asyncio.Task[Any]] = {}
         self._inflight: set[asyncio.Task[Any]] = set()
+        self._dispatching: int = 0
         self._lock = asyncio.Lock()
 
     def subscribe(self, event_type: EventType | None, handler: EventHandlerFn) -> None:
@@ -73,7 +74,11 @@ class InProcessAsyncEventBus:
             event = await queue.get()
             if event is None:
                 break
-            await self._dispatch(event)
+            self._dispatching += 1
+            try:
+                await self._dispatch(event)
+            finally:
+                self._dispatching -= 1
 
     async def _dispatch(self, event: DomainEvent) -> None:
         handlers = list(self._subs.get(event.event_type, [])) + list(self._subs.get(None, []))
@@ -109,26 +114,30 @@ class InProcessAsyncEventBus:
                 )
 
     async def drain(self, *, timeout: float = 30.0) -> None:
-        """Wait until all correlation queues are empty (test-friendly)."""
+        """Wait until all queues are empty and all dispatched handlers completed."""
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout
         while loop.time() < deadline:
-            if all(q.empty() for q in self._queues.values()):
-                # Yield so in-flight dispatch can finish after dequeue.
+            queues_empty = all(q.empty() for q in self._queues.values())
+            if queues_empty and self._dispatching == 0:
+                # Yield once more to catch races where a worker just dequeued.
                 await asyncio.sleep(0)
-                if all(q.empty() for q in self._queues.values()):
+                queues_empty = all(q.empty() for q in self._queues.values())
+                if queues_empty and self._dispatching == 0:
                     return
             await asyncio.sleep(0.01)
         raise TimeoutError("event bus drain timed out with pending work")
 
     async def close(self) -> None:
-        """Stop correlation workers cleanly."""
+        """Stop correlation workers cleanly; leaves no worker tasks running."""
+        await self.drain(timeout=max(self._handler_timeout or 10.0, 5.0))
         for queue in list(self._queues.values()):
             await queue.put(None)
         for task in list(self._workers.values()):
             await task
         self._queues.clear()
         self._workers.clear()
+        self._dispatching = 0
 
     @property
     def seen_event_ids(self) -> set[UUID]:
@@ -137,3 +146,11 @@ class InProcessAsyncEventBus:
     def clear_seen(self) -> None:
         """Clear idempotency cache (tests / new session only)."""
         self._seen.clear()
+
+    @property
+    def active_worker_count(self) -> int:
+        return sum(1 for t in self._workers.values() if not t.done())
+
+    @property
+    def is_idle(self) -> bool:
+        return self._dispatching == 0 and all(q.empty() for q in self._queues.values())

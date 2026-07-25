@@ -24,7 +24,7 @@ from joker.market.option_surface import OptionSurfaceBuilder, OptionSurfaceRepos
 from joker.market.snapshots import SnapshotRepository
 from joker.persistence.migrations import apply_task1_migrations
 from joker.runtime.compatibility import NullAgentRuntime
-from joker.runtime.execution_runtime import ExecutionRuntime
+from joker.runtime.execution_runtime import ExecutionRuntime, UnresolvedReconciliation
 from joker.runtime.market_runtime import MarketRuntime, MarketRuntimeConfig
 from joker.time.calendar import MarketCalendar
 from joker.time.clock import ExchangeClock, SystemExchangeClock
@@ -43,6 +43,7 @@ class SessionSupervisorConfig:
     broker_account_id: str = "default"
     late_observation_tolerance_seconds: float = 2.0
     event_handler_timeout_seconds: float = 10.0
+    auto_apply_reconciliation_corrections: bool = True
     market: MarketRuntimeConfig = field(default_factory=MarketRuntimeConfig)
 
 
@@ -88,6 +89,7 @@ class SessionSupervisor:
             "errors": [],
         }
         self._last_reconciliation: ReconciliationReport | None = None
+        self._unresolved: UnresolvedReconciliation | None = None
 
     @property
     def session_id(self) -> str:
@@ -120,6 +122,20 @@ class SessionSupervisor:
     @property
     def graph_state(self) -> JokerGraphState:
         return self._graph_state
+
+    @property
+    def ledger_store(self) -> SqliteLedgerStore | None:
+        return self._ledger
+
+    @property
+    def unresolved_reconciliation(self) -> UnresolvedReconciliation | None:
+        return self._unresolved
+
+    @property
+    def claims_recovery(self) -> bool:
+        if self._execution is None:
+            return False
+        return self._execution.claims_recovery() and self._unresolved is None
 
     async def start(self) -> JokerGraphState:
         """Apply migrations, restore checkpoints, reconcile, start runtimes."""
@@ -170,6 +186,7 @@ class SessionSupervisor:
             session_id=self._session_id,
             broker_account_id=self._config.broker_account_id,
         )
+        await self._execution.restore_order_mappings()
 
         # Agent boundary: passthrough subscriptions only (no decisions).
         self._bus.subscribe(EventType.MARKET_SNAPSHOT_CREATED, self._on_agent_passthrough)
@@ -188,7 +205,31 @@ class SessionSupervisor:
             )
         )
 
-        self._last_reconciliation = await self._execution.run_reconciliation()
+        report = await self._execution.run_reconciliation()
+        if not report.is_consistent:
+            if self._config.auto_apply_reconciliation_corrections:
+                await self._execution.apply_reconciliation_corrections(report)
+                report = await self._execution.run_reconciliation()
+            if not report.is_consistent:
+                self._unresolved = UnresolvedReconciliation(report=report)
+                errors = list(self._graph_state.get("errors") or [])
+                errors.append(
+                    {
+                        "type": "unresolved_reconciliation",
+                        "report_id": str(report.report_id),
+                        "finding_count": len(report.findings),
+                    }
+                )
+                self._graph_state["errors"] = errors
+                logger.error(
+                    "startup_reconciliation_unresolved",
+                    extra={
+                        "session_id": self._session_id,
+                        "report_id": str(report.report_id),
+                    },
+                )
+
+        self._last_reconciliation = report
         self._graph_state["exchange_time"] = now
         await self._checkpoints.save(self._graph_state, self._session_id)
         self._started = True
@@ -217,7 +258,7 @@ class SessionSupervisor:
         return record
 
     async def shutdown(self) -> ReconciliationReport | None:
-        """Graceful shutdown: session ending → final reconciliation → ended."""
+        """Graceful shutdown: session ending → final reconciliation → close bus."""
         now = self._clock.now()
         await self._bus.publish(
             make_event(
@@ -250,7 +291,7 @@ class SessionSupervisor:
                 },
             )
         )
-        await self._bus.drain()
+        await self._bus.close()
 
         if self._ledger is not None:
             await self._ledger.close()
@@ -258,7 +299,12 @@ class SessionSupervisor:
         self._started = False
         logger.info(
             "session_shutdown_complete",
-            extra={"session_id": self._session_id, "run_id": self._run_id},
+            extra={
+                "session_id": self._session_id,
+                "run_id": self._run_id,
+                "event_bus_idle": self._bus.is_idle,
+                "active_workers": self._bus.active_worker_count,
+            },
         )
         return report
 

@@ -157,3 +157,10 @@ class PaperBroker(BrokerClient):
 
     def get_daily_pnl_available(self) -> tuple[bool, float | None]:
         return True, self._daily_pnl
+
+    def get_fill_price(self, order_id: str) -> float | None:
+        """Return verified fill price for an order, if a fill exists."""
+        for fill in self._fills.values():
+            if fill.order_id == order_id:
+                return float(fill.price)
+        return None
