@@ -43,6 +43,10 @@ class BrokerClient(ABC):
     def get_daily_pnl(self) -> float:
         ...
 
+    def get_daily_pnl_available(self) -> tuple[bool, float | None]:
+        """Return (available, value). Unavailable broker PnL must not be fabricated as 0."""
+        return True, self.get_daily_pnl()
+
 
 class PaperBroker(BrokerClient):
     """Simulated broker with configurable slippage and spread."""
@@ -150,3 +154,6 @@ class PaperBroker(BrokerClient):
 
     def get_daily_pnl(self) -> float:
         return self._daily_pnl
+
+    def get_daily_pnl_available(self) -> tuple[bool, float | None]:
+        return True, self._daily_pnl

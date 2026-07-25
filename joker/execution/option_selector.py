@@ -149,3 +149,41 @@ class OptionSelector:
         """Select from Webull OptionSnapshot objects."""
         events = [snapshot_to_quote_event(s) for s in snapshots]
         return self.select_from_events(events, direction, underlying_price, reference_time)
+
+    def select_from_surface(
+        self,
+        surface,
+        direction: str,
+        underlying_price: float,
+        reference_time: datetime,
+    ) -> SelectedOptionContract:
+        """Select nearest ATM from a full OptionSurfaceSnapshot (compatibility path)."""
+        from joker.schemas.replay import OptionQuoteEvent
+
+        option_type = "call" if direction == "long_call" else "put"
+        events: list[OptionQuoteEvent] = []
+        for c in surface.contracts:
+            if c.option_type != option_type:
+                continue
+            if c.bid is None or c.ask is None:
+                continue
+            mid = float(c.mid) if c.mid is not None else (float(c.bid) + float(c.ask)) / 2.0
+            spread_pct = 0.0
+            if mid > 0:
+                spread_pct = ((float(c.ask) - float(c.bid)) / mid) * 100.0
+            events.append(
+                OptionQuoteEvent(
+                    timestamp=c.quote_timestamp,
+                    source="option_surface",
+                    contract_id=c.contract_id,
+                    expiration=c.expiry,
+                    strike=float(c.strike),
+                    option_type=c.option_type,
+                    bid=float(c.bid),
+                    ask=float(c.ask),
+                    mid=mid,
+                    spread_pct=spread_pct,
+                    quote_timestamp=c.quote_timestamp,
+                )
+            )
+        return self.select_from_events(events, direction, underlying_price, reference_time)

@@ -78,3 +78,27 @@ broker:
 data:
   default_provider: webull
   quote_poll_interval_seconds: 1.0
+
+exchange:
+  calendar: XNYS
+  timezone: America/New_York
+
+market_data:
+  observation_poll_seconds: 1
+  bar_timeframes:
+    - 1m
+    - 5m
+  late_observation_tolerance_seconds: 2
+
+data_quality:
+  underlying_stale_seconds: 5
+  option_stale_seconds: 10
+  maximum_relative_spread: 0.25
+
+runtime:
+  event_handler_timeout_seconds: 10
+  reconciliation_interval_seconds: 5
+
+persistence:
+  database_url: sqlite:///data/joker.db
+  checkpoint_database_url: sqlite:///data/joker_checkpoints.db

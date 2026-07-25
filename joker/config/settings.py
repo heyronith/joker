@@ -109,6 +109,39 @@ class BrokerSettings(BaseModel):
 class DataSettings(BaseModel):
     default_provider: str = "webull"
     quote_poll_interval_seconds: float = 1.0
+    # Task 1 observation/bar settings (aliases under market_data in YAML)
+    observation_poll_seconds: float = 1.0
+    bar_timeframes: list[str] = Field(default_factory=lambda: ["1m", "5m"])
+    late_observation_tolerance_seconds: float = 2.0
+
+
+class ExchangeSettings(BaseModel):
+    """Canonical exchange clock/calendar configuration."""
+
+    calendar: str = "XNYS"
+    timezone: str = "America/New_York"
+
+
+class MarketDataSettings(BaseModel):
+    observation_poll_seconds: float = 1.0
+    bar_timeframes: list[str] = Field(default_factory=lambda: ["1m", "5m"])
+    late_observation_tolerance_seconds: float = 2.0
+
+
+class DataQualitySettings(BaseModel):
+    underlying_stale_seconds: float = 5.0
+    option_stale_seconds: float = 10.0
+    maximum_relative_spread: float = 0.25
+
+
+class RuntimeSettings(BaseModel):
+    event_handler_timeout_seconds: float = 10.0
+    reconciliation_interval_seconds: float = 5.0
+
+
+class PersistenceSettings(BaseModel):
+    database_url: str = "sqlite:///data/joker.db"
+    checkpoint_database_url: str = "sqlite:///data/joker_checkpoints.db"
 
 
 class AppSettings(BaseModel):
@@ -127,6 +160,11 @@ class AppSettings(BaseModel):
     logging: LoggingSettings = Field(default_factory=LoggingSettings)
     broker: BrokerSettings = Field(default_factory=BrokerSettings)
     data: DataSettings = Field(default_factory=DataSettings)
+    exchange: ExchangeSettings = Field(default_factory=ExchangeSettings)
+    market_data: MarketDataSettings = Field(default_factory=MarketDataSettings)
+    data_quality: DataQualitySettings = Field(default_factory=DataQualitySettings)
+    runtime: RuntimeSettings = Field(default_factory=RuntimeSettings)
+    persistence: PersistenceSettings = Field(default_factory=PersistenceSettings)
 
     @field_validator("mode", mode="before")
     @classmethod

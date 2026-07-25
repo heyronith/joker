@@ -197,8 +197,13 @@ class WebullClient(BrokerClient):
         return extract_cash_balance(payload)
 
     def get_daily_pnl(self) -> float:
-        # Webull day-PnL field varies; return 0 until a verified field is mapped.
+        # Legacy float API — callers must use get_daily_pnl_available() for truthfulness.
+        # Unavailable day PnL must not be treated as a real zero by ExecutionRuntime.
         return 0.0
+
+    def get_daily_pnl_available(self) -> tuple[bool, float | None]:
+        """Webull day-PnL field is not verified — report unavailable (do not fabricate)."""
+        return False, None
 
     def list_accounts_raw(self) -> list[dict[str, Any]]:
         return self._api.list_accounts()
@@ -244,4 +249,9 @@ class MockWebullClient(BrokerClient):
         return 0.0
 
     def get_daily_pnl(self) -> float:
-        return 0.0
+        available, value = self.get_daily_pnl_available()
+        return 0.0 if not available or value is None else value
+
+    def get_daily_pnl_available(self) -> tuple[bool, float | None]:
+        """Mock has no day-PnL source — unavailable."""
+        return (False, None)

@@ -1,4 +1,10 @@
-"""Live paper session — real Webull market data + auto paper execution."""
+"""Live paper session — real Webull market data + auto paper execution.
+
+Compatibility façade (Task 1):
+- Prefer MarketRuntime for observation/bar/snapshot truth.
+- Prefer ExecutionRuntime + ledger for order/fill/position accounting.
+- This module remains the CLI entry for `joker paper run` and gradually delegates.
+"""
 
 from __future__ import annotations
 

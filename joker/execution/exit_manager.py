@@ -36,13 +36,27 @@ class ExitManager:
         *,
         eod_time: time = time(15, 55),
         timezone_info=None,
+        clock=None,
         trail_activate_mfe_pct: float = 0.35,
         trail_giveback_pct: float = 0.20,
         late_day_tighten_minutes: float = 45.0,
         late_day_stop_floor_pct: float = 0.35,
     ) -> None:
         self.eod_time = eod_time
-        self.tz = timezone_info or _ET
+        # Prefer explicit timezone_info; else clock.tz / clock.timezone; else
+        # timezone from clock.now(); else America/New_York.
+        if timezone_info is not None:
+            self.tz = timezone_info
+        elif clock is not None and getattr(clock, "tz", None) is not None:
+            self.tz = clock.tz
+        elif clock is not None and getattr(clock, "timezone", None) is not None:
+            self.tz = clock.timezone
+        elif clock is not None and hasattr(clock, "now"):
+            now = clock.now()
+            self.tz = now.tzinfo or _ET
+        else:
+            self.tz = _ET
+        self.clock = clock
         self.trail_activate_mfe_pct = trail_activate_mfe_pct
         self.trail_giveback_pct = trail_giveback_pct
         self.late_day_tighten_minutes = late_day_tighten_minutes

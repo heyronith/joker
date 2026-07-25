@@ -191,6 +191,62 @@ class FeatureEngine:
     def __init__(self, max_age_seconds: int = 60) -> None:
         self.max_age_seconds = max_age_seconds
 
+    def compute_from_bars(
+        self,
+        *,
+        symbol: str,
+        price: float,
+        bars,
+        timeframe,
+        as_of: datetime,
+        reference_time: datetime | None = None,
+        prior_day_candles: list[Candle] | None = None,
+        premarket_candles: list[Candle] | None = None,
+    ) -> TechnicalFeatures:
+        """Compute features from explicitly timeframe-tagged bars.
+
+        Raises FeatureTimeframeError when timeframe is missing/invalid.
+        Does not infer timeframe from list length.
+        """
+        from joker.market.bars import MarketBar, require_timeframe
+        from joker.market.exceptions import FeatureTimeframeError
+
+        tf = require_timeframe(timeframe)
+        if not isinstance(bars, (list, tuple)):
+            raise FeatureTimeframeError("bars must be a sequence of MarketBar")
+        for b in bars:
+            if not isinstance(b, MarketBar):
+                raise FeatureTimeframeError("all bars must be MarketBar instances")
+            if b.timeframe != tf:
+                raise FeatureTimeframeError(
+                    f"bar timeframe {b.timeframe.value} does not match requested {tf.value}"
+                )
+        candles = [
+            Candle(
+                symbol=symbol,
+                timestamp=b.start,
+                open=float(b.open),
+                high=float(b.high),
+                low=float(b.low),
+                close=float(b.close),
+                volume=float(b.volume),
+            )
+            for b in bars
+        ]
+        snap = MarketSnapshot(
+            symbol=symbol,
+            timestamp=as_of,
+            price=price,
+            candles=candles,
+        )
+        return self.compute(
+            snap,
+            prior_day_candles=prior_day_candles,
+            premarket_candles=premarket_candles,
+            as_of=as_of,
+            reference_time=reference_time,
+        )
+
     def compute(
         self,
         snapshot: MarketSnapshot,
@@ -199,6 +255,10 @@ class FeatureEngine:
         as_of: datetime | None = None,
         reference_time: datetime | None = None,
     ) -> TechnicalFeatures:
+        """Legacy path: uses snapshot.candles as 1m-equivalent history.
+
+        Prefer compute_from_bars(..., timeframe=BarTimeframe.M1) for Task 1 callers.
+        """
         as_of = as_of or snapshot.timestamp
         intraday = snapshot.candles
         vwap = calculate_vwap(intraday)
