@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, time, timezone
 from statistics import pstdev
 from zoneinfo import ZoneInfo
 
@@ -11,18 +11,31 @@ from joker.schemas.domain import Candle, MarketSnapshot, TechnicalFeatures
 _ET = ZoneInfo("America/New_York")
 
 
-def calculate_vwap(candles: list[Candle]) -> float | None:
+def calculate_vwap(
+    candles: list[Candle],
+    *,
+    allow_equal_weight_fallback: bool = True,
+) -> float | None:
+    """Volume-weighted typical price; equal-weight fallback when volume is all zero.
+
+    Quote-derived candles (Webull bars unavailable) often have volume=0. Without a
+    fallback, distance_from_vwap stays None and EdgePrefilter blocks the LLM forever.
+    """
     if not candles:
         return None
     total_pv = 0.0
     total_volume = 0.0
+    typicals: list[float] = []
     for c in candles:
         typical = (c.high + c.low + c.close) / 3.0
+        typicals.append(typical)
         total_pv += typical * c.volume
         total_volume += c.volume
-    if total_volume <= 0:
+    if total_volume > 0:
+        return total_pv / total_volume
+    if not allow_equal_weight_fallback or not typicals:
         return None
-    return total_pv / total_volume
+    return sum(typicals) / len(typicals)
 
 
 def previous_day_levels(candles: list[Candle]) -> tuple[float | None, float | None]:
@@ -135,6 +148,36 @@ def session_minutes(as_of: datetime) -> tuple[float | None, float | None, str]:
     return float(open_m), float(close_m), part
 
 
+def split_session_candles(
+    candles: list[Candle],
+) -> tuple[list[Candle], list[Candle], list[Candle]]:
+    """Split candles into prior_day / premarket / RTH by America/New_York clock.
+
+    Heuristic: bars before 09:30 ET today = premarket; bars from previous calendar
+    day(s) = prior_day; rest = intraday RTH (caller still uses snapshot.candles for VWAP).
+    """
+    if not candles:
+        return [], [], []
+    last = candles[-1].timestamp
+    if last.tzinfo is None:
+        last = last.replace(tzinfo=timezone.utc)
+    et_last = last.astimezone(_ET)
+    today = et_last.date()
+    prior: list[Candle] = []
+    premarket: list[Candle] = []
+    rth: list[Candle] = []
+    for c in candles:
+        ts = c.timestamp if c.timestamp.tzinfo else c.timestamp.replace(tzinfo=timezone.utc)
+        et = ts.astimezone(_ET)
+        if et.date() < today:
+            prior.append(c)
+        elif et.time() < time(9, 30):
+            premarket.append(c)
+        else:
+            rth.append(c)
+    return prior, premarket, rth
+
+
 def is_stale(as_of: datetime, max_age_seconds: int = 60, reference_time: datetime | None = None) -> bool:
     now = reference_time or datetime.now(timezone.utc)
     ts = as_of if as_of.tzinfo else as_of.replace(tzinfo=timezone.utc)
@@ -168,6 +211,11 @@ class FeatureEngine:
         or_high, or_low = opening_range(intraday, bars=5)
         upper, lower = vwap_bands(intraday, vwap)
         mins_open, mins_close, day_part = session_minutes(as_of)
+        volume_confirmed: bool | None
+        if not intraday:
+            volume_confirmed = None
+        else:
+            volume_confirmed = any(c.volume > 0 for c in intraday)
 
         return TechnicalFeatures(
             symbol=snapshot.symbol,
@@ -182,7 +230,7 @@ class FeatureEngine:
             momentum_5m=mom,
             distance_from_vwap_pct=dist,
             trend_label=trend_label(mom),
-            volume_confirmed=None,
+            volume_confirmed=volume_confirmed,
             is_stale=is_stale(snapshot.timestamp, self.max_age_seconds, reference_time=reference_time),
             candle_count=len(intraday),
             opening_range_high=or_high,

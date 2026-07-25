@@ -303,6 +303,7 @@ def test_time_stop_exit() -> None:
 
 
 def test_eod_exit() -> None:
+    # EOD is America/New_York 15:55; July is EDT (UTC-4) → 19:55 UTC
     mgr = ExitManager(eod_time=datetime(2026, 7, 1, 15, 55).time())
     ctx = OpenTradeContext(
         position_id="p1",
@@ -311,9 +312,44 @@ def test_eod_exit() -> None:
         take_profit_price=2.0,
         entry_time=datetime(2026, 7, 1, 14, 0, tzinfo=timezone.utc),
     )
-    decision = mgr.check_exit(ctx, 1.0, datetime(2026, 7, 1, 15, 56, tzinfo=timezone.utc))
+    decision = mgr.check_exit(ctx, 1.0, datetime(2026, 7, 1, 19, 56, tzinfo=timezone.utc))
     assert decision is not None
     assert decision.reason is ExitReason.END_OF_DAY
+
+
+def test_trailing_stop_activates_and_exits() -> None:
+    mgr = ExitManager(trail_activate_mfe_pct=0.35, trail_giveback_pct=0.20)
+    ctx = OpenTradeContext(
+        position_id="p1",
+        entry_price=1.0,
+        stop_price=0.5,
+        take_profit_price=5.0,
+        entry_time=datetime(2026, 7, 1, 14, 0, tzinfo=timezone.utc),
+    )
+    # MFE 40% → trail activates at peak * 0.8 = 1.12
+    ctx = mgr.update_trailing(ctx, 1.40)
+    assert ctx.trail_active is True
+    assert ctx.trail_stop_price is not None
+    assert ctx.trail_stop_price == pytest.approx(1.12)
+    # Giveback through trail
+    decision = mgr.check_exit(ctx, 1.10, datetime(2026, 7, 1, 14, 10, tzinfo=timezone.utc))
+    assert decision is not None
+    assert decision.reason is ExitReason.STOP_LOSS
+    assert "Trailing" in (decision.message or "")
+
+
+def test_eod_not_triggered_before_et_close() -> None:
+    mgr = ExitManager(eod_time=datetime(2026, 7, 1, 15, 55).time())
+    ctx = OpenTradeContext(
+        position_id="p1",
+        entry_price=1.0,
+        stop_price=0.5,
+        take_profit_price=2.0,
+        entry_time=datetime(2026, 7, 1, 14, 0, tzinfo=timezone.utc),
+    )
+    # 15:56 UTC is still morning ET — must not force EOD
+    decision = mgr.check_exit(ctx, 1.0, datetime(2026, 7, 1, 15, 56, tzinfo=timezone.utc))
+    assert decision is None
 
 
 def _make_handler(tmp_path, mode=SafetyMode.PAPER):

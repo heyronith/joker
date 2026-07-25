@@ -123,16 +123,44 @@ def _parse_quote_payload(symbol: str, data: dict[str, Any]) -> WebullQuote:
     )
 
 
+def normalize_stock_timespan(timeframe: str) -> str:
+    """Map joker timeframes to Webull stock bars timespan codes."""
+    key = (timeframe or "").strip().lower()
+    mapping = {
+        "1m": "M1",
+        "m1": "M1",
+        "5m": "M5",
+        "m5": "M5",
+        "15m": "M15",
+        "m15": "M15",
+        "30m": "M30",
+        "m30": "M30",
+        "60m": "M60",
+        "1h": "M60",
+        "1d": "D",
+        "d": "D",
+    }
+    if key.upper() in {"M1", "M5", "M15", "M30", "M60", "D", "W", "MO"}:
+        return key.upper()
+    return mapping.get(key, timeframe)
+
+
 def _parse_candle_row(row: dict[str, Any]) -> WebullCandle:
     ts_raw = row.get("timestamp") or row.get("time") or row.get("t")
     if ts_raw is None:
         raise WebullApiError("Malformed Webull candle: missing timestamp")
+    open_v = row.get("open") if row.get("open") is not None else row.get("o")
+    high_v = row.get("high") if row.get("high") is not None else row.get("h")
+    low_v = row.get("low") if row.get("low") is not None else row.get("l")
+    close_v = row.get("close") if row.get("close") is not None else row.get("c")
+    if open_v is None or high_v is None or low_v is None or close_v is None:
+        raise WebullApiError("Malformed Webull candle: missing OHLC")
     return WebullCandle(
         timestamp=_parse_timestamp(ts_raw),
-        open=float(row.get("open") or row.get("o")),
-        high=float(row.get("high") or row.get("h")),
-        low=float(row.get("low") or row.get("l")),
-        close=float(row.get("close") or row.get("c")),
+        open=float(open_v),
+        high=float(high_v),
+        low=float(low_v),
+        close=float(close_v),
         volume=float(row.get("volume") or row.get("v") or 0),
     )
 
@@ -182,18 +210,22 @@ class HttpWebullMarketApi:
         _ensure_spy(symbol)
         require_verified("stock_bars")
         self._ensure_auth()
+        timespan = normalize_stock_timespan(timeframe)
         payload = self._http.request_json(
             "stock_bars",
             params={
-                "symbols": symbol.upper(),
+                "symbol": symbol.upper(),
                 "category": "US_STOCK",
-                "timespan": timeframe,
+                "timespan": timespan,
             },
         )
         rows = payload if isinstance(payload, list) else payload.get("data") or payload.get("bars") or []
         if not isinstance(rows, list):
             raise WebullApiError("Malformed Webull candles response")
-        return [_parse_candle_row(row) for row in rows if isinstance(row, dict)]
+        candles = [_parse_candle_row(row) for row in rows if isinstance(row, dict)]
+        # Webull returns newest-first; FeatureEngine expects chronological order.
+        candles.sort(key=lambda c: c.timestamp)
+        return candles
 
     def stream_quotes(
         self,

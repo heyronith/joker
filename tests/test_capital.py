@@ -11,7 +11,13 @@ from tests.fixtures.domain import make_candidate, make_daily_state
 
 def test_allocate_respects_authorized_ceiling() -> None:
     budget = CapitalBudget(
-        plan=CapitalPlan(authorized_usd=500.0, target_profit_pct=20.0, max_contracts_per_trade=50)
+        plan=CapitalPlan(
+            authorized_usd=500.0,
+            target_profit_pct=20.0,
+            max_contracts_per_trade=50,
+            aggression_mode="fixed",
+            max_kelly_fraction=1.0,
+        )
     )
     # $2.00 premium => $200 per contract
     result = budget.allocate(

@@ -54,10 +54,20 @@ class WebullMarketDataProvider(MarketDataProvider):
         self._stream_events: list[MarketEvent] = []
         self._stream_index = 0
         self._authenticated = False
+        # "bars" = Webull 1m OHLCV loaded; "quotes" = quote-derived fallback
+        self._candle_source: str = "none"
 
     @property
     def feed_health(self) -> str:
         return self._feed_health
+
+    @property
+    def candle_source(self) -> str:
+        return self._candle_source
+
+    @property
+    def has_volume_bars(self) -> bool:
+        return self._candle_source == "bars" and any(c.volume > 0 for c in self._candles)
 
     @property
     def permission_warning(self) -> str | None:
@@ -154,8 +164,18 @@ class WebullMarketDataProvider(MarketDataProvider):
             else:
                 self._feed_health = "OK"
 
-    def _apply_candle_event(self, event: SpyCandleEvent) -> None:
-        self._candles.append(event.candle)
+    def _apply_candle_event(self, event: SpyCandleEvent, *, replace_same_minute: bool = False) -> None:
+        candle = event.candle
+        if replace_same_minute and self._candles:
+            last = self._candles[-1]
+            last_m = last.timestamp.astimezone(timezone.utc).replace(second=0, microsecond=0)
+            new_m = candle.timestamp.astimezone(timezone.utc).replace(second=0, microsecond=0)
+            if last_m == new_m:
+                self._candles[-1] = candle
+            else:
+                self._candles.append(candle)
+        else:
+            self._candles.append(candle)
         ts = event.timestamp
         if self._latest_snapshot:
             self._latest_snapshot = self._latest_snapshot.model_copy(
@@ -163,24 +183,51 @@ class WebullMarketDataProvider(MarketDataProvider):
             )
 
     def append_quote_as_candle(self, event: SpyQuoteEvent) -> None:
-        """Build session candle history from live quotes when stock bars are unavailable."""
+        """Upsert the forming 1-minute bar from a live quote (fallback or bar refresh)."""
+        ts = event.timestamp if event.timestamp.tzinfo else event.timestamp.replace(tzinfo=timezone.utc)
+        minute_ts = ts.astimezone(timezone.utc).replace(second=0, microsecond=0)
+        price = float(event.price)
+        if self._candles:
+            last = self._candles[-1]
+            last_m = last.timestamp.astimezone(timezone.utc).replace(second=0, microsecond=0)
+            if last_m == minute_ts:
+                updated = Candle(
+                    symbol=ALLOWED_SYMBOL,
+                    timestamp=minute_ts,
+                    open=last.open,
+                    high=max(last.high, price),
+                    low=min(last.low, price),
+                    close=price,
+                    # Preserve real bar volume when present; quote ticks have no volume.
+                    volume=last.volume,
+                )
+                self._candles[-1] = updated
+                if self._latest_snapshot:
+                    self._latest_snapshot = self._latest_snapshot.model_copy(
+                        update={"candles": list(self._candles), "timestamp": ts, "price": price}
+                    )
+                return
+
         candle = Candle(
             symbol=ALLOWED_SYMBOL,
-            timestamp=event.timestamp,
-            open=event.price,
-            high=event.price,
-            low=event.price,
-            close=event.price,
+            timestamp=minute_ts,
+            open=price,
+            high=price,
+            low=price,
+            close=price,
             volume=0.0,
         )
+        if self._candle_source == "none":
+            self._candle_source = "quotes"
         self._apply_candle_event(
             SpyCandleEvent(
-                timestamp=event.timestamp,
+                timestamp=minute_ts,
                 symbol=ALLOWED_SYMBOL,
                 source=SOURCE_WEBULL_STOCK,
                 candle=candle,
                 data_classification=DataClassification.STOCK_MARKET_DATA.value,
-            )
+            ),
+            replace_same_minute=True,
         )
 
     def fetch_snapshot_event(self) -> SpyQuoteEvent:
@@ -200,9 +247,12 @@ class WebullMarketDataProvider(MarketDataProvider):
 
     def fetch_candle_events(self, timeframe: str) -> list[SpyCandleEvent]:
         rows = self._api.get_candles(ALLOWED_SYMBOL, timeframe)
+        # Replace prior history with authoritative bars (chronological).
+        self._candles = []
         events = [self._candle_to_event(row) for row in rows]
         for event in events:
             self._apply_candle_event(event)
+        self._candle_source = "bars" if events else self._candle_source
         return events
 
     def prepare_stream(self, *, duration_seconds: float) -> None:

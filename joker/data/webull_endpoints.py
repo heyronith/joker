@@ -73,11 +73,13 @@ WEBULL_ENDPOINTS: dict[str, WebullEndpoint] = {
         name="stock_bars",
         method="GET",
         path="/openapi/market-data/stock/bars",
-        verified=False,
+        verified=True,
         rate_limit_per_minute=60,
-        required_params=("symbols", "category", "timespan"),
+        # Live-verified 2026-07-24: param is `symbol` (singular), timespan `M1`.
+        # `symbols` (plural) returns HTTP 400 Parameters not valid.
+        required_params=("symbol", "category", "timespan"),
         docs_url="https://developer.webull.com/apis/docs/reference/stock-historical-bars",
-        notes="Verify timespan mapping (M1 vs 1m) before enabling.",
+        notes="category=US_STOCK; timespan=M1 (joker maps 1m→M1). Response: OHLCV array newest-first.",
     ),
     "stock_streaming": WebullEndpoint(
         name="stock_streaming",

@@ -44,14 +44,14 @@ Central registry: `joker/data/webull_endpoints.py`
 |-------|-------|
 | Method | `GET` |
 | Path | `/openapi/market-data/stock/bars` |
-| Required params | `symbols`, `category=US_STOCK`, `timespan` (e.g. `M1`) |
+| Required params | `symbol` (singular), `category=US_STOCK`, `timespan` (`M1`, …) |
 | Required headers | Signed market-data v2 headers |
-| Response shape | Array of OHLCV bar objects |
+| Response shape | Array of OHLCV bar objects (often newest-first) |
 | Rate limit | 60 req/min |
-| Verified | **false** (timespan mapping not confirmed in joker) |
+| Verified | **true** (live-checked 2026-07-24: `symbol`+`M1` works; `symbols` returns 400) |
 | Docs | https://developer.webull.com/apis/docs/reference/stock-historical-bars |
 
-Unverified endpoints raise `OptionEndpointUnverified` — joker does not guess.
+joker maps `1m` → `M1` via `normalize_stock_timespan`.
 
 ---
 
@@ -132,7 +132,7 @@ Same endpoint as option snapshot — pass up to 20 comma-separated OSI symbols.
 ## Known limitations
 
 1. **No official option chain API** — contract discovery via chain endpoint is disabled; use OSI construction for 0DTE verification.
-2. **Stock bars** endpoint registered but marked unverified until timespan mapping is confirmed.
+2. **Stock bars** verified with `symbol` + `timespan=M1` (do not use `symbols`).
 3. **MQTT streaming** not implemented in joker; polling uses stock snapshot.
 4. **Shadow mode** refuses options unless `data/capabilities/webull_options_capability.json` says `usable_for_shadow=true` or in-session verification succeeds.
 5. **Rate limits** enforced client-side via `RateLimiter` (60/min default).

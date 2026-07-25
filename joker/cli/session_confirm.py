@@ -28,6 +28,11 @@ def plan_from_settings(settings: CapitalSettings) -> CapitalPlan:
         max_concurrent_positions=int(settings.max_concurrent_positions),
         max_contracts_per_trade=int(settings.max_contracts_per_trade),
         min_contracts_per_trade=int(settings.min_contracts_per_trade),
+        aggression_mode=str(settings.aggression_mode),
+        max_kelly_fraction=float(settings.max_kelly_fraction),
+        min_win_probability=float(settings.min_win_probability),
+        behind_goal_boost=float(settings.behind_goal_boost),
+        ahead_goal_dampen=float(settings.ahead_goal_dampen),
     )
 
 
@@ -91,6 +96,11 @@ def confirm_session_capital(
         max_concurrent_positions=max(1, concurrent),
         max_contracts_per_trade=int(settings.max_contracts_per_trade),
         min_contracts_per_trade=int(settings.min_contracts_per_trade),
+        aggression_mode=str(settings.aggression_mode),
+        max_kelly_fraction=float(settings.max_kelly_fraction),
+        min_win_probability=float(settings.min_win_probability),
+        behind_goal_boost=float(settings.behind_goal_boost),
+        ahead_goal_dampen=float(settings.ahead_goal_dampen),
     )
     budget = CapitalBudget(plan=plan)
 

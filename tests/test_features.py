@@ -32,6 +32,31 @@ def test_vwap_calculation() -> None:
     assert 100 < vwap < 102
 
 
+def test_vwap_equal_weight_fallback_when_volume_zero() -> None:
+    base = datetime(2026, 7, 1, 14, 0, tzinfo=timezone.utc)
+    candles = [
+        _candle(base, 100, 0),
+        _candle(base + timedelta(minutes=1), 102, 0),
+    ]
+    vwap = calculate_vwap(candles)
+    assert vwap is not None
+    # Equal-weight typical prices: both typical ≈ close when OHLC near close
+    assert 100 < vwap < 102
+
+
+def test_features_set_volume_confirmed_false_for_quote_candles() -> None:
+    engine = FeatureEngine(max_age_seconds=999999)
+    base = datetime(2026, 7, 1, 14, 0, tzinfo=timezone.utc)
+    candles = [_candle(base + timedelta(minutes=i), 550 + i, volume=0) for i in range(6)]
+    snap = make_snapshot(candles=candles, timestamp=base + timedelta(minutes=5), price=555.0)
+    features = engine.compute(snap, as_of=base + timedelta(minutes=5))
+    assert features.vwap is not None
+    assert features.distance_from_vwap_pct is not None
+    assert features.momentum_5m is not None
+    assert features.volume_confirmed is False
+    assert features.candle_count == 6
+
+
 def test_stale_snapshot_detected() -> None:
     engine = FeatureEngine(max_age_seconds=30)
     snap = make_snapshot(

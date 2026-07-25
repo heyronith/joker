@@ -41,6 +41,8 @@ agents:
   confirm_ttl_seconds: 120.0
   max_confirm_spy_drift_pct: 0.20
   max_confirm_option_mid_worsen_pct: 15.0
+  use_edge_prefilter: true
+  fast_confirm_min_seconds: 8.0
   memory_lookback_days: 5
   postmarket_learner_enabled: true
 
@@ -52,6 +54,11 @@ capital:
   min_contracts_per_trade: 1
   require_session_confirm: true
   pause_entries_when_goal_met: true
+  aggression_mode: goal_adaptive
+  max_kelly_fraction: 0.35
+  min_win_probability: 0.45
+  behind_goal_boost: 0.15
+  ahead_goal_dampen: 0.15
 
 logging:
   level: INFO

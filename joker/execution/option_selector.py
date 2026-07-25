@@ -25,6 +25,8 @@ class OptionSelectorConfig:
     allow_delayed_quotes: bool = True
     feed_max_silence_seconds: int = 60
     delayed_quote_max_age_seconds: int = 900
+    # When True (agent_led), soft spread/premium caps become advisory — still select.
+    soft_liquidity_advisory: bool = False
 
 
 class OptionSelector:
@@ -40,6 +42,7 @@ class OptionSelector:
 
     def __init__(self, config: OptionSelectorConfig | None = None) -> None:
         self.config = config or OptionSelectorConfig()
+        self.last_advisories: list[str] = []
 
     def _freshness_config(self) -> FreshnessConfig:
         return FreshnessConfig(
@@ -49,7 +52,8 @@ class OptionSelector:
             allow_delayed_quotes=self.config.allow_delayed_quotes,
         )
 
-    def _validate_quote(self, event: OptionQuoteEvent, reference_time: datetime) -> None:
+    def _validate_quote(self, event: OptionQuoteEvent, reference_time: datetime) -> list[str]:
+        advisories: list[str] = []
         if event.symbol != self.config.allowed_symbol:
             raise OptionSelectionError(f"Wrong symbol: {event.symbol}")
         if event.bid <= 0 or event.ask <= 0:
@@ -68,10 +72,17 @@ class OptionSelector:
                 raise OptionSelectionError(self.REJECT_FEED_SILENT)
             raise OptionSelectionError(self.REJECT_STALE)
         if event.spread_pct > self.config.max_spread_pct:
-            raise OptionSelectionError(self.REJECT_WIDE_SPREAD)
+            if self.config.soft_liquidity_advisory:
+                advisories.append(f"{self.REJECT_WIDE_SPREAD}:{event.spread_pct:.1f}")
+            else:
+                raise OptionSelectionError(self.REJECT_WIDE_SPREAD)
         premium = event.mid * 100
         if premium > self.config.max_premium_usd:
-            raise OptionSelectionError(self.REJECT_PREMIUM)
+            if self.config.soft_liquidity_advisory:
+                advisories.append(f"{self.REJECT_PREMIUM}:{premium:.1f}")
+            else:
+                raise OptionSelectionError(self.REJECT_PREMIUM)
+        return advisories
 
     def select_from_events(
         self,
@@ -80,6 +91,7 @@ class OptionSelector:
         underlying_price: float,
         reference_time: datetime,
     ) -> SelectedOptionContract:
+        self.last_advisories = []
         option_type = "call" if direction == "long_call" else "put"
         candidates = [q for q in quotes if q.option_type == option_type]
         if not candidates:
@@ -89,7 +101,8 @@ class OptionSelector:
         last_error: OptionSelectionError | None = None
         for event in candidates:
             try:
-                self._validate_quote(event, reference_time)
+                advisories = self._validate_quote(event, reference_time)
+                self.last_advisories = advisories
                 contract = OptionContract(
                     symbol=event.symbol,
                     expiration=event.expiration,
@@ -111,11 +124,14 @@ class OptionSelector:
                     delayed=event.delayed,
                     received_at=event.received_at,
                 )
+                reason = f"near-ATM {option_type} strike {event.strike}"
+                if advisories:
+                    reason = f"{reason} advisory={','.join(advisories)}"
                 return SelectedOptionContract(
                     contract_id=event.contract_id,
                     contract=contract,
                     quote=quote,
-                    selection_reason=f"near-ATM {option_type} strike {event.strike}",
+                    selection_reason=reason,
                     underlying_price=underlying_price,
                 )
             except OptionSelectionError as exc:

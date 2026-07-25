@@ -329,6 +329,10 @@ class IntradayDecision(VersionedModel):
     capital_fraction: float | None = Field(default=None, ge=0.0, le=1.0)
     target_contracts: int | None = Field(default=None, ge=1, le=100)
     allocation_style: Literal["auto", "aggressive", "split", "conservative"] = "auto"
+    # Structured edge estimates (required on propose/confirm; enforced deterministically)
+    win_probability: float | None = Field(default=None, ge=0.0, le=1.0)
+    expected_r: float | None = None
+    expected_value_usd: float | None = None
 
 
 class OrderIntent(VersionedModel):

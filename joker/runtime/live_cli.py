@@ -40,9 +40,12 @@ LIVE_CLI_EVENT_TYPES: frozenset[str] = frozenset(
         "agent.confirm_rejected",
         "agent.confirm_executed",
         "agent.outcome",
+        "agent.prefilter_skip",
         "capital.reserved",
         "capital.rejected",
+        "capital.sized",
         "capital.goal_met_pause",
+        "option.advisory",
         "proposal.rejected_low_confidence",
         "proposal.unknown_setup",
         "proposal.direction_mismatch",
@@ -101,17 +104,36 @@ def format_live_event(event_type: str, payload: dict[str, Any] | None = None) ->
         return (
             f"AI {str(p.get('action', '')).upper()} "
             f"dir={p.get('direction')} conf={p.get('confidence')} "
+            f"p_win={p.get('win_probability')} ev={p.get('expected_value_usd')} "
+            f"agg={p.get('aggression_cap')} gap={p.get('goal_gap_pct')} "
             f"pending={p.get('pending')} "
             f"{str(p.get('summary', ''))[:80]}"
         )
     if event_type == "agent.propose":
-        return f"AI PROPOSE {p.get('direction')} conf={p.get('confidence')} via={p.get('via', '')}"
+        return (
+            f"AI PROPOSE {p.get('direction')} conf={p.get('confidence')} "
+            f"p_win={p.get('win_probability')} ev={p.get('expected_value_usd')} "
+            f"gap={p.get('goal_gap_pct')} via={p.get('via', '')}"
+        )
     if event_type == "agent.confirm_executed":
-        return f"AI CONFIRM {p.get('direction')} conf={p.get('confidence')}"
+        return (
+            f"AI CONFIRM {p.get('direction')} conf={p.get('confidence')} "
+            f"p_win={p.get('win_probability')} ev={p.get('expected_value_usd')} "
+            f"gap={p.get('goal_gap_pct')}"
+        )
     if event_type == "agent.confirm_rejected":
         return f"AI CONFIRM REJECTED {p.get('reason')}"
+    if event_type == "agent.prefilter_skip":
+        return f"AI PREFILTER SKIP {p.get('reason')}"
     if event_type == "agent.outcome":
         return f"AI OUTCOME {p.get('quality_note')}"
+    if event_type == "capital.sized":
+        return (
+            f"SIZE qty={p.get('quantity')} notional={p.get('notional_usd')} "
+            f"agg={p.get('aggression_cap')} ev_gate={p.get('ev_gate')}"
+        )
+    if event_type == "option.advisory":
+        return f"OPTION ADVISORY {p.get('advisories') or p.get('reason')}"
     if event_type == "agent.execute":
         return (
             f"AI EXECUTE {p.get('direction')} conf={p.get('confidence')} "

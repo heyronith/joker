@@ -277,6 +277,8 @@ def paper_run(
             console.print(f"[bold green]» {line}[/bold green]")
         elif event_type in ("agent.propose", "agent.confirm_executed", "agent.outcome"):
             console.print(f"[bold green]» {line}[/bold green]")
+        elif event_type in ("capital.sized", "option.advisory", "agent.prefilter_skip"):
+            console.print(f"[cyan]» {line}[/cyan]")
         elif event_type == "risk.decision" and payload.get("approved"):
             console.print(f"[bold green]» {line}[/bold green]")
         elif event_type == "risk.decision":

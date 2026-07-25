@@ -30,17 +30,20 @@ DECISION_ROLE = (
     "You are the primary trading authority for this session. Soft risk caps in context "
     "are advisory only. "
     "Optimize toward the session capital goal in context.capital (target profit on "
-    "authorized capital) while never exceeding available_usd. "
+    "authorized capital) while never exceeding available_usd or aggression_cap. "
+    "On propose/confirm you MUST set win_probability (0-1), expected_r (reward:risk), "
+    "and expected_value_usd (positive only when edge is real). Code rejects EV<=0 or "
+    "low win_probability. "
     "When proposing/confirming, set allocation_style and optionally capital_fraction "
-    "(0-1 of available) or target_contracts. Use aggressive only for high-confidence "
-    "edges; prefer split/conservative to leave dry powder for later trades. "
+    "(0-1 of available) or target_contracts. Use aggressive only for high-EV edges; "
+    "prefer split/conservative to leave dry powder. "
     "Use a TWO-STEP entry process: "
     "(1) action='propose' when you see an emerging edge — do not enter yet; "
     "(2) on a later tick, action='confirm' only if the edge still holds vs the pending "
     "proposal and fresh quotes; otherwise action='abandon' or 'hold'. "
     "Never confirm without a pending proposal. Prefer hold when data is incoherent. "
-    "If goal_met is true, hold. "
-    "You cannot place broker orders directly, change kill_switch, or enable live money."
+    "If goal_met or stance=defend_pause, hold. Use session_expectancy to avoid repeating "
+    "bad timing. You cannot place broker orders, change kill_switch, or enable live money."
 )
 
 
@@ -76,7 +79,11 @@ def run_decision_agent(
         "execution_mode": "agent_led",
         "open_position": open_position,
         "trades_entered": trades_entered,
-        "capital": capital_budget.prompt_dict() if capital_budget is not None else {},
+        "capital": (
+            capital_budget.prompt_dict(minutes_to_close=features.minutes_to_close)
+            if capital_budget is not None
+            else {}
+        ),
         "advisory_risk_caps": {
             "daily_loss_cap_usd": risk.max_daily_loss_usd,
             "trades_cap_per_day": risk.max_trades_per_day,
@@ -95,7 +102,8 @@ def run_decision_agent(
     prompt = (
         f"Context JSON:\n{json.dumps(safe_context, default=str)}\n\n"
         f"Pending proposal active: {has_pending}. "
-        "Decide now. Return IntradayDecision with action hold|propose|confirm|abandon."
+        "Decide now. Return IntradayDecision with action hold|propose|confirm|abandon "
+        "and EV fields on propose/confirm."
     )
     try:
         result = llm.complete_structured(
@@ -116,6 +124,19 @@ def run_decision_agent(
             raise DecisionAgentError(f"{out.action} requires direction long_call or long_put")
         if out.confidence < 0:
             raise DecisionAgentError("invalid confidence")
+        # Soft fill EV defaults so schema always has numbers for downstream gates
+        if out.win_probability is None:
+            out = out.model_copy(update={"win_probability": out.confidence})
+        if out.expected_r is None:
+            # Rough R from stop/TP percents
+            stop = max(out.stop_pct, 0.05)
+            out = out.model_copy(update={"expected_r": out.take_profit_pct / stop})
+        if out.expected_value_usd is None:
+            # Unit EV proxy in R terms; sizing uses sign + p_win
+            p = float(out.win_probability or 0.0)
+            er = float(out.expected_r or 0.0)
+            unit = p * er - (1.0 - p)
+            out = out.model_copy(update={"expected_value_usd": unit})
     return out
 
 
@@ -172,6 +193,9 @@ def pending_from_decision(
         capital_fraction=decision.capital_fraction,
         target_contracts=decision.target_contracts,
         allocation_style=decision.allocation_style,
+        win_probability=decision.win_probability,
+        expected_r=decision.expected_r,
+        expected_value_usd=decision.expected_value_usd,
     )
 
 
@@ -213,6 +237,9 @@ def decision_from_pending(
     capital_fraction: float | None = None,
     target_contracts: int | None = None,
     allocation_style: str | None = None,
+    win_probability: float | None = None,
+    expected_r: float | None = None,
+    expected_value_usd: float | None = None,
 ) -> IntradayDecision:
     return IntradayDecision(
         action="confirm",
@@ -228,7 +255,27 @@ def decision_from_pending(
         allocation_style=(
             allocation_style or pending.allocation_style or "auto"  # type: ignore[arg-type]
         ),
+        win_probability=win_probability if win_probability is not None else pending.win_probability,
+        expected_r=expected_r if expected_r is not None else pending.expected_r,
+        expected_value_usd=(
+            expected_value_usd if expected_value_usd is not None else pending.expected_value_usd
+        ),
     )
+
+
+def ev_entry_allowed(
+    decision: IntradayDecision,
+    *,
+    min_win_probability: float = 0.45,
+) -> tuple[bool, str]:
+    """Deterministic reckless-aggression veto before sizing/order."""
+    if decision.action not in ("propose", "confirm", "enter"):
+        return True, "n/a"
+    if decision.expected_value_usd is not None and decision.expected_value_usd <= 0:
+        return False, "ev_non_positive"
+    if decision.win_probability is not None and decision.win_probability < min_win_probability:
+        return False, f"win_probability_low:{decision.win_probability:.2f}"
+    return True, "ok"
 
 
 def mock_decision(
@@ -258,5 +305,8 @@ def mock_decision(
                     stop_pct=chosen.stop_pct,
                     take_profit_pct=chosen.take_profit_pct,
                     summary="mock propose" if session_memory is not None else "mock enter",
+                    win_probability=0.62,
+                    expected_r=chosen.take_profit_pct / max(chosen.stop_pct, 0.05),
+                    expected_value_usd=0.5,
                 )
     return IntradayDecision(action="hold", summary="mock hold", confidence=0.0)

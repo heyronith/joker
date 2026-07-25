@@ -47,6 +47,12 @@ class CapitalSettings(BaseModel):
     require_session_confirm: bool = True
     # Stop seeking new entries after daily profit goal is met (fail-safe greed brake)
     pause_entries_when_goal_met: bool = True
+    # EV / aggression policy
+    aggression_mode: str = "goal_adaptive"  # fixed | goal_adaptive
+    max_kelly_fraction: float = 0.35
+    min_win_probability: float = 0.45
+    behind_goal_boost: float = 0.15
+    ahead_goal_dampen: float = 0.15
 
 
 class AgentSettings(BaseModel):
@@ -68,6 +74,9 @@ class AgentSettings(BaseModel):
     confirm_ttl_seconds: float = 120.0
     max_confirm_spy_drift_pct: float = 0.20
     max_confirm_option_mid_worsen_pct: float = 15.0
+    # Latency: skip LLM when no cheap edge; fast-confirm pending proposals
+    use_edge_prefilter: bool = True
+    fast_confirm_min_seconds: float = 8.0
     memory_lookback_days: int = 5
     postmarket_learner_enabled: bool = True
 

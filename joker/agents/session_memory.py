@@ -26,6 +26,9 @@ class PendingProposal:
     capital_fraction: float | None = None
     target_contracts: int | None = None
     allocation_style: str = "auto"
+    win_probability: float | None = None
+    expected_r: float | None = None
+    expected_value_usd: float | None = None
 
 
 @dataclass
@@ -204,9 +207,14 @@ class SessionMicroMemory:
                 "capital_fraction": p.capital_fraction,
                 "target_contracts": p.target_contracts,
                 "allocation_style": p.allocation_style,
+                "win_probability": p.win_probability,
+                "expected_r": p.expected_r,
+                "expected_value_usd": p.expected_value_usd,
             }
+        stats = self.expectancy_stats()
         return {
             "pending_proposal": pending,
+            "session_expectancy": stats,
             "recent_decisions": [
                 {
                     "at": d.at.isoformat(),
@@ -231,4 +239,39 @@ class SessionMicroMemory:
             ],
             "recent_risk_notes": list(self.risk_notes[-8:]),
             "prior_option_mids": dict(self.last_option_mids),
+        }
+
+    def expectancy_stats(self) -> dict[str, Any]:
+        """Rolling win rate / avg R / expectancy from in-session outcomes."""
+        rows = [o for o in self.outcomes if o.entry_price and o.exit_price and o.entry_price > 0]
+        if not rows:
+            return {
+                "n": 0,
+                "win_rate": None,
+                "avg_r": None,
+                "expectancy_r": None,
+                "avg_pnl_usd": None,
+            }
+        rs: list[float] = []
+        wins = 0
+        pnls: list[float] = []
+        for o in rows:
+            assert o.entry_price and o.exit_price
+            r = (o.exit_price - o.entry_price) / o.entry_price
+            rs.append(r)
+            if r > 0:
+                wins += 1
+            if o.realized_pnl_usd is not None:
+                pnls.append(float(o.realized_pnl_usd))
+            else:
+                # Approximate 1-contract R in premium terms only
+                pnls.append(r * o.entry_price * 100.0)
+        n = len(rs)
+        avg_r = sum(rs) / n
+        return {
+            "n": n,
+            "win_rate": round(wins / n, 3),
+            "avg_r": round(avg_r, 3),
+            "expectancy_r": round(avg_r, 3),
+            "avg_pnl_usd": round(sum(pnls) / len(pnls), 2) if pnls else None,
         }

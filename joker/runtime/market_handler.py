@@ -261,6 +261,10 @@ class MarketEventHandler:
         target_contracts: int | None = None,
         confidence: float = 0.5,
         allocation_style: str = "auto",
+        win_probability: float | None = None,
+        expected_value_usd: float | None = None,
+        expected_r: float | None = None,
+        minutes_to_close: float | None = None,
     ) -> tuple[int, float]:
         """Return (quantity, notional). Falls back to 1 contract without a budget."""
         if self.capital_budget is None:
@@ -275,10 +279,31 @@ class MarketEventHandler:
             target_contracts=target_contracts,
             confidence=confidence,
             allocation_style=style,  # type: ignore[arg-type]
+            win_probability=win_probability,
+            expected_value_usd=expected_value_usd,
+            expected_r=expected_r,
+            minutes_to_close=minutes_to_close,
         )
         if result.quantity < 1:
-            self._log("capital.rejected", {"reason": result.reason, "available": self.capital_budget.available_usd})
+            self._log(
+                "capital.rejected",
+                {
+                    "reason": result.reason,
+                    "available": self.capital_budget.available_usd,
+                    "aggression_cap": result.aggression_cap,
+                    "ev_gate": result.ev_gate,
+                },
+            )
             return 0, 0.0
+        self._log(
+            "capital.sized",
+            {
+                "quantity": result.quantity,
+                "notional_usd": result.notional_usd,
+                "fraction_used": result.capital_fraction_used,
+                "aggression_cap": result.aggression_cap,
+            },
+        )
         return result.quantity, result.notional_usd
 
     def _try_exit(self, quote_event: OptionQuoteEvent) -> ExitDecision | None:
@@ -435,6 +460,9 @@ class MarketEventHandler:
                     self.state.max_adverse_excursion = adverse
                 if self.state.max_favorable_excursion is None or favorable > self.state.max_favorable_excursion:
                     self.state.max_favorable_excursion = favorable
+                self.state.open_trade = self.exit_manager.update_trailing(
+                    self.state.open_trade, event.mid
+                )
             exit_dec = self._try_exit(event)
             if exit_dec:
                 return
@@ -538,6 +566,9 @@ class MarketEventHandler:
             target_contracts=decision.target_contracts,
             confidence=decision.confidence,
             allocation_style=decision.allocation_style,
+            win_probability=decision.win_probability,
+            expected_value_usd=decision.expected_value_usd,
+            expected_r=decision.expected_r,
         )
 
     def try_enter_from_proposal(
@@ -609,6 +640,9 @@ class MarketEventHandler:
         target_contracts: int | None = None,
         confidence: float = 0.5,
         allocation_style: str = "auto",
+        win_probability: float | None = None,
+        expected_value_usd: float | None = None,
+        expected_r: float | None = None,
     ) -> bool:
         if self.state.open_trade is not None or self.state.pending_entry is not None:
             return False
@@ -688,15 +722,36 @@ class MarketEventHandler:
             return False
 
         premium = float(selected.quote.ask)
+        minutes_to_close = None
+        try:
+            feat = self.feature_engine.compute(
+                snapshot,
+                prior_day_candles=getattr(self, "_prior_day_candles", None),
+                premarket_candles=getattr(self, "_premarket_candles", None),
+                reference_time=self.provider.current_time,
+            )
+            minutes_to_close = feat.minutes_to_close
+        except Exception:
+            minutes_to_close = None
         qty, notional = self._size_for_entry(
             premium,
             capital_fraction=capital_fraction,
             target_contracts=target_contracts,
             confidence=confidence,
             allocation_style=allocation_style,
+            win_probability=win_probability,
+            expected_value_usd=expected_value_usd,
+            expected_r=expected_r,
+            minutes_to_close=minutes_to_close,
         )
         if qty < 1:
             return False
+
+        if self.option_selector.last_advisories:
+            self._log(
+                "option.advisory",
+                {"advisories": list(self.option_selector.last_advisories)},
+            )
 
         self._log(
             "option.selected",

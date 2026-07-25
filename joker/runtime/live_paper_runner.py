@@ -129,6 +129,11 @@ def _default_capital_budget(settings: AppSettings) -> CapitalBudget:
             max_concurrent_positions=int(c.max_concurrent_positions),
             max_contracts_per_trade=int(c.max_contracts_per_trade),
             min_contracts_per_trade=int(c.min_contracts_per_trade),
+            aggression_mode=str(c.aggression_mode),
+            max_kelly_fraction=float(c.max_kelly_fraction),
+            min_win_probability=float(c.min_win_probability),
+            behind_goal_boost=float(c.behind_goal_boost),
+            ahead_goal_dampen=float(c.ahead_goal_dampen),
         )
     )
 
@@ -365,6 +370,8 @@ class LivePaperRunner:
                     "price": snapshot.price,
                     "delayed": provider.last_quote_delayed,
                     "feed_health": provider.feed_health,
+                    "candle_source": getattr(provider, "candle_source", "unknown"),
+                    "has_volume_bars": bool(getattr(provider, "has_volume_bars", False)),
                     "snapshot_event_id": snapshot_event.event_id,
                 },
             )
@@ -559,6 +566,12 @@ class LivePaperRunner:
                     delayed_quote_max_age_seconds=(
                         self.app_settings.risk.delayed_quote_max_age_seconds
                     ),
+                    soft_liquidity_advisory=(
+                        (self.app_settings.agents.execution_mode or "").strip().lower()
+                        == "agent_led"
+                        or (self.app_settings.risk.policy or "").strip().lower()
+                        == "agent_led"
+                    ),
                 )
             ),
             exit_manager=ExitManager(),
@@ -577,6 +590,17 @@ class LivePaperRunner:
         handler._pause_when_goal_met = bool(
             self.app_settings.capital.pause_entries_when_goal_met
         )
+        # Prior / premarket levels from warmed candle buffer when available
+        try:
+            from joker.features.engine import split_session_candles
+
+            snap_levels = provider.get_latest_snapshot()
+            if snap_levels is not None and snap_levels.candles:
+                prior, pm, _rth = split_session_candles(snap_levels.candles)
+                handler._prior_day_candles = prior
+                handler._premarket_candles = pm
+        except Exception:
+            pass
         if armed and playbook:
             handler.state.setups_armed = len([s for s in playbook.setups if s.enabled])
 
@@ -673,180 +697,220 @@ class LivePaperRunner:
                     now_mono = _time.monotonic()
 
                     # --- agent_led: primary AI decision loop (propose → confirm) ---
+                    has_pending = session_memory.pending is not None
+                    fast_confirm_min = float(
+                        getattr(agent_cfg, "fast_confirm_min_seconds", 8.0) or 8.0
+                    )
+                    use_prefilter = bool(getattr(agent_cfg, "use_edge_prefilter", True))
+                    interval_due = (now_mono - last_decision_at) >= (
+                        fast_confirm_min if has_pending else decision_interval
+                    )
                     if (
                         agent_led
                         and agent_cfg.intraday_enabled
                         and decision_calls < max_decision_calls
                         and proposals_acted < agent_cfg.max_proposals_per_session
-                        and (now_mono - last_decision_at) >= decision_interval
+                        and interval_due
                         and handler.state.open_trade is None
                         and handler.state.pending_entry is None
                     ):
-                        last_decision_at = now_mono
                         snap_now = provider.get_latest_snapshot()
                         if snap_now is not None:
+                            from joker.features.engine import split_session_candles
+
+                            prior_c, pm_c, _ = split_session_candles(snap_now.candles or [])
+                            if prior_c:
+                                handler._prior_day_candles = prior_c
+                            if pm_c:
+                                handler._premarket_candles = pm_c
                             feat_now = FeatureEngine(
                                 max_age_seconds=self.app_settings.risk.feed_max_silence_seconds
-                            ).compute(snap_now, reference_time=provider.current_time)
-                            option_context: dict = {}
-                            if options_provider is not None and options_provider.is_available():
-                                try:
-                                    call_snap, put_snap = options_provider.fetch_atm_snapshots(
-                                        snap_now.price
-                                    )
-                                    if call_snap is not None:
-                                        option_context["atm_call"] = {
-                                            "strike": call_snap.contract.strike,
-                                            "bid": call_snap.bid,
-                                            "ask": call_snap.ask,
-                                            "mid": call_snap.mid,
-                                            "spread_pct": call_snap.spread_pct,
-                                        }
-                                    if put_snap is not None:
-                                        option_context["atm_put"] = {
-                                            "strike": put_snap.contract.strike,
-                                            "bid": put_snap.bid,
-                                            "ask": put_snap.ask,
-                                            "mid": put_snap.mid,
-                                            "spread_pct": put_snap.spread_pct,
-                                        }
-                                except Exception as exc:
-                                    option_context["error"] = str(exc)
-                            try:
-                                from joker.agents.decision import (
-                                    confirm_gate,
-                                    decision_from_pending,
-                                    pending_from_decision,
-                                )
+                            ).compute(
+                                snap_now,
+                                prior_day_candles=getattr(handler, "_prior_day_candles", None),
+                                premarket_candles=getattr(handler, "_premarket_candles", None),
+                                reference_time=provider.current_time,
+                            )
 
-                                require_propose = bool(
-                                    getattr(agent_cfg, "require_propose_before_enter", True)
-                                )
-                                # Expire stale proposals before asking the agent
-                                if session_memory.pending is not None:
-                                    ok, reason = confirm_gate(
-                                        session_memory.pending,
-                                        spy_price=float(snap_now.price),
-                                        option_context=option_context,
-                                        ttl_seconds=float(
-                                            getattr(agent_cfg, "confirm_ttl_seconds", 120.0)
-                                        ),
-                                        max_spy_drift_pct=float(
-                                            getattr(
-                                                agent_cfg, "max_confirm_spy_drift_pct", 0.20
-                                            )
-                                        ),
-                                        max_option_mid_worsen_pct=float(
-                                            getattr(
-                                                agent_cfg,
-                                                "max_confirm_option_mid_worsen_pct",
-                                                15.0,
-                                            )
-                                        ),
-                                    )
-                                    if not ok and reason.startswith("proposal_expired"):
-                                        log(
-                                            "agent.propose_expired",
-                                            {"reason": reason},
-                                        )
-                                        session_memory.clear_pending()
+                            skip_llm = False
+                            if (
+                                use_prefilter
+                                and not has_pending
+                                and not config.mock_agents
+                            ):
+                                from joker.strategy.edge_prefilter import edge_prefilter
 
-                                if config.mock_agents:
-                                    decision = mock_decision(
-                                        feat_now,
-                                        playbook,
-                                        session_memory=session_memory,
-                                    )
-                                else:
-                                    llm = config.llm_client or OpenAILLMClient(
-                                        api_key=self.env_settings.openai_api_key,
-                                        model=self.env_settings.openai_model,
-                                        max_retries=agent_cfg.max_retries,
-                                        default_timeout_seconds=float(
-                                            agent_cfg.council_timeout_seconds
-                                        ),
-                                    )
-                                    decision = run_decision_agent(
-                                        llm,
-                                        agent_cfg,
-                                        run_id=run_id,
-                                        playbook=playbook,
-                                        features=feat_now,
-                                        risk=risk_config,
-                                        memory=day_memory,
-                                        session_memory=session_memory,
-                                        capital_budget=capital_budget,
-                                        open_position=False,
-                                        trades_entered=handler.state.trades_entered,
-                                        spy_price=snap_now.price,
-                                        option_context=option_context,
-                                    )
-                                decision_calls += 1
-                                session_memory.record_decision(
-                                    action=decision.action,
-                                    direction=decision.direction,
-                                    confidence=decision.confidence,
-                                    summary=decision.summary or decision.rationale,
-                                    spy_price=snap_now.price,
+                                pre = edge_prefilter(
+                                    feat_now, goal_met=capital_budget.goal_met
                                 )
-                                session_memory.update_option_mids(option_context)
-                                log(
-                                    "agent.decision",
-                                    {
-                                        "action": decision.action,
-                                        "direction": decision.direction,
-                                        "confidence": decision.confidence,
-                                        "summary": (decision.summary or decision.rationale)[
-                                            :160
-                                        ],
-                                        "pending": bool(session_memory.pending),
-                                    },
-                                )
-                                if decision.patch is not None and playbook is not None:
+                                if not pre.candidate:
+                                    log(
+                                        "agent.prefilter_skip",
+                                        {"reason": pre.reason},
+                                    )
+                                    last_decision_at = now_mono
+                                    skip_llm = True
+
+                            if not skip_llm:
+                                last_decision_at = now_mono
+                                option_context: dict = {}
+                                if (
+                                    options_provider is not None
+                                    and options_provider.is_available()
+                                ):
                                     try:
-                                        playbook = apply_patch(playbook, decision.patch)
-                                        reactive.active_playbook = playbook
-                                        log(
-                                            "playbook.patched",
-                                            {
-                                                "disable": decision.patch.disable_setup_ids,
-                                                "enable": decision.patch.enable_setup_ids,
-                                            },
-                                        )
-                                    except PatchError as exc:
-                                        log(
-                                            "playbook.patch_rejected",
-                                            {"reason": str(exc)},
-                                        )
-
-                                action = decision.action
-                                if action == "abandon":
-                                    session_memory.clear_pending()
-                                    log("agent.propose_abandoned", {})
-                                elif action == "propose":
-                                    if decision.direction in ("long_call", "long_put"):
-                                        session_memory.set_pending(
-                                            pending_from_decision(
-                                                decision,
-                                                spy_price=float(snap_now.price),
-                                                option_context=option_context,
+                                        call_snap, put_snap = (
+                                            options_provider.fetch_atm_snapshots(
+                                                snap_now.price
                                             )
                                         )
-                                        log(
-                                            "agent.propose",
-                                            {
-                                                "direction": decision.direction,
-                                                "confidence": decision.confidence,
-                                            },
+                                        if call_snap is not None:
+                                            option_context["atm_call"] = {
+                                                "strike": call_snap.contract.strike,
+                                                "bid": call_snap.bid,
+                                                "ask": call_snap.ask,
+                                                "mid": call_snap.mid,
+                                                "spread_pct": call_snap.spread_pct,
+                                            }
+                                        if put_snap is not None:
+                                            option_context["atm_put"] = {
+                                                "strike": put_snap.contract.strike,
+                                                "bid": put_snap.bid,
+                                                "ask": put_snap.ask,
+                                                "mid": put_snap.mid,
+                                                "spread_pct": put_snap.spread_pct,
+                                            }
+                                    except Exception as exc:
+                                        option_context["error"] = str(exc)
+                                try:
+                                    from joker.agents.decision import (
+                                        confirm_gate,
+                                        decision_from_pending,
+                                        ev_entry_allowed,
+                                        pending_from_decision,
+                                    )
+
+                                    require_propose = bool(
+                                        getattr(
+                                            agent_cfg,
+                                            "require_propose_before_enter",
+                                            True,
                                         )
-                                elif action in ("confirm", "enter"):
-                                    pending = session_memory.pending
-                                    if require_propose and pending is None:
-                                        # Treat bare enter as propose when two-step required
-                                        if action == "enter" and decision.direction in (
-                                            "long_call",
-                                            "long_put",
-                                        ):
+                                    )
+                                    # Expire stale proposals before asking the agent
+                                    if session_memory.pending is not None:
+                                        ok, reason = confirm_gate(
+                                            session_memory.pending,
+                                            spy_price=float(snap_now.price),
+                                            option_context=option_context,
+                                            ttl_seconds=float(
+                                                getattr(
+                                                    agent_cfg, "confirm_ttl_seconds", 120.0
+                                                )
+                                            ),
+                                            max_spy_drift_pct=float(
+                                                getattr(
+                                                    agent_cfg,
+                                                    "max_confirm_spy_drift_pct",
+                                                    0.20,
+                                                )
+                                            ),
+                                            max_option_mid_worsen_pct=float(
+                                                getattr(
+                                                    agent_cfg,
+                                                    "max_confirm_option_mid_worsen_pct",
+                                                    15.0,
+                                                )
+                                            ),
+                                        )
+                                        if not ok and reason.startswith("proposal_expired"):
+                                            log(
+                                                "agent.propose_expired",
+                                                {"reason": reason},
+                                            )
+                                            session_memory.clear_pending()
+
+                                    if config.mock_agents:
+                                        decision = mock_decision(
+                                            feat_now,
+                                            playbook,
+                                            session_memory=session_memory,
+                                        )
+                                    else:
+                                        llm = config.llm_client or OpenAILLMClient(
+                                            api_key=self.env_settings.openai_api_key,
+                                            model=self.env_settings.openai_model,
+                                            max_retries=agent_cfg.max_retries,
+                                            default_timeout_seconds=float(
+                                                agent_cfg.council_timeout_seconds
+                                            ),
+                                        )
+                                        decision = run_decision_agent(
+                                            llm,
+                                            agent_cfg,
+                                            run_id=run_id,
+                                            playbook=playbook,
+                                            features=feat_now,
+                                            risk=risk_config,
+                                            memory=day_memory,
+                                            session_memory=session_memory,
+                                            capital_budget=capital_budget,
+                                            open_position=False,
+                                            trades_entered=handler.state.trades_entered,
+                                            spy_price=snap_now.price,
+                                            option_context=option_context,
+                                        )
+                                    decision_calls += 1
+                                    session_memory.record_decision(
+                                        action=decision.action,
+                                        direction=decision.direction,
+                                        confidence=decision.confidence,
+                                        summary=decision.summary or decision.rationale,
+                                        spy_price=snap_now.price,
+                                    )
+                                    session_memory.update_option_mids(option_context)
+                                    log(
+                                        "agent.decision",
+                                        {
+                                            "action": decision.action,
+                                            "direction": decision.direction,
+                                            "confidence": decision.confidence,
+                                            "win_probability": decision.win_probability,
+                                            "expected_r": decision.expected_r,
+                                            "expected_value_usd": decision.expected_value_usd,
+                                            "summary": (
+                                                decision.summary or decision.rationale
+                                            )[:160],
+                                            "pending": bool(session_memory.pending),
+                                            "goal_gap_pct": capital_budget.goal_gap_pct,
+                                            "aggression_cap": capital_budget.aggression_cap(
+                                                minutes_to_close=feat_now.minutes_to_close
+                                            ),
+                                        },
+                                    )
+                                    if decision.patch is not None and playbook is not None:
+                                        try:
+                                            playbook = apply_patch(playbook, decision.patch)
+                                            reactive.active_playbook = playbook
+                                            log(
+                                                "playbook.patched",
+                                                {
+                                                    "disable": decision.patch.disable_setup_ids,
+                                                    "enable": decision.patch.enable_setup_ids,
+                                                },
+                                            )
+                                        except PatchError as exc:
+                                            log(
+                                                "playbook.patch_rejected",
+                                                {"reason": str(exc)},
+                                            )
+
+                                    action = decision.action
+                                    if action == "abandon":
+                                        session_memory.clear_pending()
+                                        log("agent.propose_abandoned", {})
+                                    elif action == "propose":
+                                        if decision.direction in ("long_call", "long_put"):
                                             session_memory.set_pending(
                                                 pending_from_decision(
                                                     decision,
@@ -859,91 +923,138 @@ class LivePaperRunner:
                                                 {
                                                     "direction": decision.direction,
                                                     "confidence": decision.confidence,
-                                                    "via": "enter_downgraded_to_propose",
+                                                    "win_probability": decision.win_probability,
+                                                    "expected_value_usd": decision.expected_value_usd,
+                                                    "goal_gap_pct": capital_budget.goal_gap_pct,
                                                 },
                                             )
-                                        else:
-                                            log(
-                                                "agent.confirm_rejected",
-                                                {"reason": "no_pending_proposal"},
-                                            )
-                                    else:
-                                        if pending is None:
-                                            pending_decision = decision
-                                        else:
-                                            ok, reason = confirm_gate(
-                                                pending,
-                                                spy_price=float(snap_now.price),
-                                                option_context=option_context,
-                                                ttl_seconds=float(
-                                                    getattr(
-                                                        agent_cfg, "confirm_ttl_seconds", 120.0
+                                    elif action in ("confirm", "enter"):
+                                        pending = session_memory.pending
+                                        pending_decision = None
+                                        if require_propose and pending is None:
+                                            # Treat bare enter as propose when two-step required
+                                            if action == "enter" and decision.direction in (
+                                                "long_call",
+                                                "long_put",
+                                            ):
+                                                session_memory.set_pending(
+                                                    pending_from_decision(
+                                                        decision,
+                                                        spy_price=float(snap_now.price),
+                                                        option_context=option_context,
                                                     )
-                                                ),
-                                                max_spy_drift_pct=float(
-                                                    getattr(
-                                                        agent_cfg,
-                                                        "max_confirm_spy_drift_pct",
-                                                        0.20,
-                                                    )
-                                                ),
-                                                max_option_mid_worsen_pct=float(
-                                                    getattr(
-                                                        agent_cfg,
-                                                        "max_confirm_option_mid_worsen_pct",
-                                                        15.0,
-                                                    )
-                                                ),
-                                            )
-                                            if not ok:
+                                                )
                                                 log(
-                                                    "agent.confirm_rejected",
-                                                    {"reason": reason},
-                                                )
-                                                if reason.startswith("proposal_expired"):
-                                                    session_memory.clear_pending()
-                                                pending_decision = None
-                                            else:
-                                                # Prefer pending stops/direction; allow confidence update
-                                                pending_decision = decision_from_pending(
-                                                    pending,
-                                                    confidence=decision.confidence
-                                                    or pending.confidence,
-                                                    capital_fraction=decision.capital_fraction,
-                                                    target_contracts=decision.target_contracts,
-                                                    allocation_style=decision.allocation_style,
-                                                )
-                                                if decision.rationale:
-                                                    pending_decision = (
-                                                        pending_decision.model_copy(
-                                                            update={
-                                                                "rationale": decision.rationale,
-                                                                "summary": decision.summary
-                                                                or pending.summary,
-                                                            }
-                                                        )
-                                                    )
-                                        if pending_decision is not None:
-                                            acted = handler.try_enter_from_decision(
-                                                pending_decision,
-                                                min_confidence=agent_cfg.min_proposal_confidence,
-                                            )
-                                            if acted:
-                                                proposals_acted += 1
-                                                session_memory.note_entry(
-                                                    direction=pending_decision.direction,
-                                                    entry_price=None,
-                                                )
-                                                session_memory.clear_pending()
-                                                log(
-                                                    "agent.confirm_executed",
+                                                    "agent.propose",
                                                     {
-                                                        "direction": pending_decision.direction,
-                                                        "confidence": pending_decision.confidence,
+                                                        "direction": decision.direction,
+                                                        "confidence": decision.confidence,
+                                                        "via": "enter_downgraded_to_propose",
+                                                        "win_probability": decision.win_probability,
+                                                        "expected_value_usd": decision.expected_value_usd,
                                                     },
                                                 )
-                            except (DecisionAgentError, Exception) as exc:
-                                log("agent.decision_failed", {"reason": str(exc)})
+                                            else:
+                                                log(
+                                                    "agent.confirm_rejected",
+                                                    {"reason": "no_pending_proposal"},
+                                                )
+                                        else:
+                                            if pending is None:
+                                                pending_decision = decision
+                                            else:
+                                                ok, reason = confirm_gate(
+                                                    pending,
+                                                    spy_price=float(snap_now.price),
+                                                    option_context=option_context,
+                                                    ttl_seconds=float(
+                                                        getattr(
+                                                            agent_cfg,
+                                                            "confirm_ttl_seconds",
+                                                            120.0,
+                                                        )
+                                                    ),
+                                                    max_spy_drift_pct=float(
+                                                        getattr(
+                                                            agent_cfg,
+                                                            "max_confirm_spy_drift_pct",
+                                                            0.20,
+                                                        )
+                                                    ),
+                                                    max_option_mid_worsen_pct=float(
+                                                        getattr(
+                                                            agent_cfg,
+                                                            "max_confirm_option_mid_worsen_pct",
+                                                            15.0,
+                                                        )
+                                                    ),
+                                                )
+                                                if not ok:
+                                                    log(
+                                                        "agent.confirm_rejected",
+                                                        {"reason": reason},
+                                                    )
+                                                    if reason.startswith("proposal_expired"):
+                                                        session_memory.clear_pending()
+                                                    pending_decision = None
+                                                else:
+                                                    pending_decision = decision_from_pending(
+                                                        pending,
+                                                        confidence=decision.confidence
+                                                        or pending.confidence,
+                                                        capital_fraction=decision.capital_fraction,
+                                                        target_contracts=decision.target_contracts,
+                                                        allocation_style=decision.allocation_style,
+                                                        win_probability=decision.win_probability,
+                                                        expected_r=decision.expected_r,
+                                                        expected_value_usd=decision.expected_value_usd,
+                                                    )
+                                                    if decision.rationale:
+                                                        pending_decision = (
+                                                            pending_decision.model_copy(
+                                                                update={
+                                                                    "rationale": decision.rationale,
+                                                                    "summary": decision.summary
+                                                                    or pending.summary,
+                                                                }
+                                                            )
+                                                        )
+                                        if pending_decision is not None:
+                                            ok_ev, ev_reason = ev_entry_allowed(
+                                                pending_decision,
+                                                min_win_probability=float(
+                                                    capital_budget.plan.min_win_probability
+                                                ),
+                                            )
+                                            if not ok_ev:
+                                                log(
+                                                    "agent.confirm_rejected",
+                                                    {"reason": ev_reason},
+                                                )
+                                            else:
+                                                acted = handler.try_enter_from_decision(
+                                                    pending_decision,
+                                                    min_confidence=agent_cfg.min_proposal_confidence,
+                                                )
+                                                if acted:
+                                                    proposals_acted += 1
+                                                    session_memory.note_entry(
+                                                        direction=pending_decision.direction,
+                                                        entry_price=None,
+                                                    )
+                                                    session_memory.clear_pending()
+                                                    log(
+                                                        "agent.confirm_executed",
+                                                        {
+                                                            "direction": pending_decision.direction,
+                                                            "confidence": pending_decision.confidence,
+                                                            "win_probability": pending_decision.win_probability,
+                                                            "expected_value_usd": pending_decision.expected_value_usd,
+                                                            "goal_gap_pct": capital_budget.goal_gap_pct,
+                                                        },
+                                                    )
+                                except (DecisionAgentError, Exception) as exc:
+                                    log("agent.decision_failed", {"reason": str(exc)})
 
                     # --- rules_hybrid: legacy intraday council ---
                     elif (
