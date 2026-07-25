@@ -25,6 +25,7 @@ dependencies = [
     "aiosqlite>=0.20",
     "langgraph>=0.2",
     "langgraph-checkpoint-sqlite>=2.0",
+    "tzdata>=2024.1",
 ]
 
 [project.optional-dependencies]

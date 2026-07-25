@@ -16,8 +16,6 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
-from joker.storage.database import Database
-
 _TASK1_SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS market_snapshots (
     snapshot_id TEXT PRIMARY KEY,
@@ -96,20 +94,13 @@ CREATE INDEX IF NOT EXISTS idx_task1_dq_reports_session
 def apply_task1_migrations(db_path: str | Path) -> Path:
     """Apply Task 1 table DDL to ``db_path`` (create if not exists).
 
-    Reuses ``Database`` only to ensure the parent directory exists and to avoid
-    inventing a second run-record owner. Run tables are created via
-    ``Database.initialize()`` when callers need them; this function adds Task 1
-    tables only via raw SQL ``CREATE TABLE IF NOT EXISTS``.
+    Does not instantiate ``joker.storage.database.Database`` so legacy SQLModel
+    tables cannot shadow Task 1 schemas via ``CREATE TABLE IF NOT EXISTS``.
 
     Returns the resolved database path.
     """
     path = Path(db_path)
     path.parent.mkdir(parents=True, exist_ok=True)
-
-    # Touch Database ownership boundary without creating a second run store API.
-    # Callers that need run records still use Database.create_run / etc.
-    _ = Database(path)
-
     conn = sqlite3.connect(path)
     try:
         conn.executescript(_TASK1_SCHEMA_SQL)
