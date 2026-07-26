@@ -15,6 +15,10 @@ from joker.evolution.episode_compiler import EpisodeCompiler
 from joker.evolution.migrations import apply_task3_migrations
 from joker.evolution.repositories import build_evolution_repositories
 from joker.evolution.schemas import TradingEpisode
+from tests.evolution.projection_helpers import (
+    FakeExecutionProjection,
+    closed_trade_projection,
+)
 
 
 @pytest.mark.asyncio
@@ -27,63 +31,71 @@ async def test_closed_trade_and_no_trade_episodes(tmp_path) -> None:
     compiler = EpisodeCompiler(repos["episodes"], repos["traces"])
     cfg = uuid4()
     snap = uuid4()
-    closed = await compiler.compile_closed_trade(
+    contract = "SPY:2026-07-01:500:call"
+    event_id = str(uuid4())
+    closed = await compiler.compile_from_position_closed(
         session_id="s",
         run_id="r",
         trading_date=date(2026, 7, 1),
         configuration_version_id=cfg,
+        event_payload={
+            "contract_id": contract,
+            "client_order_id": "exit-1",
+            "realized_pnl": "50",
+        },
+        event_id=event_id,
+        execution=FakeExecutionProjection(
+            closed_trade_projection(
+                contract_id=contract,
+                realised_pnl=Decimal("50"),
+                entry_price=Decimal("1.00"),
+                exit_price=Decimal("1.50"),
+            )
+        ),
         initial_snapshot_id=snap,
-        terminal_snapshot_id=snap,
-        contract_id="SPY:2026-07-01:500:call",
-        direction="bullish",
-        entry_order_ids=("e1",),
-        exit_order_ids=("x1",),
-        entry_price=Decimal("1.00"),
-        exit_price=Decimal("1.50"),
-        entry_quantity=Decimal("1"),
-        exit_quantity=Decimal("1"),
-        remaining_quantity=Decimal("0"),
-        realised_pnl=Decimal("50"),
-        max_favourable_excursion=Decimal("60"),
-        max_adverse_excursion=Decimal("-10"),
-        holding_seconds=600,
-        terminal_event_id="term-1",
     )
     assert closed.completed is True
     assert closed.action_class == "closed_trade"
+    assert closed.realised_pnl == Decimal("50")
     metrics = compute_deterministic_metrics(closed)
     assert metrics.realised_pnl == Decimal("50")
-    assert metrics.profit_capture_ratio is not None
 
-    incomplete = await compiler.compile_closed_trade(
+    incomplete = await compiler.compile_from_position_closed(
         session_id="s",
         run_id="r",
         trading_date=date(2026, 7, 1),
         configuration_version_id=cfg,
+        event_payload={
+            "contract_id": "SPY:2026-07-01:501:call",
+            "client_order_id": "exit-2",
+            "realized_pnl": "-50",
+        },
+        event_id=str(uuid4()),
+        execution=FakeExecutionProjection(
+            closed_trade_projection(
+                contract_id="SPY:2026-07-01:501:call",
+                entry_id="e2",
+                exit_id="x2",
+                qty=Decimal("2"),
+                remaining_mismatch=True,
+                realised_pnl=Decimal("-50"),
+                exit_price=Decimal("0.50"),
+            )
+        ),
         initial_snapshot_id=snap,
-        terminal_snapshot_id=None,
-        contract_id="SPY:2026-07-01:501:call",
-        direction="bullish",
-        entry_order_ids=("e2",),
-        exit_order_ids=("x2",),
-        entry_price=Decimal("1.00"),
-        exit_price=Decimal("0.50"),
-        entry_quantity=Decimal("2"),
-        exit_quantity=Decimal("1"),
-        remaining_quantity=Decimal("0"),  # mismatched vs entry-exit
-        realised_pnl=Decimal("-50"),
-        terminal_event_id="term-2",
     )
     assert incomplete.completed is False
     assert "quantity_identity_mismatch" in incomplete.completeness_findings
 
-    no_trade = await compiler.compile_no_trade(
+    no_trade = await compiler.compile_from_no_trade_cycle(
         session_id="s",
         run_id="r",
         trading_date=date(2026, 7, 1),
         configuration_version_id=cfg,
-        initial_snapshot_id=snap,
-        terminal_event_id="term-3",
+        cycle_id="cycle-3",
+        snapshot_id=snap,
+        event_id=str(uuid4()),
+        outcome="no_trade",
         rejection_codes=("low_confidence",),
         decision_rationale="insufficient evidence",
         confidence_values={"meta": Decimal("0.4")},

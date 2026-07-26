@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Any
+from typing import Any, Literal
 
 from joker.evolution.config import PromotionSettings
 from joker.evolution.schemas import (
@@ -34,7 +34,16 @@ HARD_VETO_CODES = frozenset(
         "adversarial_scenario_failure",
         "starting_state_mismatch",
         "source_code_or_validator_mutation",
+        "missing_critical_metric",
     }
+)
+
+# Metrics that must be present on both champion and challenger.
+CRITICAL_METRICS: tuple[tuple[str, Literal["higher", "lower"]], ...] = (
+    ("tail_loss", "lower"),  # more negative is worse
+    ("calibration_error", "higher"),
+    ("latency_ms", "higher"),
+    ("cost_gbp", "higher"),
 )
 
 
@@ -69,8 +78,8 @@ class PromotionEligibilityGate:
         if result.data_integrity_failures:
             codes.append("execution_integrity_violation")
         for failure in result.gate_rejection_codes:
-            if failure in HARD_VETO_CODES:
-                codes.append(failure)
+            if failure in HARD_VETO_CODES or str(failure).startswith("missing_"):
+                codes.append(str(failure))
         if not adversarial_passed:
             codes.append("adversarial_scenario_failure")
         if prohibited_mutation_attempted:
@@ -87,43 +96,26 @@ class PromotionEligibilityGate:
         if holdout_episode_count < self._settings.minimum_holdout_episodes:
             codes.append("insufficient_holdout_episodes")
 
-        # Non-inferiority / regression checks on aggregate metrics.
         champ = result.champion_metrics
         chall = result.challenger_metrics
-        codes.extend(
-            self._regression_codes(
-                champ, chall, "tail_loss", self._settings.maximum_tail_loss_regression_pct
+        thresholds = {
+            "tail_loss": self._settings.maximum_tail_loss_regression_pct,
+            "calibration_error": self._settings.maximum_calibration_regression_pct,
+            "latency_ms": self._settings.maximum_latency_regression_pct,
+            "cost_gbp": self._settings.maximum_cost_regression_pct,
+        }
+        for metric, worse_direction in CRITICAL_METRICS:
+            codes.extend(
+                self._regression_codes(
+                    champ,
+                    chall,
+                    metric,
+                    thresholds[metric],
+                    worse_direction=worse_direction,
+                    required=True,
+                )
             )
-        )
-        codes.extend(
-            self._regression_codes(
-                champ,
-                chall,
-                "calibration_error",
-                self._settings.maximum_calibration_regression_pct,
-                higher_is_worse=True,
-            )
-        )
-        codes.extend(
-            self._regression_codes(
-                champ,
-                chall,
-                "latency_ms",
-                self._settings.maximum_latency_regression_pct,
-                higher_is_worse=True,
-            )
-        )
-        codes.extend(
-            self._regression_codes(
-                champ,
-                chall,
-                "cost_gbp",
-                self._settings.maximum_cost_regression_pct,
-                higher_is_worse=True,
-            )
-        )
 
-        # Deduplicate while preserving order.
         seen: set[str] = set()
         ordered: list[str] = []
         for code in codes:
@@ -131,18 +123,19 @@ class PromotionEligibilityGate:
                 seen.add(code)
                 ordered.append(code)
 
-        hard = [c for c in ordered if c in HARD_VETO_CODES]
-        eligible = len(hard) == 0 and "insufficient_completed_episodes" not in ordered
+        hard = [
+            c
+            for c in ordered
+            if c in HARD_VETO_CODES
+            or c.startswith("missing_critical_metric")
+            or c.endswith("_regression")
+        ]
+        eligible = not hard and "insufficient_completed_episodes" not in ordered
         if "insufficient_holdout_episodes" in ordered:
-            eligible = False
-        if any(
-            c.endswith("_regression") for c in ordered
-        ) and self._settings.require_deterministic_eligibility:
-            # Soft regressions block eligibility by default.
             eligible = False
 
         return EligibilityResult(
-            eligible=eligible and not ordered[:1] == ["safety_violation"],
+            eligible=eligible,
             gate_codes=tuple(ordered),
             details={
                 "hard_vetoes": hard,
@@ -158,23 +151,44 @@ class PromotionEligibilityGate:
         metric: str,
         max_regression_pct: Decimal,
         *,
-        higher_is_worse: bool = True,
+        worse_direction: Literal["higher", "lower"] = "higher",
+        required: bool = False,
     ) -> list[str]:
         if metric not in champion or metric not in challenger:
+            if required:
+                return [f"missing_critical_metric:{metric}"]
             return []
         try:
             c0 = Decimal(str(champion[metric]))
             c1 = Decimal(str(challenger[metric]))
         except Exception:
+            if required:
+                return [f"missing_critical_metric:{metric}"]
             return []
         if c0 == 0:
+            # Zero baseline: any movement in the worse direction is a veto when required.
+            if worse_direction == "higher" and c1 > 0:
+                return [f"{metric}_regression"]
+            if worse_direction == "lower" and c1 < 0:
+                return [f"{metric}_regression"]
             return []
-        if higher_is_worse:
+
+        if worse_direction == "higher":
+            # Larger values are worse (latency, cost, calibration error).
+            if c1 <= c0:
+                return []
             change_pct = ((c1 - c0) / abs(c0)) * Decimal("100")
-            if change_pct > max_regression_pct:
-                return [f"{metric}_regression"]
         else:
+            # Smaller / more-negative values are worse (tail_loss).
+            # champion=-10, challenger=-40 → regression 300%.
+            if c1 >= c0:
+                return []
             change_pct = ((c0 - c1) / abs(c0)) * Decimal("100")
-            if change_pct > max_regression_pct:
-                return [f"{metric}_regression"]
+
+        if change_pct > max_regression_pct:
+            code = f"{metric}_regression"
+            if metric == "tail_loss" and change_pct > max_regression_pct:
+                # Also emit the catastrophic veto alias when downside collapses.
+                return [code, "catastrophic_tail_loss_regression"]
+            return [code]
         return []

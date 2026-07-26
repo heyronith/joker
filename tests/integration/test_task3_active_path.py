@@ -1,4 +1,4 @@
-"""Task 3 active-path acceptance: Task1/2 contracts → episode → shadow → decision."""
+"""Task 3 active-path: Task1 surface → projection-backed episode → shadow."""
 
 from __future__ import annotations
 
@@ -23,6 +23,10 @@ from joker.runtime.session_supervisor import SessionSupervisor, SessionSuperviso
 from joker.time.calendar import MarketCalendar
 from joker.time.clock import FrozenExchangeClock
 from tests.cognitive.task2_canned import CONTRACT_ID
+from tests.evolution.projection_helpers import (
+    FakeExecutionProjection,
+    closed_trade_projection,
+)
 
 ET = ZoneInfo("America/New_York")
 
@@ -92,44 +96,50 @@ async def test_task3_active_path_with_task1_task2_surface(tmp_path) -> None:
     compiler = EpisodeCompiler(repos["episodes"], repos["traces"])
     evaluator = EvaluationGraphRunner(repos["evaluations"])
 
-    # Verified paper fill path is Task1 execution; here we compile the resulting episode.
-    episode = await compiler.compile_closed_trade(
+    event_id = str(uuid4())
+    episode = await compiler.compile_from_position_closed(
         session_id="task3-active",
         run_id="run",
         trading_date=date(2026, 7, 1),
         configuration_version_id=champion.configuration_version_id,
+        event_payload={
+            "contract_id": CONTRACT_ID,
+            "client_order_id": "exit-1",
+            "realized_pnl": "30",
+        },
+        event_id=event_id,
+        execution=FakeExecutionProjection(
+            closed_trade_projection(
+                contract_id=CONTRACT_ID,
+                entry_price=Decimal("1.10"),
+                exit_price=Decimal("1.40"),
+                realised_pnl=Decimal("30"),
+            )
+        ),
         initial_snapshot_id=tick.snapshot.snapshot_id,
-        terminal_snapshot_id=tick.snapshot.snapshot_id,
-        contract_id=CONTRACT_ID,
-        direction="bullish",
-        entry_order_ids=("entry-1",),
-        exit_order_ids=("exit-1",),
-        entry_price=Decimal("1.10"),
-        exit_price=Decimal("1.40"),
-        entry_quantity=Decimal("1"),
-        exit_quantity=Decimal("1"),
-        remaining_quantity=Decimal("0"),
-        realised_pnl=Decimal("30"),
-        terminal_event_id="pos-closed-1",
-        data_quality_ids=(),
-        option_surface_ids=(),
     )
+    assert episode.completed is True
     evaluation = await evaluator.evaluate(episode)
     assert evaluation.episode_id == episode.episode_id
 
-    improvement = ImprovementProposalService(repos["proposals"], repos["configurations"])
+    improvement = ImprovementProposalService(
+        repos["proposals"], repos["configurations"], registry.policy_store
+    )
     proposal, challenger = await improvement.propose(
         parent_champion=champion,
         weakness="execution_quality",
         hypothesis="emphasize spread discipline",
         patch=PromptPatch(
-            role="strategy",
+            role="meta_decision",
             parent_prompt_version_id=uuid4(),
             replacement_template="Prefer tighter spreads when confidence is moderate.",
             change_rationale="fill quality",
         ),
     )
-    shadow = ShadowRuntime(repos["shadow"])
+    ok, problems = await registry.policy_store.verify_configuration_resolvable(challenger)
+    assert ok, problems
+
+    shadow = ShadowRuntime(repos["shadow"], policy_store=registry.policy_store)
     await shadow.start()
     assignment = await shadow.register_challenger(challenger=challenger, champion=champion)
     await shadow.enqueue_snapshot(
@@ -142,7 +152,6 @@ async def test_task3_active_path_with_task1_task2_surface(tmp_path) -> None:
 
     await asyncio.sleep(0.05)
     assert shadow.results
-    # Champion remains sole broker authority.
     current = await registry.get_current_champion()
     assert current.configuration_version_id == champion.configuration_version_id
     assert proposal.status == "registered"

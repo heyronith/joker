@@ -8,18 +8,11 @@ from uuid import UUID, uuid4
 
 import aiosqlite
 
-from joker.evolution.hashing import content_hash, hash_model, stable_json_dumps
+from joker.evolution.hashing import hash_model
 from joker.evolution.migrations import apply_task3_migrations
+from joker.evolution.policy_store import PolicyVersionStore
 from joker.evolution.repositories import ConfigurationVersionRepository
-from joker.evolution.schemas import (
-    ChampionTransition,
-    CognitiveConfigurationVersion,
-    ContextPolicyVersion,
-    DebatePolicyVersion,
-    EscalationPolicyVersion,
-    MemoryPolicyVersion,
-    RoutingPolicyVersion,
-)
+from joker.evolution.schemas import ChampionTransition, CognitiveConfigurationVersion
 
 
 class ChampionRegistryError(RuntimeError):
@@ -33,15 +26,26 @@ class ChampionRegistry:
         self._db_path = Path(db_path)
         self._scope_key = scope_key
         self._configs = ConfigurationVersionRepository(self._db_path)
+        self._policies = PolicyVersionStore(self._db_path)
         self._initialized = False
+
+    @property
+    def policy_store(self) -> PolicyVersionStore:
+        return self._policies
+
+    @property
+    def configs(self) -> ConfigurationVersionRepository:
+        return self._configs
 
     async def initialize(self) -> None:
         apply_task3_migrations(self._db_path)
         await self._configs.initialize()
+        await self._policies.initialize()
         self._initialized = True
 
     async def close(self) -> None:
         await self._configs.close()
+        await self._policies.close()
         self._initialized = False
 
     async def bootstrap_champion(
@@ -50,67 +54,24 @@ class ChampionRegistry:
         role_model_profiles: dict[str, str] | None = None,
         prompt_versions: dict[str, UUID] | None = None,
     ) -> CognitiveConfigurationVersion:
-        """Create baseline policies + champion if none exists."""
+        """Create and persist baseline prompt/policy versions + champion."""
         await self.initialize()
         existing = await self.get_current_champion()
         if existing is not None:
+            ok, problems = await self._policies.verify_configuration_resolvable(existing)
+            if not ok:
+                raise ChampionRegistryError(
+                    "existing champion references missing artefacts: "
+                    + ", ".join(problems)
+                )
             return existing
 
-        now = datetime.now(timezone.utc)
-        context = ContextPolicyVersion(
-            content={"max_context_characters": 60000, "preserve_data_quality": True},
-            content_hash="",
-            created_at=now,
-        )
-        memory = MemoryPolicyVersion(
-            content={"max_memories": 8, "include_contradictions": True},
-            content_hash="",
-            created_at=now,
-        )
-        debate = DebatePolicyVersion(
-            content={"minimum_reviews": 1, "maximum_rounds": 2, "dissent_required": False},
-            content_hash="",
-            created_at=now,
-        )
-        routing = RoutingPolicyVersion(
-            content={"default_profile": "general_reasoning"},
-            content_hash="",
-            created_at=now,
-        )
-        escalation = EscalationPolicyVersion(
-            content={"escalate_on_unresolved_conflict": True},
-            content_hash="",
-            created_at=now,
-        )
-        for policy in (context, memory, debate, routing, escalation):
-            object.__setattr__(
-                policy,
-                "content_hash",
-                content_hash(stable_json_dumps(policy.content)),
-            )
-
-        version = CognitiveConfigurationVersion(
-            parent_version_id=None,
-            status="champion",
-            prompt_versions=prompt_versions or {},
-            role_model_profiles=role_model_profiles
-            or {
-                "perception": "fast_structured",
-                "world_model": "general_reasoning",
-                "strategy": "general_reasoning",
-                "critic": "independent_critic",
-                "meta_decision": "general_reasoning",
-            },
-            context_policy_version_id=context.version_id,
-            memory_policy_version_id=memory.version_id,
-            debate_policy_version_id=debate.version_id,
-            routing_policy_version_id=routing.version_id,
-            escalation_policy_version_id=escalation.version_id,
-            content_hash="",
-            created_by="bootstrap",
-            created_at=now,
-            scope_key=self._scope_key,
-        )
+        version = await self._policies.bootstrap_defaults()
+        if role_model_profiles:
+            version = version.model_copy(update={"role_model_profiles": role_model_profiles})
+        if prompt_versions:
+            version = version.model_copy(update={"prompt_versions": prompt_versions})
+        version = version.model_copy(update={"scope_key": self._scope_key})
         version = version.model_copy(
             update={
                 "content_hash": hash_model(
@@ -141,11 +102,9 @@ class ChampionRegistry:
         return await self._configs.get_by_id(row["configuration_version_id"])
 
     async def get_previous_champion(self) -> CognitiveConfigurationVersion | None:
-        history = await self.compare_champion_history(limit=2)
-        if len(history) < 2:
+        history = await self.compare_champion_history(limit=1)
+        if not history:
             return None
-        prev_id = history[1].previous_version_id or history[1].new_version_id
-        # history[0] is latest; previous champion is history[0].previous_version_id
         latest = history[0]
         if latest.previous_version_id is None:
             return None
@@ -176,18 +135,17 @@ class ChampionRegistry:
         experiment_id: UUID | None = None,
         promotion_decision_id: UUID | None = None,
     ) -> ChampionTransition:
-        """Atomic CAS promotion. Fails if current champion != expected."""
         await self.initialize()
-        if challenger.content_hash != hash_model(
-            challenger, exclude={"created_at", "status", "configuration_version_id"}
-        ) and challenger.content_hash != challenger.content_hash:
-            # Always re-verify stored challenger hash matches DB row.
-            pass
         stored = await self._configs.get_by_id(challenger.configuration_version_id)
         if stored is None:
             raise ChampionRegistryError("challenger configuration not found")
         if stored.content_hash != challenger.content_hash:
             raise ChampionRegistryError("challenger configuration-hash mismatch")
+        ok, problems = await self._policies.verify_configuration_resolvable(stored)
+        if not ok:
+            raise ChampionRegistryError(
+                "challenger not materialisable: " + ", ".join(problems)
+            )
         return await self._activate(
             previous_version_id=expected_champion_id,
             new_version=stored.model_copy(update={"status": "champion"}),
@@ -208,6 +166,11 @@ class ChampionRegistry:
         restore = await self._configs.get_by_id(restore_version_id)
         if restore is None:
             raise ChampionRegistryError("restore target not found")
+        ok, problems = await self._policies.verify_configuration_resolvable(restore)
+        if not ok:
+            raise ChampionRegistryError(
+                "rollback target not materialisable: " + ", ".join(problems)
+            )
         return await self._activate(
             previous_version_id=expected_champion_id,
             new_version=restore.model_copy(update={"status": "champion"}),
@@ -264,24 +227,17 @@ class ChampionRegistry:
                         )
 
                 if previous_version_id is not None:
+                    new_status = (
+                        "rolled_back" if reason.startswith("rollback") else "retired"
+                    )
                     await db.execute(
                         """
                         UPDATE cognitive_configuration_versions
-                        SET status = 'retired'
-                        WHERE configuration_version_id = ? AND status = 'champion'
+                        SET status = ?
+                        WHERE configuration_version_id = ?
                         """,
-                        (str(previous_version_id),),
+                        (new_status, str(previous_version_id)),
                     )
-                    # Mark rolled_back when reason indicates rollback
-                    if reason.startswith("rollback"):
-                        await db.execute(
-                            """
-                            UPDATE cognitive_configuration_versions
-                            SET status = 'rolled_back'
-                            WHERE configuration_version_id = ?
-                            """,
-                            (str(previous_version_id),),
-                        )
 
                 await db.execute(
                     """

@@ -1,11 +1,13 @@
-"""Isolated champion/challenger experiment runner (never uses live ExecutionRuntime)."""
+"""Isolated champion/challenger experiment runner with durable episode results."""
 
 from __future__ import annotations
 
 from decimal import Decimal
-from typing import Any, Callable, Awaitable
+from pathlib import Path
+from typing import Any, Awaitable, Callable
 from uuid import UUID, uuid4
 
+from joker.evolution.experiment_results_store import ExperimentEpisodeResultStore
 from joker.evolution.hashing import hash_model
 from joker.evolution.idempotency import experiment_episode_key
 from joker.evolution.promotion_gate import PromotionEligibilityGate
@@ -17,7 +19,6 @@ from joker.evolution.schemas import (
     TradingEpisode,
 )
 
-
 ReplayFn = Callable[[TradingEpisode, UUID, int], Awaitable[dict[str, Any]]]
 
 
@@ -26,7 +27,7 @@ class ExperimentRunnerError(RuntimeError):
 
 
 class ExperimentRunner:
-    """Replay-only experiment execution with resume + idempotent episode keys."""
+    """Replay-only experiments; persists every episode/sample idempotency key."""
 
     def __init__(
         self,
@@ -34,17 +35,36 @@ class ExperimentRunner:
         *,
         gate: PromotionEligibilityGate | None = None,
         repeated_samples: int = 3,
+        db_path: str | Path | None = None,
+        result_store: ExperimentEpisodeResultStore | None = None,
+        replay_service: Any | None = None,
     ) -> None:
         self._experiments = experiment_repo
         self._gate = gate or PromotionEligibilityGate()
         self._repeated_samples = repeated_samples
-        self._completed_keys: set[str] = set()
+        self._replay_service = replay_service
+        if result_store is not None:
+            self._results = result_store
+        elif db_path is not None:
+            self._results = ExperimentEpisodeResultStore(db_path)
+        else:
+            raise ExperimentRunnerError(
+                "ExperimentRunner requires db_path or result_store for durable idempotency"
+            )
 
-    async def create(
-        self, definition: ExperimentDefinition
-    ) -> ExperimentDefinition:
+    async def create(self, definition: ExperimentDefinition) -> ExperimentDefinition:
         await self._experiments.append_definition(definition)
         return definition
+
+    def _resolve_replay_fn(self, replay_fn: ReplayFn | None) -> ReplayFn:
+        if replay_fn is not None:
+            return replay_fn
+        if self._replay_service is None:
+            raise ExperimentRunnerError(
+                "replay_fn is required unless ExperimentRunner was constructed "
+                "with a CognitiveReplayService"
+            )
+        return self._replay_service.replay_episode
 
     async def run(
         self,
@@ -55,12 +75,15 @@ class ExperimentRunner:
         replay_fn: ReplayFn | None = None,
         adversarial_passed: bool = True,
     ) -> ExperimentResult:
+        if self._results is None:
+            raise ExperimentRunnerError("experiment result store is required")
+        await self._results.initialize()
+        resolved_replay = self._resolve_replay_fn(replay_fn)
         definition = await self._experiments.get_definition(experiment_id)
         if definition is None:
             raise ExperimentRunnerError(f"experiment not found: {experiment_id}")
         await self._experiments.mark_status(experiment_id, "running")
 
-        replay = replay_fn or self._default_replay
         by_id = {ep.episode_id: ep for ep in episodes}
         slice_results: list[ExperimentSliceResult] = []
         champ_vals: list[Decimal] = []
@@ -68,9 +91,10 @@ class ExperimentRunner:
         missing: list[UUID] = []
         model_calls = 0
         cost = Decimal("0")
+        completed_keys = await self._results.list_keys(experiment_id)
 
         for slice_name, ids in partition_map.items():
-            metrics_acc: dict[str, list[Decimal]] = {"pnl": []}
+            deltas: list[Decimal] = []
             missing_count = 0
             for eid in ids:
                 ep = by_id.get(eid)
@@ -79,48 +103,56 @@ class ExperimentRunner:
                     missing_count += 1
                     continue
                 for sample in range(1, self._repeated_samples + 1):
-                    key = experiment_episode_key(
-                        experiment_id,
-                        eid,
-                        definition.challenger_version_id,
-                        sample,
-                    )
-                    if key in self._completed_keys:
-                        continue
-                    champ = await replay(ep, definition.champion_version_id, sample)
-                    chall = await replay(ep, definition.challenger_version_id, sample)
-                    self._completed_keys.add(key)
-                    await self._experiments.mark_status(
-                        experiment_id, "running", recovery_cursor=key
-                    )
-                    c_pnl = Decimal(str(champ.get("realised_pnl", 0)))
-                    h_pnl = Decimal(str(chall.get("realised_pnl", 0)))
-                    champ_vals.append(c_pnl)
-                    chall_vals.append(h_pnl)
-                    metrics_acc["pnl"].append(h_pnl - c_pnl)
-                    model_calls += int(champ.get("model_calls", 1)) + int(
-                        chall.get("model_calls", 1)
-                    )
-                    cost += Decimal(str(champ.get("cost_gbp", "0.01"))) + Decimal(
-                        str(chall.get("cost_gbp", "0.01"))
-                    )
-                    if cost > definition.maximum_cost_gbp:
-                        await self._experiments.mark_status(experiment_id, "failed")
-                        raise ExperimentRunnerError("maximum_cost_gbp exceeded")
+                    for cfg_id, bucket in (
+                        (definition.champion_version_id, "champion"),
+                        (definition.challenger_version_id, "challenger"),
+                    ):
+                        key = experiment_episode_key(
+                            experiment_id, eid, cfg_id, sample
+                        )
+                        if key in completed_keys:
+                            payload = await self._results.get_payload(key)
+                            assert payload is not None
+                        else:
+                            payload = await resolved_replay(ep, cfg_id, sample)
+                            if payload.get("broker_submit"):
+                                raise ExperimentRunnerError(
+                                    "experiment replay attempted broker submission"
+                                )
+                            await self._results.append(
+                                idempotency_key=key,
+                                experiment_id=experiment_id,
+                                episode_id=eid,
+                                configuration_version_id=cfg_id,
+                                sample_number=sample,
+                                payload=payload,
+                            )
+                            completed_keys.add(key)
+                            await self._experiments.mark_status(
+                                experiment_id, "running", recovery_cursor=key
+                            )
+                        pnl = Decimal(str(payload.get("realised_pnl", 0)))
+                        model_calls += int(payload.get("model_calls", 1))
+                        cost += Decimal(str(payload.get("cost_gbp", "0.01")))
+                        if bucket == "champion":
+                            champ_vals.append(pnl)
+                        else:
+                            chall_vals.append(pnl)
+                            if champ_vals:
+                                deltas.append(chall_vals[-1] - champ_vals[-1])
+                        if cost > definition.maximum_cost_gbp:
+                            await self._experiments.mark_status(experiment_id, "failed")
+                            raise ExperimentRunnerError("maximum_cost_gbp exceeded")
             avg_delta = (
-                sum(metrics_acc["pnl"]) / Decimal(len(metrics_acc["pnl"]))
-                if metrics_acc["pnl"]
-                else Decimal("0")
+                sum(deltas) / Decimal(len(deltas)) if deltas else Decimal("0")
             )
             slice_results.append(
                 ExperimentSliceResult(
                     slice_name=slice_name,
-                    metrics={"pnl_delta": avg_delta, "samples": len(metrics_acc["pnl"])},
+                    metrics={"pnl_delta": avg_delta, "samples": len(deltas)},
                     episode_count=len(ids) - missing_count,
                     missing_episode_count=missing_count,
-                    confidence_intervals={
-                        "pnl_delta": self._ci(metrics_acc["pnl"]),
-                    },
+                    confidence_intervals={"pnl_delta": self._ci(deltas)},
                 )
             )
 
@@ -130,6 +162,8 @@ class ExperimentRunner:
         chall_mean = (
             sum(chall_vals) / Decimal(len(chall_vals)) if chall_vals else Decimal("0")
         )
+        champ_tail = min(champ_vals) if champ_vals else Decimal("0")
+        chall_tail = min(chall_vals) if chall_vals else Decimal("0")
         result = ExperimentResult(
             result_id=uuid4(),
             experiment_id=definition.experiment_id,
@@ -140,24 +174,26 @@ class ExperimentRunner:
                 "pnl_delta": chall_mean - champ_mean,
             },
             confidence_intervals={
-                "pnl_delta": self._ci([b - a for a, b in zip(champ_vals, chall_vals)])
+                "pnl_delta": self._ci(
+                    [b - a for a, b in zip(champ_vals, chall_vals)]
+                )
             },
             cost_gbp=cost,
             model_call_counts={"total": model_calls},
             missing_episodes=tuple(missing),
             champion_metrics={
                 "mean_pnl": champ_mean,
-                "tail_loss": min(champ_vals) if champ_vals else Decimal("0"),
+                "tail_loss": champ_tail,
                 "calibration_error": Decimal("0.10"),
                 "latency_ms": 100,
-                "cost_gbp": cost / Decimal("2"),
+                "cost_gbp": cost / Decimal("2") if cost else Decimal("0"),
             },
             challenger_metrics={
                 "mean_pnl": chall_mean,
-                "tail_loss": min(chall_vals) if chall_vals else Decimal("0"),
+                "tail_loss": chall_tail,
                 "calibration_error": Decimal("0.09"),
                 "latency_ms": 110,
-                "cost_gbp": cost / Decimal("2"),
+                "cost_gbp": cost / Decimal("2") if cost else Decimal("0"),
             },
             eligibility_outcome=False,
             gate_rejection_codes=(),
@@ -174,14 +210,15 @@ class ExperimentRunner:
             update={
                 "eligibility_outcome": eligibility.eligible,
                 "gate_rejection_codes": eligibility.gate_codes,
-                "content_hash": "",
             }
         )
         result = result.model_copy(
             update={"content_hash": hash_model(result, exclude={"created_at"})}
         )
         await self._experiments.append_result(result)
-        await self._experiments.mark_status(experiment_id, "completed", recovery_cursor=None)
+        await self._experiments.mark_status(
+            experiment_id, "completed", recovery_cursor=None
+        )
         return result
 
     async def resume(
@@ -191,13 +228,7 @@ class ExperimentRunner:
         episodes: list[TradingEpisode],
         partition_map: dict[str, tuple[UUID, ...]],
         replay_fn: ReplayFn | None = None,
-        known_completed_keys: set[str] | None = None,
     ) -> ExperimentResult:
-        if known_completed_keys:
-            self._completed_keys |= set(known_completed_keys)
-        definition = await self._experiments.get_definition(experiment_id)
-        if definition and definition.recovery_cursor:
-            self._completed_keys.add(definition.recovery_cursor)
         existing = await self._experiments.get_result(experiment_id)
         if existing is not None:
             return existing
@@ -208,28 +239,9 @@ class ExperimentRunner:
             replay_fn=replay_fn,
         )
 
-    async def _default_replay(
-        self, episode: TradingEpisode, configuration_version_id: UUID, sample: int
-    ) -> dict[str, Any]:
-        """Deterministic stub fill model for tests — not live broker."""
-        base = episode.realised_pnl or Decimal("0")
-        # Slight challenger bump encoded via UUID nibble for stability in tests.
-        bump = Decimal(int(str(configuration_version_id).replace("-", "")[:2], 16) % 5) / Decimal(
-            "100"
-        )
-        return {
-            "realised_pnl": base + bump + Decimal(sample - 1) * Decimal("0.01"),
-            "model_calls": 2,
-            "cost_gbp": "0.02",
-            "configuration_version_id": str(configuration_version_id),
-            "broker_submit": False,
-        }
-
     @staticmethod
     def _ci(values: list[Decimal]) -> tuple[Decimal, Decimal]:
         if not values:
             return (Decimal("0"), Decimal("0"))
         ordered = sorted(values)
-        lo = ordered[0]
-        hi = ordered[-1]
-        return (lo, hi)
+        return (ordered[0], ordered[-1])

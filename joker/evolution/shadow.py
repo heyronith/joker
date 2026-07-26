@@ -1,4 +1,4 @@
-"""Shadow evaluation runtime — challenger has no broker / ExecutionRuntime access."""
+"""Shadow evaluation runtime — runs challenger cognitive graph without broker access."""
 
 from __future__ import annotations
 
@@ -6,15 +6,21 @@ import asyncio
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Awaitable, Callable
 from uuid import UUID, uuid4
 
+from joker.evolution.policy_store import PolicyVersionStore
 from joker.evolution.repositories import ShadowAssignmentRepository
 from joker.evolution.schemas import CognitiveConfigurationVersion, ShadowAssignment
 
 
 class ShadowIsolationError(RuntimeError):
     """Raised if shadow path attempts broker or execution access."""
+
+
+ChallengerRunner = Callable[
+    [CognitiveConfigurationVersion, dict[str, Any]], Awaitable[dict[str, Any]]
+]
 
 
 @dataclass
@@ -31,11 +37,14 @@ class ShadowRuntime:
     """Bounded-queue shadow worker. Never submits orders."""
 
     assignment_repo: ShadowAssignmentRepository
+    policy_store: PolicyVersionStore | None = None
     queue_size: int = 128
+    challenger_runner: ChallengerRunner | None = None
     _queue: deque[dict[str, Any]] = field(default_factory=deque)
     _worker: asyncio.Task[None] | None = None
     _stopped: bool = True
     _results: list[ShadowCycleResult] = field(default_factory=list)
+    _configs: dict[UUID, CognitiveConfigurationVersion] = field(default_factory=dict)
 
     async def start(self) -> None:
         self._stopped = False
@@ -58,6 +67,14 @@ class ShadowRuntime:
         challenger: CognitiveConfigurationVersion,
         champion: CognitiveConfigurationVersion,
     ) -> ShadowAssignment:
+        if self.policy_store is not None:
+            ok, problems = await self.policy_store.verify_configuration_resolvable(
+                challenger
+            )
+            if not ok:
+                raise ShadowIsolationError(
+                    "challenger not materialisable: " + ", ".join(problems)
+                )
         assignment = ShadowAssignment(
             assignment_id=uuid4(),
             challenger_version_id=challenger.configuration_version_id,
@@ -65,6 +82,7 @@ class ShadowRuntime:
             status="active",
         )
         await self.assignment_repo.append(assignment)
+        self._configs[challenger.configuration_version_id] = challenger
         return assignment
 
     async def enqueue_snapshot(
@@ -79,7 +97,6 @@ class ShadowRuntime:
         if len(self._queue) >= self.queue_size:
             return False
         if coalesce:
-            # Drop older entry snapshots for same assignment (not position events).
             self._queue = deque(
                 item
                 for item in self._queue
@@ -113,13 +130,26 @@ class ShadowRuntime:
             await self._run_shadow_cycle(item)
 
     async def _run_shadow_cycle(self, item: dict[str, Any]) -> None:
-        # Hypothetical command only — never broker.
-        command = {
-            "action": "hypothetical_entry",
-            "snapshot_id": item.get("snapshot_id"),
-            "shadow": True,
-            "payload_keys": sorted(item.get("payload", {}).keys()),
-        }
+        challenger_id = UUID(item["challenger_version_id"])
+        challenger = self._configs.get(challenger_id)
+        command: dict[str, Any]
+        if self.challenger_runner is not None and challenger is not None:
+            # Real challenger cognitive execution — must not touch broker.
+            command = await self.challenger_runner(challenger, item)
+            if command.get("broker_submit") or command.get("execution_runtime"):
+                raise ShadowIsolationError("challenger runner attempted live execution")
+            command = {**command, "shadow": True}
+        else:
+            command = {
+                "action": "hypothetical_entry",
+                "snapshot_id": item.get("snapshot_id"),
+                "shadow": True,
+                "challenger_version_id": str(challenger_id),
+                "configuration_hash": (
+                    challenger.content_hash if challenger is not None else None
+                ),
+                "ran_challenger_graph": False,
+            }
         command_id = str(uuid4())
         created = datetime.now(timezone.utc).isoformat()
         await self.assignment_repo.append_hypothetical_command(
@@ -133,7 +163,7 @@ class ShadowRuntime:
         self._results.append(
             ShadowCycleResult(
                 assignment_id=UUID(item["assignment_id"]),
-                challenger_version_id=UUID(item["challenger_version_id"]),
+                challenger_version_id=challenger_id,
                 snapshot_id=item.get("snapshot_id"),
                 hypothetical_command=command,
                 created_at=datetime.now(timezone.utc),

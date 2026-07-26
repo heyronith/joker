@@ -309,7 +309,12 @@ _PROMPTS: dict[AgentRole, PromptSpec] = {
 
 
 def get_prompt(role: AgentRole) -> PromptSpec:
-    """Return the versioned prompt for an agent role."""
+    """Return the versioned prompt for an agent role (honours cycle overrides)."""
+    from joker.cognition.prompt_overrides import get_override_prompt
+
+    override = get_override_prompt(role)
+    if override is not None:
+        return override
     try:
         return _PROMPTS[role]
     except KeyError as exc:

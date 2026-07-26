@@ -83,12 +83,14 @@ class CognitiveAgentRuntime:
         graph_deps: CognitiveGraphDeps | None = None,
         registry: ModelRegistry | None = None,
         checkpointer_path: Path | str | None = None,
+        evolution_runtime: Any | None = None,
     ) -> None:
         self._session_id = session_id
         self._run_id = run_id
         self._router = router
         self._config = config
         self._registry = registry
+        self._evolution_runtime = evolution_runtime
         self._deps = graph_deps or CognitiveGraphDeps(
             router=router,
             config=config,
@@ -680,10 +682,26 @@ class CognitiveAgentRuntime:
             cycle_id=cycle_id,
         )
         try:
-            result_state = await asyncio.wait_for(
-                self._decision_graph.ainvoke(state, config=config),
-                timeout=float(self._config.max_cycle_seconds),
-            )
+            from joker.cognition.prompt_overrides import pinned_configuration_overrides
+
+            applied = None
+            if self._evolution_runtime is not None:
+                applied = await self._evolution_runtime.pin_and_apply_for_cycle(cycle_id)
+            if applied is not None:
+                with pinned_configuration_overrides(
+                    configuration_version_id=str(applied.configuration_version_id),
+                    prompt_overrides=applied.prompt_overrides,
+                    role_profiles=applied.role_profiles,
+                ):
+                    result_state = await asyncio.wait_for(
+                        self._decision_graph.ainvoke(state, config=config),
+                        timeout=float(self._config.max_cycle_seconds),
+                    )
+            else:
+                result_state = await asyncio.wait_for(
+                    self._decision_graph.ainvoke(state, config=config),
+                    timeout=float(self._config.max_cycle_seconds),
+                )
             self._counters.last_success_at = datetime.now(timezone.utc)
             self._status = "healthy"
             if self._deps.cycle_registry is not None:

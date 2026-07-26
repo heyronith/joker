@@ -56,7 +56,7 @@ async def test_experiment_resume_and_no_broker(tmp_path) -> None:
     repos = build_evolution_repositories(db)
     registry = ChampionRegistry(db)
     champ = await registry.bootstrap_champion()
-    svc = ImprovementProposalService(repos["proposals"], repos["configurations"])
+    svc = ImprovementProposalService(repos["proposals"], repos["configurations"], registry.policy_store)
     _proposal, challenger = await svc.propose(
         parent_champion=champ,
         weakness="w",
@@ -91,7 +91,7 @@ async def test_experiment_resume_and_no_broker(tmp_path) -> None:
         dataset_id=dataset.dataset_id,
         maximum_cost_gbp=Decimal("25"),
     )
-    runner = ExperimentRunner(repos["experiments"], repeated_samples=1)
+    runner = ExperimentRunner(repos["experiments"], repeated_samples=1, db_path=db)
     await runner.create(definition)
 
     async def replay(ep, cfg_id, sample):
@@ -128,7 +128,7 @@ async def test_promotion_blocked_and_agent_reject(tmp_path) -> None:
     repos = build_evolution_repositories(db)
     registry = ChampionRegistry(db)
     champ = await registry.bootstrap_champion()
-    svc = ImprovementProposalService(repos["proposals"], repos["configurations"])
+    svc = ImprovementProposalService(repos["proposals"], repos["configurations"], registry.policy_store)
     proposal, challenger = await svc.propose(
         parent_champion=champ,
         weakness="calibration",
@@ -189,11 +189,31 @@ async def test_shadow_isolation_and_backpressure(tmp_path) -> None:
     apply_task3_migrations(db)
     repos = build_evolution_repositories(db)
     await repos["shadow"].initialize()
-    runtime = ShadowRuntime(repos["shadow"], queue_size=2)
-    await runtime.start()
     registry = ChampionRegistry(db)
     champ = await registry.bootstrap_champion()
-    svc = ImprovementProposalService(repos["proposals"], repos["configurations"])
+
+    async def challenger_runner(challenger, item):
+        return {
+            "action": "challenger_shadow_decision",
+            "snapshot_id": item.get("snapshot_id"),
+            "shadow": True,
+            "broker_submit": False,
+            "execution_runtime": False,
+            "ran_challenger_graph": True,
+            "challenger_version_id": str(challenger.configuration_version_id),
+            "configuration_hash": challenger.content_hash,
+        }
+
+    runtime = ShadowRuntime(
+        repos["shadow"],
+        policy_store=registry.policy_store,
+        queue_size=2,
+        challenger_runner=challenger_runner,
+    )
+    await runtime.start()
+    svc = ImprovementProposalService(
+        repos["proposals"], repos["configurations"], registry.policy_store
+    )
     _, challenger = await svc.propose(
         parent_champion=champ,
         weakness="w",
@@ -233,6 +253,8 @@ async def test_shadow_isolation_and_backpressure(tmp_path) -> None:
     import asyncio
 
     await asyncio.sleep(0.05)
+    assert runtime.results
+    assert runtime.results[0].hypothetical_command.get("ran_challenger_graph") is True
     await runtime.stop()
     await registry.close()
 
@@ -244,7 +266,7 @@ async def test_safety_rollback_and_idempotent(tmp_path) -> None:
     repos = build_evolution_repositories(db)
     registry = ChampionRegistry(db)
     champ = await registry.bootstrap_champion()
-    svc = ImprovementProposalService(repos["proposals"], repos["configurations"])
+    svc = ImprovementProposalService(repos["proposals"], repos["configurations"], registry.policy_store)
     _, challenger = await svc.propose(
         parent_champion=champ,
         weakness="w",

@@ -2,9 +2,14 @@
 
 from __future__ import annotations
 
-from typing import Literal
+from pathlib import Path
+from typing import Any, Literal, TypedDict
 from uuid import UUID, uuid4
 
+from langgraph.graph import END, START, StateGraph
+
+from joker.evolution.agent_invoke import invoke_evolution_agent
+from joker.evolution.agent_schemas import EvolutionDecisionAgentOutput
 from joker.evolution.champion_registry import ChampionRegistry
 from joker.evolution.idempotency import promotion_idempotency_key
 from joker.evolution.promotion_gate import EligibilityResult, PromotionEligibilityGate
@@ -18,13 +23,69 @@ from joker.evolution.schemas import (
     ImprovementProposal,
     PromotionDecision,
 )
+from joker.graph.langgraph_checkpointer import CognitiveCheckpointer, ainvoke_config
+from joker.models.router import ModelRouter
 
 
 AgentAction = Literal["promote", "reject", "extend_shadow", "request_more_evidence"]
 
 
 class EvolutionDecisionAgent:
-    """Strategic promotion judgement — cannot override failed deterministic gates."""
+    """Strategic promotion judgement via ModelRouter — cannot override failed gates."""
+
+    def __init__(self, router: ModelRouter | None = None) -> None:
+        self._router = router
+
+    async def decide_async(
+        self,
+        *,
+        eligibility: EligibilityResult,
+        result: ExperimentResult,
+        proposal: ImprovementProposal | None = None,
+        session_id: str = "evolution",
+        snapshot_id: UUID | None = None,
+    ) -> tuple[AgentAction, str, tuple[str, ...]]:
+        if not eligibility.eligible:
+            return (
+                "reject",
+                "deterministic eligibility failed; agent cannot promote",
+                tuple(eligibility.gate_codes),
+            )
+        if self._router is None:
+            return self.decide(eligibility=eligibility, result=result, proposal=proposal)
+
+        payload = {
+            "eligible": eligibility.eligible,
+            "gate_codes": list(eligibility.gate_codes),
+            "aggregate_metrics": {
+                k: str(v) for k, v in result.aggregate_metrics.items()
+            },
+            "champion_metrics": {k: str(v) for k, v in result.champion_metrics.items()},
+            "challenger_metrics": {
+                k: str(v) for k, v in result.challenger_metrics.items()
+            },
+            "proposal_metrics_to_improve": (
+                list(proposal.metrics_to_improve) if proposal else []
+            ),
+            "allowed_actions": [
+                "promote",
+                "reject",
+                "extend_shadow",
+                "request_more_evidence",
+            ],
+        }
+        output, _call_id = await invoke_evolution_agent(
+            self._router,
+            role="evolution_decision",
+            prompt_id="task3.evolution_decision",
+            prompt_version="3.0.0",
+            payload=payload,
+            output_type=EvolutionDecisionAgentOutput,
+            snapshot_id=snapshot_id or uuid4(),
+            cycle_id=f"promotion:{result.experiment_id}",
+            session_id=session_id,
+        )
+        return output.action, output.summary, output.rationale_codes
 
     def decide(
         self,
@@ -33,13 +94,13 @@ class EvolutionDecisionAgent:
         result: ExperimentResult,
         proposal: ImprovementProposal | None = None,
     ) -> tuple[AgentAction, str, tuple[str, ...]]:
+        """Deterministic fallback used only when ModelRouter is unavailable."""
         if not eligibility.eligible:
             return (
                 "reject",
                 "deterministic eligibility failed; agent cannot promote",
                 tuple(eligibility.gate_codes),
             )
-        # Prefer promote when challenger mean pnl improves and no unresolved hard risks.
         delta = result.aggregate_metrics.get("pnl_delta")
         if delta is not None and float(delta) < 0:
             return (
@@ -67,6 +128,33 @@ class EvolutionDecisionAgent:
         )
 
 
+class DecisionGraphState(TypedDict, total=False):
+    eligibility: EligibilityResult
+    result: ExperimentResult
+    proposal: ImprovementProposal | None
+    session_id: str
+    action: AgentAction
+    rationale: str
+    risks: tuple[str, ...]
+
+
+def build_evolution_decision_graph(agent: EvolutionDecisionAgent):
+    async def decide_node(state: DecisionGraphState) -> dict[str, Any]:
+        action, rationale, risks = await agent.decide_async(
+            eligibility=state["eligibility"],
+            result=state["result"],
+            proposal=state.get("proposal"),
+            session_id=state.get("session_id") or "evolution",
+        )
+        return {"action": action, "rationale": rationale, "risks": risks}
+
+    graph = StateGraph(DecisionGraphState)
+    graph.add_node("decide", decide_node)
+    graph.add_edge(START, "decide")
+    graph.add_edge("decide", END)
+    return graph
+
+
 class EvolutionDecisionService:
     def __init__(
         self,
@@ -76,12 +164,17 @@ class EvolutionDecisionService:
         *,
         gate: PromotionEligibilityGate | None = None,
         agent: EvolutionDecisionAgent | None = None,
+        router: ModelRouter | None = None,
+        checkpointer_path: Path | None = None,
+        session_id: str = "evolution",
     ) -> None:
         self._promotions = promotion_repo
         self._configs = config_repo
         self._champions = champion_registry
         self._gate = gate or PromotionEligibilityGate()
-        self._agent = agent or EvolutionDecisionAgent()
+        self._agent = agent or EvolutionDecisionAgent(router)
+        self._checkpointer_path = checkpointer_path
+        self._session_id = session_id
 
     async def decide_and_apply(
         self,
@@ -112,9 +205,31 @@ class EvolutionDecisionService:
                 rationale = "override blocked by deterministic gate"
                 risks = eligibility.gate_codes
         else:
-            action, rationale, risks = self._agent.decide(
-                eligibility=eligibility, result=result, proposal=proposal
-            )
+            builder = build_evolution_decision_graph(self._agent)
+            state: DecisionGraphState = {
+                "eligibility": eligibility,
+                "result": result,
+                "proposal": proposal,
+                "session_id": self._session_id,
+            }
+            if self._checkpointer_path is not None:
+                checkpointer = CognitiveCheckpointer(self._checkpointer_path)
+                saver = await checkpointer.open()
+                compiled = builder.compile(checkpointer=saver)
+                config = ainvoke_config(
+                    session_id=self._session_id,
+                    graph_kind="evolution_decision",
+                    cycle_id=str(experiment_id),
+                )
+                try:
+                    decided = await compiled.ainvoke(state, config=config)
+                finally:
+                    await checkpointer.close()
+            else:
+                decided = await builder.compile().ainvoke(state)
+            action = decided["action"]
+            rationale = decided["rationale"]
+            risks = decided["risks"]
 
         if not eligibility.eligible:
             final_status: Literal[

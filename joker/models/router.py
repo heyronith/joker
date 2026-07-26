@@ -118,6 +118,12 @@ class ModelRouter:
         if force_profile:
             return force_profile, "forced_profile", False
 
+        from joker.cognition.prompt_overrides import get_override_profile
+
+        override_profile = get_override_profile(request.role)
+        if override_profile and override_profile in self._registry.profiles:
+            return override_profile, "configuration_role_profile", False
+
         if escalate or request.context_payload.get("escalate"):
             return "remote_escalation", "explicit_escalation", False
 

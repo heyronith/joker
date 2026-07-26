@@ -171,6 +171,7 @@ class LivePaperRunner:
             redact_keys=app_settings.logging.redact_env_keys,
         )
         self._task1_bridge: CompatibilityLivePaperBridge | None = None
+        self._evolution_runtime = None
 
     @property
     def task1_bridge(self) -> CompatibilityLivePaperBridge | None:
@@ -376,6 +377,22 @@ class LivePaperRunner:
             assert cognitive_graph_deps.execution_runtime is not None
             assert cognitive_graph_deps.order_action_gateway is not None
             task1_bridge.start_agent()
+            if bool(getattr(self.app_settings.evolution, "enabled", False)):
+                from joker.evolution.runtime import EvolutionRuntime
+
+                evolution_runtime = EvolutionRuntime(
+                    db_path=task1_db,
+                    settings=self.app_settings.evolution,
+                    session_id=bridge_session_id,
+                    run_id=run_id,
+                    event_bus=task1_bridge.supervisor.event_bus,
+                    execution_runtime=task1_bridge.execution_runtime,
+                    model_router=model_router,
+                    cognitive_graph_deps=cognitive_graph_deps,
+                )
+                task1_bridge.run_coro(evolution_runtime.start())
+                injected_agent_runtime._evolution_runtime = evolution_runtime
+                self._evolution_runtime = evolution_runtime
         self._task1_bridge = task1_bridge
         execution_broker = ExecutionDelegatingBroker(
             inner=broker,
@@ -384,6 +401,13 @@ class LivePaperRunner:
         )
 
         def shutdown_task1() -> None:
+            evolution = getattr(self, "_evolution_runtime", None)
+            if evolution is not None and self._task1_bridge is not None:
+                try:
+                    self._task1_bridge.run_coro(evolution.shutdown())
+                except Exception:
+                    pass
+                self._evolution_runtime = None
             if self._task1_bridge is not None:
                 try:
                     self._task1_bridge.shutdown()
