@@ -154,6 +154,11 @@ class CompatibilityLivePaperBridge:
         try:
             if not self._loop.is_closed():
                 self.run_coro(self._supervisor.shutdown())
+                # Supervisor already drains aiosqlite workers; re-drain in case a
+                # cancelled cognitive task opened a short-lived connection.
+                from joker.persistence.aiosqlite_lifecycle import drain_aiosqlite_workers
+
+                self.run_coro(drain_aiosqlite_workers())
         finally:
             if not self._loop.is_closed():
                 try:
@@ -166,6 +171,9 @@ class CompatibilityLivePaperBridge:
                         )
                 except Exception:
                     pass
+                from joker.persistence.aiosqlite_lifecycle import join_aiosqlite_workers
+
+                join_aiosqlite_workers()
                 self._loop.close()
 
     def _sync_health_to_graph(self) -> None:

@@ -9,6 +9,8 @@ from pathlib import Path
 import aiosqlite
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
+from joker.persistence.aiosqlite_lifecycle import close_aiosqlite_connection
+
 logger = logging.getLogger(__name__)
 
 
@@ -48,32 +50,8 @@ class CognitiveCheckpointer:
         conn = self._conn
         self._saver = None
         self._conn = None
-        worker = None
         if conn is not None:
-            worker = getattr(conn, "_connection_thread", None) or getattr(
-                conn, "_thread", None
-            )
-            try:
-                await conn.commit()
-            except Exception:
-                pass
-            try:
-                await conn.close()
-            except Exception as exc:  # noqa: BLE001 — best-effort shutdown
-                logger.warning(
-                    "cognitive_checkpointer_close_failed", extra={"error": str(exc)}
-                )
-        import asyncio
-
-        # Drain the loop so aiosqlite's worker can observe the closed connection
-        # before the event loop itself is destroyed.
-        await asyncio.sleep(0)
-        if worker is not None and getattr(worker, "is_alive", lambda: False)():
-            try:
-                await asyncio.to_thread(worker.join, 2.0)
-            except Exception:
-                pass
-        await asyncio.sleep(0)
+            await close_aiosqlite_connection(conn)
         logger.info(
             "cognitive_checkpointer_closed",
             extra={"db_path": str(self.db_path), "had_saver": saver is not None},

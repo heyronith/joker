@@ -48,6 +48,8 @@ pythonpath = ["."]
 asyncio_mode = "auto"
 filterwarnings = [
     "ignore::DeprecationWarning",
+    # aiosqlite worker must not outlive the owning loop (CPython 3.12 CI gate).
+    "error::pytest.PytestUnhandledThreadExceptionWarning",
 ]
 
 [tool.ruff]

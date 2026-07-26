@@ -50,8 +50,11 @@ class SqliteLedgerStore:
 
     async def close(self) -> None:
         if self._conn is not None:
-            await self._conn.close()
+            from joker.persistence.aiosqlite_lifecycle import close_aiosqlite_connection
+
+            conn = self._conn
             self._conn = None
+            await close_aiosqlite_connection(conn)
 
     def _require_conn(self) -> aiosqlite.Connection:
         if self._conn is None:

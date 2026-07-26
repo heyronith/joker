@@ -339,10 +339,10 @@ class SessionSupervisor:
         if self._ledger is not None:
             await self._ledger.close()
         await self._checkpoints.close()
-        # Let aiosqlite worker threads observe closed connections before loop teardown.
-        import asyncio
+        # Join aiosqlite workers before callers destroy the owning event loop.
+        from joker.persistence.aiosqlite_lifecycle import drain_aiosqlite_workers
 
-        await asyncio.sleep(0)
+        await drain_aiosqlite_workers()
         self._started = False
         logger.info(
             "session_shutdown_complete",
