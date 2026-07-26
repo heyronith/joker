@@ -77,14 +77,33 @@ class SurfaceFetchResult:
             }
             if self.failed_batches:
                 details["failed_batches"] = "; ".join(self.failed_batches)[:500]
+            unavailable = (
+                self.selected_count == 0
+                or self.fetched_count == 0
+                or any(
+                    "zero_" in batch or "unavailable" in batch.lower()
+                    for batch in self.failed_batches
+                )
+            )
+            code = (
+                DataQualityCode.OPTION_SURFACE_UNAVAILABLE
+                if unavailable
+                else DataQualityCode.PARTIAL_OPTION_SURFACE
+            )
+            message = (
+                "option surface unavailable; zero eligible SPY 0DTE contracts were "
+                "discovered or returned for the exchange trading date"
+                if code is DataQualityCode.OPTION_SURFACE_UNAVAILABLE
+                else (
+                    "option surface fetch incomplete; partial surface must not be "
+                    "treated as the full SPY 0DTE chain"
+                )
+            )
             findings.append(
                 DataQualityFinding(
-                    code=DataQualityCode.PARTIAL_OPTION_SURFACE,
+                    code=code,
                     severity=DataQualitySeverity.ERROR,
-                    message=(
-                        "option surface fetch incomplete; partial surface must not be "
-                        "treated as the full SPY 0DTE chain"
-                    ),
+                    message=message,
                     symbol=ALLOWED_SYMBOL,
                     details=details,
                 )
@@ -299,14 +318,19 @@ class WebullOptionsDataProvider:
             )
         selected_count = len(selected)
         if not selected:
+            reason = (
+                "zero_contracts_discovered"
+                if discovered_count == 0
+                else "zero_eligible_spy_0dte_contracts"
+            )
             return SurfaceFetchResult(
                 snapshots=[],
                 discovered_count=discovered_count,
                 selected_count=0,
                 fetched_count=0,
-                failed_batches=tuple(failed_batches),
+                failed_batches=tuple([*failed_batches, reason]),
                 emergency_truncated=emergency_truncated,
-                complete=complete and discovered_count == 0,
+                complete=False,
                 trading_date=exp,
             )
 

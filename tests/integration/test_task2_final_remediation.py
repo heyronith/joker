@@ -394,8 +394,8 @@ async def test_surface_fetch_result_records_partial_batches() -> None:
         snapshots=[],
         discovered_count=10,
         selected_count=10,
-        fetched_count=0,
-        failed_batches=("batch[0:20]: Timeout",),
+        fetched_count=8,
+        failed_batches=("batch[0:20]: missing_ids=a,b",),
         complete=False,
         trading_date=date(2026, 7, 1),
     )
@@ -678,7 +678,7 @@ async def test_two_phase_supervisor_bind_before_agent_recovery(tmp_path) -> None
     broker = PaperBroker(slippage_pct=0)
     session_id = stable_cognitive_session_id(
         trading_date=date(2026, 7, 1),
-        broker_account_id="paper",
+        account_identity="local_paper",
         mode="paper",
     )
     fake = FakeModelProvider(available=True)

@@ -20,7 +20,7 @@ def test_live_paper_runner_two_phase_cognitive_startup_ordering() -> None:
     assert "start_agent=not cognitive_mode" in source
     assert "bind_cognitive_graph_to_task1(" in source
     assert "task1_bridge.start_agent()" in source
-    assert "stable_cognitive_session_id" in source
+    assert "live_paper_cognitive_session_id" in source
     bind_idx = source.index("bind_cognitive_graph_to_task1(")
     agent_idx = source.index("task1_bridge.start_agent()")
     assert bind_idx < agent_idx

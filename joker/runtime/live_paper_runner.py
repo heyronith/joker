@@ -285,12 +285,11 @@ class LivePaperRunner:
 
             registry = startup.registry
             # Stable cognitive session survives process restart; run_id remains audit-only.
-            from joker.runtime.cognitive_session import stable_cognitive_session_id
+            from joker.runtime.cognitive_session import live_paper_cognitive_session_id
 
-            cognitive_session_id = stable_cognitive_session_id(
-                trading_date=trading_day,
-                broker_account_id=selection.kind,
-                mode="paper",
+            cognitive_session_id = live_paper_cognitive_session_id(
+                broker_kind=selection.kind,
+                env=self.env_settings,
             )
             model_router = ModelRouter(
                 registry,
