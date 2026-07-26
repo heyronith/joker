@@ -343,6 +343,9 @@ class CognitiveAgentRuntime:
         if self._checkpointer_helper is not None:
             await self._checkpointer_helper.close()
             self._deps.checkpointer = None
+        from joker.persistence.aiosqlite_lifecycle import drain_aiosqlite_workers
+
+        await drain_aiosqlite_workers()
         self._started = False
 
     async def health(self) -> CognitiveRuntimeHealth:

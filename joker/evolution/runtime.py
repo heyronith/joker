@@ -99,7 +99,7 @@ class EvolutionRuntime:
         self.episode_compiler = EpisodeCompiler(
             self._repos["episodes"], self._repos["traces"]
         )
-        eval_ckpt = self.db_path.with_name(self.db_path.stem + "_evolution_eval_ckpt.db")
+        eval_ckpt = None
         if self.model_router is not None:
             self.evaluation_runner = AgenticEvaluationGraphRunner(
                 self._repos["evaluations"],
@@ -125,9 +125,7 @@ class EvolutionRuntime:
             self.improvement_graph = ImprovementGraphRunner(
                 router=self.model_router,
                 service=self.improvement,
-                checkpointer_path=self.db_path.with_name(
-                    self.db_path.stem + "_evolution_improve_ckpt.db"
-                ),
+                checkpointer_path=None,
                 session_id=self.session_id or "evolution",
             )
         if self.cognitive_graph_deps is not None:
@@ -135,9 +133,7 @@ class EvolutionRuntime:
                 template_deps=self.cognitive_graph_deps,
                 config_repo=self._repos["configurations"],
                 policy_store=self.champion_registry.policy_store,
-                checkpointer_path=self.db_path.with_name(
-                    self.db_path.stem + "_evolution_replay_ckpt.db"
-                ),
+                checkpointer_path=None,
             )
         self.experiments = ExperimentRunner(
             self._repos["experiments"],
@@ -150,9 +146,7 @@ class EvolutionRuntime:
             self._repos["configurations"],
             self.champion_registry,
             router=self.model_router,
-            checkpointer_path=self.db_path.with_name(
-                self.db_path.stem + "_evolution_decision_ckpt.db"
-            ),
+            checkpointer_path=None,
             session_id=self.session_id or "evolution",
         )
         challenger_runner = None
@@ -210,6 +204,9 @@ class EvolutionRuntime:
             await self.champion_registry.close()
         for repo in self._repos.values():
             await repo.close()
+        from joker.persistence.aiosqlite_lifecycle import drain_aiosqlite_workers
+
+        await drain_aiosqlite_workers()
         self._started = False
 
     async def configuration_for_new_cycle(self) -> CognitiveConfigurationVersion | None:

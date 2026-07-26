@@ -329,3 +329,12 @@ async def test_production_cognitive_replay_and_shadow_challenger(tmp_path) -> No
 
     await champ_registry.close()
     await supervisor.shutdown()
+    from joker.persistence.aiosqlite_lifecycle import (
+        drain_aiosqlite_workers,
+        iter_aiosqlite_worker_threads,
+        join_aiosqlite_workers,
+    )
+
+    await drain_aiosqlite_workers()
+    join_aiosqlite_workers()
+    assert not iter_aiosqlite_worker_threads()
