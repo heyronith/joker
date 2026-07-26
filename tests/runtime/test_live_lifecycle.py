@@ -597,7 +597,8 @@ def test_tick_failure_degrades_and_snapshot_recovers(tmp_path: Path) -> None:
         bridge.shutdown()
 
 
-def test_same_contract_two_round_trips_report_trade_pnl_delta(tmp_path: Path) -> None:
+def test_same_contract_two_round_trips_via_try_exit(tmp_path: Path) -> None:
+    """Baseline must be captured before submit inside _try_exit (immediate paper fills)."""
     broker = PaperBroker(slippage_pct=0)
     bridge = CompatibilityLivePaperBridge(
         broker=broker, db_path=tmp_path / "2x.db", session_id="2x"
@@ -610,96 +611,78 @@ def test_same_contract_two_round_trips_report_trade_pnl_delta(tmp_path: Path) ->
         outcomes: list[dict] = []
         handler._on_trade_outcome = lambda payload: outcomes.append(dict(payload))
 
-        # Trade 1: +50
-        buy1 = OrderIntent(
-            candidate_id="b1",
-            contract=contract,
-            side="buy",
-            order_type="limit",
-            quantity=1,
-            limit_price=1.0,
+        def _tp_quote(mid: float) -> OptionQuoteEvent:
+            now = handler.provider.current_time
+            return OptionQuoteEvent(
+                timestamp=now,
+                contract_id=cid,
+                expiration=contract.expiration,
+                strike=contract.strike,
+                option_type="call",
+                bid=mid - 0.05,
+                ask=mid + 0.05,
+                mid=mid,
+                spread_pct=((0.1) / mid) * 100.0,
+                quote_timestamp=now,
+            )
+
+        # Trade 1: buy @ 1.0, exit via take-profit at mid 1.5 → +50
+        exec_broker.submit_order(
+            OrderIntent(
+                candidate_id="b1",
+                contract=contract,
+                side="buy",
+                order_type="limit",
+                quantity=1,
+                limit_price=1.0,
+            )
         )
-        exec_broker.submit_order(buy1)
         handler.state.open_trade = OpenTradeContext(
             position_id="t1",
             entry_price=1.0,
             stop_price=0.5,
-            take_profit_price=2.0,
+            take_profit_price=1.5,
             entry_time=handler.provider.current_time,
             time_stop_minutes=30,
             quantity=1,
             reserved_notional_usd=100.0,
         )
         capital.reserve(100.0)
-        baseline1 = bridge.project_session().positions[cid].realized_pnl
-        sell1 = OrderIntent(
-            candidate_id="s1",
-            contract=contract,
-            side="sell",
-            order_type="limit",
-            quantity=1,
-            limit_price=1.5,
-        )
-        sell1_order = exec_broker.submit_order(sell1)
-        handler.state.pending_exit = PendingExit(
-            client_order_id=sell1.intent_id,
-            broker_order_id=sell1_order.order_id,
-            position_id="t1",
-            contract_id=cid,
-            requested_quantity=1,
-            reason="take_profit",
-            submitted_at=handler.provider.current_time,
-            realized_pnl_before=baseline1,
-        )
-        handler._reconcile_pending_exit()
+        decision1 = handler._try_exit(_tp_quote(1.5))
+        assert decision1 is not None
+        assert handler.state.pending_exit is None
+        assert handler.state.open_trade is None
         assert handler.state.trades_exited == 1
         assert outcomes[-1]["trade_pnl_usd"] == 50.0
         assert capital.realized_pnl_usd == 50.0
         assert bridge.project_session().positions[cid].realized_pnl == Decimal("50")
 
-        # Trade 2: +20 (same contract); must not report cumulative 70 as trade PnL.
-        buy2 = OrderIntent(
-            candidate_id="b2",
-            contract=contract,
-            side="buy",
-            order_type="limit",
-            quantity=1,
-            limit_price=1.0,
+        # Trade 2: same contract, exit at mid 1.2 → +20 (not cumulative 70)
+        exec_broker.submit_order(
+            OrderIntent(
+                candidate_id="b2",
+                contract=contract,
+                side="buy",
+                order_type="limit",
+                quantity=1,
+                limit_price=1.0,
+            )
         )
-        exec_broker.submit_order(buy2)
         handler.state.open_trade = OpenTradeContext(
             position_id="t2",
             entry_price=1.0,
             stop_price=0.5,
-            take_profit_price=2.0,
+            take_profit_price=1.2,
             entry_time=handler.provider.current_time,
             time_stop_minutes=30,
             quantity=1,
             reserved_notional_usd=100.0,
         )
         capital.reserve(100.0)
-        baseline2 = bridge.project_session().positions[cid].realized_pnl
-        assert baseline2 == Decimal("50")
-        sell2 = OrderIntent(
-            candidate_id="s2",
-            contract=contract,
-            side="sell",
-            order_type="limit",
-            quantity=1,
-            limit_price=1.2,
-        )
-        sell2_order = exec_broker.submit_order(sell2)
-        handler.state.pending_exit = PendingExit(
-            client_order_id=sell2.intent_id,
-            broker_order_id=sell2_order.order_id,
-            position_id="t2",
-            contract_id=cid,
-            requested_quantity=1,
-            reason="take_profit",
-            submitted_at=handler.provider.current_time,
-            realized_pnl_before=baseline2,
-        )
-        handler._reconcile_pending_exit()
+        decision2 = handler._try_exit(_tp_quote(1.2))
+        assert decision2 is not None
+        assert handler.state.pending_exit is None
+        assert handler.state.open_trade is None
         assert handler.state.trades_exited == 2
         assert outcomes[-1]["trade_pnl_usd"] == 20.0
         assert capital.realized_pnl_usd == 70.0

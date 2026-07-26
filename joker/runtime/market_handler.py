@@ -418,12 +418,15 @@ class MarketEventHandler:
             closed_qty = max(0, int(open_trade.quantity) - int(remaining))
             if closed_qty > 0:
                 open_trade.quantity = int(remaining)
+                trade_realized = (
+                    float(pos.realized_pnl - pending.realized_pnl_before) if pos else 0.0
+                )
                 self._log(
                     "exit.partial_fill",
                     {
                         "closed_qty": closed_qty,
                         "remaining_qty": int(remaining),
-                        "realized_pnl_usd": float(pos.realized_pnl) if pos else 0.0,
+                        "realized_pnl_usd": trade_realized,
                     },
                 )
 
@@ -506,15 +509,28 @@ class MarketEventHandler:
             quantity=max(1, int(qty)),
             limit_price=decision.exit_price,
         )
+
+        from joker.runtime.execution_runtime import contract_id_for
+
+        contract_id = contract_id_for(pos.contract)
+
+        # Capture contract realised P&L *before* submission — paper fills are
+        # recorded inside submit_execution_command before it returns.
+        realized_before = Decimal("0")
+        if self._task1_bridge is not None:
+            try:
+                projection = self._task1_bridge.project_session()
+                projected = projection.positions.get(contract_id)
+                if projected is not None:
+                    realized_before = Decimal(projected.realized_pnl)
+            except Exception as exc:
+                self._log("exit.baseline_failed", {"reason": str(exc)})
+
         try:
             exit_order = self.broker.submit_order(intent)
         except Exception as exc:
             self._log("exit.submit_failed", {"reason": str(exc)})
             return None
-
-        from joker.runtime.execution_runtime import contract_id_for
-
-        contract_id = contract_id_for(pos.contract)
 
         # Health-blocked / rejected / cancelled: never create PendingExit.
         if exit_order.status in {"rejected", "cancelled"}:
@@ -532,16 +548,6 @@ class MarketEventHandler:
                 },
             )
             return None
-
-        realized_before = Decimal("0")
-        if self._task1_bridge is not None:
-            try:
-                projection = self._task1_bridge.project_session()
-                projected = projection.positions.get(contract_id)
-                if projected is not None:
-                    realized_before = Decimal(projected.realized_pnl)
-            except Exception as exc:
-                self._log("exit.baseline_failed", {"reason": str(exc)})
 
         self.state.pending_exit = PendingExit(
             client_order_id=intent.intent_id,
