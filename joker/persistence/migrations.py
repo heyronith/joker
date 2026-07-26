@@ -88,6 +88,54 @@ CREATE TABLE IF NOT EXISTS data_quality_reports (
 );
 CREATE INDEX IF NOT EXISTS idx_task1_dq_reports_session
     ON data_quality_reports (session_id, created_at);
+
+CREATE TABLE IF NOT EXISTS cognitive_artifacts (
+    artifact_id TEXT PRIMARY KEY NOT NULL,
+    artifact_type TEXT NOT NULL,
+    schema_version TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    cycle_id TEXT,
+    snapshot_id TEXT NOT NULL,
+    agent_role TEXT,
+    prompt_version TEXT,
+    model_call_id TEXT,
+    parent_artifact_ids_json TEXT NOT NULL DEFAULT '[]',
+    payload_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_cognitive_artifacts_session
+    ON cognitive_artifacts (session_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_cognitive_artifacts_cycle
+    ON cognitive_artifacts (session_id, cycle_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_cognitive_artifacts_snapshot
+    ON cognitive_artifacts (snapshot_id, created_at);
+
+CREATE TABLE IF NOT EXISTS model_calls (
+    request_id TEXT PRIMARY KEY NOT NULL,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    session_id TEXT NOT NULL,
+    cycle_id TEXT NOT NULL,
+    snapshot_id TEXT NOT NULL,
+    agent_role TEXT NOT NULL,
+    prompt_id TEXT NOT NULL,
+    prompt_version TEXT NOT NULL,
+    provider TEXT,
+    model TEXT,
+    status TEXT NOT NULL,
+    attempt_count INTEGER NOT NULL DEFAULT 1,
+    escalation_source TEXT,
+    started_at TEXT NOT NULL,
+    finished_at TEXT,
+    latency_ms INTEGER,
+    input_tokens INTEGER,
+    output_tokens INTEGER,
+    error_code TEXT,
+    validated_output_artifact_id TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_model_calls_session
+    ON model_calls (session_id, started_at);
+CREATE INDEX IF NOT EXISTS idx_model_calls_snapshot
+    ON model_calls (snapshot_id, started_at);
 """
 
 

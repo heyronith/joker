@@ -49,6 +49,7 @@ risk:
   max_daily_loss_usd: 500.0
 
 agents:
+  runtime: cognitive_graph
   mock_agents: false
   execution_mode: agent_led
   intraday_enabled: true
@@ -67,6 +68,36 @@ agents:
   fast_confirm_min_seconds: 8.0
   postmarket_learner_enabled: true
   memory_lookback_days: 5
+
+cognitive_graph:
+  enabled: true
+  max_parallel_agents: 5
+  max_cycle_seconds: 90
+  max_debate_rounds: 2
+  max_strategy_candidates: 3
+  max_hypotheses_per_cycle: 5
+  max_strategy_switches: 1
+  max_agent_data_requests: 1
+  market_snapshot_coalescing: true
+  legacy_fallback_enabled: false
+  position:
+    enabled: true
+    minimum_reassessment_interval_seconds: 5
+    prioritise_over_new_entries: true
+  context:
+    max_1m_bars: 60
+    max_5m_bars: 36
+    maximum_option_rows_per_request: 80
+    maximum_context_characters: 60000
+
+models:
+  ollama:
+    enabled: false
+  openai:
+    enabled: false
+  max_schema_repair_attempts: 1
+  max_provider_escalations: 1
+  max_parallel_model_calls: 5
 
 # Daily authorized capital + profit goal (confirmed at session start)
 capital:

@@ -33,6 +33,7 @@ from joker.schemas.domain import (
 from joker.time.clock import ExchangeClock
 
 if TYPE_CHECKING:
+    from joker.runtime.agent_runtime import AgentRuntime
     from joker.runtime.session_supervisor import SessionSupervisor
 
 
@@ -92,6 +93,7 @@ class CompatibilityLivePaperBridge:
         clock: ExchangeClock | None = None,
         broker_account_id: str = "paper",
         health_failure_threshold: int = 1,
+        agent_runtime: AgentRuntime | None = None,
     ) -> None:
         self.session_id = session_id or str(uuid4())
         self._loop = asyncio.new_event_loop()
@@ -106,6 +108,7 @@ class CompatibilityLivePaperBridge:
                 run_id=run_id,
                 broker_account_id=broker_account_id,
             ),
+            agent_runtime=agent_runtime,
         )
         self._started = False
         self.health = Task1RuntimeHealth(failure_threshold=health_failure_threshold)
@@ -364,6 +367,9 @@ class NullAgentRuntime:
     def __init__(self) -> None:
         self.received_events: list[DomainEvent] = []
 
+    async def start(self) -> None:
+        """No-op start for Task 1 null runtime."""
+
     async def on_event(self, event: DomainEvent) -> None:
         """Accept an event without acting on it (passthrough / audit buffer)."""
         self.received_events.append(event)
@@ -374,6 +380,10 @@ class NullAgentRuntime:
 
     async def tick(self) -> None:
         """No-op periodic agent tick."""
+        return None
+
+    async def shutdown(self) -> None:
+        """No-op shutdown for Task 1 null runtime."""
         return None
 
 

@@ -248,13 +248,71 @@ class LivePaperRunner:
 
         # Task 1 cutover: SessionSupervisor owns market/execution truth.
         task1_db = Path(self.app_settings.db_path).parent / "joker_task1.db"
+        agent_runtime_mode = (self.app_settings.agents.runtime or "legacy").strip().lower()
+        cognitive_mode = agent_runtime_mode == "cognitive_graph"
+        null_agent_mode = agent_runtime_mode == "null"
+
+        injected_agent_runtime = None
+        cognitive_graph_deps = None
+        if cognitive_mode:
+            from joker.graph.graph_deps import CognitiveGraphDeps
+            from joker.market.snapshots import SnapshotRepository
+            from joker.models.fake_provider import FakeModelProvider
+            from joker.models.registry import ModelRegistry
+            from joker.models.router import ModelRouter
+            from joker.runtime.cognitive_agent_runtime import CognitiveAgentRuntime
+
+            registry = ModelRegistry.with_defaults(self.app_settings.models)
+            # Deterministic mock sessions force the fake provider onto all profiles.
+            if self.app_settings.agents.mock_agents or config.mock_agents:
+                fake_provider = FakeModelProvider(available=True)
+                registry.register_provider("fake", fake_provider)
+                remapped = {
+                    name: profile.model_copy(update={"provider": "fake"})
+                    for name, profile in registry.profiles.items()
+                }
+                registry.update_config(
+                    registry.config.model_copy(update={"profiles": remapped})
+                )
+            model_router = ModelRouter(registry, session_id=run_id)
+            cognitive_graph_deps = CognitiveGraphDeps(
+                router=model_router,
+                config=self.app_settings.cognitive_graph,
+                session_id=run_id,
+                run_id=run_id,
+                snapshot_repo=SnapshotRepository(task1_db),
+            )
+            injected_agent_runtime = CognitiveAgentRuntime(
+                session_id=run_id,
+                run_id=run_id,
+                router=model_router,
+                config=self.app_settings.cognitive_graph,
+                graph_deps=cognitive_graph_deps,
+                registry=registry,
+            )
+        elif null_agent_mode:
+            from joker.runtime.compatibility import NullAgentRuntime
+
+            injected_agent_runtime = NullAgentRuntime()
+
         task1_bridge = CompatibilityLivePaperBridge(
             broker=broker,
             db_path=task1_db,
             session_id=run_id,
             run_id=run_id,
             broker_account_id=selection.kind,
+            agent_runtime=injected_agent_runtime,
         )
+        if cognitive_mode and cognitive_graph_deps is not None:
+            async def _submit_callback(provenanced: Any) -> Any:
+                execution = task1_bridge.supervisor.execution_runtime
+                if execution is None:
+                    raise RuntimeError("ExecutionRuntime not available")
+                return await execution.submit_execution_command(provenanced.command)
+
+            cognitive_graph_deps.submit_callback = _submit_callback
+            cognitive_graph_deps.event_bus = task1_bridge.supervisor.event_bus
+            cognitive_graph_deps.execution_runtime = task1_bridge.supervisor.execution_runtime
         task1_bridge.start()
         self._task1_bridge = task1_bridge
         execution_broker = ExecutionDelegatingBroker(
@@ -618,6 +676,11 @@ class LivePaperRunner:
                     )
                 )
 
+        agent_cfg = self.app_settings.agents
+        execution_mode = (agent_cfg.execution_mode or "rules_hybrid").strip().lower()
+        # Legacy agent_led loop is disabled under cognitive_graph authority.
+        agent_led = execution_mode == "agent_led" and not cognitive_mode
+
         handler = MarketEventHandler(
             provider=provider,
             reactive_engine=reactive,
@@ -651,8 +714,8 @@ class LivePaperRunner:
             on_log=on_log,
             options_provider=options_provider,
             rules_auto_entry=(
-                (self.app_settings.agents.execution_mode or "rules_hybrid").strip().lower()
-                != "agent_led"
+                not cognitive_mode
+                and not agent_led
             ),
             on_trade_outcome=on_trade_outcome,
             capital_budget=capital_budget,
@@ -679,15 +742,14 @@ class LivePaperRunner:
         intraday_calls = 0
         decision_calls = 0
         proposals_acted = 0
-        agent_cfg = self.app_settings.agents
-        execution_mode = (agent_cfg.execution_mode or "rules_hybrid").strip().lower()
-        agent_led = execution_mode == "agent_led"
         log(
             "execution.mode",
             {
                 "execution_mode": execution_mode,
+                "agent_runtime": agent_runtime_mode,
                 "risk_policy": risk_config.policy,
-                "rules_auto_entry": not agent_led,
+                "rules_auto_entry": not cognitive_mode and not agent_led,
+                "cognitive_mode": cognitive_mode,
             },
         )
 

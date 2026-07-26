@@ -1,0 +1,72 @@
+"""Task 2 cognitive graph state contract (spec section 18)."""
+
+from __future__ import annotations
+
+from datetime import datetime
+from typing import Annotated
+
+from typing_extensions import TypedDict
+
+from joker.cognition.context import ContextPackage
+from joker.cognition.schemas import (
+    AgentDataRequest,
+    AgentEvidence,
+    CognitiveError,
+    DebateReview,
+    ExecutionProposal,
+    GraphNodeTrace,
+    MarketWorldModel,
+    MetaDecision,
+    PatternHypothesis,
+    StrategyHypothesis,
+)
+from joker.graph.reducers import (
+    merge_errors,
+    merge_evidence,
+    merge_hypotheses,
+    merge_reviews,
+    merge_strategies,
+    merge_traces,
+)
+
+
+class CognitiveGraphState(TypedDict, total=False):
+    """Dedicated Task 2 LangGraph state — no full snapshots or option surfaces."""
+
+    run_id: str
+    session_id: str
+    cycle_id: str
+
+    trigger_event_id: str
+    trigger_event_type: str
+    snapshot_id: str
+    latest_known_snapshot_id: str
+    started_at: datetime
+
+    context_ref: str
+    evidence: Annotated[list[AgentEvidence], merge_evidence]
+    world_model: MarketWorldModel | None
+
+    hypotheses: Annotated[list[PatternHypothesis], merge_hypotheses]
+    strategies: Annotated[list[StrategyHypothesis], merge_strategies]
+    reviews: Annotated[list[DebateReview], merge_reviews]
+
+    meta_decision: MetaDecision | None
+    execution_proposal: ExecutionProposal | None
+    execution_command_id: str | None
+    execution_result_ref: str | None
+
+    pending_evidence_requests: list[AgentDataRequest]
+    pending_hypothesis_ids: list[str]
+
+    node_trace: Annotated[list[GraphNodeTrace], merge_traces]
+    errors: Annotated[list[CognitiveError], merge_errors]
+
+    # Graph control (bounded loops — not trading decisions)
+    debate_round: int
+    strategy_switch_count: int
+    selected_strategy_ids: list[str]
+    stale_decision: bool
+
+    # Runtime-only hydrated context (not persisted to checkpoints)
+    _context_package: ContextPackage | None

@@ -23,6 +23,7 @@ from joker.market.bars import BarBuilder
 from joker.market.option_surface import OptionSurfaceBuilder, OptionSurfaceRepository
 from joker.market.snapshots import SnapshotRepository
 from joker.persistence.migrations import apply_task1_migrations
+from joker.runtime.agent_runtime import AgentRuntime
 from joker.runtime.compatibility import NullAgentRuntime
 from joker.runtime.execution_runtime import ExecutionRuntime, UnresolvedReconciliation
 from joker.runtime.market_runtime import MarketRuntime, MarketRuntimeConfig
@@ -58,7 +59,7 @@ class SessionSupervisor:
         clock: ExchangeClock | None = None,
         calendar: MarketCalendar | None = None,
         event_bus: InProcessAsyncEventBus | None = None,
-        agent_runtime: NullAgentRuntime | None = None,
+        agent_runtime: AgentRuntime | None = None,
     ) -> None:
         self._config = config
         self._calendar = calendar or MarketCalendar()
@@ -116,7 +117,7 @@ class SessionSupervisor:
         return self._execution
 
     @property
-    def agent_runtime(self) -> NullAgentRuntime:
+    def agent_runtime(self) -> AgentRuntime:
         return self._agent
 
     @property
@@ -188,11 +189,22 @@ class SessionSupervisor:
         )
         await self._execution.restore_order_mappings()
 
-        # Agent boundary: passthrough subscriptions only (no decisions).
-        self._bus.subscribe(EventType.MARKET_SNAPSHOT_CREATED, self._on_agent_passthrough)
-        self._bus.subscribe(EventType.ORDER_FILLED, self._on_agent_passthrough)
-        self._bus.subscribe(EventType.POSITION_OPENED, self._on_agent_passthrough)
-        self._bus.subscribe(EventType.POSITION_CLOSED, self._on_agent_passthrough)
+        # Agent boundary: forward domain events to injected runtime.
+        for event_type in (
+            EventType.MARKET_SNAPSHOT_CREATED,
+            EventType.ORDER_FILLED,
+            EventType.ORDER_PARTIALLY_FILLED,
+            EventType.ORDER_SUBMITTED,
+            EventType.ORDER_ACCEPTED,
+            EventType.ORDER_CANCELLED,
+            EventType.ORDER_REJECTED,
+            EventType.POSITION_OPENED,
+            EventType.POSITION_CHANGED,
+            EventType.POSITION_CLOSED,
+        ):
+            self._bus.subscribe(event_type, self._on_agent_event)
+
+        await self._agent.start()
 
         now = self._clock.now()
         await self._bus.publish(
@@ -235,8 +247,8 @@ class SessionSupervisor:
         self._started = True
         return self._graph_state
 
-    async def _on_agent_passthrough(self, event: DomainEvent) -> None:
-        """Forward domain events to NullAgentRuntime (no trading decisions)."""
+    async def _on_agent_event(self, event: DomainEvent) -> None:
+        """Forward domain events to the injected agent runtime."""
         await self._agent.on_event(event)
 
     async def checkpoint(self) -> str:
@@ -275,6 +287,7 @@ class SessionSupervisor:
             self._last_reconciliation = report
 
         await self.checkpoint()
+        await self._agent.shutdown()
         await self._bus.drain()
 
         await self._bus.publish(

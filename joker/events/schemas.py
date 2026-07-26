@@ -31,6 +31,21 @@ class EventType(StrEnum):
     RECONCILIATION_REQUIRED = "reconciliation_required"
     SESSION_ENDING = "session_ending"
     SESSION_ENDED = "session_ended"
+    # Task 2 cognitive lifecycle
+    COGNITIVE_CYCLE_STARTED = "cognitive_cycle_started"
+    AGENT_EVIDENCE_CREATED = "agent_evidence_created"
+    WORLD_MODEL_CREATED = "world_model_created"
+    HYPOTHESIS_CREATED = "hypothesis_created"
+    STRATEGY_CREATED = "strategy_created"
+    DEBATE_REVIEW_CREATED = "debate_review_created"
+    META_DECISION_CREATED = "meta_decision_created"
+    MORE_EVIDENCE_REQUESTED = "more_evidence_requested"
+    EXECUTION_PROPOSAL_CREATED = "execution_proposal_created"
+    COGNITIVE_DECISION_STALE = "cognitive_decision_stale"
+    COGNITIVE_RUNTIME_DEGRADED = "cognitive_runtime_degraded"
+    POSITION_THESIS_UPDATED = "position_thesis_updated"
+    POSITION_ACTION_PROPOSED = "position_action_proposed"
+    COGNITIVE_CYCLE_COMPLETED = "cognitive_cycle_completed"
 
 
 class DomainEvent(BaseModel):

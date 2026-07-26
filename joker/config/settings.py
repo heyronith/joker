@@ -59,6 +59,8 @@ class AgentSettings(BaseModel):
     mock_agents: bool = True
     council_timeout_seconds: int = 120
     max_retries: int = 2
+    # Agent runtime: cognitive_graph | legacy | null
+    runtime: str = "legacy"
     # Agentic paper loop
     # rules_hybrid = structured rules can auto-enter; agent_led = AI is sole entry authority
     execution_mode: str = "rules_hybrid"  # rules_hybrid | agent_led
@@ -139,9 +141,43 @@ class RuntimeSettings(BaseModel):
     reconciliation_interval_seconds: float = 5.0
 
 
+class CognitivePositionSettings(BaseModel):
+    enabled: bool = True
+    minimum_reassessment_interval_seconds: float = 5.0
+    prioritise_over_new_entries: bool = True
+
+
+class CognitiveContextSettings(BaseModel):
+    max_1m_bars: int = 60
+    max_5m_bars: int = 36
+    maximum_option_rows_per_request: int = 80
+    maximum_context_characters: int = 60_000
+
+
+class CognitiveGraphSettings(BaseModel):
+    enabled: bool = True
+    max_parallel_agents: int = 5
+    max_cycle_seconds: int = 90
+    max_debate_rounds: int = 2
+    max_strategy_candidates: int = 3
+    max_hypotheses_per_cycle: int = 5
+    max_strategy_switches: int = 1
+    max_agent_data_requests: int = 1
+    market_snapshot_coalescing: bool = True
+    legacy_fallback_enabled: bool = False
+    position: CognitivePositionSettings = Field(default_factory=CognitivePositionSettings)
+    context: CognitiveContextSettings = Field(default_factory=CognitiveContextSettings)
+
+
 class PersistenceSettings(BaseModel):
     database_url: str = "sqlite:///data/joker.db"
     checkpoint_database_url: str = "sqlite:///data/joker_checkpoints.db"
+
+
+def _default_models_config() -> Any:
+    from joker.models.schemas import ModelsConfig
+
+    return ModelsConfig()
 
 
 class AppSettings(BaseModel):
@@ -165,6 +201,8 @@ class AppSettings(BaseModel):
     data_quality: DataQualitySettings = Field(default_factory=DataQualitySettings)
     runtime: RuntimeSettings = Field(default_factory=RuntimeSettings)
     persistence: PersistenceSettings = Field(default_factory=PersistenceSettings)
+    cognitive_graph: CognitiveGraphSettings = Field(default_factory=CognitiveGraphSettings)
+    models: Any = Field(default_factory=_default_models_config)
 
     @field_validator("mode", mode="before")
     @classmethod
