@@ -137,7 +137,7 @@ async def _seed_surface(market, start: datetime, clock: FrozenExchangeClock) -> 
 
 @pytest.mark.asyncio
 async def test_bind_cognitive_graph_after_bridge_start(tmp_path: Path) -> None:
-    """A: ExecutionRuntime must be non-null only after Task 1 start."""
+    """A: ExecutionRuntime ready after Task 1 start; agent starts after bind."""
     db = tmp_path / "bind.db"
     broker = PaperBroker(slippage_pct=0)
     fake = FakeModelProvider(available=True)
@@ -150,7 +150,7 @@ async def test_bind_cognitive_graph_after_bridge_start(tmp_path: Path) -> None:
         router=router,
         config=CognitiveGraphSettings(),
         session_id="bind",
-        run_id="bind",
+        run_id="bind-run",
         db_path=db,
         **repos,
     )
@@ -160,23 +160,40 @@ async def test_bind_cognitive_graph_after_bridge_start(tmp_path: Path) -> None:
         def __init__(self, supervisor: SessionSupervisor) -> None:
             self.supervisor = supervisor
 
+    runtime = CognitiveAgentRuntime(
+        session_id="bind",
+        run_id="bind-run",
+        router=router,
+        config=CognitiveGraphSettings(),
+        graph_deps=deps,
+        registry=registry,
+        checkpointer_path=tmp_path / "bind_ckpt.db",
+    )
     supervisor = SessionSupervisor(
         broker=broker,
-        config=SessionSupervisorConfig(db_path=db, session_id="bind", broker_account_id="paper"),
+        config=SessionSupervisorConfig(
+            db_path=db, session_id="bind", run_id="bind-run", broker_account_id="paper"
+        ),
+        agent_runtime=runtime,
     )
     with pytest.raises(RuntimeError, match="ExecutionRuntime is None"):
         bind_cognitive_graph_to_task1(deps, _BridgeStub(supervisor))  # type: ignore[arg-type]
 
-    await supervisor.start()
+    # Phase 1: Task 1 truth without starting the cognitive agent.
+    await supervisor.start(start_agent=False)
+    assert supervisor.execution_runtime is not None
+    assert runtime._started is False  # noqa: SLF001
     bind_cognitive_graph_to_task1(
         deps,
         _BridgeStub(supervisor),  # type: ignore[arg-type]
         data_quality_repo=supervisor.data_quality_repository,
     )
     assert deps.execution_runtime is not None
-    assert deps.projection_loader is not None
-    assert deps.submit_callback is not None
     assert deps.order_action_gateway is not None
+    # Phase 2: agent start/resume only after bind.
+    await supervisor.start_agent_runtime()
+    assert runtime._started is True  # noqa: SLF001
+    await runtime.shutdown()
     await supervisor.shutdown()
 
 

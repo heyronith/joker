@@ -131,10 +131,21 @@ class CompatibilityLivePaperBridge:
             self._loop = asyncio.new_event_loop()
         return self._loop.run_until_complete(coro)
 
-    def start(self) -> None:
-        """Start SessionSupervisor (migrations, restore, reconciliation)."""
-        self.run_coro(self._supervisor.start())
+    def start(self, *, start_agent: bool = True) -> None:
+        """Start SessionSupervisor (migrations, restore, reconciliation).
+
+        Pass ``start_agent=False`` for two-phase cognitive startup: Task 1
+        ExecutionRuntime is created first, cognitive deps/gateway are bound,
+        then ``start_agent()`` resumes unfinished cycles.
+        """
+        self.run_coro(self._supervisor.start(start_agent=start_agent))
         self._started = True
+
+    def start_agent(self) -> None:
+        """Start the injected agent runtime after cognitive binding."""
+        if not self._started:
+            raise RuntimeError("CompatibilityLivePaperBridge.start() required first")
+        self.run_coro(self._supervisor.start_agent_runtime())
 
     def shutdown(self) -> None:
         if not self._started:

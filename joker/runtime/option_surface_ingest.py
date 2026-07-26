@@ -2,12 +2,56 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from datetime import date
 from typing import Any, Sequence
 
 from joker.runtime.execution_runtime import contract_id_for
 from joker.schemas.domain import OptionContract
 from joker.schemas.options_data import OptionSnapshot
+
+
+@dataclass
+class SurfaceRowConversionResult:
+    """Row conversion outcome with explicit conversion-failure accounting."""
+
+    rows: list[dict[str, Any]] = field(default_factory=list)
+    input_count: int = 0
+    converted_count: int = 0
+    skipped_symbol_or_expiry: int = 0
+    conversion_failures: tuple[str, ...] = ()
+
+    @property
+    def complete(self) -> bool:
+        return not self.conversion_failures and self.converted_count == self.input_count
+
+    def to_data_quality_findings(self) -> list:
+        if self.complete:
+            return []
+        from joker.market.quality import (
+            DataQualityCode,
+            DataQualityFinding,
+            DataQualitySeverity,
+        )
+
+        return [
+            DataQualityFinding(
+                code=DataQualityCode.PARTIAL_OPTION_SURFACE,
+                severity=DataQualitySeverity.ERROR,
+                message=(
+                    "option surface row conversion incomplete; persisted rows do not "
+                    "cover every fetched snapshot"
+                ),
+                symbol="SPY",
+                details={
+                    "input_count": self.input_count,
+                    "converted_count": self.converted_count,
+                    "skipped_symbol_or_expiry": self.skipped_symbol_or_expiry,
+                    "conversion_failure_count": len(self.conversion_failures),
+                    "conversion_failures": "; ".join(self.conversion_failures)[:500],
+                },
+            )
+        ]
 
 
 def option_snapshot_to_surface_row(
@@ -57,20 +101,50 @@ def option_snapshots_to_surface_rows(
     *,
     trading_date: date | None = None,
 ) -> list[dict[str, Any]]:
-    """Convert snapshots whose expiry matches ``trading_date`` when provided."""
+    """Convert snapshots; prefer ``convert_option_snapshots_to_surface_rows``."""
+    return convert_option_snapshots_to_surface_rows(
+        snapshots, trading_date=trading_date
+    ).rows
+
+
+def convert_option_snapshots_to_surface_rows(
+    snapshots: Sequence[OptionSnapshot],
+    *,
+    trading_date: date | None = None,
+) -> SurfaceRowConversionResult:
+    """Convert snapshots and record explicit conversion failures."""
     rows: list[dict[str, Any]] = []
+    failures: list[str] = []
+    skipped = 0
     for snap in snapshots:
         if trading_date is not None and snap.contract.expiration != trading_date:
+            skipped += 1
+            failures.append(
+                f"skipped_expiry:{snap.contract.contract_id}:{snap.contract.expiration}"
+            )
             continue
         if (snap.contract.underlying_symbol or "SPY").upper() != "SPY":
+            skipped += 1
+            failures.append(
+                f"skipped_symbol:{snap.contract.contract_id}:"
+                f"{snap.contract.underlying_symbol}"
+            )
             continue
         try:
             rows.append(
                 option_snapshot_to_surface_row(snap, trading_date=trading_date)
             )
-        except Exception:
-            continue
-    return rows
+        except Exception as exc:  # noqa: BLE001 — counted as conversion failure
+            failures.append(
+                f"conversion:{snap.contract.contract_id}:{type(exc).__name__}:{exc}"
+            )
+    return SurfaceRowConversionResult(
+        rows=rows,
+        input_count=len(snapshots),
+        converted_count=len(rows),
+        skipped_symbol_or_expiry=skipped,
+        conversion_failures=tuple(failures),
+    )
 
 
 def filter_0dte_contracts(

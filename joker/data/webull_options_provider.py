@@ -311,19 +311,54 @@ class WebullOptionsDataProvider:
             )
 
         snapshots: list[OptionSnapshot] = []
+        seen_ids: set[str] = set()
         for start in range(0, len(selected), max(1, batch_size)):
             batch = selected[start : start + max(1, batch_size)]
+            requested_ids = [c.contract_id for c in batch if c.contract_id]
             try:
                 self._rate_limiter.acquire()
                 batch_snaps = self.api.get_option_snapshots(batch)
+                returned_valid: dict[str, OptionSnapshot] = {}
                 for snap in batch_snaps:
-                    if (snap.contract.underlying_symbol or ALLOWED_SYMBOL).upper() != ALLOWED_SYMBOL:
+                    key = snap.contract.contract_id or ""
+                    symbol = (snap.contract.underlying_symbol or ALLOWED_SYMBOL).upper()
+                    if symbol != ALLOWED_SYMBOL:
+                        complete = False
+                        failed_batches.append(
+                            f"batch[{start}:{start + len(batch)}]: wrong_symbol={symbol}"
+                        )
                         continue
                     if snap.contract.expiration != exp:
+                        complete = False
+                        failed_batches.append(
+                            f"batch[{start}:{start + len(batch)}]: wrong_expiry="
+                            f"{snap.contract.expiration}"
+                        )
                         continue
-                    key = snap.contract.contract_id or ""
-                    if key:
-                        self._snapshot_cache.set(key, snap)
+                    if not key:
+                        complete = False
+                        failed_batches.append(
+                            f"batch[{start}:{start + len(batch)}]: missing_contract_id"
+                        )
+                        continue
+                    if key in returned_valid or key in seen_ids:
+                        complete = False
+                        failed_batches.append(
+                            f"batch[{start}:{start + len(batch)}]: duplicate_contract_id={key}"
+                        )
+                        continue
+                    returned_valid[key] = snap
+                    self._snapshot_cache.set(key, snap)
+                missing = [cid for cid in requested_ids if cid not in returned_valid]
+                if missing:
+                    complete = False
+                    failed_batches.append(
+                        f"batch[{start}:{start + len(batch)}]: missing_ids="
+                        f"{','.join(missing[:8])}"
+                        + ("..." if len(missing) > 8 else "")
+                    )
+                for key, snap in returned_valid.items():
+                    seen_ids.add(key)
                     snapshots.append(snap)
             except Exception as exc:  # noqa: BLE001 — batch failure becomes DQ finding
                 complete = False
@@ -332,12 +367,17 @@ class WebullOptionsDataProvider:
                 )
         if failed_batches:
             complete = False
+        if len(snapshots) != selected_count:
+            complete = False
+            failed_batches.append(
+                f"fetched_count={len(snapshots)} != selected_count={selected_count}"
+            )
         return SurfaceFetchResult(
             snapshots=snapshots,
             discovered_count=discovered_count,
             selected_count=selected_count,
             fetched_count=len(snapshots),
-            failed_batches=tuple(failed_batches),
+            failed_batches=tuple(dict.fromkeys(failed_batches)),
             emergency_truncated=emergency_truncated,
             complete=complete,
             trading_date=exp,

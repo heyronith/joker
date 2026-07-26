@@ -225,7 +225,10 @@ class CognitiveAgentRuntime:
                 )
             )
             try:
-                await graph.ainvoke(None, config=config)
+                resumed = await graph.ainvoke(None, config=config)
+                terminal_ok = self._cycle_reached_terminal_outcome(
+                    resumed, graph_kind=record.graph_kind
+                )
                 await registry.upsert(
                     CognitiveCycleRecord(
                         session_id=record.session_id,
@@ -233,21 +236,83 @@ class CognitiveAgentRuntime:
                         cycle_id=record.cycle_id,
                         trigger_event_id=record.trigger_event_id,
                         snapshot_id=record.snapshot_id,
-                        status="completed",
+                        status="completed" if terminal_ok else "running",
                         checkpoint_thread_id=record.checkpoint_thread_id,
                         last_completed_node=record.last_completed_node,
                         parent_entry_cycle_id=record.parent_entry_cycle_id,
                         original_strategy_id=record.original_strategy_id,
                         original_proposal_id=record.original_proposal_id,
-                        payload=record.payload,
+                        payload={
+                            **(record.payload or {}),
+                            "recovery_terminal_ok": terminal_ok,
+                        },
                     )
                 )
+                if not terminal_ok:
+                    self._status = "degraded"
+                    logger.warning(
+                        "cycle_resume_incomplete",
+                        extra={
+                            "cycle_id": record.cycle_id,
+                            "errors": [
+                                getattr(e, "error_code", None)
+                                for e in (resumed or {}).get("errors") or []
+                            ],
+                        },
+                    )
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
                     "cycle_resume_failed",
                     extra={"cycle_id": record.cycle_id, "error": str(exc)},
                 )
                 self._status = "degraded"
+
+    @staticmethod
+    def _cycle_reached_terminal_outcome(
+        state: dict[str, Any] | None,
+        *,
+        graph_kind: str,
+    ) -> bool:
+        """Return True only for a valid terminal graph outcome without blocking errors."""
+        if not isinstance(state, dict):
+            return False
+        errors = state.get("errors") or []
+        blocking_codes = {
+            "no_submit_callback",
+            "no_order_action_gateway",
+            "gateway_blocked",
+            "submit_validation_failed",
+            "validation_failed",
+            "cycle_recovery_failed",
+        }
+        for err in errors:
+            code = getattr(err, "error_code", None)
+            if code is None and isinstance(err, dict):
+                code = err.get("error_code")
+            if code in blocking_codes:
+                return False
+        traces = state.get("node_trace") or []
+        terminal_nodes = {
+            "persist_cycle",
+            "persist_pending_cycle",
+            "persist_evidence_request",
+            "persist_stale",
+            "route_position_action",
+        }
+        for trace in traces:
+            name = getattr(trace, "node_name", None)
+            status = getattr(trace, "status", None)
+            if name is None and isinstance(trace, dict):
+                name = trace.get("node_name")
+                status = trace.get("status")
+            if name in terminal_nodes and status == "completed":
+                return True
+        if graph_kind == "decision" and state.get("execution_command_id"):
+            return True
+        if graph_kind == "position" and state.get("_position_command_id"):
+            return True
+        # Delayed / evidence / hold without order still count if a persist node ran.
+        return False
 
     async def shutdown(self) -> None:
         """Checkpoint active cycles rather than merely cancelling them."""
@@ -615,13 +680,16 @@ class CognitiveAgentRuntime:
             cycle_id=cycle_id,
         )
         try:
-            await asyncio.wait_for(
+            result_state = await asyncio.wait_for(
                 self._decision_graph.ainvoke(state, config=config),
                 timeout=float(self._config.max_cycle_seconds),
             )
             self._counters.last_success_at = datetime.now(timezone.utc)
             self._status = "healthy"
             if self._deps.cycle_registry is not None:
+                terminal_ok = self._cycle_reached_terminal_outcome(
+                    result_state, graph_kind="decision"
+                )
                 await self._deps.cycle_registry.upsert(
                     CognitiveCycleRecord(
                         session_id=self._session_id,
@@ -629,7 +697,7 @@ class CognitiveAgentRuntime:
                         cycle_id=cycle_id,
                         trigger_event_id=str(event.event_id),
                         snapshot_id=snapshot_id,
-                        status="completed",
+                        status="completed" if terminal_ok else "running",
                         checkpoint_thread_id=thread_id,
                     )
                 )
@@ -782,9 +850,12 @@ class CognitiveAgentRuntime:
         task = asyncio.create_task(self._position_graph.ainvoke(state, config=config))
         self._active_position_tasks.add(task)
         try:
-            await task
+            result_state = await task
             self._counters.last_success_at = datetime.now(timezone.utc)
             if self._deps.cycle_registry is not None:
+                terminal_ok = self._cycle_reached_terminal_outcome(
+                    result_state, graph_kind="position"
+                )
                 await self._deps.cycle_registry.upsert(
                     CognitiveCycleRecord(
                         session_id=self._session_id,
@@ -792,7 +863,7 @@ class CognitiveAgentRuntime:
                         cycle_id=cycle_id,
                         trigger_event_id=str(event.event_id),
                         snapshot_id=snapshot_id,
-                        status="completed",
+                        status="completed" if terminal_ok else "running",
                         checkpoint_thread_id=thread_id,
                         original_strategy_id=str(
                             resolved.get("original_strategy_id")

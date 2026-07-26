@@ -405,13 +405,131 @@ async def test_surface_fetch_result_records_partial_batches() -> None:
 
 
 @pytest.mark.asyncio
+async def test_partial_batch_without_exception_marks_incomplete() -> None:
+    """20 requested → 18 returned without exception → complete=False → DQ error."""
+    from joker.config.settings import EnvSettings
+    from joker.data.webull_options_provider import WebullOptionsDataProvider
+    from joker.schemas.options_data import OptionContractMetadata, OptionSnapshot
+
+    exp = date(2026, 7, 1)
+    contracts = [
+        OptionContractMetadata(
+            underlying_symbol="SPY",
+            expiration=exp,
+            strike=400.0 + i,
+            option_type="call",
+            contract_id=f"SPY{i}",
+        )
+        for i in range(20)
+    ]
+    snaps = {
+        c.contract_id: OptionSnapshot(
+            contract=c,
+            bid=1.0,
+            ask=1.1,
+            last=1.05,
+            quote_timestamp=datetime(2026, 7, 1, 14, 0, tzinfo=ET),
+        )
+        for c in contracts[:18]
+    }
+
+    class _PartialApi:
+        CONTRACT_DISCOVERY_VERIFIED = True
+        SNAPSHOT_VERIFIED = True
+
+        def find_option_contracts(self, symbol, expiration):
+            return contracts
+
+        def get_option_snapshots(self, batch):
+            # Return only contracts that exist in snaps — silent shortfall.
+            out = []
+            for c in batch:
+                if c.contract_id in snaps:
+                    out.append(snaps[c.contract_id])
+            return out
+
+    provider = WebullOptionsDataProvider(
+        env=EnvSettings.model_construct(),
+        api=_PartialApi(),  # type: ignore[arg-type]
+    )
+    result = provider.fetch_surface_snapshots(500.0, trading_date=exp, batch_size=20)
+    assert result.selected_count == 20
+    assert result.fetched_count == 18
+    assert result.complete is False
+    findings = result.to_data_quality_findings()
+    assert findings
+    assert findings[0].severity.value == "error"
+    assert findings[0].code.value == "partial_option_surface"
+
+
+@pytest.mark.asyncio
+async def test_row_conversion_failure_marks_partial_surface() -> None:
+    """Valid snapshots with one conversion failure → partial finding."""
+    from joker.runtime.option_surface_ingest import convert_option_snapshots_to_surface_rows
+    from joker.schemas.options_data import OptionContractMetadata, OptionSnapshot
+    from unittest.mock import patch
+
+    exp = date(2026, 7, 1)
+    good = OptionSnapshot(
+        contract=OptionContractMetadata(
+            underlying_symbol="SPY",
+            expiration=exp,
+            strike=500.0,
+            option_type="call",
+            contract_id="good",
+        ),
+        bid=1.0,
+        ask=1.1,
+        quote_timestamp=datetime(2026, 7, 1, 14, 0, tzinfo=ET),
+    )
+    bad = OptionSnapshot(
+        contract=OptionContractMetadata(
+            underlying_symbol="SPY",
+            expiration=exp,
+            strike=501.0,
+            option_type="call",
+            contract_id="bad",
+        ),
+        bid=1.0,
+        ask=1.1,
+        quote_timestamp=datetime(2026, 7, 1, 14, 0, tzinfo=ET),
+    )
+    original = __import__(
+        "joker.runtime.option_surface_ingest", fromlist=["option_snapshot_to_surface_row"]
+    ).option_snapshot_to_surface_row
+
+    def _maybe_fail(snap, *, trading_date=None):
+        if snap.contract.contract_id == "bad":
+            raise ValueError("invalid strike payload")
+        return original(snap, trading_date=trading_date)
+
+    with patch(
+        "joker.runtime.option_surface_ingest.option_snapshot_to_surface_row",
+        side_effect=_maybe_fail,
+    ):
+        conversion = convert_option_snapshots_to_surface_rows(
+            [good, bad], trading_date=exp
+        )
+    assert conversion.converted_count == 1
+    assert conversion.complete is False
+    findings = conversion.to_data_quality_findings()
+    assert findings
+    assert findings[0].code.value == "partial_option_surface"
+    assert findings[0].severity.value == "error"
+
+
+@pytest.mark.asyncio
 async def test_cycle_registry_resume_after_interrupt(tmp_path) -> None:
     """Unfinished cycle resumes on start() without re-delivering the event."""
+    from joker.graph.cognitive_graph import build_cognitive_graph, initial_cycle_state
+    from joker.graph.langgraph_checkpointer import CognitiveCheckpointer, ainvoke_config
+    from joker.persistence.cognitive_cycle_registry import CognitiveCycleRecord
+
     start = datetime(2026, 7, 1, 10, 0, tzinfo=ET)
     clock = FrozenExchangeClock(start, calendar=MarketCalendar())
     db = tmp_path / "resume.db"
     broker = PaperBroker(slippage_pct=0)
-    session_id = "resume"
+    session_id = "resume-stable"
     supervisor = SessionSupervisor(
         broker=broker,
         clock=clock,
@@ -426,7 +544,7 @@ async def test_cycle_registry_resume_after_interrupt(tmp_path) -> None:
             ),
         ),
     )
-    await supervisor.start()
+    await supervisor.start(start_agent=False)
     snapshot = await _seed_with_far_contract(supervisor.market_runtime, start, clock)
     fake = FakeModelProvider(available=True)
     cycle_id = "cycle-resume"
@@ -448,11 +566,14 @@ async def test_cycle_registry_resume_after_interrupt(tmp_path) -> None:
     ckpt_path = tmp_path / "resume_ckpt.db"
     cycle_reg = CognitiveCycleRegistry(tmp_path / "cycles.db")
     await cycle_reg.initialize()
+    checkpointer = CognitiveCheckpointer(ckpt_path)
+    saver = await checkpointer.open()
+
     deps = CognitiveGraphDeps(
         router=router,
         config=CognitiveGraphSettings(max_cycle_seconds=60),
         session_id=session_id,
-        run_id=session_id,
+        run_id="run-1",
         snapshot_repo=SnapshotRepository(db),
         option_surface_repo=OptionSurfaceRepository(db),
         data_quality_repo=supervisor.data_quality_repository,
@@ -461,39 +582,55 @@ async def test_cycle_registry_resume_after_interrupt(tmp_path) -> None:
         submit_callback=submit_callback,
         db_path=db,
         cycle_registry=cycle_reg,
+        checkpointer=saver,
         **repos,
     )
     deps.order_action_gateway = OrderActionGateway(deps)
 
-    runtime1 = CognitiveAgentRuntime(
+    # Interrupt after a middle node so a durable checkpoint exists.
+    graph = build_cognitive_graph(deps)
+    state = initial_cycle_state(
         session_id=session_id,
-        run_id=session_id,
-        router=router,
-        config=CognitiveGraphSettings(max_cycle_seconds=60),
-        graph_deps=deps,
-        registry=registry,
-        checkpointer_path=ckpt_path,
+        run_id="run-1",
+        cycle_id=cycle_id,
+        trigger_event_id=str(uuid4()),
+        trigger_event_type=EventType.MARKET_SNAPSHOT_CREATED.value,
+        snapshot_id=str(snapshot.snapshot_id),
     )
-    await runtime1.start()
-    # Start a decision cycle then interrupt mid-flight by shutting down while in flight.
-    await runtime1.on_event(
-        make_event(
-            EventType.MARKET_SNAPSHOT_CREATED,
+    config = ainvoke_config(
+        session_id=session_id, graph_kind="decision", cycle_id=cycle_id
+    )
+    config = {
+        **config,
+        "configurable": {
+            **config["configurable"],
+            "checkpoint_ns": "",
+        },
+        "interrupt_before": ["synthesise_world_model"],
+    }
+    await graph.ainvoke(state, config=config)
+    assert len(submitted) == 0
+    thread_id = f"{session_id}:decision:{cycle_id}"
+    await cycle_reg.upsert(
+        CognitiveCycleRecord(
             session_id=session_id,
-            source="test",
-            exchange_timestamp=start,
-            payload={"snapshot_id": str(snapshot.snapshot_id), "cycle_id": cycle_id},
+            graph_kind="decision",
+            cycle_id=cycle_id,
+            trigger_event_id=str(state["trigger_event_id"]),
+            snapshot_id=str(snapshot.snapshot_id),
+            status="running",
+            checkpoint_thread_id=thread_id,
+            last_completed_node="perception",
         )
     )
-    await asyncio.sleep(0.15)
-    await runtime1.shutdown()
+    await checkpointer.close()
 
-    # New runtime — start() only resumes unfinished work.
+    # New runtime — start() alone resumes; no event redelivery.
     deps2 = CognitiveGraphDeps(
         router=router,
         config=CognitiveGraphSettings(max_cycle_seconds=60),
         session_id=session_id,
-        run_id=session_id,
+        run_id="run-2",
         snapshot_repo=SnapshotRepository(db),
         option_surface_repo=OptionSurfaceRepository(db),
         data_quality_repo=supervisor.data_quality_repository,
@@ -508,7 +645,7 @@ async def test_cycle_registry_resume_after_interrupt(tmp_path) -> None:
     deps2.order_action_gateway = OrderActionGateway(deps2)
     runtime2 = CognitiveAgentRuntime(
         session_id=session_id,
-        run_id=session_id,
+        run_id="run-2",
         router=router,
         config=CognitiveGraphSettings(max_cycle_seconds=60),
         graph_deps=deps2,
@@ -516,10 +653,150 @@ async def test_cycle_registry_resume_after_interrupt(tmp_path) -> None:
         checkpointer_path=ckpt_path,
     )
     await runtime2.start()
-    await asyncio.sleep(1.0)
+    await asyncio.sleep(1.5)
     await runtime2.shutdown()
-    # Either completed on first attempt or resumed — at most one submission.
-    assert len(submitted) <= 1
+    projection = await supervisor.execution_runtime.project_session()
+    assert projection.orders, "resumed cycle must submit exactly one order"
+    assert len(projection.orders) == 1
+    remaining = await cycle_reg.list_resumable(session_id)
+    assert not any(r.cycle_id == cycle_id for r in remaining)
+    await supervisor.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_two_phase_supervisor_bind_before_agent_recovery(tmp_path) -> None:
+    """Live ordering: Task1 start → bind → agent start resumes unfinished cycle."""
+    from joker.graph.cognitive_graph import build_cognitive_graph, initial_cycle_state
+    from joker.graph.langgraph_checkpointer import CognitiveCheckpointer, ainvoke_config
+    from joker.persistence.cognitive_cycle_registry import CognitiveCycleRecord
+    from joker.runtime.cognitive_binding import bind_cognitive_graph_to_task1
+    from joker.runtime.cognitive_session import stable_cognitive_session_id
+
+    start = datetime(2026, 7, 1, 10, 0, tzinfo=ET)
+    clock = FrozenExchangeClock(start, calendar=MarketCalendar())
+    db = tmp_path / "twophase.db"
+    broker = PaperBroker(slippage_pct=0)
+    session_id = stable_cognitive_session_id(
+        trading_date=date(2026, 7, 1),
+        broker_account_id="paper",
+        mode="paper",
+    )
+    fake = FakeModelProvider(available=True)
+    registry = _fake_registry(fake)
+    router = ModelRouter(registry, session_id=session_id)
+    repos = build_default_repositories(db)
+    for r in repos.values():
+        await r.initialize()
+
+    submitted: list[str] = []
+    deps = CognitiveGraphDeps(
+        router=router,
+        config=CognitiveGraphSettings(max_cycle_seconds=60),
+        session_id=session_id,
+        run_id="audit-run-1",
+        snapshot_repo=SnapshotRepository(db),
+        option_surface_repo=OptionSurfaceRepository(db),
+        data_quality_repo=DataQualityRepository(db),
+        db_path=db,
+        **repos,
+    )
+    runtime = CognitiveAgentRuntime(
+        session_id=session_id,
+        run_id="audit-run-1",
+        router=router,
+        config=CognitiveGraphSettings(max_cycle_seconds=60),
+        graph_deps=deps,
+        registry=registry,
+        checkpointer_path=tmp_path / "twophase_ckpt.db",
+    )
+    supervisor = SessionSupervisor(
+        broker=broker,
+        clock=clock,
+        config=SessionSupervisorConfig(
+            db_path=db,
+            session_id=session_id,
+            run_id="audit-run-1",
+            broker_account_id="paper",
+            market=MarketRuntimeConfig(
+                min_option_contracts=1,
+                underlying_stale_seconds=3600,
+                option_stale_seconds=3600,
+            ),
+        ),
+        agent_runtime=runtime,
+    )
+
+    class _BridgeStub:
+        def __init__(self, sup: SessionSupervisor) -> None:
+            self.supervisor = sup
+
+    # Phase 1 — Task 1 only.
+    await supervisor.start(start_agent=False)
+    assert runtime._started is False  # noqa: SLF001
+    assert deps.execution_runtime is None
+    bind_cognitive_graph_to_task1(
+        deps,
+        _BridgeStub(supervisor),  # type: ignore[arg-type]
+        data_quality_repo=supervisor.data_quality_repository,
+    )
+    assert deps.execution_runtime is not None
+    assert deps.order_action_gateway is not None
+
+    async def _track(provenanced):
+        submitted.append(provenanced.command.client_order_id)
+        return await deps.execution_runtime.submit_execution_command(provenanced.command)
+
+    deps.submit_callback = _track
+    snapshot = await _seed_with_far_contract(supervisor.market_runtime, start, clock)
+    cycle_id = "phase-cycle"
+    register_full_path_canned(fake, snapshot.snapshot_id, cycle_id, session=session_id)
+
+    # Persist an interrupted decision cycle before the agent is started.
+    ckpt = CognitiveCheckpointer(tmp_path / "twophase_ckpt.db")
+    saver = await ckpt.open()
+    deps.checkpointer = saver
+    graph = build_cognitive_graph(deps)
+    state = initial_cycle_state(
+        session_id=session_id,
+        run_id="audit-run-1",
+        cycle_id=cycle_id,
+        trigger_event_id=str(uuid4()),
+        trigger_event_type=EventType.MARKET_SNAPSHOT_CREATED.value,
+        snapshot_id=str(snapshot.snapshot_id),
+    )
+    config = ainvoke_config(
+        session_id=session_id, graph_kind="decision", cycle_id=cycle_id
+    )
+    config = {**config, "interrupt_before": ["synthesise_world_model"]}
+    await graph.ainvoke(state, config=config)
+    assert submitted == []
+    if deps.cycle_registry is None:
+        deps.cycle_registry = CognitiveCycleRegistry(
+            db.with_name(db.stem + "_cognitive_cycles.db")
+        )
+        await deps.cycle_registry.initialize()
+    await deps.cycle_registry.upsert(
+        CognitiveCycleRecord(
+            session_id=session_id,
+            graph_kind="decision",
+            cycle_id=cycle_id,
+            trigger_event_id=str(state["trigger_event_id"]),
+            snapshot_id=str(snapshot.snapshot_id),
+            status="running",
+            checkpoint_thread_id=f"{session_id}:decision:{cycle_id}",
+            last_completed_node="perception",
+        )
+    )
+    await ckpt.close()
+    deps.checkpointer = None
+
+    # Phase 2 — start agent after bind; recovery runs with gateway present.
+    await supervisor.start_agent_runtime()
+    await asyncio.sleep(1.5)
+    await runtime.shutdown()
+    projection = await supervisor.execution_runtime.project_session()
+    assert projection.orders, "recovered cycle must submit through bound gateway"
+    assert len(projection.orders) == 1
     await supervisor.shutdown()
 
 

@@ -48,6 +48,7 @@ class DataQualityCode(StrEnum):
     CUMULATIVE_VOLUME_REGRESSION = "cumulative_volume_regression"
     INSUFFICIENT_OPTION_SURFACE = "insufficient_option_surface"
     PARTIAL_OPTION_SURFACE = "partial_option_surface"
+    OPTION_SURFACE_UNAVAILABLE = "option_surface_unavailable"
     REPORT_UNAVAILABLE = "report_unavailable"
 
 

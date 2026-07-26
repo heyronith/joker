@@ -284,9 +284,17 @@ class LivePaperRunner:
                 raise LivePaperError(f"cognitive-runtime configuration error: {exc}") from exc
 
             registry = startup.registry
+            # Stable cognitive session survives process restart; run_id remains audit-only.
+            from joker.runtime.cognitive_session import stable_cognitive_session_id
+
+            cognitive_session_id = stable_cognitive_session_id(
+                trading_date=trading_day,
+                broker_account_id=selection.kind,
+                mode="paper",
+            )
             model_router = ModelRouter(
                 registry,
-                session_id=run_id,
+                session_id=cognitive_session_id,
                 model_call_repo=None,  # wired after repos below
             )
             repos = build_default_repositories(task1_db)
@@ -294,7 +302,7 @@ class LivePaperRunner:
             cognitive_graph_deps = CognitiveGraphDeps(
                 router=model_router,
                 config=self.app_settings.cognitive_graph,
-                session_id=run_id,
+                session_id=cognitive_session_id,
                 run_id=run_id,
                 context_assembler=context_assembler_from_settings(
                     self.app_settings.cognitive_graph
@@ -306,7 +314,7 @@ class LivePaperRunner:
                 **repos,
             )
             injected_agent_runtime = CognitiveAgentRuntime(
-                session_id=run_id,
+                session_id=cognitive_session_id,
                 run_id=run_id,
                 router=model_router,
                 config=self.app_settings.cognitive_graph,
@@ -332,19 +340,22 @@ class LivePaperRunner:
 
             injected_agent_runtime = NullAgentRuntime()
 
+        bridge_session_id = (
+            cognitive_graph_deps.session_id
+            if cognitive_graph_deps is not None
+            else run_id
+        )
         task1_bridge = CompatibilityLivePaperBridge(
             broker=broker,
             db_path=task1_db,
-            session_id=run_id,
+            session_id=bridge_session_id,
             run_id=run_id,
             broker_account_id=selection.kind,
             agent_runtime=injected_agent_runtime,
         )
-        if cognitive_mode and cognitive_graph_deps is not None:
-            # Callbacks/repos are wired after start() — ExecutionRuntime does not
-            # exist until SessionSupervisor.start() completes.
-            pass
-        task1_bridge.start()
+        # Two-phase startup for cognitive mode:
+        # Create Task 1 stores/ExecutionRuntime → bind gateway → start agent → resume.
+        task1_bridge.start(start_agent=not cognitive_mode)
         if cognitive_mode and cognitive_graph_deps is not None:
             from joker.persistence.cognitive_execution_provenance import (
                 CognitiveExecutionProvenanceRegistry,
@@ -364,6 +375,8 @@ class LivePaperRunner:
                 provenance_registry=provenance,
             )
             assert cognitive_graph_deps.execution_runtime is not None
+            assert cognitive_graph_deps.order_action_gateway is not None
+            task1_bridge.start_agent()
         self._task1_bridge = task1_bridge
         execution_broker = ExecutionDelegatingBroker(
             inner=broker,
@@ -876,7 +889,7 @@ class LivePaperRunner:
                             if options_provider is not None:
                                 try:
                                     from joker.runtime.option_surface_ingest import (
-                                        option_snapshots_to_surface_rows,
+                                        convert_option_snapshots_to_surface_rows,
                                     )
 
                                     trading_day = None
@@ -891,13 +904,42 @@ class LivePaperRunner:
                                         trading_date=trading_day,
                                         max_contracts=None,
                                     )
-                                    rows = option_snapshots_to_surface_rows(
+                                    conversion = convert_option_snapshots_to_surface_rows(
                                         fetch.snapshots,
                                         trading_date=fetch.trading_date,
                                     )
+                                    rows = conversion.rows
                                     if rows:
                                         task1_bridge.ingest_option_quotes(rows)
-                                    findings = fetch.to_data_quality_findings()
+                                    findings = list(fetch.to_data_quality_findings())
+                                    findings.extend(conversion.to_data_quality_findings())
+                                    if (
+                                        fetch.complete
+                                        and conversion.converted_count
+                                        != fetch.selected_count
+                                    ):
+                                        from joker.market.quality import (
+                                            DataQualityCode,
+                                            DataQualityFinding,
+                                            DataQualitySeverity,
+                                        )
+
+                                        findings.append(
+                                            DataQualityFinding(
+                                                code=DataQualityCode.PARTIAL_OPTION_SURFACE,
+                                                severity=DataQualitySeverity.ERROR,
+                                                message=(
+                                                    "persisted option rows differ from "
+                                                    "selected SPY 0DTE contract count"
+                                                ),
+                                                symbol="SPY",
+                                                details={
+                                                    "selected_count": fetch.selected_count,
+                                                    "persisted_rows": len(rows),
+                                                    "fetched_count": fetch.fetched_count,
+                                                },
+                                            )
+                                        )
                                     market = task1_bridge.supervisor.market_runtime
                                     if market is not None and findings:
                                         market.enqueue_quality_findings(findings)
@@ -907,8 +949,12 @@ class LivePaperRunner:
                                             "contract_count": len(rows),
                                             "discovered_count": fetch.discovered_count,
                                             "fetched_count": fetch.fetched_count,
-                                            "complete": fetch.complete,
+                                            "complete": fetch.complete
+                                            and conversion.complete,
                                             "failed_batches": list(fetch.failed_batches),
+                                            "conversion_failures": list(
+                                                conversion.conversion_failures
+                                            ),
                                         },
                                     )
                                 except Exception as opt_exc:
@@ -916,6 +962,30 @@ class LivePaperRunner:
                                         "task1.option_surface_ingest_failed",
                                         {"reason": str(opt_exc)},
                                     )
+                                    market = task1_bridge.supervisor.market_runtime
+                                    if market is not None:
+                                        from joker.market.quality import (
+                                            DataQualityCode,
+                                            DataQualityFinding,
+                                            DataQualitySeverity,
+                                        )
+
+                                        market.enqueue_quality_findings(
+                                            [
+                                                DataQualityFinding(
+                                                    code=DataQualityCode.OPTION_SURFACE_UNAVAILABLE,
+                                                    severity=DataQualitySeverity.ERROR,
+                                                    message=(
+                                                        "option surface fetch failed; "
+                                                        "do not treat the previous "
+                                                        "surface as the current complete "
+                                                        "SPY 0DTE chain"
+                                                    ),
+                                                    symbol="SPY",
+                                                    details={"reason": str(opt_exc)[:500]},
+                                                )
+                                            ]
+                                        )
                             task1_bridge.tick()
                         except Exception as ingest_exc:
                             log(

@@ -152,8 +152,13 @@ class SessionSupervisor:
             return False
         return self._execution.claims_recovery() and self._unresolved is None
 
-    async def start(self) -> JokerGraphState:
-        """Apply migrations, restore checkpoints, reconcile, start runtimes."""
+    async def start(self, *, start_agent: bool = True) -> JokerGraphState:
+        """Apply migrations, restore checkpoints, reconcile, start runtimes.
+
+        When ``start_agent=False``, Task 1 stores/runtimes are ready but the
+        injected agent is not started yet. Call ``start_agent_runtime()`` after
+        cognitive dependencies (ExecutionRuntime, gateway, etc.) are bound.
+        """
         apply_task1_migrations(self._config.db_path)
         await self._checkpoints.initialize()
 
@@ -221,8 +226,6 @@ class SessionSupervisor:
         ):
             self._bus.subscribe(event_type, self._on_agent_event)
 
-        await self._agent.start()
-
         now = self._clock.now()
         await self._bus.publish(
             make_event(
@@ -262,7 +265,17 @@ class SessionSupervisor:
         self._graph_state["exchange_time"] = now
         await self._checkpoints.save(self._graph_state, self._session_id)
         self._started = True
+        if start_agent:
+            await self.start_agent_runtime()
         return self._graph_state
+
+    async def start_agent_runtime(self) -> None:
+        """Start the injected agent after Task 1 truth dependencies are bound."""
+        if not self._started:
+            raise RuntimeError(
+                "SessionSupervisor.start() must complete before start_agent_runtime()"
+            )
+        await self._agent.start()
 
     async def _on_agent_event(self, event: DomainEvent) -> None:
         """Forward domain events to the injected agent runtime."""
