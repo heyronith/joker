@@ -123,7 +123,12 @@ class SqliteLedgerStore:
 
     @staticmethod
     def _events_equivalent(left: LedgerEvent, right: LedgerEvent) -> bool:
-        """Compare business fields ignoring created_at / ledger_event_id differences."""
+        """Compare business fields ignoring created_at / ledger_event_id / exchange_timestamp.
+
+        ``exchange_timestamp`` is excluded so re-polling an already-recorded fill
+        (same idempotency_key, new wall-clock stamp) is treated as an idempotent
+        replay rather than a conflict.
+        """
         return (
             left.broker_account_id == right.broker_account_id
             and left.client_order_id == right.client_order_id
@@ -132,7 +137,6 @@ class SqliteLedgerStore:
             and left.side == right.side
             and left.quantity == right.quantity
             and left.price == right.price
-            and left.exchange_timestamp == right.exchange_timestamp
             and left.source_event_id == right.source_event_id
             and left.idempotency_key == right.idempotency_key
             and left.event_type == right.event_type

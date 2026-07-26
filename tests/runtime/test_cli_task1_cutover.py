@@ -10,14 +10,14 @@ from unittest.mock import MagicMock
 from joker.broker.interface import PaperBroker
 from joker.config.settings import AppSettings, EnvSettings
 from joker.runtime.compatibility import CompatibilityLivePaperBridge, ExecutionDelegatingBroker
-from joker.runtime.execution_runtime import ExecutionCommand, ExecutionRuntime
+from joker.runtime.execution_runtime import ExecutionRuntime
 from joker.runtime.live_paper_runner import LivePaperRunConfig, LivePaperRunner
 from joker.runtime.market_runtime import MarketRuntime
 from joker.runtime.session_supervisor import SessionSupervisor
-from joker.schemas.domain import OptionContract, OrderIntent, Playbook
+from joker.schemas.domain import OptionContract, OrderIntent
 
 
-def test_paper_path_task1_cutover_components(tmp_path: Path, monkeypatch) -> None:
+def test_paper_path_task1_cutover_components(tmp_path: Path) -> None:
     """Prove the paper session wiring reaches Task 1 runtimes and ledger."""
     broker = PaperBroker(slippage_pct=0)
     bridge = CompatibilityLivePaperBridge(
@@ -33,7 +33,6 @@ def test_paper_path_task1_cutover_components(tmp_path: Path, monkeypatch) -> Non
         assert isinstance(bridge.execution_runtime, ExecutionRuntime)
         assert bridge.supervisor.ledger_store is not None
 
-        # Market path
         obs = bridge.ingest_underlying_quote(
             symbol="SPY",
             last=Decimal("500"),
@@ -43,7 +42,6 @@ def test_paper_path_task1_cutover_components(tmp_path: Path, monkeypatch) -> Non
         )
         assert obs.symbol == "SPY"
 
-        # Execution path → append-only ledger
         contract = OptionContract(
             symbol="SPY",
             expiration=date(2026, 7, 1),
@@ -67,7 +65,10 @@ def test_paper_path_task1_cutover_components(tmp_path: Path, monkeypatch) -> Non
         events = bridge.run_coro(
             bridge.supervisor.ledger_store.get_by_session("cli-sess")  # type: ignore[union-attr]
         )
-        assert any(e.event_type.value.endswith("fill") or "submission" in e.event_type.value for e in events)
+        assert any(
+            e.event_type.value.endswith("fill") or "submission" in e.event_type.value
+            for e in events
+        )
     finally:
         bridge.shutdown()
 
@@ -75,15 +76,15 @@ def test_paper_path_task1_cutover_components(tmp_path: Path, monkeypatch) -> Non
 def test_live_paper_runner_constructs_bridge_on_run_start(tmp_path: Path, monkeypatch) -> None:
     """LivePaperRunner.run instantiates CompatibilityLivePaperBridge (cutover)."""
     app = AppSettings(db_path=str(tmp_path / "app.db"))
+    # OPENAI_API_KEY is required by EnvSettings; CI has no .env — set explicitly.
     env = EnvSettings(
+        OPENAI_API_KEY="test-ci-key-not-real",
         webull_market_data_enabled=True,
         webull_live_trading_enabled=False,
     )
-    # Bypass safety / auth by forcing early failure after bridge start.
     runner = LivePaperRunner(app, env)
 
     created: dict[str, CompatibilityLivePaperBridge] = {}
-
     real_bridge_cls = CompatibilityLivePaperBridge
 
     def tracking_bridge(*args, **kwargs):
@@ -105,7 +106,6 @@ def test_live_paper_runner_constructs_bridge_on_run_start(tmp_path: Path, monkey
         ),
     )
 
-    # Force auth failure after bridge starts.
     class BoomProvider:
         def __init__(self, *a, **k):
             pass
@@ -129,6 +129,5 @@ def test_live_paper_runner_constructs_bridge_on_run_start(tmp_path: Path, monkey
     )
     assert "bridge" in created
     assert isinstance(created["bridge"].supervisor, SessionSupervisor)
-    # Bridge should be shut down after early return.
     assert runner.task1_bridge is None
     assert result.errors

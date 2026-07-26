@@ -213,6 +213,38 @@ class ExecutionRuntime:
                 )
         return order
 
+    async def cancel_order(self, *, client_order_id: str) -> BrokerOrder:
+        """Cancel via broker adapter, append ledger cancellation, reconcile."""
+        await self.restore_order_mappings()
+        broker_order_id = self._client_to_broker.get(client_order_id)
+        if broker_order_id is None:
+            raise RuntimeError(
+                f"No broker mapping for client_order_id={client_order_id!r}; "
+                "cannot cancel through ExecutionRuntime"
+            )
+        order = self._broker.cancel_order(broker_order_id)
+        await self.on_broker_update(order, client_order_id=client_order_id)
+        await self.run_reconciliation()
+        return order
+
+    async def cancel_order_by_broker_id(self, broker_order_id: str) -> BrokerOrder:
+        """Cancel using broker order id after resolving the client mapping."""
+        await self.restore_order_mappings()
+        client_order_id: str | None = None
+        for cid, bid in self._client_to_broker.items():
+            if bid == broker_order_id:
+                client_order_id = cid
+                break
+        if client_order_id is None:
+            # Fall back: cancel at broker, then map from order.intent_id.
+            order = self._broker.cancel_order(broker_order_id)
+            client_order_id = order.intent_id
+            self._client_to_broker[client_order_id] = broker_order_id
+            await self.on_broker_update(order, client_order_id=client_order_id)
+            await self.run_reconciliation()
+            return order
+        return await self.cancel_order(client_order_id=client_order_id)
+
     async def poll_order_status(self, client_order_id: str) -> BrokerOrder | None:
         """Poll broker for order status and write ledger events on transitions."""
         broker_order_id = self._client_to_broker.get(client_order_id)

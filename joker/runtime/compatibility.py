@@ -9,7 +9,8 @@ from __future__ import annotations
 
 import asyncio
 import warnings
-from datetime import datetime
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -35,6 +36,43 @@ if TYPE_CHECKING:
     from joker.runtime.session_supervisor import SessionSupervisor
 
 
+@dataclass
+class Task1RuntimeHealth:
+    """Tracks whether the Task 1 market truth layer is healthy enough to trade."""
+
+    consecutive_failures: int = 0
+    degraded: bool = False
+    last_error: str | None = None
+    last_success_at: datetime | None = None
+    last_failure_at: datetime | None = None
+    failure_threshold: int = 1
+    _history: list[dict[str, Any]] = field(default_factory=list, repr=False)
+
+    @property
+    def allows_execution(self) -> bool:
+        return not self.degraded
+
+    def record_success(self) -> None:
+        self.consecutive_failures = 0
+        self.degraded = False
+        self.last_error = None
+        self.last_success_at = datetime.now(timezone.utc)
+
+    def record_failure(self, reason: str) -> None:
+        self.consecutive_failures += 1
+        self.last_error = reason
+        self.last_failure_at = datetime.now(timezone.utc)
+        self._history.append(
+            {
+                "at": self.last_failure_at.isoformat(),
+                "reason": reason,
+                "consecutive_failures": self.consecutive_failures,
+            }
+        )
+        if self.consecutive_failures >= self.failure_threshold:
+            self.degraded = True
+
+
 class CompatibilityLivePaperBridge:
     """Active bridge: owns a SessionSupervisor and delegates market/execution.
 
@@ -53,6 +91,7 @@ class CompatibilityLivePaperBridge:
         run_id: str | None = None,
         clock: ExchangeClock | None = None,
         broker_account_id: str = "paper",
+        health_failure_threshold: int = 1,
     ) -> None:
         self.session_id = session_id or str(uuid4())
         self._loop = asyncio.new_event_loop()
@@ -69,6 +108,7 @@ class CompatibilityLivePaperBridge:
             ),
         )
         self._started = False
+        self.health = Task1RuntimeHealth(failure_threshold=health_failure_threshold)
 
     @property
     def supervisor(self) -> SessionSupervisor:
@@ -98,25 +138,94 @@ class CompatibilityLivePaperBridge:
         self._started = False
         self._loop.close()
 
+    def _sync_health_to_graph(self) -> None:
+        """Persist truth-layer degradation into session/graph state for audit."""
+        errors = list(self._supervisor.graph_state.get("errors") or [])
+        errors = [e for e in errors if e.get("code") != "task1_truth_degraded"]
+        if self.health.degraded:
+            errors.append(
+                {
+                    "code": "task1_truth_degraded",
+                    "message": self.health.last_error or "Task 1 market runtime unhealthy",
+                    "consecutive_failures": self.health.consecutive_failures,
+                    "at": (
+                        self.health.last_failure_at.isoformat()
+                        if self.health.last_failure_at
+                        else None
+                    ),
+                }
+            )
+        self._supervisor.graph_state["errors"] = errors
+
+    def _ingest_ok(self, result: Any) -> Any:
+        was_degraded = self.health.degraded
+        self.health.record_success()
+        if was_degraded:
+            self._sync_health_to_graph()
+        return result
+
+    def _ingest_fail(self, exc: Exception) -> None:
+        self.health.record_failure(str(exc))
+        self._sync_health_to_graph()
+
     def ingest_underlying_quote(self, **kwargs: Any) -> Any:
         market = self._require_market()
-        return self.run_coro(market.ingest_underlying_quote(**kwargs))
+        try:
+            result = self.run_coro(market.ingest_underlying_quote(**kwargs))
+            return self._ingest_ok(result)
+        except Exception as exc:
+            self._ingest_fail(exc)
+            raise
 
     def ingest_trade(self, **kwargs: Any) -> Any:
         market = self._require_market()
-        return self.run_coro(market.ingest_trade(**kwargs))
+        try:
+            result = self.run_coro(market.ingest_trade(**kwargs))
+            return self._ingest_ok(result)
+        except Exception as exc:
+            self._ingest_fail(exc)
+            raise
 
     def ingest_option_quotes(self, quotes: Any) -> Any:
         market = self._require_market()
-        return self.run_coro(market.ingest_option_quotes(quotes))
+        try:
+            result = self.run_coro(market.ingest_option_quotes(quotes))
+            return self._ingest_ok(result)
+        except Exception as exc:
+            self._ingest_fail(exc)
+            raise
 
     def tick(self, now: datetime | None = None) -> Any:
         market = self._require_market()
-        return self.run_coro(market.tick(now=now))
+        try:
+            result = self.run_coro(market.tick(now=now))
+            return self._ingest_ok(result)
+        except Exception as exc:
+            self._ingest_fail(exc)
+            raise
 
     def submit_execution_command(self, command: ExecutionCommand) -> BrokerOrder:
+        if not self.health.allows_execution:
+            intent = command.intent
+            return BrokerOrder(
+                order_id=f"blocked-{command.client_order_id}",
+                intent_id=command.client_order_id,
+                status="rejected",
+                contract=intent.contract,
+                side=intent.side,
+                quantity=intent.quantity,
+                limit_price=intent.limit_price,
+            )
         execution = self._require_execution()
         return self.run_coro(execution.submit_execution_command(command))
+
+    def cancel_order(self, *, client_order_id: str) -> BrokerOrder:
+        execution = self._require_execution()
+        return self.run_coro(execution.cancel_order(client_order_id=client_order_id))
+
+    def cancel_order_by_broker_id(self, broker_order_id: str) -> BrokerOrder:
+        execution = self._require_execution()
+        return self.run_coro(execution.cancel_order_by_broker_id(broker_order_id))
 
     def record_verified_fill(self, *args: Any, **kwargs: Any) -> Any:
         execution = self._require_execution()
@@ -176,6 +285,16 @@ class ExecutionDelegatingBroker:
         self._broker_account_id = broker_account_id
 
     def submit_order(self, intent: OrderIntent) -> BrokerOrder:
+        if not self._bridge.health.allows_execution:
+            return BrokerOrder(
+                order_id=f"blocked-{intent.intent_id}",
+                intent_id=intent.intent_id,
+                status="rejected",
+                contract=intent.contract,
+                side=intent.side,
+                quantity=intent.quantity,
+                limit_price=intent.limit_price,
+            )
         command = ExecutionCommand(
             client_order_id=intent.intent_id,
             intent=intent,
@@ -184,7 +303,8 @@ class ExecutionDelegatingBroker:
         return self._bridge.submit_execution_command(command)
 
     def cancel_order(self, order_id: str) -> BrokerOrder:
-        return self._inner.cancel_order(order_id)
+        """Cancel by broker order id via ExecutionRuntime (ledger + domain events)."""
+        return self._bridge.cancel_order_by_broker_id(order_id)
 
     def get_order(self, order_id: str) -> BrokerOrder | None:
         return self._inner.get_order(order_id)

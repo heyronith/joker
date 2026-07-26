@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
+from decimal import Decimal
 from typing import TYPE_CHECKING, Callable
 from uuid import uuid4
 
@@ -31,14 +32,29 @@ from joker.schemas.replay import (
 if TYPE_CHECKING:
     from joker.agents.intraday import IntradayDecision, TradeProposal
     from joker.data.webull_options_provider import WebullOptionsDataProvider
+    from joker.runtime.compatibility import CompatibilityLivePaperBridge
 
 
 @dataclass
 class PendingEntry:
     order_id: str
+    client_order_id: str
     candidate: TradeCandidate
     setup: PlaybookSetup
     source: str = "structured_signal"
+
+
+@dataclass
+class PendingExit:
+    """Exit order awaiting verified closing fills before finalising the trade."""
+
+    client_order_id: str
+    broker_order_id: str
+    position_id: str
+    contract_id: str
+    requested_quantity: int
+    reason: str
+    submitted_at: datetime
 
 
 @dataclass
@@ -56,6 +72,7 @@ class MarketHandlerState:
     latest_option_mid: float | None = None
     open_trade: OpenTradeContext | None = None
     pending_entry: PendingEntry | None = None
+    pending_exit: PendingExit | None = None
     signaled_setups: set[str] = field(default_factory=set)
     setups_armed: int = 0
     exits_by_reason: dict[str, int] = field(default_factory=dict)
@@ -90,6 +107,7 @@ class MarketEventHandler:
         rules_auto_entry: bool = True,
         on_trade_outcome: Callable[[dict], None] | None = None,
         capital_budget: CapitalBudget | None = None,
+        task1_bridge: CompatibilityLivePaperBridge | None = None,
     ) -> None:
         self.provider = provider
         self.engine = reactive_engine
@@ -104,6 +122,7 @@ class MarketEventHandler:
         self.rules_auto_entry = rules_auto_entry
         self._on_trade_outcome = on_trade_outcome
         self.capital_budget = capital_budget
+        self._task1_bridge = task1_bridge
         self._pending_allocation: dict | None = None
         self._pause_when_goal_met = True
         self.daily_state = daily_state or DailyState(
@@ -154,11 +173,97 @@ class MarketEventHandler:
             },
         )
     def _reconcile_pending_entry(self) -> None:
-        """Promote working paper-account orders to open_trade once filled."""
+        """Promote pending entries only when ledger shows verified position + avg price."""
         pending = self.state.pending_entry
         if pending is None or self.state.open_trade is not None:
             return
 
+        bridge = self._task1_bridge
+        if bridge is not None:
+            try:
+                bridge.poll_order_status(pending.client_order_id)
+                projection = bridge.project_session()
+            except Exception as exc:
+                self._log("entry.reconcile_failed", {"reason": str(exc)})
+                return
+
+            order_state = projection.orders.get(pending.client_order_id)
+            if order_state is not None and order_state.status.value in {
+                "cancelled",
+                "rejected",
+            }:
+                self._log(
+                    "order.failed",
+                    {
+                        "order_id": pending.order_id,
+                        "status": order_state.status.value,
+                        "candidate_id": pending.candidate.candidate_id,
+                    },
+                )
+                self.state.pending_entry = None
+                if self.capital_budget is not None and self._pending_allocation:
+                    self.capital_budget.release(
+                        float(self._pending_allocation.get("notional_usd") or 0.0),
+                        realized_pnl_usd=0.0,
+                    )
+                    self._pending_allocation = None
+                    self._sync_risk_capital()
+                if self.engine.state in (
+                    TradingState.OPEN_POSITION,
+                    TradingState.ENTERING,
+                    TradingState.MANAGING_EXIT,
+                ):
+                    try:
+                        self.engine.transition(
+                            TradingState.WATCHING, {"order_gone": order_state.status.value}
+                        )
+                    except StateMachineError:
+                        self.engine.state = TradingState.WATCHING
+                return
+
+            # Authoritative: positive projected qty + average fill price for this contract.
+            from joker.runtime.execution_runtime import contract_id_for
+
+            cid = contract_id_for(pending.candidate.contract)
+            pos = projection.positions.get(cid)
+            if (
+                pos is not None
+                and pos.open
+                and pos.quantity > 0
+                and pos.avg_price is not None
+            ):
+                # Prefer ledger quantity over candidate sizing without mutating
+                # the immutable-ish candidate model in place.
+                qty = max(1, int(pos.quantity))
+                candidate = pending.candidate.model_copy(update={"quantity": qty})
+                self.state.pending_entry = None
+                self._attach_open_trade(
+                    position_id=pos.position_id or pending.order_id,
+                    entry_price=float(pos.avg_price),
+                    candidate=candidate,
+                    setup=pending.setup,
+                )
+                return
+
+            # Broker says filled but ledger has no verified fill price — stay pending.
+            order = self.broker.get_order(pending.order_id)
+            if order is not None and order.status == "filled":
+                self._log(
+                    "entry.awaiting_verified_fill",
+                    {
+                        "order_id": pending.order_id,
+                        "client_order_id": pending.client_order_id,
+                        "broker_status": order.status,
+                    },
+                )
+                try:
+                    if bridge.execution_runtime is not None:
+                        bridge.run_coro(bridge.execution_runtime.run_reconciliation())
+                except Exception as exc:
+                    self._log("entry.reconciliation_failed", {"reason": str(exc)})
+            return
+
+        # Legacy path without Task 1 bridge: require broker position with avg price.
         positions = [p for p in self.broker.list_positions() if p.is_open]
         if positions:
             pos = positions[-1]
@@ -175,14 +280,10 @@ class MarketEventHandler:
         if order is None:
             return
         if order.status == "filled":
-            # Position list lag — synthesize from order limit until broker lists it.
-            entry = order.limit_price or pending.candidate.entry_limit_price
-            self.state.pending_entry = None
-            self._attach_open_trade(
-                position_id=order.order_id,
-                entry_price=float(entry),
-                candidate=pending.candidate,
-                setup=pending.setup,
+            # Do not synthesise entry from limit_price — wait for a broker position.
+            self._log(
+                "entry.awaiting_verified_fill",
+                {"order_id": order.order_id, "broker_status": order.status},
             )
             return
         if order.status in {"cancelled", "rejected"}:
@@ -205,6 +306,232 @@ class MarketEventHandler:
                 except StateMachineError:
                     self.engine.state = TradingState.WATCHING
             return
+
+    def _finalize_exit(
+        self,
+        *,
+        reason: str,
+        exit_price: float,
+        quantity: int,
+        realized_pnl_usd: float,
+        entry_price: float | None,
+        entry_time: datetime | None,
+        reserved: float,
+    ) -> None:
+        """Complete an exit after ledger-confirmed flat position."""
+        mae = self.state.max_adverse_excursion
+        mfe = self.state.max_favorable_excursion
+        if self.capital_budget is not None and reserved > 0:
+            self.capital_budget.release(reserved, realized_pnl_usd=float(realized_pnl_usd))
+            self._sync_risk_capital()
+        self.state.open_trade = None
+        self.state.pending_exit = None
+        self.state.trades_exited += 1
+        self.state.last_exit_reason = reason
+        self.state.exits_by_reason[reason] = self.state.exits_by_reason.get(reason, 0) + 1
+        duration_minutes = None
+        if entry_time:
+            elapsed = (self.provider.current_time - entry_time).total_seconds() / 60.0
+            self.state.trade_durations_minutes.append(elapsed)
+            duration_minutes = elapsed
+        if self.engine.state in (TradingState.OPEN_POSITION, TradingState.MANAGING_EXIT):
+            self.engine.transition(TradingState.EXITED, {"reason": reason})
+            self.engine.transition(TradingState.COOLDOWN)
+            self.engine.transition(TradingState.WATCHING)
+        outcome_payload = {
+            "exit_reason": reason,
+            "exit_price": exit_price,
+            "entry_price": entry_price,
+            "quantity": quantity,
+            "mae": mae,
+            "mfe": mfe,
+            "duration_minutes": duration_minutes,
+            "trade_pnl_usd": realized_pnl_usd,
+            "realized_pnl_usd": (
+                self.capital_budget.realized_pnl_usd
+                if self.capital_budget is not None
+                else realized_pnl_usd
+            ),
+            "capital": self.capital_budget.prompt_dict() if self.capital_budget else None,
+        }
+        self.state.exit_decisions.append({"reason": reason, **outcome_payload})
+        self._log("exit.executed", outcome_payload)
+        if self._on_trade_outcome is not None:
+            try:
+                self._on_trade_outcome(outcome_payload)
+            except Exception:
+                pass
+        self.state.max_adverse_excursion = None
+        self.state.max_favorable_excursion = None
+
+    def _reconcile_pending_exit(self) -> None:
+        """Finalise or revise a pending exit from ledger projection."""
+        pending = self.state.pending_exit
+        if pending is None or self.state.open_trade is None:
+            return
+        bridge = self._task1_bridge
+        if bridge is None:
+            return
+
+        try:
+            order = bridge.poll_order_status(pending.client_order_id)
+            projection = bridge.project_session()
+        except Exception as exc:
+            self._log("exit.reconcile_failed", {"reason": str(exc)})
+            return
+
+        order_state = projection.orders.get(pending.client_order_id)
+        pos = projection.positions.get(pending.contract_id)
+        remaining = float(pos.quantity) if pos is not None else 0.0
+        open_trade = self.state.open_trade
+
+        if order is not None and order.status in {"cancelled", "rejected"}:
+            self._log(
+                "exit.order_failed",
+                {
+                    "client_order_id": pending.client_order_id,
+                    "broker_order_id": pending.broker_order_id,
+                    "status": order.status,
+                    "reason": pending.reason,
+                },
+            )
+            self.state.pending_exit = None
+            return
+
+        if order_state is not None and order_state.status.value in {"cancelled", "rejected"}:
+            self._log(
+                "exit.order_failed",
+                {
+                    "client_order_id": pending.client_order_id,
+                    "status": order_state.status.value,
+                    "reason": pending.reason,
+                },
+            )
+            self.state.pending_exit = None
+            return
+
+        # Update remaining quantity from projection without closing.
+        if remaining > 0 and open_trade is not None:
+            closed_qty = max(0, int(open_trade.quantity) - int(remaining))
+            if closed_qty > 0:
+                open_trade.quantity = int(remaining)
+                self._log(
+                    "exit.partial_fill",
+                    {
+                        "closed_qty": closed_qty,
+                        "remaining_qty": int(remaining),
+                        "realized_pnl_usd": float(pos.realized_pnl) if pos else 0.0,
+                    },
+                )
+
+        if remaining == 0 and pos is not None:
+            exit_price = float(order_state.avg_fill_price) if order_state and order_state.avg_fill_price else open_trade.entry_price
+            self._finalize_exit(
+                reason=pending.reason,
+                exit_price=exit_price,
+                quantity=pending.requested_quantity,
+                realized_pnl_usd=float(pos.realized_pnl),
+                entry_price=open_trade.entry_price if open_trade else None,
+                entry_time=open_trade.entry_time if open_trade else None,
+                reserved=open_trade.reserved_notional_usd if open_trade else 0.0,
+            )
+            return
+
+        # Exit order fully filled but position still open (partial intentional size).
+        if (
+            order_state is not None
+            and order_state.status.value == "filled"
+            and remaining > 0
+        ):
+            self.state.pending_exit = None
+            self._log(
+                "exit.partial_complete",
+                {
+                    "remaining_qty": int(remaining),
+                    "realized_pnl_usd": float(pos.realized_pnl) if pos else 0.0,
+                },
+            )
+
+    def _try_exit(self, quote_event: OptionQuoteEvent) -> ExitDecision | None:
+        if self.state.open_trade is None:
+            return None
+        if self.state.pending_exit is not None:
+            self._reconcile_pending_exit()
+            return None
+        decision = self.exit_manager.check_exit(
+            self.state.open_trade,
+            quote_event.mid,
+            self.provider.current_time,
+        )
+        if decision is None:
+            return None
+
+        if self.mode is SafetyMode.SHADOW:
+            label = None
+            if self.shadow and self.shadow.records:
+                rec = self.shadow.records[-1]
+                self.shadow.simulate_outcome(rec, quote_event.mid)
+                label = rec.shadow_result_label
+            self._log(
+                "exit.shadow",
+                exit_decision_safe_metadata(
+                    decision.reason.value,
+                    shadow_result_label=label,
+                ),
+            )
+            # Shadow continues to simulate without live order lifecycle.
+            return decision
+
+        positions = [p for p in self.broker.list_positions() if p.is_open]
+        if not positions:
+            return None
+        pos = positions[0]
+        qty = (
+            self.state.open_trade.quantity
+            if self.state.open_trade is not None
+            else pos.quantity
+        )
+        intent = OrderIntent(
+            candidate_id=str(uuid4()),
+            contract=pos.contract,
+            side="sell",
+            order_type="limit",
+            quantity=max(1, int(qty)),
+            limit_price=decision.exit_price,
+        )
+        try:
+            exit_order = self.broker.submit_order(intent)
+        except Exception as exc:
+            self._log("exit.submit_failed", {"reason": str(exc)})
+            return None
+
+        from joker.runtime.execution_runtime import contract_id_for
+
+        contract_id = contract_id_for(pos.contract)
+        self.state.pending_exit = PendingExit(
+            client_order_id=intent.intent_id,
+            broker_order_id=exit_order.order_id,
+            position_id=self.state.open_trade.position_id,
+            contract_id=contract_id,
+            requested_quantity=max(1, int(qty)),
+            reason=decision.reason.value,
+            submitted_at=self.provider.current_time,
+        )
+        self._log(
+            "exit.order_submitted",
+            {
+                "side": "sell",
+                "order_id": exit_order.order_id,
+                "client_order_id": intent.intent_id,
+                "status": exit_order.status,
+                "limit_price": exit_order.limit_price,
+                "quantity": qty,
+                "reason": decision.reason.value,
+            },
+        )
+        # Do not release capital / clear open_trade / increment exits yet.
+        self._reconcile_pending_exit()
+        return decision
 
     def _detect_signal(self, features, playbook: Playbook) -> PlaybookSetup | None:
         from joker.strategy.signal_rules import detect_setup_from_playbook
@@ -307,131 +634,10 @@ class MarketEventHandler:
         )
         return result.quantity, result.notional_usd
 
-    def _try_exit(self, quote_event: OptionQuoteEvent) -> ExitDecision | None:
-        if self.state.open_trade is None:
-            return None
-        decision = self.exit_manager.check_exit(
-            self.state.open_trade,
-            quote_event.mid,
-            self.provider.current_time,
-        )
-        if decision is None:
-            return None
-
-        if self.mode is SafetyMode.SHADOW:
-            label = None
-            if self.shadow and self.shadow.records:
-                rec = self.shadow.records[-1]
-                self.shadow.simulate_outcome(rec, quote_event.mid)
-                label = rec.shadow_result_label
-            self._log(
-                "exit.shadow",
-                exit_decision_safe_metadata(
-                    decision.reason.value,
-                    shadow_result_label=label,
-                ),
-            )
-        else:
-            positions = [p for p in self.broker.list_positions() if p.is_open]
-            if positions:
-                pos = positions[0]
-                qty = (
-                    self.state.open_trade.quantity
-                    if self.state.open_trade is not None
-                    else pos.quantity
-                )
-                intent = OrderIntent(
-                    candidate_id=str(uuid4()),
-                    contract=pos.contract,
-                    side="sell",
-                    order_type="limit",
-                    quantity=max(1, int(qty)),
-                    limit_price=decision.exit_price,
-                )
-                exit_order = self.broker.submit_order(intent)
-                self._log(
-                    "order.submitted",
-                    {
-                        "side": "sell",
-                        "order_id": exit_order.order_id,
-                        "status": exit_order.status,
-                        "limit_price": exit_order.limit_price,
-                        "quantity": qty,
-                        "reason": decision.reason.value,
-                    },
-                )
-        entry_time = self.state.open_trade.entry_time if self.state.open_trade else None
-        entry_price = self.state.open_trade.entry_price if self.state.open_trade else None
-        qty = self.state.open_trade.quantity if self.state.open_trade else 1
-        reserved = (
-            self.state.open_trade.reserved_notional_usd if self.state.open_trade else 0.0
-        )
-        mae = self.state.max_adverse_excursion
-        mfe = self.state.max_favorable_excursion
-        # Per-trade PnL estimate from premium change (long options)
-        trade_pnl = None
-        if entry_price is not None and decision.exit_price is not None:
-            trade_pnl = (decision.exit_price - entry_price) * 100.0 * max(1, int(qty))
-        if self.capital_budget is not None and reserved > 0:
-            self.capital_budget.release(
-                reserved,
-                realized_pnl_usd=float(trade_pnl or 0.0),
-            )
-            self._sync_risk_capital()
-        self.state.open_trade = None
-        self.state.trades_exited += 1
-        self.state.last_exit_reason = decision.reason.value
-        self.state.exits_by_reason[decision.reason.value] = (
-            self.state.exits_by_reason.get(decision.reason.value, 0) + 1
-        )
-        self.state.exit_decisions.append(
-            exit_decision_safe_metadata(decision.reason.value)
-            if self.mode is SafetyMode.SHADOW
-            else decision.model_dump(mode="json")
-        )
-        duration_minutes = None
-        if entry_time:
-            elapsed = (self.provider.current_time - entry_time).total_seconds() / 60.0
-            self.state.trade_durations_minutes.append(elapsed)
-            duration_minutes = elapsed
-        if self.engine.state in (TradingState.OPEN_POSITION, TradingState.MANAGING_EXIT):
-            self.engine.transition(TradingState.EXITED, {"reason": decision.reason.value})
-            self.engine.transition(TradingState.COOLDOWN)
-            self.engine.transition(TradingState.WATCHING)
-        outcome_payload = {
-            "exit_reason": decision.reason.value,
-            "exit_price": decision.exit_price,
-            "entry_price": entry_price,
-            "quantity": qty,
-            "mae": mae,
-            "mfe": mfe,
-            "duration_minutes": duration_minutes,
-            "trade_pnl_usd": trade_pnl,
-            "realized_pnl_usd": (
-                self.capital_budget.realized_pnl_usd
-                if self.capital_budget is not None
-                else self.broker.get_daily_pnl()
-            ),
-            "capital": self.capital_budget.prompt_dict() if self.capital_budget else None,
-        }
-        self._log(
-            "exit.executed",
-            exit_decision_safe_metadata(decision.reason.value)
-            if self.mode is SafetyMode.SHADOW
-            else {**decision.model_dump(mode="json"), **outcome_payload},
-        )
-        if self._on_trade_outcome is not None:
-            try:
-                self._on_trade_outcome(outcome_payload)
-            except Exception:
-                pass
-        self.state.max_adverse_excursion = None
-        self.state.max_favorable_excursion = None
-        return decision
-
     def handle_event(self, event: MarketEvent) -> None:
         self.state.last_event_type = event.event_type
         self._reconcile_pending_entry()
+        self._reconcile_pending_exit()
         self._log("market.event_received", {"event_type": event.event_type, "event_id": event.event_id})
 
         if isinstance(event, SpyQuoteEvent):
@@ -856,18 +1062,11 @@ class MarketEventHandler:
             return False
 
         self.state.trades_entered += 1
-        positions = [p for p in self.broker.list_positions() if p.is_open]
-        if positions:
-            pos = positions[-1]
-            self._attach_open_trade(
-                position_id=pos.position_id,
-                entry_price=pos.avg_entry_price,
-                candidate=candidate,
-                setup=setup,
-            )
-        elif order is not None and order.status in {"open", "pending", "filled"}:
+        # Always wait for verified ledger/broker position before attaching open_trade.
+        if order is not None:
             self.state.pending_entry = PendingEntry(
                 order_id=order.order_id,
+                client_order_id=order.intent_id,
                 candidate=candidate,
                 setup=setup,
                 source=source,
@@ -876,8 +1075,7 @@ class MarketEventHandler:
                 "order.pending_fill",
                 {"order_id": order.order_id, "status": order.status},
             )
-            if order.status == "filled":
-                self._reconcile_pending_entry()
+            self._reconcile_pending_entry()
         self.state.signaled_setups.add(setup.setup_id)
         return True
 

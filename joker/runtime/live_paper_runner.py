@@ -422,7 +422,16 @@ class LivePaperRunner:
                     source="live_paper_warmup",
                 )
             except Exception as ingest_exc:
-                log("task1.market_ingest_failed", {"reason": str(ingest_exc)})
+                log(
+                    "task1.market_ingest_failed",
+                    {
+                        "reason": str(ingest_exc),
+                        "degraded": task1_bridge.health.degraded,
+                        "consecutive_failures": (
+                            task1_bridge.health.consecutive_failures
+                        ),
+                    },
+                )
             log("market.warmup",
                 {
                     "candles": len(snapshot.candles),
@@ -647,6 +656,7 @@ class LivePaperRunner:
             ),
             on_trade_outcome=on_trade_outcome,
             capital_budget=capital_budget,
+            task1_bridge=task1_bridge,
         )
         handler._pause_when_goal_met = bool(
             self.app_settings.capital.pause_entries_when_goal_met
@@ -743,9 +753,32 @@ class LivePaperRunner:
                         except Exception as ingest_exc:
                             log(
                                 "task1.market_ingest_failed",
-                                {"reason": str(ingest_exc)},
+                                {
+                                    "reason": str(ingest_exc),
+                                    "degraded": task1_bridge.health.degraded,
+                                    "consecutive_failures": (
+                                        task1_bridge.health.consecutive_failures
+                                    ),
+                                },
                             )
                         provider.append_quote_as_candle(event)
+
+                    if task1_bridge.health.degraded:
+                        log(
+                            "task1.truth_degraded",
+                            {
+                                "last_error": task1_bridge.health.last_error,
+                                "consecutive_failures": (
+                                    task1_bridge.health.consecutive_failures
+                                ),
+                                "new_entries_blocked": True,
+                            },
+                        )
+                        # Still reconcile pending exits/entries; block new agent entries.
+                        handler.handle_event(event)
+                        _time.sleep(min(poll, max(0.0, deadline - _time.monotonic())))
+                        continue
+
                     handler.handle_event(event)
 
                     latest = provider.get_latest_snapshot()

@@ -7,13 +7,20 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version:
+          - "3.11"
+          - "3.12"
     env:
       TZ: America/New_York
+      OPENAI_API_KEY: test-ci-key-not-real
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python-version }}
       - name: Install OS timezone data
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends tzdata
       - name: Install package with dev dependencies
@@ -24,10 +31,13 @@ jobs:
       - name: Ruff
         run: ruff check .
       - name: Pytest
-        run: pytest -q --tb=short | tee pytest-output.txt
+        shell: bash
+        run: |
+          set -o pipefail
+          pytest -q --tb=short | tee pytest-output.txt
       - name: Upload pytest output
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: pytest-output
+          name: pytest-output-${{ matrix.python-version }}
           path: pytest-output.txt

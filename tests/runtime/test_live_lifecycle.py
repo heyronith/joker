@@ -1,0 +1,514 @@
+"""Live order lifecycle: pending exit, verified entry, cancellation via ExecutionRuntime."""
+
+from __future__ import annotations
+
+from datetime import date, datetime
+from decimal import Decimal
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+from joker.app.safety import SafetyMode
+from joker.broker.interface import PaperBroker
+from joker.execution.exit_manager import ExitManager, OpenTradeContext
+from joker.execution.option_selector import OptionSelector
+from joker.features.engine import FeatureEngine
+from joker.risk.capital import CapitalBudget, CapitalPlan
+from joker.risk.governor import RiskGovernor
+from joker.runtime.compatibility import CompatibilityLivePaperBridge, ExecutionDelegatingBroker
+from joker.runtime.execution_runtime import contract_id_for
+from joker.runtime.market_handler import MarketEventHandler, PendingEntry, PendingExit
+from joker.runtime.reactive_engine import ReactiveEngine
+from joker.schemas.domain import (
+    OptionContract,
+    OptionQuote,
+    OrderIntent,
+    PlaybookSetup,
+    RiskConfig,
+    TradeCandidate,
+)
+
+ET = ZoneInfo("America/New_York")
+
+
+def _risk() -> RiskConfig:
+    return RiskConfig(
+        max_daily_loss_usd=500,
+        max_trades_per_day=10,
+        max_open_positions=1,
+        max_premium_usd=500,
+        max_spread_pct=0.5,
+        quote_max_age_seconds=60,
+        allowed_symbol="SPY",
+        kill_switch=False,
+        allow_delayed_quotes=True,
+        feed_max_silence_seconds=120,
+        delayed_quote_max_age_seconds=300,
+        policy="strict",
+    )
+
+
+def _contract() -> OptionContract:
+    return OptionContract(
+        symbol="SPY",
+        expiration=date(2026, 7, 1),
+        strike=500.0,
+        option_type="call",
+        is_0dte=True,
+    )
+
+
+def _setup() -> PlaybookSetup:
+    return PlaybookSetup(
+        setup_id="s1",
+        name="t",
+        direction="long_call",
+        enabled=True,
+        stop_rule="0.5",
+        take_profit_rule="1.0",
+        stop_pct=0.3,
+        take_profit_pct=0.5,
+        time_stop_minutes=30,
+    )
+
+
+def _candidate(contract: OptionContract, now: datetime, quantity: int = 1) -> TradeCandidate:
+    quote = OptionQuote(contract=contract, bid=0.9, ask=1.0, timestamp=now)
+    return TradeCandidate(
+        run_id="life",
+        setup_id="s1",
+        contract=contract,
+        quote=quote,
+        direction="long_call",
+        entry_limit_price=1.0,
+        stop_price=0.7,
+        take_profit_price=1.5,
+        quantity=quantity,
+    )
+
+
+def _handler(broker: PaperBroker, bridge: CompatibilityLivePaperBridge):
+    exec_broker = ExecutionDelegatingBroker(inner=broker, bridge=bridge)
+    risk = _risk()
+    reactive = ReactiveEngine(
+        RiskGovernor(risk, SafetyMode.PAPER, live_enabled=False), exec_broker
+    )
+    capital = CapitalBudget(
+        plan=CapitalPlan(
+            authorized_usd=1000,
+            target_profit_pct=10,
+            max_concurrent_positions=1,
+            max_contracts_per_trade=5,
+            min_contracts_per_trade=1,
+        )
+    )
+
+    class _Prov:
+        current_time = datetime(2026, 7, 1, 11, 0, tzinfo=ET)
+
+        def get_latest_snapshot(self):
+            return None
+
+    handler = MarketEventHandler(
+        provider=_Prov(),  # type: ignore[arg-type]
+        reactive_engine=reactive,
+        risk_governor=reactive.risk_governor,
+        broker=exec_broker,
+        feature_engine=FeatureEngine(),
+        option_selector=OptionSelector(),
+        exit_manager=ExitManager(),
+        mode=SafetyMode.PAPER,
+        run_id="life-1",
+        capital_budget=capital,
+        task1_bridge=bridge,
+    )
+    return handler, capital, exec_broker
+
+
+def test_unfilled_exit_keeps_position_and_capital(tmp_path: Path) -> None:
+    class OpenExitBroker(PaperBroker):
+        def _should_fill(self, intent: OrderIntent, fill_price: float) -> bool:
+            if intent.side == "sell":
+                return False
+            return super()._should_fill(intent, fill_price)
+
+    broker = OpenExitBroker(slippage_pct=0)
+    bridge = CompatibilityLivePaperBridge(
+        broker=broker, db_path=tmp_path / "u.db", session_id="u1"
+    )
+    bridge.start()
+    try:
+        handler, capital, exec_broker = _handler(broker, bridge)
+        contract = _contract()
+        buy = OrderIntent(
+            candidate_id="b",
+            contract=contract,
+            side="buy",
+            order_type="limit",
+            quantity=1,
+            limit_price=1.0,
+        )
+        buy_order = exec_broker.submit_order(buy)
+        assert buy_order.status == "filled"
+        cid = contract_id_for(contract)
+        handler.state.open_trade = OpenTradeContext(
+            position_id="p1",
+            entry_price=1.0,
+            stop_price=0.5,
+            take_profit_price=2.0,
+            entry_time=handler.provider.current_time,
+            time_stop_minutes=30,
+            quantity=1,
+            reserved_notional_usd=100.0,
+        )
+        capital.reserve(100.0)
+        reserved_before = capital.reserved_usd
+        realized_before = capital.realized_pnl_usd
+
+        sell = OrderIntent(
+            candidate_id="s",
+            contract=contract,
+            side="sell",
+            order_type="limit",
+            quantity=1,
+            limit_price=1.5,
+        )
+        sell_order = exec_broker.submit_order(sell)
+        assert sell_order.status == "open"
+        handler.state.pending_exit = PendingExit(
+            client_order_id=sell.intent_id,
+            broker_order_id=sell_order.order_id,
+            position_id="p1",
+            contract_id=cid,
+            requested_quantity=1,
+            reason="stop_loss",
+            submitted_at=handler.provider.current_time,
+        )
+        handler._reconcile_pending_exit()
+        assert handler.state.open_trade is not None
+        assert handler.state.trades_exited == 0
+        assert capital.reserved_usd == reserved_before
+        assert capital.realized_pnl_usd == realized_before
+        assert handler.state.pending_exit is not None
+        proj = bridge.project_session()
+        assert proj.positions[cid].quantity == Decimal("1")
+        assert proj.positions[cid].open is True
+    finally:
+        bridge.shutdown()
+
+
+def test_rejected_exit_keeps_position(tmp_path: Path) -> None:
+    broker = PaperBroker(slippage_pct=0)
+    bridge = CompatibilityLivePaperBridge(
+        broker=broker, db_path=tmp_path / "r.db", session_id="r1"
+    )
+    bridge.start()
+    try:
+        handler, capital, exec_broker = _handler(broker, bridge)
+        contract = _contract()
+        buy = OrderIntent(
+            candidate_id="b",
+            contract=contract,
+            side="buy",
+            order_type="limit",
+            quantity=1,
+            limit_price=1.0,
+        )
+        exec_broker.submit_order(buy)
+        handler.state.open_trade = OpenTradeContext(
+            position_id="p1",
+            entry_price=1.0,
+            stop_price=0.5,
+            take_profit_price=2.0,
+            entry_time=handler.provider.current_time,
+            time_stop_minutes=30,
+            quantity=1,
+            reserved_notional_usd=100.0,
+        )
+        capital.reserve(100.0)
+        logs: list[str] = []
+        handler._on_log = lambda et, p=None: logs.append(et)
+
+        # Rejected exit via degraded health → no exit.executed
+        bridge.health.degraded = True
+        sell = OrderIntent(
+            candidate_id="s",
+            contract=contract,
+            side="sell",
+            order_type="limit",
+            quantity=1,
+            limit_price=1.5,
+        )
+        rejected = exec_broker.submit_order(sell)
+        assert rejected.status == "rejected"
+        bridge.health.degraded = False
+        assert handler.state.open_trade is not None
+        assert handler.state.trades_exited == 0
+        assert "exit.executed" not in logs
+    finally:
+        bridge.shutdown()
+
+
+def test_partial_exit_leaves_one_contract(tmp_path: Path) -> None:
+    broker = PaperBroker(slippage_pct=0)
+    bridge = CompatibilityLivePaperBridge(
+        broker=broker, db_path=tmp_path / "p.db", session_id="p1"
+    )
+    bridge.start()
+    try:
+        handler, capital, exec_broker = _handler(broker, bridge)
+        contract = _contract()
+        buy = OrderIntent(
+            candidate_id="b",
+            contract=contract,
+            side="buy",
+            order_type="limit",
+            quantity=2,
+            limit_price=1.0,
+        )
+        exec_broker.submit_order(buy)
+        cid = contract_id_for(contract)
+        handler.state.open_trade = OpenTradeContext(
+            position_id="p1",
+            entry_price=1.0,
+            stop_price=0.5,
+            take_profit_price=2.0,
+            entry_time=handler.provider.current_time,
+            time_stop_minutes=30,
+            quantity=2,
+            reserved_notional_usd=200.0,
+        )
+        capital.reserve(200.0)
+        sell = OrderIntent(
+            candidate_id="s",
+            contract=contract,
+            side="sell",
+            order_type="limit",
+            quantity=1,
+            limit_price=1.2,
+        )
+        sell_order = exec_broker.submit_order(sell)
+        handler.state.pending_exit = PendingExit(
+            client_order_id=sell.intent_id,
+            broker_order_id=sell_order.order_id,
+            position_id="p1",
+            contract_id=cid,
+            requested_quantity=1,
+            reason="take_profit",
+            submitted_at=handler.provider.current_time,
+        )
+        handler._reconcile_pending_exit()
+        assert handler.state.open_trade is not None
+        assert handler.state.open_trade.quantity == 1
+        assert handler.state.trades_exited == 0
+        proj = bridge.project_session()
+        assert proj.positions[cid].quantity == Decimal("1")
+        assert proj.positions[cid].realized_pnl > 0
+    finally:
+        bridge.shutdown()
+
+
+def test_completed_exit_uses_ledger_pnl(tmp_path: Path) -> None:
+    broker = PaperBroker(slippage_pct=0)
+    bridge = CompatibilityLivePaperBridge(
+        broker=broker, db_path=tmp_path / "c.db", session_id="c1"
+    )
+    bridge.start()
+    try:
+        handler, capital, exec_broker = _handler(broker, bridge)
+        contract = _contract()
+        buy = OrderIntent(
+            candidate_id="b",
+            contract=contract,
+            side="buy",
+            order_type="limit",
+            quantity=1,
+            limit_price=1.0,
+        )
+        exec_broker.submit_order(buy)
+        cid = contract_id_for(contract)
+        handler.state.open_trade = OpenTradeContext(
+            position_id="p1",
+            entry_price=1.0,
+            stop_price=0.5,
+            take_profit_price=2.0,
+            entry_time=handler.provider.current_time,
+            time_stop_minutes=30,
+            quantity=1,
+            reserved_notional_usd=100.0,
+        )
+        capital.reserve(100.0)
+        sell = OrderIntent(
+            candidate_id="s",
+            contract=contract,
+            side="sell",
+            order_type="limit",
+            quantity=1,
+            limit_price=1.5,
+        )
+        sell_order = exec_broker.submit_order(sell)
+        handler.state.pending_exit = PendingExit(
+            client_order_id=sell.intent_id,
+            broker_order_id=sell_order.order_id,
+            position_id="p1",
+            contract_id=cid,
+            requested_quantity=1,
+            reason="take_profit",
+            submitted_at=handler.provider.current_time,
+        )
+        logs: list[str] = []
+        handler._on_log = lambda et, p=None: logs.append(et)
+        handler._reconcile_pending_exit()
+        assert handler.state.open_trade is None
+        assert handler.state.pending_exit is None
+        assert handler.state.trades_exited == 1
+        assert capital.reserved_usd == 0.0
+        assert capital.realized_pnl_usd == 50.0
+        assert "exit.executed" in logs
+        proj = bridge.project_session()
+        assert proj.positions[cid].quantity == Decimal("0")
+        assert proj.positions[cid].realized_pnl == Decimal("50")
+    finally:
+        bridge.shutdown()
+
+
+def test_verified_entry_waits_for_fill_price(tmp_path: Path) -> None:
+    broker = PaperBroker(slippage_pct=0)
+    bridge = CompatibilityLivePaperBridge(
+        broker=broker, db_path=tmp_path / "e.db", session_id="e1"
+    )
+    bridge.start()
+    try:
+        handler, capital, exec_broker = _handler(broker, bridge)
+        setup = _setup()
+        contract = _contract()
+        candidate = _candidate(contract, handler.provider.current_time)
+        # Pending entry with client id not in ledger → stay pending.
+        handler.state.pending_entry = PendingEntry(
+            order_id="orphan",
+            client_order_id="missing-in-ledger",
+            candidate=candidate,
+            setup=setup,
+        )
+        handler._reconcile_pending_entry()
+        assert handler.state.open_trade is None
+        assert handler.state.pending_entry is not None
+
+        buy = OrderIntent(
+            candidate_id="b2",
+            contract=contract,
+            side="buy",
+            order_type="limit",
+            quantity=1,
+            limit_price=1.0,
+        )
+        order = exec_broker.submit_order(buy)
+        handler.state.pending_entry = PendingEntry(
+            order_id=order.order_id,
+            client_order_id=buy.intent_id,
+            candidate=candidate,
+            setup=setup,
+        )
+        handler._reconcile_pending_entry()
+        assert handler.state.open_trade is not None
+        assert handler.state.open_trade.entry_price == 1.0
+        assert handler.state.pending_entry is None
+    finally:
+        bridge.shutdown()
+
+
+def test_cancellation_writes_ledger_event(tmp_path: Path) -> None:
+    broker = PaperBroker(slippage_pct=50)
+    bridge = CompatibilityLivePaperBridge(
+        broker=broker, db_path=tmp_path / "x.db", session_id="x1"
+    )
+    bridge.start()
+    try:
+        exec_broker = ExecutionDelegatingBroker(inner=broker, bridge=bridge)
+        contract = _contract()
+        intent = OrderIntent(
+            candidate_id="c",
+            contract=contract,
+            side="buy",
+            order_type="limit",
+            quantity=1,
+            limit_price=0.01,
+        )
+        order = exec_broker.submit_order(intent)
+        assert order.status == "open"
+        cancelled = exec_broker.cancel_order(order.order_id)
+        assert cancelled.status == "cancelled"
+        events = bridge.run_coro(
+            bridge.supervisor.ledger_store.get_by_session("x1")  # type: ignore[union-attr]
+        )
+        assert any(e.event_type.value == "cancellation" for e in events)
+    finally:
+        bridge.shutdown()
+
+
+def test_full_cli_session_buy_sell_via_runtimes(tmp_path: Path) -> None:
+    broker = PaperBroker(slippage_pct=0)
+    bridge = CompatibilityLivePaperBridge(
+        broker=broker, db_path=tmp_path / "f.db", session_id="f1"
+    )
+    bridge.start()
+    try:
+        handler, capital, exec_broker = _handler(broker, bridge)
+        start = datetime(2026, 7, 1, 10, 0, tzinfo=ET)
+        bridge.ingest_underlying_quote(
+            symbol="SPY",
+            last=Decimal("500"),
+            bid=Decimal("499.9"),
+            ask=Decimal("500.1"),
+            source_timestamp=start,
+            received_timestamp=start,
+        )
+        contract = _contract()
+        buy = OrderIntent(
+            candidate_id="b",
+            contract=contract,
+            side="buy",
+            order_type="limit",
+            quantity=1,
+            limit_price=1.0,
+        )
+        buy_order = exec_broker.submit_order(buy)
+        assert buy_order.status == "filled"
+        assert handler.state.open_trade is None
+        handler.state.pending_entry = PendingEntry(
+            order_id=buy_order.order_id,
+            client_order_id=buy.intent_id,
+            candidate=_candidate(contract, start),
+            setup=_setup(),
+        )
+        handler._reconcile_pending_entry()
+        assert handler.state.open_trade is not None
+        capital.reserve(handler.state.open_trade.reserved_notional_usd)
+
+        sell = OrderIntent(
+            candidate_id="s",
+            contract=contract,
+            side="sell",
+            order_type="limit",
+            quantity=1,
+            limit_price=1.4,
+        )
+        sell_order = exec_broker.submit_order(sell)
+        handler.state.pending_exit = PendingExit(
+            client_order_id=sell.intent_id,
+            broker_order_id=sell_order.order_id,
+            position_id=handler.state.open_trade.position_id,
+            contract_id=contract_id_for(contract),
+            requested_quantity=1,
+            reason="take_profit",
+            submitted_at=start,
+        )
+        assert handler.state.trades_exited == 0
+        handler._reconcile_pending_exit()
+        assert handler.state.open_trade is None
+        assert handler.state.trades_exited == 1
+        proj = bridge.project_session()
+        cid = contract_id_for(contract)
+        assert proj.positions[cid].quantity == Decimal("0")
+        assert proj.positions[cid].realized_pnl == Decimal("40")
+    finally:
+        bridge.shutdown()
