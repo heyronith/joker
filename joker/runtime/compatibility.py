@@ -124,6 +124,8 @@ class CompatibilityLivePaperBridge:
 
     def run_coro(self, coro: Any) -> Any:
         """Run an async coroutine on the bridge event loop."""
+        if self._loop.is_closed():
+            self._loop = asyncio.new_event_loop()
         return self._loop.run_until_complete(coro)
 
     def start(self) -> None:
@@ -134,9 +136,23 @@ class CompatibilityLivePaperBridge:
     def shutdown(self) -> None:
         if not self._started:
             return
-        self.run_coro(self._supervisor.shutdown())
         self._started = False
-        self._loop.close()
+        try:
+            if not self._loop.is_closed():
+                self.run_coro(self._supervisor.shutdown())
+        finally:
+            if not self._loop.is_closed():
+                try:
+                    pending = asyncio.all_tasks(self._loop)
+                    for task in pending:
+                        task.cancel()
+                    if pending:
+                        self._loop.run_until_complete(
+                            asyncio.gather(*pending, return_exceptions=True)
+                        )
+                except Exception:
+                    pass
+                self._loop.close()
 
     def _sync_health_to_graph(self) -> None:
         """Persist truth-layer degradation into session/graph state for audit."""
@@ -196,13 +212,9 @@ class CompatibilityLivePaperBridge:
             raise
 
     def tick(self, now: datetime | None = None) -> Any:
+        """Advance MarketRuntime clocks/bars without changing truth-layer health."""
         market = self._require_market()
-        try:
-            result = self.run_coro(market.tick(now=now))
-            return self._ingest_ok(result)
-        except Exception as exc:
-            self._ingest_fail(exc)
-            raise
+        return self.run_coro(market.tick(now=now))
 
     def submit_execution_command(self, command: ExecutionCommand) -> BrokerOrder:
         if not self.health.allows_execution:

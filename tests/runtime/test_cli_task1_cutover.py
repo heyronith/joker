@@ -76,11 +76,15 @@ def test_paper_path_task1_cutover_components(tmp_path: Path) -> None:
 def test_live_paper_runner_constructs_bridge_on_run_start(tmp_path: Path, monkeypatch) -> None:
     """LivePaperRunner.run instantiates CompatibilityLivePaperBridge (cutover)."""
     app = AppSettings(db_path=str(tmp_path / "app.db"))
-    # OPENAI_API_KEY is required by EnvSettings; CI has no .env — set explicitly.
+    # EnvSettings fields use aliases; CI has no .env — set env vars + construct explicitly.
+    monkeypatch.setenv("OPENAI_API_KEY", "test-ci-key-not-real")
+    monkeypatch.setenv("WEBULL_MARKET_DATA_ENABLED", "true")
+    monkeypatch.setenv("WEBULL_LIVE_TRADING_ENABLED", "false")
     env = EnvSettings(
+        _env_file=None,
         OPENAI_API_KEY="test-ci-key-not-real",
-        webull_market_data_enabled=True,
-        webull_live_trading_enabled=False,
+        WEBULL_MARKET_DATA_ENABLED=True,
+        WEBULL_LIVE_TRADING_ENABLED=False,
     )
     runner = LivePaperRunner(app, env)
 
