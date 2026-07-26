@@ -137,16 +137,117 @@ class CognitiveAgentRuntime:
         if self._checkpointer_helper is not None:
             saver = await self._checkpointer_helper.open()
             self._deps.checkpointer = saver
+        from joker.runtime.order_action_gateway import ensure_order_action_gateway
+
+        ensure_order_action_gateway(self._deps)
+        if self._deps.cycle_registry is None and self._deps.db_path is not None:
+            from joker.persistence.cognitive_cycle_registry import CognitiveCycleRegistry
+
+            registry = CognitiveCycleRegistry(
+                Path(self._deps.db_path).with_name(
+                    Path(self._deps.db_path).stem + "_cognitive_cycles.db"
+                )
+            )
+            await registry.initialize()
+            self._deps.cycle_registry = registry
+        if (
+            self._deps.order_management_action_repo is None
+            and self._deps.db_path is not None
+        ):
+            from joker.persistence.order_management_actions import (
+                OrderManagementActionRepository,
+            )
+
+            om_repo = OrderManagementActionRepository(
+                Path(self._deps.db_path).with_name(
+                    Path(self._deps.db_path).stem + "_om_actions.db"
+                )
+            )
+            await om_repo.initialize()
+            self._deps.order_management_action_repo = om_repo
         self._decision_graph = build_cognitive_graph(self._deps)
         self._position_graph = build_position_graph(self._deps)
         self._started = True
         self._shutdown = False
+        # Resume unfinished cycles before accepting new events.
+        try:
+            await self._resume_unfinished_cycles()
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("cognitive_cycle_recovery_failed", exc_info=exc)
+            self._status = "degraded"
+            self._counters.last_error = CognitiveError(
+                error_code="cycle_recovery_failed",
+                message=str(exc),
+                recoverable=True,
+            )
         self._decision_worker = asyncio.create_task(
             self._decision_worker_loop(), name="cognitive-decision-worker"
         )
         self._position_worker = asyncio.create_task(
             self._position_worker_loop(), name="cognitive-position-worker"
         )
+
+    async def _resume_unfinished_cycles(self) -> None:
+        registry = self._deps.cycle_registry
+        if registry is None or self._deps.checkpointer is None:
+            return
+        from joker.graph.langgraph_checkpointer import ainvoke_config
+        from joker.persistence.cognitive_cycle_registry import CognitiveCycleRecord
+
+        resumable = await registry.list_resumable(self._session_id)
+        for record in resumable:
+            graph = (
+                self._decision_graph
+                if record.graph_kind == "decision"
+                else self._position_graph
+            )
+            if graph is None:
+                continue
+            config = ainvoke_config(
+                session_id=record.session_id,
+                graph_kind=record.graph_kind,
+                cycle_id=record.cycle_id,
+            )
+            await registry.upsert(
+                CognitiveCycleRecord(
+                    session_id=record.session_id,
+                    graph_kind=record.graph_kind,
+                    cycle_id=record.cycle_id,
+                    trigger_event_id=record.trigger_event_id,
+                    snapshot_id=record.snapshot_id,
+                    status="running",
+                    checkpoint_thread_id=record.checkpoint_thread_id,
+                    last_completed_node=record.last_completed_node,
+                    parent_entry_cycle_id=record.parent_entry_cycle_id,
+                    original_strategy_id=record.original_strategy_id,
+                    original_proposal_id=record.original_proposal_id,
+                    payload=record.payload,
+                )
+            )
+            try:
+                await graph.ainvoke(None, config=config)
+                await registry.upsert(
+                    CognitiveCycleRecord(
+                        session_id=record.session_id,
+                        graph_kind=record.graph_kind,
+                        cycle_id=record.cycle_id,
+                        trigger_event_id=record.trigger_event_id,
+                        snapshot_id=record.snapshot_id,
+                        status="completed",
+                        checkpoint_thread_id=record.checkpoint_thread_id,
+                        last_completed_node=record.last_completed_node,
+                        parent_entry_cycle_id=record.parent_entry_cycle_id,
+                        original_strategy_id=record.original_strategy_id,
+                        original_proposal_id=record.original_proposal_id,
+                        payload=record.payload,
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "cycle_resume_failed",
+                    extra={"cycle_id": record.cycle_id, "error": str(exc)},
+                )
+                self._status = "degraded"
 
     async def shutdown(self) -> None:
         """Checkpoint active cycles rather than merely cancelling them."""
@@ -228,6 +329,7 @@ class CognitiveAgentRuntime:
             or ""
         )
         open_positions = await self._open_position_contract_ids()
+        working_entry = await self._has_working_entry_order()
         if open_positions and self._config.position.enabled:
             for contract_id in open_positions:
                 enriched = make_event(
@@ -243,6 +345,7 @@ class CognitiveAgentRuntime:
                         "position_id": contract_id,
                         "contract_id": contract_id,
                         "active_position_id": contract_id,
+                        "trigger_event_id": str(event.event_id),
                     },
                 )
                 self._sequence += 1
@@ -254,8 +357,8 @@ class CognitiveAgentRuntime:
                         kind="position",
                     )
                 )
-        # New-entry only when flat (operationally appropriate default).
-        if not open_positions:
+        # New-entry only when flat and no working entry order.
+        if not open_positions and not working_entry:
             if (
                 self._config.market_snapshot_coalescing
                 and self._new_entry_in_flight
@@ -274,6 +377,20 @@ class CognitiveAgentRuntime:
         self._counters.queued_events = (
             self._decision_queue.qsize() + self._position_queue.qsize()
         )
+
+    async def _has_working_entry_order(self) -> bool:
+        if self._deps.projection_loader is None:
+            return False
+        try:
+            projection = await self._deps.projection_loader()
+        except Exception:
+            return False
+        from joker.runtime.order_action_gateway import (
+            has_working_entry_order,
+            working_orders_from_projection,
+        )
+
+        return has_working_entry_order(working_orders_from_projection(projection))
 
     async def _open_position_contract_ids(self) -> list[str]:
         if self._deps.projection_loader is None:
@@ -440,6 +557,12 @@ class CognitiveAgentRuntime:
 
     async def _invoke_decision_graph(self, event: DomainEvent) -> None:
         assert self._decision_graph is not None
+        if await self._has_working_entry_order():
+            logger.info(
+                "decision_cycle_skipped_working_entry",
+                extra={"event_id": str(event.event_id)},
+            )
+            return
         snapshot_id = str(
             event.payload.get("snapshot_id")
             or event.payload.get("market_snapshot_id")
@@ -448,6 +571,24 @@ class CognitiveAgentRuntime:
         if not snapshot_id:
             return
         cycle_id = str(event.payload.get("cycle_id") or uuid4())
+        from joker.graph.langgraph_checkpointer import cognitive_thread_id
+        from joker.persistence.cognitive_cycle_registry import CognitiveCycleRecord
+
+        thread_id = cognitive_thread_id(
+            session_id=self._session_id, graph_kind="decision", cycle_id=cycle_id
+        )
+        if self._deps.cycle_registry is not None:
+            await self._deps.cycle_registry.upsert(
+                CognitiveCycleRecord(
+                    session_id=self._session_id,
+                    graph_kind="decision",
+                    cycle_id=cycle_id,
+                    trigger_event_id=str(event.event_id),
+                    snapshot_id=snapshot_id,
+                    status="running",
+                    checkpoint_thread_id=thread_id,
+                )
+            )
         state = initial_cycle_state(
             session_id=self._session_id,
             run_id=self._run_id,
@@ -480,6 +621,18 @@ class CognitiveAgentRuntime:
             )
             self._counters.last_success_at = datetime.now(timezone.utc)
             self._status = "healthy"
+            if self._deps.cycle_registry is not None:
+                await self._deps.cycle_registry.upsert(
+                    CognitiveCycleRecord(
+                        session_id=self._session_id,
+                        graph_kind="decision",
+                        cycle_id=cycle_id,
+                        trigger_event_id=str(event.event_id),
+                        snapshot_id=snapshot_id,
+                        status="completed",
+                        checkpoint_thread_id=thread_id,
+                    )
+                )
         except asyncio.TimeoutError:
             self._counters.last_error = CognitiveError(
                 error_code="cycle_timeout",
@@ -565,7 +718,44 @@ class CognitiveAgentRuntime:
                 extra={"position_id": position_id},
             )
             return
-        cycle_id = str(resolved.get("cycle_id") or uuid4())
+        # Position reassessment always gets its own cycle — never reuse entry.
+        from joker.persistence.cognitive_cycle_registry import stable_position_cycle_id
+
+        cycle_id = stable_position_cycle_id(
+            self._session_id,
+            str(event.event_id),
+        )
+        parent_entry_cycle_id = str(
+            resolved.get("parent_entry_cycle_id")
+            or resolved.get("cycle_id")
+            or ""
+        ) or None
+        from joker.graph.langgraph_checkpointer import cognitive_thread_id
+        from joker.persistence.cognitive_cycle_registry import CognitiveCycleRecord
+
+        thread_id = cognitive_thread_id(
+            session_id=self._session_id, graph_kind="position", cycle_id=cycle_id
+        )
+        if self._deps.cycle_registry is not None:
+            await self._deps.cycle_registry.upsert(
+                CognitiveCycleRecord(
+                    session_id=self._session_id,
+                    graph_kind="position",
+                    cycle_id=cycle_id,
+                    trigger_event_id=str(event.event_id),
+                    snapshot_id=snapshot_id,
+                    status="running",
+                    checkpoint_thread_id=thread_id,
+                    parent_entry_cycle_id=parent_entry_cycle_id,
+                    original_strategy_id=str(
+                        resolved.get("original_strategy_id")
+                        or resolved.get("strategy_id")
+                        or ""
+                    )
+                    or None,
+                    original_proposal_id=str(resolved.get("proposal_id") or "") or None,
+                )
+            )
         self._counters.active_position_cycles += 1
         state: dict[str, Any] = {
             "session_id": self._session_id,
@@ -576,6 +766,13 @@ class CognitiveAgentRuntime:
             "_contract_id": resolved.get("contract_id") or position_id,
             "_original_strategy_id": resolved.get("original_strategy_id")
             or resolved.get("strategy_id"),
+            "_parent_entry_cycle_id": parent_entry_cycle_id,
+            "_original_proposal_id": resolved.get("proposal_id"),
+            # Clear per-cycle transients explicitly.
+            "_position_command_id": None,
+            "_position_decision": None,
+            "_position_thesis": None,
+            "_position_critic_notes": None,
         }
         config = ainvoke_config(
             session_id=self._session_id,
@@ -587,6 +784,25 @@ class CognitiveAgentRuntime:
         try:
             await task
             self._counters.last_success_at = datetime.now(timezone.utc)
+            if self._deps.cycle_registry is not None:
+                await self._deps.cycle_registry.upsert(
+                    CognitiveCycleRecord(
+                        session_id=self._session_id,
+                        graph_kind="position",
+                        cycle_id=cycle_id,
+                        trigger_event_id=str(event.event_id),
+                        snapshot_id=snapshot_id,
+                        status="completed",
+                        checkpoint_thread_id=thread_id,
+                        original_strategy_id=str(
+                            resolved.get("original_strategy_id")
+                            or resolved.get("strategy_id")
+                            or ""
+                        )
+                        or None,
+                        original_proposal_id=str(resolved.get("proposal_id") or "") or None,
+                    )
+                )
         finally:
             self._active_position_tasks.discard(task)
             self._counters.active_position_cycles = max(
@@ -680,13 +896,18 @@ class CognitiveAgentRuntime:
         self._order_decision_ids.add(decision_key)
         if self._deps.order_management_repo is not None:
             await self._deps.order_management_repo.append(decision)
-        await self._apply_order_decision(decision, order_projection=order_projection)
+        await self._apply_order_decision(
+            decision,
+            order_projection=order_projection,
+            trigger_event_id=str(event.event_id),
+        )
 
     async def _apply_order_decision(
         self,
         decision: OrderManagementDecision,
         *,
         order_projection: dict[str, Any] | None = None,
+        trigger_event_id: str | None = None,
     ) -> None:
         runtime = self._deps.execution_runtime
         if runtime is None:
@@ -694,6 +915,31 @@ class CognitiveAgentRuntime:
         action = decision.action
         if action == "continue_waiting":
             return
+        source_state = str(
+            (order_projection or {}).get("status")
+            or (order_projection or {}).get("event_type")
+            or "unknown"
+        )
+        from joker.persistence.order_management_actions import (
+            OrderManagementActionRecord,
+            make_order_management_action_key,
+        )
+
+        action_key = make_order_management_action_key(
+            source_order_id=decision.client_order_id,
+            source_order_state=source_state,
+            trigger_event_id=str(trigger_event_id or ""),
+            decision_id=str(decision.decision_id),
+            action=str(action),
+        )
+        om_repo = self._deps.order_management_action_repo
+        if om_repo is not None and await om_repo.has_key(action_key):
+            logger.info(
+                "order_management_action_idempotent_skip",
+                extra={"action_key": action_key, "action": action},
+            )
+            return
+
         if action in {"cancel", "abandon"}:
             try:
                 await runtime.cancel_order(client_order_id=decision.client_order_id)
@@ -705,19 +951,29 @@ class CognitiveAgentRuntime:
                         "error": str(exc),
                     },
                 )
+                return
+            if om_repo is not None:
+                await om_repo.record(
+                    OrderManagementActionRecord(
+                        action_key=action_key,
+                        session_id=self._session_id,
+                        source_order_id=decision.client_order_id,
+                        action=str(action),
+                        source_order_state=source_state,
+                        trigger_event_id=str(trigger_event_id or ""),
+                        decision_id=str(decision.decision_id),
+                    )
+                )
             return
         if action in {"replace", "reduce_quantity"}:
-            try:
-                await runtime.cancel_order(client_order_id=decision.client_order_id)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "order_replace_cancel_failed",
-                    extra={
-                        "client_order_id": decision.client_order_id,
-                        "error": str(exc),
-                    },
-                )
+            if self._deps.order_action_gateway is None:
+                logger.warning("order_replace_skipped_no_gateway")
                 return
+            from joker.runtime.order_action_gateway import (
+                OrderActionKind,
+                OrderActionRequest,
+            )
+
             projection = order_projection or {}
             contract = projection.get("_contract_obj") or projection.get("contract")
             if isinstance(contract, dict):
@@ -730,8 +986,7 @@ class CognitiveAgentRuntime:
                     extra={"client_order_id": decision.client_order_id},
                 )
                 return
-            from joker.runtime.execution_runtime import ExecutionCommand
-            from joker.schemas.domain import OrderIntent
+            from joker.runtime.execution_runtime import contract_id_for
 
             side = str(projection.get("side") or "buy")
             qty = int(
@@ -760,32 +1015,32 @@ class CognitiveAgentRuntime:
                 )
             )
             new_client_id = f"{decision.client_order_id}:replace:{decision.decision_id}"
-            intent = OrderIntent(
-                intent_id=new_client_id,
-                candidate_id=str(decision.decision_id),
-                contract=contract,
-                side=side,  # type: ignore[arg-type]
-                order_type="limit" if limit is not None else "market",
-                quantity=qty,
-                limit_price=limit,
-            )
-            await runtime.submit_execution_command(
-                ExecutionCommand(client_order_id=new_client_id, intent=intent)
-            )
-            if self._deps.provenance_registry is not None:
-                from joker.persistence.cognitive_execution_provenance import (
-                    ExecutionProvenanceRecord,
+            result = await self._deps.order_action_gateway.submit(
+                OrderActionRequest(
+                    action=OrderActionKind.REPLACE,
+                    snapshot_id=str(decision.snapshot_id),
+                    contract_id=contract_id_for(contract),
+                    side=side,  # type: ignore[arg-type]
+                    quantity=qty,
+                    client_order_id=new_client_id,
+                    limit_price=limit,
+                    order_type="limit" if limit is not None else "market",
+                    decision_id=str(decision.decision_id),
+                    cycle_id=str(decision.cycle_id),
+                    replace_of_client_order_id=decision.client_order_id,
                 )
-                from joker.runtime.execution_runtime import contract_id_for
-
-                await self._deps.provenance_registry.record(
-                    ExecutionProvenanceRecord(
-                        client_order_id=new_client_id,
-                        decision_id=str(decision.decision_id),
-                        snapshot_id=str(decision.snapshot_id),
-                        contract_id=contract_id_for(contract),
+            )
+            if result.submitted and om_repo is not None:
+                await om_repo.record(
+                    OrderManagementActionRecord(
+                        action_key=action_key,
                         session_id=self._session_id,
-                        kind="replace",
+                        source_order_id=decision.client_order_id,
+                        action=str(action),
+                        source_order_state=source_state,
+                        trigger_event_id=str(trigger_event_id or ""),
+                        decision_id=str(decision.decision_id),
+                        replacement_client_order_id=new_client_id,
                     )
                 )
             return

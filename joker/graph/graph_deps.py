@@ -74,6 +74,9 @@ class CognitiveGraphDeps:
     data_quality_loader: DataQualityLoader | None = None
     projection_loader: ProjectionLoader | None = None
     provenance_registry: CognitiveExecutionProvenanceRegistry | None = None
+    order_action_gateway: Any | None = None
+    cycle_registry: Any | None = None
+    order_management_action_repo: Any | None = None
     submitted_proposal_ids: set[str] = field(default_factory=set)
 
     def limits_dict(self) -> dict[str, int]:

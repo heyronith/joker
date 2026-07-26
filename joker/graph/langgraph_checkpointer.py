@@ -48,10 +48,12 @@ class CognitiveCheckpointer:
         conn = self._conn
         self._saver = None
         self._conn = None
+        worker = None
         if conn is not None:
+            worker = getattr(conn, "_connection_thread", None) or getattr(
+                conn, "_thread", None
+            )
             try:
-                # Flush pending checkpoint writes then close the owned connection
-                # while the event loop is still alive.
                 await conn.commit()
             except Exception:
                 pass
@@ -61,9 +63,16 @@ class CognitiveCheckpointer:
                 logger.warning(
                     "cognitive_checkpointer_close_failed", extra={"error": str(exc)}
                 )
-        # Allow aiosqlite worker threads to observe the closed connection.
         import asyncio
 
+        # Drain the loop so aiosqlite's worker can observe the closed connection
+        # before the event loop itself is destroyed.
+        await asyncio.sleep(0)
+        if worker is not None and getattr(worker, "is_alive", lambda: False)():
+            try:
+                await asyncio.to_thread(worker.join, 2.0)
+            except Exception:
+                pass
         await asyncio.sleep(0)
         logger.info(
             "cognitive_checkpointer_closed",

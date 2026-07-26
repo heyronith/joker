@@ -879,16 +879,38 @@ class LivePaperRunner:
                                         option_snapshots_to_surface_rows,
                                     )
 
-                                    surface_snaps = options_provider.fetch_surface_snapshots(
-                                        float(event.price)
+                                    trading_day = None
+                                    try:
+                                        trading_day = (
+                                            task1_bridge.supervisor.clock.trading_date()
+                                        )
+                                    except Exception:
+                                        trading_day = None
+                                    fetch = options_provider.fetch_surface_snapshots(
+                                        float(event.price),
+                                        trading_date=trading_day,
+                                        max_contracts=None,
                                     )
-                                    rows = option_snapshots_to_surface_rows(surface_snaps)
+                                    rows = option_snapshots_to_surface_rows(
+                                        fetch.snapshots,
+                                        trading_date=fetch.trading_date,
+                                    )
                                     if rows:
                                         task1_bridge.ingest_option_quotes(rows)
-                                        log(
-                                            "task1.option_surface_ingested",
-                                            {"contract_count": len(rows)},
-                                        )
+                                    findings = fetch.to_data_quality_findings()
+                                    market = task1_bridge.supervisor.market_runtime
+                                    if market is not None and findings:
+                                        market.enqueue_quality_findings(findings)
+                                    log(
+                                        "task1.option_surface_ingested",
+                                        {
+                                            "contract_count": len(rows),
+                                            "discovered_count": fetch.discovered_count,
+                                            "fetched_count": fetch.fetched_count,
+                                            "complete": fetch.complete,
+                                            "failed_batches": list(fetch.failed_batches),
+                                        },
+                                    )
                                 except Exception as opt_exc:
                                     log(
                                         "task1.option_surface_ingest_failed",

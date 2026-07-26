@@ -36,6 +36,7 @@ class ProvenancedExecutionCommand:
     snapshot_id: str
     cycle_id: str
     evidence_ids: tuple[str, ...]
+    max_quote_age_seconds: int | None = 3600
 
 
 @dataclass(frozen=True)
@@ -57,6 +58,7 @@ class AuthoritativeMarketTruth:
     snapshot: MarketSnapshot
     data_quality: DataQualityReport | None = None
     option_surface: OptionSurfaceSnapshot | None = None
+    working_orders: tuple[Any, ...] = ()
     open_order_client_ids: frozenset[str] = field(default_factory=frozenset)
     open_position_contract_ids: frozenset[str] = field(default_factory=frozenset)
     already_submitted_proposal_ids: frozenset[str] = field(default_factory=frozenset)
@@ -250,12 +252,26 @@ class ExecutionProposalValidator:
                     raise CognitiveValidationError(
                         "conflicting active position exists for contract"
                     )
-            if truth.open_order_client_ids and leg.side == "buy":
-                # Presence of any open entry-style order blocks duplicate entry.
-                # Callers may pass only conflicting ids.
+            if truth.working_orders:
+                from joker.runtime.order_action_gateway import has_working_entry_order
+
+                if leg.side == "buy" and has_working_entry_order(truth.working_orders):
+                    raise CognitiveValidationError(
+                        "conflicting working entry order exists; no additional entry"
+                    )
+            elif truth.open_order_client_ids and leg.side == "buy":
                 pass
 
-        if truth.open_order_client_ids and proposal.action in {"execute", "probe"}:
+        if truth.working_orders and proposal.action in {"execute", "probe"}:
+            proposal_order_token = str(proposal.proposal_id)
+            if any(
+                getattr(o, "proposal_id", None) == proposal_order_token
+                for o in truth.working_orders
+            ):
+                raise CognitiveValidationError(
+                    "conflicting active order exists for proposal"
+                )
+        elif truth.open_order_client_ids and proposal.action in {"execute", "probe"}:
             # Block when an open working order already covers this proposal id.
             proposal_order_token = str(proposal.proposal_id)
             if any(proposal_order_token in oid for oid in truth.open_order_client_ids):
@@ -341,6 +357,7 @@ class ExecutionCommandCompiler:
             snapshot_id=str(proposal.snapshot_id),
             cycle_id=proposal.cycle_id,
             evidence_ids=tuple(str(eid) for eid in evidence_ids),
+            max_quote_age_seconds=leg.max_quote_age_seconds,
         )
 
 
@@ -442,55 +459,20 @@ def build_truth_from_deps(
     trading_mode: str = "PAPER",
 ) -> AuthoritativeMarketTruth:
     """Assemble authoritative truth from Task 1 repositories / projection."""
-    open_orders: set[str] = set()
-    open_positions: set[str] = set()
-    if projection is not None:
-        orders = getattr(projection, "orders", None) or {}
-        if isinstance(orders, dict):
-            order_iter = orders.values()
-        else:
-            order_iter = orders
-        for order in order_iter:
-            status = getattr(order, "status", None) or (
-                order.get("status") if isinstance(order, dict) else None
-            )
-            client_id = getattr(order, "client_order_id", None) or (
-                order.get("client_order_id") if isinstance(order, dict) else None
-            )
-            status_val = getattr(status, "value", status)
-            if client_id and status_val in {
-                "submitted",
-                "accepted",
-                "partially_filled",
-                "open",
-                "WORKING",
-                "working",
-            }:
-                open_orders.add(str(client_id))
-        positions = getattr(projection, "positions", None) or {}
-        if isinstance(positions, dict):
-            pos_iter = positions.items()
-        else:
-            pos_iter = ((getattr(p, "contract_id", None), p) for p in positions)
-        for key, pos in pos_iter:
-            qty = getattr(pos, "quantity", None)
-            if qty is None and isinstance(pos, dict):
-                qty = pos.get("quantity") or pos.get("net_quantity")
-            cid = getattr(pos, "contract_id", None) or key
-            if cid is None and isinstance(pos, dict):
-                cid = pos.get("contract_id")
-            try:
-                q = Decimal(str(qty)) if qty is not None else Decimal("0")
-            except Exception:
-                q = Decimal("0")
-            if cid and q != 0:
-                open_positions.add(str(cid))
+    from joker.runtime.order_action_gateway import (
+        open_positions_from_projection,
+        working_orders_from_projection,
+    )
+
+    working = working_orders_from_projection(projection)
+    open_positions = open_positions_from_projection(projection)
     return AuthoritativeMarketTruth(
         snapshot=snapshot,
         data_quality=data_quality,
         option_surface=option_surface,
-        open_order_client_ids=frozenset(open_orders),
-        open_position_contract_ids=frozenset(open_positions),
+        working_orders=working,
+        open_order_client_ids=frozenset(o.client_order_id for o in working),
+        open_position_contract_ids=frozenset(open_positions.keys()),
         already_submitted_proposal_ids=frozenset(str(x) for x in already_submitted_proposal_ids),
         trading_mode=trading_mode,
     )

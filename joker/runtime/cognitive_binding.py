@@ -83,3 +83,6 @@ def bind_cognitive_graph_to_task1(
         deps.option_surface_repo = bridge.supervisor.option_surface_repository
     if bridge.supervisor.snapshot_repository is not None:
         deps.snapshot_repo = bridge.supervisor.snapshot_repository
+    from joker.runtime.order_action_gateway import OrderActionGateway
+
+    deps.order_action_gateway = OrderActionGateway(deps)

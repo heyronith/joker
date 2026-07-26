@@ -46,6 +46,53 @@ class AtmCandidateSet:
 
 
 @dataclass
+class SurfaceFetchResult:
+    """Outcome of a complete SPY surface fetch for one trading date."""
+
+    snapshots: list[OptionSnapshot] = field(default_factory=list)
+    discovered_count: int = 0
+    selected_count: int = 0
+    fetched_count: int = 0
+    failed_batches: tuple[str, ...] = ()
+    emergency_truncated: bool = False
+    complete: bool = True
+    trading_date: date | None = None
+
+    def to_data_quality_findings(self) -> list:
+        """Build explicit DQ findings when the surface is incomplete."""
+        from joker.market.quality import (
+            DataQualityCode,
+            DataQualityFinding,
+            DataQualitySeverity,
+        )
+
+        findings: list = []
+        if self.failed_batches or self.emergency_truncated or not self.complete:
+            details: dict[str, str | int | float | bool | None] = {
+                "discovered_count": self.discovered_count,
+                "selected_count": self.selected_count,
+                "fetched_count": self.fetched_count,
+                "emergency_truncated": self.emergency_truncated,
+                "failed_batch_count": len(self.failed_batches),
+            }
+            if self.failed_batches:
+                details["failed_batches"] = "; ".join(self.failed_batches)[:500]
+            findings.append(
+                DataQualityFinding(
+                    code=DataQualityCode.PARTIAL_OPTION_SURFACE,
+                    severity=DataQualitySeverity.ERROR,
+                    message=(
+                        "option surface fetch incomplete; partial surface must not be "
+                        "treated as the full SPY 0DTE chain"
+                    ),
+                    symbol=ALLOWED_SYMBOL,
+                    details=details,
+                )
+            )
+        return findings
+
+
+@dataclass
 class WebullOptionsDataProvider:
     """Discover and fetch SPY 0DTE option quotes — no order submission."""
 
@@ -210,44 +257,91 @@ class WebullOptionsDataProvider:
         underlying_price: float,
         expiration: date | None = None,
         *,
-        max_contracts: int = 40,
+        trading_date: date | None = None,
+        max_contracts: int | None = None,
         allow_osi_fallback: bool = True,
-        strike_window: int = 10,
-    ) -> list[OptionSnapshot]:
-        """Fetch a near-ATM 0DTE option surface (not limited to two ATM contracts)."""
-        exp = expiration or self.market_today()
+        batch_size: int = 20,
+    ) -> SurfaceFetchResult:
+        """Fetch the complete SPY surface for the exchange trading date.
+
+        Discovers every contract, filters strictly to SPY with
+        ``expiry == trading_date``, then fetches snapshots in provider-supported
+        batches with rate-limit spacing. ``max_contracts`` is an explicit
+        operational emergency limit only — disabled (``None``) by default.
+        """
+        exp = trading_date or expiration or self.market_today()
+        failed_batches: list[str] = []
+        emergency_truncated = False
+        complete = True
         try:
             contracts = self.discover_contracts(ALLOWED_SYMBOL, exp)
         except OptionEndpointUnverified:
             if not allow_osi_fallback:
                 raise
             contracts = self.discover_osi_candidates(underlying_price, exp)
-        if not contracts:
-            return []
+        discovered_count = len(contracts)
 
-        calls = sorted(
-            [c for c in contracts if c.option_type == "call"],
-            key=lambda c: abs(c.strike - underlying_price),
-        )[: max(1, strike_window)]
-        puts = sorted(
-            [c for c in contracts if c.option_type == "put"],
-            key=lambda c: abs(c.strike - underlying_price),
-        )[: max(1, strike_window)]
-        selected = [c for c in (*calls, *puts) if c.contract_id]
+        selected = [
+            c
+            for c in contracts
+            if (c.underlying_symbol or ALLOWED_SYMBOL).upper() == ALLOWED_SYMBOL
+            and c.expiration == exp
+            and c.contract_id
+        ]
+        # ATM-proximal ordering for fetch scheduling only — do not drop strikes.
+        selected = sorted(selected, key=lambda c: abs(c.strike - underlying_price))
+        if max_contracts is not None and max_contracts > 0 and len(selected) > max_contracts:
+            selected = selected[:max_contracts]
+            emergency_truncated = True
+            complete = False
+            failed_batches.append(
+                f"emergency_max_contracts={max_contracts} truncated surface"
+            )
+        selected_count = len(selected)
         if not selected:
-            # OSI fallback has no contract_id — cannot fetch live snapshots.
-            return []
-        selected = selected[:max_contracts]
-        try:
-            self._rate_limiter.acquire()
-            snapshots = self.api.get_option_snapshots(selected)
-        except RateLimitExceeded as exc:
-            raise WebullApiError(str(exc), rate_limited=True) from exc
-        for snap in snapshots:
-            key = snap.contract.contract_id or ""
-            if key:
-                self._snapshot_cache.set(key, snap)
-        return list(snapshots)
+            return SurfaceFetchResult(
+                snapshots=[],
+                discovered_count=discovered_count,
+                selected_count=0,
+                fetched_count=0,
+                failed_batches=tuple(failed_batches),
+                emergency_truncated=emergency_truncated,
+                complete=complete and discovered_count == 0,
+                trading_date=exp,
+            )
+
+        snapshots: list[OptionSnapshot] = []
+        for start in range(0, len(selected), max(1, batch_size)):
+            batch = selected[start : start + max(1, batch_size)]
+            try:
+                self._rate_limiter.acquire()
+                batch_snaps = self.api.get_option_snapshots(batch)
+                for snap in batch_snaps:
+                    if (snap.contract.underlying_symbol or ALLOWED_SYMBOL).upper() != ALLOWED_SYMBOL:
+                        continue
+                    if snap.contract.expiration != exp:
+                        continue
+                    key = snap.contract.contract_id or ""
+                    if key:
+                        self._snapshot_cache.set(key, snap)
+                    snapshots.append(snap)
+            except Exception as exc:  # noqa: BLE001 — batch failure becomes DQ finding
+                complete = False
+                failed_batches.append(
+                    f"batch[{start}:{start + len(batch)}]: {type(exc).__name__}: {exc}"
+                )
+        if failed_batches:
+            complete = False
+        return SurfaceFetchResult(
+            snapshots=snapshots,
+            discovered_count=discovered_count,
+            selected_count=selected_count,
+            fetched_count=len(snapshots),
+            failed_batches=tuple(failed_batches),
+            emergency_truncated=emergency_truncated,
+            complete=complete,
+            trading_date=exp,
+        )
 
     def to_quote_events(
         self,

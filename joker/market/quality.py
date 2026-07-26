@@ -47,6 +47,7 @@ class DataQualityCode(StrEnum):
     DUPLICATE_OBSERVATION = "duplicate_observation"
     CUMULATIVE_VOLUME_REGRESSION = "cumulative_volume_regression"
     INSUFFICIENT_OPTION_SURFACE = "insufficient_option_surface"
+    PARTIAL_OPTION_SURFACE = "partial_option_surface"
     REPORT_UNAVAILABLE = "report_unavailable"
 
 

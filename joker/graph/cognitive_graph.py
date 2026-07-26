@@ -359,35 +359,61 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
                 error_code="submit_validation_failed",
                 message=str(exc),
             )
-        if deps.submit_callback is None:
-            return append_error(
-                state,
-                node_name="submit_execution_command",
-                error_code="no_submit_callback",
-                message="execution submit callback not configured",
-            )
-        command_id = provenanced.command.client_order_id
-        if deps.provenance_registry is not None:
-            from joker.persistence.cognitive_execution_provenance import (
-                ExecutionProvenanceRecord,
-            )
-            from joker.runtime.execution_runtime import contract_id_for
+        from joker.runtime.order_action_gateway import (
+            OrderActionKind,
+            ensure_order_action_gateway,
+            provenanced_to_action_request,
+        )
 
-            await deps.provenance_registry.record(
-                ExecutionProvenanceRecord(
-                    client_order_id=command_id,
-                    proposal_id=str(provenanced.proposal_id),
-                    decision_id=str(provenanced.decision_id),
-                    strategy_id=str(provenanced.strategy_id),
-                    cycle_id=str(provenanced.cycle_id),
-                    snapshot_id=str(provenanced.snapshot_id),
-                    contract_id=contract_id_for(provenanced.command.intent.contract),
-                    session_id=deps.session_id,
-                    kind="entry",
-                )
+        gateway = ensure_order_action_gateway(deps)
+        if gateway is not None:
+            action = (
+                OrderActionKind.PROBE
+                if getattr(proposal, "action", None) == "probe"
+                else OrderActionKind.ENTRY
             )
-        result = await deps.submit_callback(provenanced)
-        deps.submitted_proposal_ids.add(str(proposal.proposal_id))
+            gateway_result = await gateway.submit(
+                provenanced_to_action_request(provenanced, action=action)
+            )
+            if not gateway_result.submitted:
+                return append_error(
+                    state,
+                    node_name="submit_execution_command",
+                    error_code="gateway_blocked",
+                    message=gateway_result.blocked_reason or "order action blocked",
+                )
+            command_id = gateway_result.client_order_id
+            result = gateway_result.broker_order
+        else:
+            if deps.submit_callback is None:
+                return append_error(
+                    state,
+                    node_name="submit_execution_command",
+                    error_code="no_submit_callback",
+                    message="execution submit callback not configured",
+                )
+            command_id = provenanced.command.client_order_id
+            if deps.provenance_registry is not None:
+                from joker.persistence.cognitive_execution_provenance import (
+                    ExecutionProvenanceRecord,
+                )
+                from joker.runtime.execution_runtime import contract_id_for
+
+                await deps.provenance_registry.record(
+                    ExecutionProvenanceRecord(
+                        client_order_id=command_id,
+                        proposal_id=str(provenanced.proposal_id),
+                        decision_id=str(provenanced.decision_id),
+                        strategy_id=str(provenanced.strategy_id),
+                        cycle_id=str(provenanced.cycle_id),
+                        snapshot_id=str(provenanced.snapshot_id),
+                        contract_id=contract_id_for(provenanced.command.intent.contract),
+                        session_id=deps.session_id,
+                        kind="entry",
+                    )
+                )
+            result = await deps.submit_callback(provenanced)
+            deps.submitted_proposal_ids.add(str(proposal.proposal_id))
         return {
             "execution_command_id": command_id,
             "execution_result_ref": str(getattr(result, "order_id", command_id)),

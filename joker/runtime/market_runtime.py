@@ -127,9 +127,14 @@ class MarketRuntime:
         self._pending_option_rows: list[dict[str, Any]] = []
         self._latest_surface: OptionSurfaceSnapshot | None = None
         self._latest_quality: DataQualityReport | None = None
+        self._pending_quality_findings: list[Any] = []
         self._source_event_ids: list[UUID] = []
         self._correlation_id = uuid4()
         self._prior_cumulative_volume: int | None = None
+
+    def enqueue_quality_findings(self, findings: list[Any]) -> None:
+        """Queue explicit data-quality findings (e.g. partial option surface)."""
+        self._pending_quality_findings.extend(findings)
 
     @property
     def session_id(self) -> str:
@@ -435,6 +440,23 @@ class MarketRuntime:
             self._bars.clear_findings()
 
         result.quality = quality
+        if self._pending_quality_findings:
+            from joker.market.quality import max_severity
+
+            merged = tuple(list(quality.findings) + list(self._pending_quality_findings))
+            severity = max_severity(list(merged))
+            usable_for_execution = severity.value not in {"error", "critical"}
+            usable_for_reasoning = severity.value != "critical"
+            quality = DataQualityReport(
+                report_id=quality.report_id,
+                snapshot_id=quality.snapshot_id,
+                severity=severity,
+                findings=merged,
+                usable_for_reasoning=usable_for_reasoning,
+                usable_for_execution=usable_for_execution,
+            )
+            self._pending_quality_findings = []
+            result.quality = quality
         self._latest_quality = quality
         if self._data_quality_repo is not None:
             await self._data_quality_repo.save(quality, session_id=self._session_id)

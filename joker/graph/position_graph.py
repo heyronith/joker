@@ -352,6 +352,24 @@ def build_position_graph(deps: CognitiveGraphDeps):
                     )
                 )
                 return result
+            from joker.runtime.order_action_gateway import (
+                OrderActionKind,
+                OrderActionRequest,
+                ensure_order_action_gateway,
+            )
+
+            gateway = ensure_order_action_gateway(deps)
+            if gateway is None:
+                return {
+                    **result,
+                    **append_error(
+                        state,
+                        node_name="route_position_action",
+                        error_code="no_order_action_gateway",
+                        message="OrderActionGateway required for position order actions",
+                    ),
+                }
+
             position_proj = state.get("_position_projection") or {}
             open_qty = 1
             try:
@@ -370,64 +388,62 @@ def build_position_graph(deps: CognitiveGraphDeps):
             except Exception:
                 open_qty = 1
             qty = decision.recommended_quantity or open_qty
+            kind = OrderActionKind.EXIT
+            side: str = "sell"
+            replace_of = None
             if action == PositionAction.EXIT:
                 qty = open_qty
+                kind = OrderActionKind.EXIT
             elif action == PositionAction.REDUCE:
                 qty = max(1, min(int(qty), open_qty))
-                if qty >= open_qty:
-                    qty = open_qty  # treat as full exit quantity bound
+                kind = OrderActionKind.REDUCE
             elif action == PositionAction.ADD:
                 qty = max(1, int(qty))
-                # Operational max matches entry validation default.
-                if qty > 20:
-                    return {
-                        **result,
-                        **append_error(
-                            state,
-                            node_name="route_position_action",
-                            error_code="add_quantity_exceeds_limit",
-                            message=f"ADD quantity {qty} exceeds operational max 20",
-                        ),
-                    }
-            side = "buy" if action == PositionAction.ADD else "sell"
-            if action == PositionAction.REPLACE_WORKING_ORDER:
+                kind = OrderActionKind.ADD
+                side = "buy"
+            elif action == PositionAction.REPLACE_WORKING_ORDER:
+                kind = OrderActionKind.REPLACE
                 orders = state.get("_order_projection") or {}
-                prior = str(orders.get("client_order_id") or "")
-                if prior:
-                    await deps.execution_runtime.cancel_order(client_order_id=prior)
-            contract = parse_contract_id(decision.contract_id, trading_date=trading_date)
+                replace_of = str(orders.get("client_order_id") or "")
+                side = str(orders.get("side") or "buy")
             limit = (
                 float(decision.recommended_limit_price)
                 if decision.recommended_limit_price is not None
                 else None
             )
             client_order_id = f"pos-{decision.thesis_version_id}-{action.value}"
-            command = ExecutionCommand(
-                client_order_id=client_order_id,
-                intent=OrderIntent(
-                    intent_id=client_order_id,
-                    candidate_id=str(decision.thesis_version_id),
-                    contract=contract,
-                    side=side,
-                    order_type="limit" if limit is not None else "market",
+            gateway_result = await gateway.submit(
+                OrderActionRequest(
+                    action=kind,
+                    snapshot_id=str(state.get("snapshot_id") or decision.snapshot_id),
+                    contract_id=str(decision.contract_id),
+                    side=side,  # type: ignore[arg-type]
                     quantity=int(qty),
+                    client_order_id=client_order_id,
                     limit_price=limit,
-                ),
-            )
-            if deps.provenance_registry is not None:
-                await deps.provenance_registry.record(
-                    ExecutionProvenanceRecord(
-                        client_order_id=client_order_id,
-                        strategy_id=str(decision.original_strategy_id),
-                        cycle_id=str(state.get("cycle_id") or ""),
-                        snapshot_id=str(decision.snapshot_id),
-                        contract_id=contract_id_for(contract),
-                        session_id=deps.session_id,
-                        kind=action.value,
-                    )
+                    order_type="limit" if limit is not None else "market",
+                    max_quote_age_seconds=3600,
+                    decision_id=str(decision.thesis_version_id),
+                    strategy_id=str(decision.original_strategy_id),
+                    cycle_id=str(state.get("cycle_id") or ""),
+                    replace_of_client_order_id=replace_of or None,
+                    allow_degraded_exit=True,
+                    degraded_exit_reason="position_close_with_degraded_market_data",
                 )
-            await deps.execution_runtime.submit_execution_command(command)
-            result["_position_command_id"] = client_order_id
+            )
+            if not gateway_result.submitted:
+                return {
+                    **result,
+                    **append_error(
+                        state,
+                        node_name="route_position_action",
+                        error_code="gateway_blocked",
+                        message=gateway_result.blocked_reason or "blocked",
+                    ),
+                }
+            result["_position_command_id"] = gateway_result.client_order_id
+            if gateway_result.degraded_exit:
+                result["_degraded_exit_reason"] = gateway_result.degraded_exit_reason
 
         result.update(
             trace_update(
