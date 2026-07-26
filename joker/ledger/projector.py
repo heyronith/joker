@@ -40,6 +40,10 @@ class OrderLifecycle(BaseModel):
     side: Side
     contract_id: str
     broker_order_id: str | None = None
+    position_lifecycle_id: str | None = None
+    originating_entry_client_order_id: str | None = None
+    parent_client_order_id: str | None = None
+    causation_event_id: str | None = None
 
 
 class PositionState(BaseModel):
@@ -54,6 +58,8 @@ class PositionState(BaseModel):
     fees: Decimal = Decimal("0")
     open: bool = False
     position_id: str | None = None
+    position_lifecycle_id: str | None = None
+    configuration_version_id: str | None = None
 
 
 class ProjectionState(BaseModel):

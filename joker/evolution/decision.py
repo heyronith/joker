@@ -136,6 +136,12 @@ class DecisionGraphState(TypedDict, total=False):
     action: AgentAction
     rationale: str
     risks: tuple[str, ...]
+    decision_persisted: bool
+    decision: PromotionDecision
+    activated: bool
+    decision_persisted: bool
+    decision: PromotionDecision
+    activated: bool
 
 
 def build_evolution_decision_graph(agent: EvolutionDecisionAgent):
@@ -148,10 +154,16 @@ def build_evolution_decision_graph(agent: EvolutionDecisionAgent):
         )
         return {"action": action, "rationale": rationale, "risks": risks}
 
+    async def persist_decision_node(state: DecisionGraphState) -> dict[str, Any]:
+        # Marker node: decision fields already in state; activation is separate.
+        return {"decision_persisted": True}
+
     graph = StateGraph(DecisionGraphState)
     graph.add_node("decide", decide_node)
+    graph.add_node("persist_decision", persist_decision_node)
     graph.add_edge(START, "decide")
-    graph.add_edge("decide", END)
+    graph.add_edge("decide", "persist_decision")
+    graph.add_edge("persist_decision", END)
     return graph
 
 

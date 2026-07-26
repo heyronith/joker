@@ -53,6 +53,8 @@ async def test_two_round_trips_same_contract_create_two_independent_episodes(
     compiler = EpisodeCompiler(repos["episodes"])
     cfg = uuid4()
     contract = "SPY:2026-07-01:500:call"
+    life1 = "s:e1:SPY:2026-07-01:500:call"
+    life2 = "s:e2:SPY:2026-07-01:500:call"
     orders = {
         "e1": OrderLifecycle(
             client_order_id="e1",
@@ -63,6 +65,8 @@ async def test_two_round_trips_same_contract_create_two_independent_episodes(
             side="buy",
             contract_id=contract,
             fees=Decimal("0.65"),
+            position_lifecycle_id=life1,
+            originating_entry_client_order_id="e1",
         ),
         "x1": OrderLifecycle(
             client_order_id="x1",
@@ -73,6 +77,9 @@ async def test_two_round_trips_same_contract_create_two_independent_episodes(
             side="sell",
             contract_id=contract,
             fees=Decimal("0.65"),
+            position_lifecycle_id=life1,
+            originating_entry_client_order_id="e1",
+            parent_client_order_id="e1",
         ),
         "e2": OrderLifecycle(
             client_order_id="e2",
@@ -83,6 +90,8 @@ async def test_two_round_trips_same_contract_create_two_independent_episodes(
             side="buy",
             contract_id=contract,
             fees=Decimal("1.30"),
+            position_lifecycle_id=life2,
+            originating_entry_client_order_id="e2",
         ),
         "x2": OrderLifecycle(
             client_order_id="x2",
@@ -93,6 +102,9 @@ async def test_two_round_trips_same_contract_create_two_independent_episodes(
             side="sell",
             contract_id=contract,
             fees=Decimal("1.30"),
+            position_lifecycle_id=life2,
+            originating_entry_client_order_id="e2",
+            parent_client_order_id="e2",
         ),
     }
     projection = ProjectionState(
@@ -170,7 +182,8 @@ async def test_missing_snapshot_creates_incomplete_episode_without_random_id(
     )
     assert ep.completed is False
     assert "missing_initial_snapshot" in ep.completeness_findings
-    assert ep.initial_snapshot_id == UUID(int=0)
+    assert ep.initial_snapshot_id is None
+    assert ep.snapshot_identity_status == "missing"
 
 
 @pytest.mark.asyncio

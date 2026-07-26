@@ -1,9 +1,8 @@
-"""Task 2 cognitive graph replay with isolated execution-faithful fills."""
+"""Task 2 cognitive graph replay with repository-backed truth and isolated fills."""
 
 from __future__ import annotations
 
 from decimal import Decimal
-from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -13,14 +12,22 @@ from joker.cognition.prompt_overrides import pinned_applied_configuration
 from joker.evolution.configuration_applicator import ConfigurationApplicator
 from joker.evolution.policy_store import PolicyVersionStore
 from joker.evolution.replay_execution import ReplayExecutionRuntime
-from joker.evolution.replay_market import build_truth_from_episode
+from joker.evolution.replay_gateway import ReplayOrderActionGateway
+from joker.evolution.replay_market import ReplayEpisodeTruth
 from joker.evolution.replay_position_runtime import ReplayPositionRuntime
+from joker.evolution.replay_truth import ReplayTruthLoadError, ReplayTruthLoader
 from joker.evolution.repositories import ConfigurationVersionRepository
 from joker.evolution.schemas import CognitiveConfigurationVersion, TradingEpisode
+from joker.evolution.telemetry import (
+    aggregate_model_call_telemetry,
+    extract_confidence_outcome_pairs,
+)
 from joker.graph.cognitive_graph import build_cognitive_graph, initial_cycle_state
 from joker.graph.graph_deps import CognitiveGraphDeps
 from joker.graph.langgraph_checkpointer import ainvoke_config
+from joker.graph.position_graph import build_position_graph
 from joker.models.router import ModelRouter
+from joker.runtime.order_action_gateway import OrderActionKind, OrderActionRequest
 
 
 class CognitiveReplayError(RuntimeError):
@@ -36,21 +43,35 @@ class CognitiveReplayService:
         template_deps: CognitiveGraphDeps,
         config_repo: ConfigurationVersionRepository,
         policy_store: PolicyVersionStore,
-        checkpointer_path: Path | None = None,
+        checkpointer_path: Any = None,
         checkpointer_saver: AsyncSqliteSaver | None = None,
         random_seed: int = 42,
+        truth_loader: ReplayTruthLoader | None = None,
+        force_terminal_liquidation: bool = False,
     ) -> None:
         self._template = template_deps
         self._configs = config_repo
         self._applicator = ConfigurationApplicator(policy_store)
-        self._checkpointer_path = checkpointer_path
         self._checkpointer_saver = checkpointer_saver
         self._random_seed = random_seed
+        self._truth_loader = truth_loader or ReplayTruthLoader(
+            snapshot_repo=template_deps.snapshot_repo,
+            option_surface_repo=template_deps.option_surface_repo,
+            data_quality_repo=template_deps.data_quality_repo,
+            random_seed=random_seed,
+        )
+        self._force_terminal_liquidation = force_terminal_liquidation
         self.replay_count = 0
         self.shadow_count = 0
         self._shadow_runtimes: dict[str, ReplayPositionRuntime] = {}
 
-    def _isolated_deps(self, router: ModelRouter | None = None) -> CognitiveGraphDeps:
+    def _isolated_deps(
+        self,
+        *,
+        router: ModelRouter | None = None,
+        gateway: ReplayOrderActionGateway | None = None,
+        projection_loader=None,
+    ) -> CognitiveGraphDeps:
         base = self._template
         return CognitiveGraphDeps(
             router=router or base.router,
@@ -77,22 +98,12 @@ class CognitiveReplayService:
             db_path=base.db_path,
             checkpointer=self._checkpointer_saver,
             data_quality_loader=base.data_quality_loader,
-            projection_loader=None,
+            projection_loader=projection_loader,
             provenance_registry=None,
-            order_action_gateway=None,
+            order_action_gateway=gateway,
             cycle_registry=None,
             order_management_action_repo=None,
         )
-
-    def _quote_pair(self, episode: TradingEpisode) -> tuple[Decimal, Decimal]:
-        mid = episode.entry_price or Decimal("1.00")
-        half = Decimal("0.01")
-        return mid - half, mid + half
-
-    def _exit_quote_pair(self, episode: TradingEpisode) -> tuple[Decimal, Decimal]:
-        mid = episode.exit_price or episode.entry_price or Decimal("1.00")
-        half = Decimal("0.01")
-        return mid - half, mid + half
 
     async def replay_episode(
         self,
@@ -107,36 +118,47 @@ class CognitiveReplayService:
                 f"configuration not found: {configuration_version_id}"
             )
         applied = await self._applicator.apply(configuration)
-        deps = self._isolated_deps()
-        if deps.execution_runtime is not None or deps.submit_callback is not None:
-            raise CognitiveReplayError(
-                "replay deps must not expose execution_runtime or submit_callback"
-            )
-        if deps.order_action_gateway is not None:
-            raise CognitiveReplayError(
-                "replay deps must not expose order_action_gateway"
-            )
+        try:
+            truth = await self._truth_loader.load_for_episode(episode)
+        except ReplayTruthLoadError as exc:
+            return {
+                "realised_pnl": Decimal("0"),
+                "model_calls": 0,
+                "cost_gbp": None,
+                "cost_known": False,
+                "latency_ms": Decimal("0"),
+                "broker_submit": False,
+                "execution_runtime": False,
+                "traded": False,
+                "integrity_findings": (str(exc),),
+                "historical_pnl_attributed": False,
+                "ran_task2_graph": False,
+                "ran_position_graph": False,
+                "sample": sample,
+                "configuration_version_id": str(configuration_version_id),
+            }
 
-        truth = build_truth_from_episode(episode, random_seed=self._random_seed + sample)
-        if episode.contract_id:
-            bid, ask = self._quote_pair(episode)
-            truth = truth.model_copy(
-                update={
-                    "contract_quotes": {
-                        episode.contract_id: {
-                            "bid": str(bid),
-                            "ask": str(ask),
-                            "mid": str((bid + ask) / Decimal("2")),
-                        }
-                    }
-                }
-            )
         execution = ReplayExecutionRuntime(truth=truth)
-        if episode.contract_id:
-            execution.lock_surface({episode.contract_id})
-        position_rt = ReplayPositionRuntime(
-            execution=execution, configuration_version_id=configuration_version_id
+        # Lock surface to first frame contracts only — no historical fallback.
+        first_quotes = truth.frame_quotes(0)
+        for cid, q in first_quotes.items():
+            execution.allow_contract(
+                cid, bid=Decimal(q["bid"]), ask=Decimal(q["ask"])
+            )
+        execution.lock_surface(set(first_quotes.keys()))
+
+        gateway = ReplayOrderActionGateway(
+            execution=execution,
+            session_id=f"replay:{episode.session_id}",
+            configuration_version_id=str(configuration_version_id),
         )
+
+        async def _projection():
+            return execution.projection()
+
+        deps = self._isolated_deps(gateway=gateway, projection_loader=_projection)
+        if deps.execution_runtime is not None or deps.submit_callback is not None:
+            raise CognitiveReplayError("replay deps must not expose production execution")
 
         cycle_id = f"replay:{episode.episode_id}:{configuration_version_id}:{sample}"
         state = initial_cycle_state(
@@ -149,9 +171,7 @@ class CognitiveReplayService:
         )
         graph = build_cognitive_graph(deps)
         config = ainvoke_config(
-            session_id=deps.session_id,
-            graph_kind="decision",
-            cycle_id=cycle_id,
+            session_id=deps.session_id, graph_kind="decision", cycle_id=cycle_id
         )
         with pinned_applied_configuration(applied):
             result = await graph.ainvoke(state, config=config)
@@ -159,85 +179,254 @@ class CognitiveReplayService:
         meta = result.get("meta_decision")
         action = getattr(meta, "action", None)
         action_value = getattr(action, "value", str(action) if action else "unknown")
+        confidence = getattr(meta, "confidence", None)
         proposal = result.get("execution_proposal")
         selected = None
+        quantity = Decimal("1")
+        limit_price = None
         if proposal is not None:
             selected = getattr(proposal, "contract_id", None) or getattr(
                 proposal, "selected_contract_id", None
             )
-        if selected is None and episode.contract_id and action_value in {
-            "execute",
-            "probe",
-            "EXECUTE",
-            "PROBE",
-        }:
-            # Faithful surface: challenger may only trade the frozen episode contract.
-            selected = episode.contract_id
+            if getattr(proposal, "quantity", None) is not None:
+                quantity = Decimal(str(proposal.quantity))
+            if getattr(proposal, "limit_price", None) is not None:
+                limit_price = float(proposal.limit_price)
 
-        node_trace = result.get("node_trace") or []
-        position_rt.model_call_ids = [
-            str(getattr(n, "model_call_id", "") or "")
-            for n in node_trace
-            if getattr(n, "model_call_id", None)
-        ]
-
-        bid, ask = self._quote_pair(episode)
-        entry = position_rt.simulate_entry_from_meta(
-            action=action_value,
-            contract_id=str(selected) if selected else None,
-            bid=bid,
-            ask=ask,
-            idempotency_key=(
-                f"{episode.episode_id}:{configuration_version_id}:{sample}:entry"
-            ),
-        )
-        if entry.get("traded"):
-            exit_bid, exit_ask = self._exit_quote_pair(episode)
-            # Opposite-direction / exit simulation uses frozen exit quotes, not
-            # historical champion PnL.
-            if action_value in {"execute", "probe", "EXECUTE", "PROBE"}:
-                position_rt.simulate_exit(
-                    bid=exit_bid,
-                    ask=exit_ask,
-                    idempotency_key=(
-                        f"{episode.episode_id}:{configuration_version_id}:{sample}:exit"
-                    ),
-                )
+        integrity: list[str] = []
+        traded = False
+        ran_position = False
+        entry_order_id = None
+        if action_value in {"execute", "probe", "EXECUTE", "PROBE"}:
+            if not selected:
+                integrity.append("missing_valid_contract_selection")
+            elif str(selected) not in first_quotes:
+                integrity.append("contract_not_on_frame_surface")
             else:
-                position_rt.mark("replay_finalised")
+                submit = await gateway.submit(
+                    OrderActionRequest(
+                        action=OrderActionKind.ENTRY,
+                        snapshot_id=str(episode.initial_snapshot_id),
+                        contract_id=str(selected),
+                        side="buy",
+                        quantity=int(quantity),
+                        client_order_id=f"replay-entry:{configuration_version_id}:{sample}",
+                        limit_price=limit_price,
+                        cycle_id=cycle_id,
+                    )
+                )
+                traded = submit.submitted
+                entry_order_id = submit.client_order_id
+                if not traded:
+                    integrity.append(submit.blocked_reason or "entry_not_submitted")
 
-        payload = position_rt.outcome_payload()
-        payload.update(
-            {
-                "realised_pnl": Decimal(str(payload["realised_pnl"])),
-                "model_calls": max(1, len(node_trace)),
-                "cost_gbp": Decimal("0.01") * Decimal(max(1, len(node_trace))),
-                "meta_decision_action": action_value,
-                "ran_task2_graph": True,
-                "sample": sample,
-                "latency_ms": int(10 * max(1, len(node_trace))),
-                "historical_pnl_attributed": False,
-            }
+        # Advance frames with actual position cognition while open.
+        if traded and selected and len(truth.frames) > 1:
+            position_graph = build_position_graph(deps)
+            for frame_index, frame in enumerate(truth.frames[1:], start=1):
+                pos = execution.positions.get(str(selected))
+                if pos is None or pos.quantity <= 0:
+                    break
+                # Refresh quotes for this frame before position decision.
+                for cid, q in truth.frame_quotes(frame_index).items():
+                    execution.allow_contract(
+                        cid, bid=Decimal(q["bid"]), ask=Decimal(q["ask"])
+                    )
+                pos_cycle = f"{cycle_id}:pos:{frame.snapshot_id}"
+                pos_state = {
+                    "session_id": deps.session_id,
+                    "run_id": deps.run_id,
+                    "cycle_id": pos_cycle,
+                    "snapshot_id": str(frame.snapshot_id),
+                    "_position_id": str(selected),
+                    "_contract_id": str(selected),
+                }
+                pos_config = ainvoke_config(
+                    session_id=deps.session_id,
+                    graph_kind="position",
+                    cycle_id=pos_cycle,
+                )
+                with pinned_applied_configuration(applied):
+                    pos_result = await position_graph.ainvoke(
+                        pos_state, config=pos_config
+                    )
+                ran_position = True
+                decision = pos_result.get("_position_decision") or pos_result.get(
+                    "position_decision"
+                )
+                thesis = pos_result.get("_position_thesis") or pos_result.get(
+                    "position_thesis"
+                )
+                action_obj = decision or thesis
+                recommended = getattr(action_obj, "recommended_action", None)
+                rec_value = getattr(
+                    recommended, "value", str(recommended) if recommended else "HOLD"
+                )
+                if rec_value in {"EXIT", "exit"}:
+                    await gateway.submit(
+                        OrderActionRequest(
+                            action=OrderActionKind.EXIT,
+                            snapshot_id=str(frame.snapshot_id),
+                            contract_id=str(selected),
+                            side="sell",
+                            quantity=int(pos.quantity),
+                            client_order_id=(
+                                f"replay-exit:{configuration_version_id}:{sample}:{frame_index}"
+                            ),
+                            cycle_id=pos_cycle,
+                        )
+                    )
+                elif rec_value in {"REDUCE", "reduce"}:
+                    qty = int(
+                        getattr(action_obj, "recommended_quantity", 1) or 1
+                    )
+                    await gateway.submit(
+                        OrderActionRequest(
+                            action=OrderActionKind.REDUCE,
+                            snapshot_id=str(frame.snapshot_id),
+                            contract_id=str(selected),
+                            side="sell",
+                            quantity=qty,
+                            client_order_id=(
+                                f"replay-reduce:{configuration_version_id}:{sample}:{frame_index}"
+                            ),
+                            cycle_id=pos_cycle,
+                        )
+                    )
+
+        open_at_end = False
+        if selected:
+            pos = execution.positions.get(str(selected))
+            open_at_end = pos is not None and pos.quantity > 0
+            if open_at_end and self._force_terminal_liquidation:
+                await gateway.submit(
+                    OrderActionRequest(
+                        action=OrderActionKind.EXIT,
+                        snapshot_id=str(truth.snapshot_sequence[-1]),
+                        contract_id=str(selected),
+                        side="sell",
+                        quantity=int(pos.quantity),
+                        client_order_id=(
+                            f"replay-terminal:{configuration_version_id}:{sample}"
+                        ),
+                        cycle_id=cycle_id,
+                    )
+                )
+                open_at_end = False
+
+        # Telemetry from model-call repo when available.
+        model_records = []
+        if deps.model_call_repo is not None:
+            list_fn = getattr(deps.model_call_repo, "list_by_cycle", None) or getattr(
+                deps.model_call_repo, "list_for_cycle", None
+            )
+            if list_fn is not None:
+                try:
+                    model_records = await list_fn(cycle_id)
+                except Exception:
+                    model_records = []
+        telemetry = aggregate_model_call_telemetry(model_records)
+        if telemetry["model_calls"] == 0:
+            # Fall back to node-trace count without inventing cost.
+            node_trace = result.get("node_trace") or []
+            telemetry["model_calls"] = max(1, len(node_trace))
+            telemetry["latency_ms"] = Decimal("0")
+            telemetry["cost_known"] = False
+            telemetry["cost_gbp"] = None
+
+        pnl = execution.realised_pnl()
+        cal_pairs = extract_confidence_outcome_pairs(
+            meta_confidence=Decimal(str(confidence)) if confidence is not None else None,
+            traded=traded,
+            realised_pnl=pnl,
         )
-        return payload
+        return {
+            "realised_pnl": pnl,
+            "model_calls": telemetry["model_calls"],
+            "cost_gbp": telemetry["cost_gbp"],
+            "cost_known": telemetry["cost_known"],
+            "latency_ms": telemetry["latency_ms"],
+            "broker_submit": False,
+            "execution_runtime": False,
+            "meta_decision_action": action_value,
+            "selected_contract": str(selected) if selected else None,
+            "entry_order": entry_order_id,
+            "traded": traded,
+            "open_at_end": open_at_end,
+            "ran_task2_graph": True,
+            "ran_position_graph": ran_position,
+            "integrity_findings": tuple(integrity),
+            "historical_pnl_attributed": False,
+            "historical_contract_fallback": False,
+            "sample": sample,
+            "configuration_version_id": str(configuration_version_id),
+            "calibration_pairs": [(str(a), b) for a, b in cal_pairs],
+            "projection": execution.projection(),
+            "fill_model_version": truth.fill_model_version,
+            "random_seed": truth.random_seed,
+        }
 
     async def run_challenger_shadow(
         self,
         challenger: CognitiveConfigurationVersion,
         item: dict[str, Any],
     ) -> dict[str, Any]:
-        """Execute challenger decision graph + isolated shadow ledger (no broker)."""
         self.shadow_count += 1
         applied = await self._applicator.apply(challenger)
-        deps = self._isolated_deps()
-        if deps.execution_runtime is not None or deps.submit_callback is not None:
-            raise CognitiveReplayError(
-                "shadow deps must not expose execution_runtime or submit_callback"
-            )
-        snapshot_id = str(item.get("snapshot_id") or uuid4())
+        snapshot_id = str(item.get("snapshot_id") or "")
+        if not snapshot_id:
+            raise CognitiveReplayError("shadow_missing_snapshot_id")
+        # Hydrate Task 1 truth — never trust payload quotes.
+        from joker.evolution.schemas import TradingEpisode
+        from datetime import date
+
+        ephemeral = TradingEpisode(
+            session_id=f"shadow:{self._template.session_id}",
+            run_id=f"shadow:{self._template.run_id}",
+            trading_date=date.today(),
+            initial_snapshot_id=UUID(snapshot_id),
+            action_class="no_trade",
+            configuration_version_id=challenger.configuration_version_id,
+            quantity=Decimal("0"),
+            completed=True,
+            idempotency_key=f"shadow-truth:{snapshot_id}",
+            snapshot_identity_status="verified",
+        )
+        try:
+            truth = await self._truth_loader.load_for_episode(ephemeral)
+        except ReplayTruthLoadError as exc:
+            return {
+                "shadow": True,
+                "broker_submit": False,
+                "execution_runtime": False,
+                "error": str(exc),
+                "snapshot_id": snapshot_id,
+            }
         assignment_key = (
             f"{challenger.configuration_version_id}:{item.get('assignment_id')}"
         )
+        runtime = self._shadow_runtimes.get(assignment_key)
+        if runtime is None:
+            execution = ReplayExecutionRuntime(truth=truth)
+            for cid, q in truth.frame_quotes(0).items():
+                execution.allow_contract(cid, bid=Decimal(q["bid"]), ask=Decimal(q["ask"]))
+            runtime = ReplayPositionRuntime(
+                execution=execution,
+                configuration_version_id=challenger.configuration_version_id,
+            )
+            self._shadow_runtimes[assignment_key] = runtime
+        else:
+            # Advance quotes from latest frame.
+            for cid, q in truth.frame_quotes(0).items():
+                runtime.execution.allow_contract(
+                    cid, bid=Decimal(q["bid"]), ask=Decimal(q["ask"])
+                )
+
+        gateway = ReplayOrderActionGateway(
+            execution=runtime.execution,
+            session_id=f"shadow:{self._template.session_id}",
+        )
+        deps = self._isolated_deps(gateway=gateway)
         cycle_id = f"shadow:{challenger.configuration_version_id}:{snapshot_id}"
         state = initial_cycle_state(
             session_id=deps.session_id,
@@ -249,51 +438,35 @@ class CognitiveReplayService:
         )
         graph = build_cognitive_graph(deps)
         config = ainvoke_config(
-            session_id=deps.session_id,
-            graph_kind="decision",
-            cycle_id=cycle_id,
+            session_id=deps.session_id, graph_kind="decision", cycle_id=cycle_id
         )
         with pinned_applied_configuration(applied):
             result = await graph.ainvoke(state, config=config)
         meta = result.get("meta_decision")
         action_value = getattr(getattr(meta, "action", None), "value", None)
-
-        runtime = self._shadow_runtimes.get(assignment_key)
-        if runtime is None:
-            from joker.evolution.replay_market import ReplayEpisodeTruth
-
-            truth = ReplayEpisodeTruth(
-                episode_id=uuid4(),
-                initial_snapshot_id=UUID(snapshot_id)
-                if _is_uuid(snapshot_id)
-                else uuid4(),
-                random_seed=self._random_seed,
+        proposal = result.get("execution_proposal")
+        selected = None
+        if proposal is not None:
+            selected = getattr(proposal, "contract_id", None)
+        if (
+            not runtime.traded
+            and action_value in {"execute", "probe", "EXECUTE", "PROBE"}
+            and selected
+        ):
+            submit = await gateway.submit(
+                OrderActionRequest(
+                    action=OrderActionKind.ENTRY,
+                    snapshot_id=snapshot_id,
+                    contract_id=str(selected),
+                    side="buy",
+                    quantity=1,
+                    client_order_id=f"shadow-entry:{assignment_key}:{snapshot_id}",
+                    cycle_id=cycle_id,
+                )
             )
-            execution = ReplayExecutionRuntime(truth=truth)
-            runtime = ReplayPositionRuntime(
-                execution=execution,
-                configuration_version_id=challenger.configuration_version_id,
-            )
-            self._shadow_runtimes[assignment_key] = runtime
-
-        contract_id = str(item.get("contract_id") or "") or None
-        bid = Decimal(str(item.get("bid", "1.00")))
-        ask = Decimal(str(item.get("ask", "1.02")))
-        if runtime.stage in {"truth_loaded", "entry_graph_completed"} and not runtime.traded:
-            runtime.simulate_entry_from_meta(
-                action=str(action_value or "no_trade"),
-                contract_id=contract_id,
-                bid=bid,
-                ask=ask,
-                idempotency_key=f"shadow-entry:{assignment_key}:{snapshot_id}",
-            )
-        elif runtime.traded and item.get("exit"):
-            runtime.simulate_exit(
-                bid=bid,
-                ask=ask,
-                idempotency_key=f"shadow-exit:{assignment_key}:{snapshot_id}",
-            )
-
+            runtime.traded = submit.submitted
+            runtime.selected_contract_id = str(selected) if submit.submitted else None
+            runtime.mark("entry_order_simulated" if submit.submitted else "replay_finalised")
         return {
             "action": "challenger_shadow_decision",
             "meta_decision_action": action_value,
@@ -307,7 +480,9 @@ class CognitiveReplayService:
             "projection": runtime.execution.projection(),
             "stage": runtime.stage,
             "traded": runtime.traded,
-            "open_at_end": runtime.open_at_end,
+            "open_at_end": any(
+                p.quantity > 0 for p in runtime.execution.positions.values()
+            ),
             "realised_pnl": str(runtime.execution.realised_pnl()),
         }
 
@@ -315,11 +490,3 @@ class CognitiveReplayService:
         self, key: str, runtime: ReplayPositionRuntime
     ) -> None:
         self._shadow_runtimes[key] = runtime
-
-
-def _is_uuid(value: str) -> bool:
-    try:
-        UUID(value)
-        return True
-    except Exception:
-        return False

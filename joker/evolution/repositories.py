@@ -754,6 +754,28 @@ class EvolutionCycleRepository(EvolutionRepository):
             )
         return out
 
+    async def get(self, session_id: str, cycle_id: str) -> EvolutionCycleRecord | None:
+        rows = await self._fetchall(
+            """
+            SELECT cycle_id, session_id, status, stage, payload_json, updated_at
+            FROM evolution_cycles
+            WHERE session_id = ? AND cycle_id = ?
+            LIMIT 1
+            """,
+            (session_id, cycle_id),
+        )
+        if not rows:
+            return None
+        row = rows[0]
+        return EvolutionCycleRecord(
+            cycle_id=row["cycle_id"],
+            session_id=row["session_id"],
+            status=row["status"],
+            stage=row["stage"],
+            payload=json.loads(row["payload_json"] or "{}"),
+            updated_at=row["updated_at"],
+        )
+
 
 def build_evolution_repositories(db_path: str | Path) -> dict[str, EvolutionRepository]:
     """Construct the Task 3 repository suite sharing one DB path."""

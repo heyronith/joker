@@ -88,10 +88,16 @@ class EpisodeCompiler:
             configuration_version_id=configuration_version_id,
             known_entry_cycle_id=entry_cycle_id,
             known_snapshot_id=initial_snapshot_id,
+            position_lifecycle_id=str(event_payload.get("position_lifecycle_id") or "")
+            or None,
         )
         findings.extend(resolved.findings)
+        if resolved.legacy_inferred:
+            findings.append("legacy_lifecycle_inference")
+            completed = False
         entry_orders = resolved.entry_orders
         exit_orders = resolved.exit_orders
+        reduction_orders = resolved.reduction_orders
         if not entry_orders:
             completed = False
         if not exit_orders and client_order_id:
@@ -102,38 +108,43 @@ class EpisodeCompiler:
         entry_qty = resolved.quantity or sum(
             (o.filled_qty for o in entry_orders), Decimal("0")
         )
-        exit_qty = sum((o.filled_qty for o in exit_orders), Decimal("0"))
+        # Quantity identity includes reductions + terminal exit.
+        exit_qty = sum(
+            (o.filled_qty for o in (*reduction_orders, *exit_orders)), Decimal("0")
+        )
         if entry_qty != exit_qty:
             findings.append("quantity_identity_mismatch")
             completed = False
 
         entry_price = self._vwap(entry_orders)
-        exit_price = self._vwap(exit_orders)
+        exit_price = self._vwap(tuple((*reduction_orders, *exit_orders)))
         realised = resolved.realised_pnl
-        projection_pnl = None
-        if "realized_pnl" in event_payload and event_payload["realized_pnl"] is not None:
-            projection_pnl = Decimal(str(event_payload["realized_pnl"]))
-        elif position is not None:
-            projection_pnl = position.realized_pnl
-        if realised is None and projection_pnl is not None:
-            realised = projection_pnl
+        # Cross-check against lifecycle-specific projection when available;
+        # never against cumulative multi-lifecycle contract P&L.
+        lifecycle_projection_pnl = None
+        if position is not None and getattr(position, "position_lifecycle_id", None):
+            if position.position_lifecycle_id == resolved.position_lifecycle_id:
+                lifecycle_projection_pnl = position.realized_pnl
         if realised is None:
             findings.append("missing_realised_pnl")
             completed = False
-        elif projection_pnl is not None and abs(realised - projection_pnl) > Decimal("0.01"):
+        elif (
+            lifecycle_projection_pnl is not None
+            and abs(realised - lifecycle_projection_pnl) > Decimal("0.01")
+        ):
             findings.append("lifecycle_pnl_mismatch")
             completed = False
 
         snap = resolved.initial_snapshot_id
+        snapshot_status: str = "verified"
         if snap is None:
             findings.append("missing_initial_snapshot")
             completed = False
-            # Do not fabricate random snapshot IDs.
-            snap = UUID(int=0)
+            snapshot_status = "missing"
 
         fees = resolved.total_fees
         if fees == 0:
-            for order in (*entry_orders, *exit_orders):
+            for order in (*entry_orders, *reduction_orders, *exit_orders):
                 fees += order.fees
 
         lifecycle = resolved.position_lifecycle_id
@@ -148,11 +159,15 @@ class EpisodeCompiler:
             decision_id=resolved.decision_id or decision_id,
             initial_snapshot_id=snap,
             terminal_snapshot_id=resolved.terminal_snapshot_id or snap,
+            snapshot_identity_status=snapshot_status,  # type: ignore[arg-type]
+            position_lifecycle_id=lifecycle,
             contract_id=contract_id or None,
             direction="bullish" if entry_orders else "none",
             action_class="closed_trade",
             entry_order_ids=tuple(o.client_order_id for o in entry_orders),
-            exit_order_ids=tuple(o.client_order_id for o in exit_orders),
+            exit_order_ids=tuple(
+                o.client_order_id for o in (*reduction_orders, *exit_orders)
+            ),
             entry_price=entry_price,
             exit_price=exit_price,
             quantity=entry_qty,
@@ -208,7 +223,9 @@ class EpisodeCompiler:
         if initial_snapshot_id is None:
             findings.append("missing_initial_snapshot")
             completed = False
-            initial_snapshot_id = UUID(int=0)
+            snap_status = "missing"
+        else:
+            snap_status = "verified"
 
         if configuration_version_id is None:
             findings.append("missing_configuration_version")
@@ -222,6 +239,7 @@ class EpisodeCompiler:
             run_id=run_id,
             trading_date=trading_date,
             initial_snapshot_id=initial_snapshot_id,
+            snapshot_identity_status=snap_status,  # type: ignore[arg-type]
             action_class=action_class,  # type: ignore[arg-type]
             entry_order_ids=(client_order_id,) if client_order_id else (),
             quantity=Decimal("0"),
@@ -255,10 +273,11 @@ class EpisodeCompiler:
     ) -> TradingEpisode:
         findings: list[str] = []
         completed = True
+        snap_status = "verified"
         if snapshot_id is None:
             findings.append("missing_snapshot")
             completed = False
-            snapshot_id = UUID(int=0)
+            snap_status = "missing"
 
         # Prefer persisted Task 2 cycle registry / cognitive repos over event-only.
         if self._cycle_registry is not None and cycle_id:
@@ -321,6 +340,7 @@ class EpisodeCompiler:
             trading_date=trading_date,
             entry_cycle_id=cycle_id,
             initial_snapshot_id=snapshot_id,
+            snapshot_identity_status=snap_status,  # type: ignore[arg-type]
             action_class="no_trade",
             quantity=Decimal("0"),
             configuration_version_id=configuration_version_id,

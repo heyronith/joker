@@ -49,6 +49,7 @@ class AgenticEvaluationState(TypedDict, total=False):
     invalid_reasons: list[str]
     valid: bool
     model_call_ids: list[str]
+    completed_evaluator_roles: list[str]
     evaluation: EpisodeEvaluation
     thesis_quality: Decimal | None
     evidence_grounding_score: Decimal | None
@@ -72,6 +73,7 @@ def build_evaluation_graph(router: ModelRouter):
         return compute_outcome_metrics(state)  # type: ignore[arg-type]
 
     async def agents_node(state: AgenticEvaluationState) -> dict[str, Any]:
+        # Retained for backwards-compatible single-node evaluation; prefer per-role nodes.
         episode = state["episode"]
         merged: dict[str, Decimal | None] = dict(state.get("agent_scores") or {})
         avoidable = list(state.get("avoidable_error_codes") or [])
@@ -115,6 +117,60 @@ def build_evaluation_graph(router: ModelRouter):
             "model_call_ids": model_calls,
         }
 
+    def _make_evaluator_node(role: str):
+        async def evaluator_node(state: AgenticEvaluationState) -> dict[str, Any]:
+            episode = state["episode"]
+            merged: dict[str, Decimal | None] = dict(state.get("agent_scores") or {})
+            avoidable = list(state.get("avoidable_error_codes") or [])
+            model_calls = list(state.get("model_call_ids") or [])
+            # Skip if this role already contributed a model call (resume).
+            role_marker = f"role:{role}"
+            completed_roles = list(state.get("completed_evaluator_roles") or [])
+            if role in completed_roles:
+                return {}
+            metrics = state.get("metrics") or compute_deterministic_metrics(episode)
+            evidence = {
+                "episode": episode.model_dump(mode="json"),
+                "metrics": metrics.model_dump(mode="json"),
+                "assembled_at": datetime.now(timezone.utc).isoformat(),
+                "role_marker": role_marker,
+            }
+            scores, call_id = await invoke_evolution_agent(
+                router,
+                role=role,
+                prompt_id=f"task3.{role}",
+                prompt_version="3.0.0",
+                payload=evidence,
+                output_type=EvaluatorAgentScores,
+                snapshot_id=episode.initial_snapshot_id,
+                cycle_id=str(episode.episode_id),
+                session_id=state.get("session_id") or episode.session_id,
+            )
+            model_calls.append(str(call_id))
+            for field_name in (
+                "thesis_quality",
+                "evidence_grounding_score",
+                "calibration_score",
+                "debate_quality",
+                "execution_quality",
+                "position_management_score",
+                "efficiency_score",
+                "decision_consistency_score",
+            ):
+                value = getattr(scores, field_name)
+                if value is not None:
+                    merged[field_name] = value
+            avoidable.extend(scores.avoidable_error_codes)
+            completed_roles.append(role)
+            return {
+                "agent_scores": merged,
+                "avoidable_error_codes": avoidable,
+                "model_call_ids": model_calls,
+                "completed_evaluator_roles": completed_roles,
+            }
+
+        return evaluator_node
+
     async def dimensions_node(state: AgenticEvaluationState) -> dict[str, Any]:
         return evaluate_dimensions(
             state,  # type: ignore[arg-type]
@@ -127,13 +183,16 @@ def build_evaluation_graph(router: ModelRouter):
     graph = StateGraph(AgenticEvaluationState)
     graph.add_node("integrity", integrity_node)
     graph.add_node("metrics", metrics_node)
-    graph.add_node("agents", agents_node)
+    for role in EVALUATOR_ROLES:
+        graph.add_node(role, _make_evaluator_node(role))
     graph.add_node("dimensions", dimensions_node)
     graph.add_node("synthesise", synthesise_node)
     graph.add_edge(START, "integrity")
     graph.add_edge("integrity", "metrics")
-    graph.add_edge("metrics", "agents")
-    graph.add_edge("agents", "dimensions")
+    graph.add_edge("metrics", EVALUATOR_ROLES[0])
+    for left, right in zip(EVALUATOR_ROLES, EVALUATOR_ROLES[1:]):
+        graph.add_edge(left, right)
+    graph.add_edge(EVALUATOR_ROLES[-1], "dimensions")
     graph.add_edge("dimensions", "synthesise")
     graph.add_edge("synthesise", END)
     return graph
@@ -195,6 +254,7 @@ class AgenticEvaluationGraphRunner:
             "integrity_violation_codes": [],
             "agent_scores": {},
             "model_call_ids": [],
+            "completed_evaluator_roles": [],
         }
         compiled = self._graph()
         if self._checkpointer_saver is not None:

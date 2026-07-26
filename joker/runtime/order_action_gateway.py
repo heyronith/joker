@@ -49,6 +49,7 @@ class OrderActionKind(StrEnum):
     REDUCE = "reduce"
     EXIT = "exit"
     REPLACE = "replace"
+    CANCEL = "cancel"
 
 
 @dataclass(frozen=True)
@@ -83,6 +84,8 @@ class OrderActionRequest:
     strategy_id: str | None = None
     cycle_id: str | None = None
     replace_of_client_order_id: str | None = None
+    position_lifecycle_id: str | None = None
+    originating_entry_client_order_id: str | None = None
     allow_degraded_exit: bool = True
     degraded_exit_reason: str | None = None
     evidence_ids: tuple[str, ...] = ()
@@ -228,6 +231,15 @@ class OrderActionGateway:
                 blocked_reason="ExecutionRuntime unavailable",
             )
 
+        if request.action == OrderActionKind.CANCEL:
+            target = request.replace_of_client_order_id or request.client_order_id
+            await self._deps.execution_runtime.cancel_order(client_order_id=target)
+            return OrderActionResult(
+                submitted=True,
+                client_order_id=target,
+                broker_order=None,
+            )
+
         snapshot, data_quality, surface, _slice = await load_snapshot_truth(
             self._deps, request.snapshot_id
         )
@@ -324,9 +336,37 @@ class OrderActionGateway:
 
         order = await self._deps.execution_runtime.submit_execution_command(command)
         if self._deps.provenance_registry is not None:
+            from joker.evolution.lifecycle_id import make_position_lifecycle_id
             from joker.persistence.cognitive_execution_provenance import (
                 ExecutionProvenanceRecord,
             )
+
+            lifecycle_id = request.position_lifecycle_id
+            originating = request.originating_entry_client_order_id
+            parent = request.replace_of_client_order_id
+            if request.action in {OrderActionKind.ENTRY, OrderActionKind.PROBE}:
+                originating = originating or command.client_order_id
+                lifecycle_id = lifecycle_id or make_position_lifecycle_id(
+                    session_id=self._deps.session_id,
+                    originating_entry_client_order_id=originating,
+                    contract_id=request.contract_id,
+                )
+            elif parent:
+                prior = await self._deps.provenance_registry.get_by_client_order_id(
+                    parent
+                )
+                if prior is not None:
+                    lifecycle_id = lifecycle_id or prior.position_lifecycle_id
+                    originating = (
+                        originating or prior.originating_entry_client_order_id
+                    )
+            if lifecycle_id is None and request.contract_id:
+                prior = await self._deps.provenance_registry.get_latest_by_contract_id(
+                    request.contract_id
+                )
+                if prior is not None:
+                    lifecycle_id = prior.position_lifecycle_id
+                    originating = prior.originating_entry_client_order_id
 
             await self._deps.provenance_registry.record(
                 ExecutionProvenanceRecord(
@@ -339,8 +379,13 @@ class OrderActionGateway:
                     contract_id=request.contract_id,
                     session_id=self._deps.session_id,
                     kind=request.action.value,
+                    position_lifecycle_id=lifecycle_id,
+                    originating_entry_client_order_id=originating,
+                    parent_client_order_id=parent,
                     extra={
                         "replace_of": request.replace_of_client_order_id,
+                        "position_lifecycle_id": lifecycle_id,
+                        "originating_entry_client_order_id": originating,
                     },
                 )
             )

@@ -144,8 +144,18 @@ class ExperimentRunner:
                             )
                         pnl = Decimal(str(payload.get("realised_pnl", 0)))
                         calls = int(payload.get("model_calls", 1))
-                        sample_cost = Decimal(str(payload.get("cost_gbp", "0")))
-                        latency = Decimal(str(payload.get("latency_ms", calls * 10)))
+                        sample_cost_raw = payload.get("cost_gbp")
+                        sample_cost = (
+                            Decimal(str(sample_cost_raw))
+                            if sample_cost_raw is not None
+                            else Decimal("0")
+                        )
+                        latency_raw = payload.get("latency_ms")
+                        latency = (
+                            Decimal(str(latency_raw))
+                            if latency_raw is not None
+                            else Decimal("0")
+                        )
                         model_calls += calls
                         cost += sample_cost
                         if bucket == "champion":
@@ -158,7 +168,10 @@ class ExperimentRunner:
                             chall_cost += sample_cost
                             if champ_vals:
                                 deltas.append(chall_vals[-1] - champ_vals[-1])
-                        if cost > definition.maximum_cost_gbp:
+                        if (
+                            sample_cost_raw is not None
+                            and cost > definition.maximum_cost_gbp
+                        ):
                             await self._experiments.mark_status(experiment_id, "failed")
                             raise ExperimentRunnerError("maximum_cost_gbp exceeded")
             avg_delta = (
@@ -202,6 +215,23 @@ class ExperimentRunner:
         )
         champ_cal = _mad(champ_vals, champ_mean)
         chall_cal = _mad(chall_vals, chall_mean)
+        champ_brier, champ_ece, champ_cal_n = _calibration_from_pairs(
+            await self._collect_calibration_pairs(
+                experiment_id, definition.champion_version_id
+            )
+        )
+        chall_brier, chall_ece, chall_cal_n = _calibration_from_pairs(
+            await self._collect_calibration_pairs(
+                experiment_id, definition.challenger_version_id
+            )
+        )
+        champ_cost_known, chall_cost_known = await self._cost_known_flags(
+            experiment_id,
+            definition.champion_version_id,
+            definition.challenger_version_id,
+        )
+        champ_cal_metric = champ_ece if champ_ece is not None else champ_cal
+        chall_cal_metric = chall_ece if chall_ece is not None else chall_cal
         deltas_all = [b - a for a, b in zip(champ_vals, chall_vals)]
         ci_all, ci_meta = self._bootstrap_ci(deltas_all)
         required_missing: list[str] = []
@@ -227,16 +257,42 @@ class ExperimentRunner:
             champion_metrics={
                 "mean_pnl": champ_mean,
                 "tail_loss": champ_tail,
-                "calibration_error": champ_cal,
+                "calibration_error": champ_cal_metric,
+                "pnl_mean_absolute_deviation": champ_cal,
+                **(
+                    {"brier_score": champ_brier}
+                    if champ_brier is not None
+                    else {}
+                ),
+                **(
+                    {"expected_calibration_error": champ_ece}
+                    if champ_ece is not None
+                    else {}
+                ),
+                "calibration_sample_count": Decimal(champ_cal_n),
                 "latency_ms": champ_lat,
                 "cost_gbp": champ_cost,
+                "cost_known": champ_cost_known,
             },
             challenger_metrics={
                 "mean_pnl": chall_mean,
                 "tail_loss": chall_tail,
-                "calibration_error": chall_cal,
+                "calibration_error": chall_cal_metric,
+                "pnl_mean_absolute_deviation": chall_cal,
+                **(
+                    {"brier_score": chall_brier}
+                    if chall_brier is not None
+                    else {}
+                ),
+                **(
+                    {"expected_calibration_error": chall_ece}
+                    if chall_ece is not None
+                    else {}
+                ),
+                "calibration_sample_count": Decimal(chall_cal_n),
                 "latency_ms": chall_lat,
                 "cost_gbp": chall_cost,
+                "cost_known": chall_cost_known,
             },
             eligibility_outcome=False,
             gate_rejection_codes=tuple(required_missing),
@@ -307,8 +363,53 @@ class ExperimentRunner:
         hi_i = max(lo_i, int((Decimal("1") - alpha) * Decimal(len(means))) - 1)
         return (means[lo_i], means[hi_i]), meta
 
+    async def _collect_calibration_pairs(
+        self, experiment_id: UUID | str, configuration_version_id: UUID
+    ) -> list[tuple[Decimal, int]]:
+        keys = await self._results.list_keys(experiment_id)
+        pairs: list[tuple[Decimal, int]] = []
+        for key in keys:
+            if str(configuration_version_id) not in key:
+                continue
+            payload = await self._results.get_payload(key)
+            if not payload:
+                continue
+            for pred, outcome in payload.get("calibration_pairs") or []:
+                pairs.append((Decimal(str(pred)), int(outcome)))
+        return pairs
+
+    async def _cost_known_flags(
+        self,
+        experiment_id: UUID | str,
+        champion_id: UUID,
+        challenger_id: UUID,
+    ) -> tuple[bool, bool]:
+        keys = await self._results.list_keys(experiment_id)
+        champ = False
+        chall = False
+        for key in keys:
+            payload = await self._results.get_payload(key)
+            if not payload:
+                continue
+            known = bool(payload.get("cost_known", payload.get("cost_gbp") is not None))
+            if str(champion_id) in key and known:
+                champ = True
+            if str(challenger_id) in key and known:
+                chall = True
+        return champ, chall
+
 
 def _mad(values: list[Decimal], mean: Decimal) -> Decimal:
     if not values:
         return Decimal("0")
     return sum(abs(v - mean) for v in values) / Decimal(len(values))
+
+
+def _calibration_from_pairs(
+    pairs: list[tuple[Decimal, int]],
+) -> tuple[Decimal | None, Decimal | None, int]:
+    from joker.evolution.telemetry import brier_score, expected_calibration_error
+
+    if not pairs:
+        return None, None, 0
+    return brier_score(pairs), expected_calibration_error(pairs), len(pairs)

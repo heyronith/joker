@@ -51,6 +51,12 @@ class ShadowSettings(BaseModel):
     maximum_challengers: int = 1
     queue_size: int = 128
     snapshot_coalescing: bool = True
+    minimum_completed_cycles: int = 20
+    minimum_traded_cycles: int = 5
+    minimum_regime_coverage: int = 2
+    minimum_observation_minutes: int = 60
+    allow_promotion_before_shadow: bool = False
+    maximum_integrity_findings: int = 0
 
 
 class PromotionSettings(BaseModel):

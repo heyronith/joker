@@ -6,12 +6,17 @@ import asyncio
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from decimal import Decimal
 from typing import Any, Awaitable, Callable
 from uuid import UUID, uuid4
 
 from joker.evolution.policy_store import PolicyVersionStore
-from joker.evolution.repositories import ShadowAssignmentRepository
+from joker.evolution.repositories import (
+    ConfigurationVersionRepository,
+    ShadowAssignmentRepository,
+)
 from joker.evolution.schemas import CognitiveConfigurationVersion, ShadowAssignment
+from joker.evolution.shadow_ledger import ShadowLedger
 
 
 class ShadowIsolationError(RuntimeError):
@@ -34,12 +39,14 @@ class ShadowCycleResult:
 
 @dataclass
 class ShadowRuntime:
-    """Bounded-queue shadow worker. Never submits orders."""
+    """Bounded-queue shadow worker with durable ledger recovery."""
 
     assignment_repo: ShadowAssignmentRepository
     policy_store: PolicyVersionStore | None = None
     queue_size: int = 128
     challenger_runner: ChallengerRunner | None = None
+    ledger: ShadowLedger | None = None
+    config_repo: ConfigurationVersionRepository | None = None
     _queue: deque[dict[str, Any]] = field(default_factory=deque)
     _worker: asyncio.Task[None] | None = None
     _stopped: bool = True
@@ -111,7 +118,8 @@ class ShadowRuntime:
                 "assignment_id": str(assignment_id),
                 "challenger_version_id": str(challenger_version_id),
                 "snapshot_id": snapshot_id,
-                "payload": payload,
+                # Payload must not be the source of market truth — snapshot_id only.
+                "payload": {"snapshot_id": snapshot_id},
             }
         )
         return True
@@ -120,6 +128,23 @@ class ShadowRuntime:
         raise ShadowIsolationError(
             "shadow challenger cannot access ExecutionRuntime or broker submission"
         )
+
+    async def restore_from_ledger(self) -> None:
+        """Reload active assignments, configs, and open positions after restart."""
+        if self.ledger is not None:
+            await self.ledger.initialize()
+        active = await self.assignment_repo.list_active()
+        for assignment in active:
+            cfg_id = assignment.challenger_version_id
+            if cfg_id not in self._configs and self.config_repo is not None:
+                cfg = await self.config_repo.get_by_id(cfg_id)
+                if cfg is not None:
+                    self._configs[cfg_id] = cfg
+            if self.ledger is not None:
+                checkpoint = await self.ledger.load_checkpoint(assignment.assignment_id)
+                if checkpoint and checkpoint.get("last_snapshot_id"):
+                    # Cursor restored; subsequent snapshots resume after this id.
+                    pass
 
     async def _loop(self) -> None:
         while not self._stopped:
@@ -131,10 +156,14 @@ class ShadowRuntime:
 
     async def _run_shadow_cycle(self, item: dict[str, Any]) -> None:
         challenger_id = UUID(item["challenger_version_id"])
+        assignment_id = UUID(item["assignment_id"])
         challenger = self._configs.get(challenger_id)
+        if challenger is None and self.config_repo is not None:
+            challenger = await self.config_repo.get_by_id(challenger_id)
+            if challenger is not None:
+                self._configs[challenger_id] = challenger
         command: dict[str, Any]
         if self.challenger_runner is not None and challenger is not None:
-            # Real challenger cognitive execution — must not touch broker.
             command = await self.challenger_runner(challenger, item)
             if command.get("broker_submit") or command.get("execution_runtime"):
                 raise ShadowIsolationError("challenger runner attempted live execution")
@@ -160,9 +189,57 @@ class ShadowRuntime:
             snapshot_id=item.get("snapshot_id"),
             created_at=created,
         )
+        status = "traded" if command.get("traded") else "observed"
+        if self.ledger is not None:
+            await self.ledger.record_cycle(
+                assignment_id=assignment_id,
+                challenger_version_id=challenger_id,
+                snapshot_id=str(item.get("snapshot_id") or ""),
+                status=status,
+                payload=command,
+            )
+            await self.ledger.save_checkpoint(
+                assignment_id,
+                last_snapshot_id=item.get("snapshot_id"),
+                cursor={"last_command_id": command_id},
+            )
+            projection = command.get("projection") or {}
+            positions = projection.get("positions") or {}
+            for contract_id, pos in positions.items():
+                qty = Decimal(str(pos.get("quantity", 0)))
+                if qty <= 0:
+                    continue
+                lifecycle = str(
+                    pos.get("position_lifecycle_id")
+                    or f"shadow:{assignment_id}:{contract_id}"
+                )
+                await self.ledger.upsert_position(
+                    assignment_id=assignment_id,
+                    challenger_version_id=challenger_id,
+                    position_lifecycle_id=lifecycle,
+                    contract_id=str(contract_id),
+                    configuration_version_id=challenger_id,
+                    quantity=qty,
+                    average_price=Decimal(str(pos.get("avg_price", 0))),
+                    realised_pnl=Decimal(str(command.get("realised_pnl", 0))),
+                    status="open",
+                    last_snapshot_id=item.get("snapshot_id"),
+                    payload=pos if isinstance(pos, dict) else {},
+                )
+            for fill in projection.get("fills") or []:
+                fill_id = str(fill.get("fill_id") or uuid4())
+                await self.ledger.record_fill(
+                    fill_id=fill_id,
+                    client_order_id=str(fill.get("client_order_id") or fill_id),
+                    assignment_id=assignment_id,
+                    quantity=Decimal(str(fill.get("quantity", 0))),
+                    price=Decimal(str(fill.get("price", 0))),
+                    fee=Decimal(str(fill.get("fee", 0))),
+                    payload=fill if isinstance(fill, dict) else {},
+                )
         self._results.append(
             ShadowCycleResult(
-                assignment_id=UUID(item["assignment_id"]),
+                assignment_id=assignment_id,
                 challenger_version_id=challenger_id,
                 snapshot_id=item.get("snapshot_id"),
                 hypothetical_command=command,

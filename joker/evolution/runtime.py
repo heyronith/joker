@@ -15,6 +15,7 @@ from joker.evaluation.dataset_builder import DatasetBuilder
 from joker.evaluation.graph import EvaluationGraphRunner
 from joker.events.bus import InProcessAsyncEventBus
 from joker.events.schemas import DomainEvent, EventType
+from joker.evolution.adversarial_suite import AdversarialResultStore, AdversarialSuiteRunner
 from joker.evolution.champion_registry import ChampionRegistry
 from joker.evolution.checkpointers import EvolutionCheckpointerOwner
 from joker.evolution.config import EvolutionSettings
@@ -25,6 +26,7 @@ from joker.evolution.configuration_applicator import (
 from joker.evolution.decision import EvolutionDecisionService
 from joker.evolution.drift import DriftMonitor
 from joker.evolution.episode_compiler import EpisodeCompiler
+from joker.evolution.evidence_claims import EvidenceClaimStore
 from joker.evolution.experiment_runner import ExperimentRunner
 from joker.evolution.improvement import ImprovementProposalService
 from joker.evolution.improvement_graph import ImprovementGraphRunner
@@ -34,6 +36,7 @@ from joker.evolution.replay import CognitiveReplayService
 from joker.evolution.repositories import build_evolution_repositories
 from joker.evolution.schemas import CognitiveConfigurationVersion
 from joker.evolution.shadow import ShadowRuntime
+from joker.evolution.shadow_ledger import ShadowLedger
 from joker.models.router import ModelRouter
 
 logger = logging.getLogger(__name__)
@@ -77,6 +80,9 @@ class EvolutionRuntime:
     decisions: EvolutionDecisionService | None = None
     replay: CognitiveReplayService | None = None
     shadow: ShadowRuntime | None = None
+    shadow_ledger: ShadowLedger | None = None
+    evidence_claims: EvidenceClaimStore | None = None
+    adversarial_suite: AdversarialSuiteRunner | None = None
     drift: DriftMonitor | None = None
     orchestrator: EvolutionOrchestrator | None = None
     checkpointer_owner: EvolutionCheckpointerOwner | None = None
@@ -174,11 +180,20 @@ class EvolutionRuntime:
         challenger_runner = None
         if self.replay is not None:
             challenger_runner = self.replay.run_challenger_shadow
+        self.shadow_ledger = ShadowLedger(self.db_path)
+        await self.shadow_ledger.initialize()
+        self.evidence_claims = EvidenceClaimStore(self.db_path)
+        await self.evidence_claims.initialize()
+        self.adversarial_suite = AdversarialSuiteRunner(
+            AdversarialResultStore(str(self.db_path))
+        )
         self.shadow = ShadowRuntime(
             self._repos["shadow"],
             policy_store=self.champion_registry.policy_store,
             queue_size=self.settings.shadow.queue_size,
             challenger_runner=challenger_runner,
+            ledger=self.shadow_ledger,
+            config_repo=self._repos["configurations"],
         )
         self.drift = DriftMonitor(
             self._repos["drift"],
@@ -187,7 +202,11 @@ class EvolutionRuntime:
             safety_rollback_immediate=self.settings.drift.safety_rollback_immediate,
             strategic_requires_agent=self.settings.drift.strategic_rollback_requires_agent,
         )
-        self.orchestrator = EvolutionOrchestrator(self)
+        self.orchestrator = EvolutionOrchestrator(
+            self,
+            checkpointer_saver=savers.orchestrator,
+            evidence_claims=self.evidence_claims,
+        )
         self._episode_queue = asyncio.Queue(maxsize=256)
         self._eval_queue = asyncio.Queue(maxsize=256)
         self._prepared = True
@@ -222,6 +241,9 @@ class EvolutionRuntime:
     async def resume(self) -> None:
         if not self.settings.enabled or not self._prepared:
             return
+        # Restore durable shadow state before orchestrator resume.
+        if self.shadow is not None:
+            await self.shadow.restore_from_ledger()
         # Resume unfinished experiments first, then orchestrator cycles.
         if self.experiments is not None:
             for definition in await self._repos["experiments"].list_resumable():

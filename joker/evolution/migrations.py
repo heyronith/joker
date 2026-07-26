@@ -248,6 +248,116 @@ CREATE TABLE IF NOT EXISTS shadow_hypothetical_commands (
     payload_json TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS evolution_evidence_claims (
+    evaluation_id TEXT PRIMARY KEY,
+    episode_id TEXT NOT NULL,
+    evolution_cycle_id TEXT NOT NULL,
+    dataset_id TEXT,
+    claim_status TEXT NOT NULL,
+    claimed_at TEXT NOT NULL,
+    released_at TEXT,
+    claim_reason TEXT NOT NULL,
+    reuse_reason TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_evidence_claims_cycle
+    ON evolution_evidence_claims (evolution_cycle_id, claim_status);
+CREATE INDEX IF NOT EXISTS idx_evidence_claims_status
+    ON evolution_evidence_claims (claim_status, claimed_at);
+
+CREATE TABLE IF NOT EXISTS adversarial_scenario_results (
+    result_key TEXT PRIMARY KEY NOT NULL,
+    experiment_id TEXT NOT NULL,
+    scenario_id TEXT NOT NULL,
+    scenario_version TEXT NOT NULL,
+    configuration_version_id TEXT NOT NULL,
+    sample_number INTEGER NOT NULL,
+    passed INTEGER NOT NULL,
+    findings_json TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_adv_results_experiment
+    ON adversarial_scenario_results (experiment_id, scenario_id);
+
+CREATE TABLE IF NOT EXISTS shadow_cycles (
+    shadow_cycle_id TEXT PRIMARY KEY NOT NULL,
+    assignment_id TEXT NOT NULL,
+    challenger_version_id TEXT NOT NULL,
+    snapshot_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_shadow_cycles_assignment
+    ON shadow_cycles (assignment_id, created_at);
+
+CREATE TABLE IF NOT EXISTS shadow_orders (
+    client_order_id TEXT PRIMARY KEY NOT NULL,
+    assignment_id TEXT NOT NULL,
+    challenger_version_id TEXT NOT NULL,
+    position_lifecycle_id TEXT,
+    contract_id TEXT NOT NULL,
+    side TEXT NOT NULL,
+    quantity TEXT NOT NULL,
+    status TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS shadow_fills (
+    fill_id TEXT PRIMARY KEY NOT NULL,
+    client_order_id TEXT NOT NULL,
+    assignment_id TEXT NOT NULL,
+    quantity TEXT NOT NULL,
+    price TEXT NOT NULL,
+    fee TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_shadow_fills_order
+    ON shadow_fills (client_order_id, quantity, price);
+
+CREATE TABLE IF NOT EXISTS shadow_positions (
+    position_key TEXT PRIMARY KEY NOT NULL,
+    assignment_id TEXT NOT NULL,
+    challenger_version_id TEXT NOT NULL,
+    position_lifecycle_id TEXT NOT NULL,
+    contract_id TEXT NOT NULL,
+    configuration_version_id TEXT NOT NULL,
+    quantity TEXT NOT NULL,
+    average_price TEXT NOT NULL,
+    realised_pnl TEXT NOT NULL,
+    status TEXT NOT NULL,
+    last_snapshot_id TEXT,
+    updated_at TEXT NOT NULL,
+    payload_json TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS shadow_position_events (
+    event_id TEXT PRIMARY KEY NOT NULL,
+    position_lifecycle_id TEXT NOT NULL,
+    assignment_id TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS shadow_runtime_checkpoints (
+    assignment_id TEXT PRIMARY KEY NOT NULL,
+    last_snapshot_id TEXT,
+    cursor_json TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS shadow_evidence_summaries (
+    shadow_evidence_id TEXT PRIMARY KEY NOT NULL,
+    assignment_id TEXT NOT NULL,
+    challenger_version_id TEXT NOT NULL,
+    champion_version_id TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
 """
 
 

@@ -105,6 +105,7 @@ class ContextAssembler:
             raise ContextAssemblyError("snapshot_id is required")
 
         from joker.cognition.prompt_overrides import get_active_context_policy
+        from joker.cognition.memory_policy import select_memories
 
         policy = get_active_context_policy() or {}
         max_chars = int(
@@ -121,6 +122,9 @@ class ContextAssembler:
                 self.config.maximum_option_rows_per_request,
             )
         )
+
+        # Apply memory policy on the live retrieval path (not test-only).
+        selected_artifacts = select_memories(list(session_artifact_summaries))
 
         truncations: list[ContextTruncationRecord] = []
         bars_1m = snapshot.bars_1m
@@ -240,7 +244,7 @@ class ContextAssembler:
             else [],
             "order_projection": order_projection if include_orders else None,
             "position_projection": position_projection if include_positions else None,
-            "session_artifact_summaries": list(session_artifact_summaries)
+            "session_artifact_summaries": list(selected_artifacts)
             if include_artifacts
             else [],
             "legacy_playbook_context": legacy_playbook_context if include_legacy else None,

@@ -170,8 +170,10 @@ class TradingEpisode(_Frozen):
     parent_strategy_id: UUID | None = None
     proposal_id: UUID | None = None
     decision_id: UUID | None = None
-    initial_snapshot_id: UUID
+    initial_snapshot_id: UUID | None = None
     terminal_snapshot_id: UUID | None = None
+    snapshot_identity_status: Literal["verified", "missing"] = "verified"
+    position_lifecycle_id: str | None = None
     contract_id: str | None = None
     direction: Literal["bullish", "bearish", "neutral", "none"] = "none"
     action_class: Literal[

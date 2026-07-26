@@ -4,10 +4,13 @@ from __future__ import annotations
 
 from datetime import datetime
 from decimal import Decimal
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
+
+if TYPE_CHECKING:
+    from joker.evolution.replay_truth import ReplayMarketFrame
 
 
 class ReplayPositionSeed(BaseModel):
@@ -37,30 +40,19 @@ class ReplayEpisodeTruth(BaseModel):
     starting_positions: tuple[ReplayPositionSeed, ...] = ()
     fill_model_version: str = "replay_fill_v1"
     random_seed: int = 42
+    # Deprecated — production path uses frames; kept for legacy unit tests only.
     contract_quotes: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    frames: tuple[Any, ...] = ()
 
-
-def build_truth_from_episode(
-    episode: Any,
-    *,
-    starting_cash: Decimal = Decimal("100000"),
-    random_seed: int = 42,
-    contract_quotes: dict[str, dict[str, Any]] | None = None,
-) -> ReplayEpisodeTruth:
-    """Derive frozen truth from an authoritative TradingEpisode (no fabrication)."""
-    snaps: list[UUID] = [episode.initial_snapshot_id]
-    if episode.terminal_snapshot_id and episode.terminal_snapshot_id != episode.initial_snapshot_id:
-        snaps.append(episode.terminal_snapshot_id)
-    return ReplayEpisodeTruth(
-        episode_id=episode.episode_id,
-        initial_snapshot_id=episode.initial_snapshot_id,
-        terminal_snapshot_id=episode.terminal_snapshot_id,
-        snapshot_sequence=tuple(snaps),
-        option_surface_sequence=tuple(getattr(episode, "option_surface_ids", ()) or ()),
-        data_quality_sequence=tuple(getattr(episode, "data_quality_ids", ()) or ()),
-        market_event_ids=tuple(getattr(episode, "source_event_ids", ()) or ()),
-        starting_cash=starting_cash,
-        fill_model_version="replay_fill_v1",
-        random_seed=random_seed,
-        contract_quotes=contract_quotes or {},
-    )
+    def frame_quotes(self, index: int = 0) -> dict[str, dict[str, str]]:
+        if self.frames:
+            frame = self.frames[index]
+            return {
+                c.contract_id: {
+                    "bid": str(c.bid),
+                    "ask": str(c.ask),
+                    "mid": str((c.bid + c.ask) / Decimal("2")),
+                }
+                for c in frame.contracts
+            }
+        return {k: dict(v) for k, v in self.contract_quotes.items()}

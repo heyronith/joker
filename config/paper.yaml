@@ -140,6 +140,12 @@ evolution:
     maximum_challengers: 1
     queue_size: 128
     snapshot_coalescing: true
+    minimum_completed_cycles: 20
+    minimum_traded_cycles: 5
+    minimum_regime_coverage: 2
+    minimum_observation_minutes: 60
+    allow_promotion_before_shadow: false
+    maximum_integrity_findings: 0
   promotion:
     auto_promote_paper_only: true
     require_agent_recommendation: true
