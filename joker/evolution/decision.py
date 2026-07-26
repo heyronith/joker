@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, Literal, TypedDict
 from uuid import UUID, uuid4
 
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.graph import END, START, StateGraph
 
 from joker.evolution.agent_invoke import invoke_evolution_agent
@@ -23,7 +24,6 @@ from joker.evolution.schemas import (
     ImprovementProposal,
     PromotionDecision,
 )
-from joker.graph.langgraph_checkpointer import CognitiveCheckpointer, ainvoke_config
 from joker.models.router import ModelRouter
 
 
@@ -166,6 +166,7 @@ class EvolutionDecisionService:
         agent: EvolutionDecisionAgent | None = None,
         router: ModelRouter | None = None,
         checkpointer_path: Path | None = None,
+        checkpointer_saver: AsyncSqliteSaver | None = None,
         session_id: str = "evolution",
     ) -> None:
         self._promotions = promotion_repo
@@ -174,7 +175,19 @@ class EvolutionDecisionService:
         self._gate = gate or PromotionEligibilityGate()
         self._agent = agent or EvolutionDecisionAgent(router)
         self._checkpointer_path = checkpointer_path
+        self._checkpointer_saver = checkpointer_saver
         self._session_id = session_id
+        self._compiled = None
+
+    def _graph(self):
+        if self._compiled is not None:
+            return self._compiled
+        builder = build_evolution_decision_graph(self._agent)
+        if self._checkpointer_saver is not None:
+            self._compiled = builder.compile(checkpointer=self._checkpointer_saver)
+        else:
+            self._compiled = builder.compile()
+        return self._compiled
 
     async def decide_and_apply(
         self,
@@ -205,28 +218,23 @@ class EvolutionDecisionService:
                 rationale = "override blocked by deterministic gate"
                 risks = eligibility.gate_codes
         else:
-            builder = build_evolution_decision_graph(self._agent)
+            compiled = self._graph()
             state: DecisionGraphState = {
                 "eligibility": eligibility,
                 "result": result,
                 "proposal": proposal,
                 "session_id": self._session_id,
             }
-            if self._checkpointer_path is not None:
-                checkpointer = CognitiveCheckpointer(self._checkpointer_path)
-                saver = await checkpointer.open()
-                compiled = builder.compile(checkpointer=saver)
-                config = ainvoke_config(
-                    session_id=self._session_id,
-                    graph_kind="evolution_decision",
-                    cycle_id=str(experiment_id),
+            if self._checkpointer_saver is not None:
+                thread_id = (
+                    f"{experiment_id}:{challenger.configuration_version_id}:"
+                    f"{champion.configuration_version_id}"
                 )
-                try:
-                    decided = await compiled.ainvoke(state, config=config)
-                finally:
-                    await checkpointer.close()
+                decided = await compiled.ainvoke(
+                    state, config={"configurable": {"thread_id": thread_id}}
+                )
             else:
-                decided = await builder.compile().ainvoke(state)
+                decided = await compiled.ainvoke(state)
             action = decided["action"]
             rationale = decided["rationale"]
             risks = decided["risks"]

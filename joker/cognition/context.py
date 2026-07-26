@@ -104,43 +104,61 @@ class ContextAssembler:
         if snapshot.snapshot_id is None:
             raise ContextAssemblyError("snapshot_id is required")
 
+        from joker.cognition.prompt_overrides import get_active_context_policy
+
+        policy = get_active_context_policy() or {}
+        max_chars = int(
+            policy.get(
+                "max_context_characters",
+                self.config.maximum_context_characters,
+            )
+        )
+        max_1m = int(policy.get("max_1m_bars", self.config.max_1m_bars))
+        max_5m = int(policy.get("max_5m_bars", self.config.max_5m_bars))
+        max_options = int(
+            policy.get(
+                "maximum_option_rows_per_request",
+                self.config.maximum_option_rows_per_request,
+            )
+        )
+
         truncations: list[ContextTruncationRecord] = []
         bars_1m = snapshot.bars_1m
         bars_5m = snapshot.bars_5m
 
-        if len(bars_1m) > self.config.max_1m_bars:
+        if len(bars_1m) > max_1m:
             truncations.append(
                 ContextTruncationRecord(
                     field_name="bars_1m",
                     original_count=len(bars_1m),
-                    retained_count=self.config.max_1m_bars,
+                    retained_count=max_1m,
                     reason="max_1m_bars budget",
                 )
             )
-            bars_1m = bars_1m[-self.config.max_1m_bars :]
+            bars_1m = bars_1m[-max_1m :]
 
-        if len(bars_5m) > self.config.max_5m_bars:
+        if len(bars_5m) > max_5m:
             truncations.append(
                 ContextTruncationRecord(
                     field_name="bars_5m",
                     original_count=len(bars_5m),
-                    retained_count=self.config.max_5m_bars,
+                    retained_count=max_5m,
                     reason="max_5m_bars budget",
                 )
             )
-            bars_5m = bars_5m[-self.config.max_5m_bars :]
+            bars_5m = bars_5m[-max_5m :]
 
         surface_slice = option_surface_slice
-        if len(surface_slice) > self.config.maximum_option_rows_per_request:
+        if len(surface_slice) > max_options:
             truncations.append(
                 ContextTruncationRecord(
                     field_name="option_surface_slice",
                     original_count=len(surface_slice),
-                    retained_count=self.config.maximum_option_rows_per_request,
+                    retained_count=max_options,
                     reason="maximum_option_rows_per_request budget",
                 )
             )
-            surface_slice = surface_slice[: self.config.maximum_option_rows_per_request]
+            surface_slice = surface_slice[:max_options]
 
         include_underlying = True
         include_bars = True
@@ -232,18 +250,18 @@ class ContextAssembler:
         serialized = json.dumps(package_body, sort_keys=True, separators=(",", ":"))
         size_chars = len(serialized)
 
-        if size_chars > self.config.maximum_context_characters:
+        if size_chars > max_chars:
             truncations.append(
                 ContextTruncationRecord(
                     field_name="serialized_payload",
                     original_count=size_chars,
-                    retained_count=self.config.maximum_context_characters,
+                    retained_count=max_chars,
                     reason="maximum_context_characters budget",
                 )
             )
             raise ContextAssemblyError(
                 f"context size {size_chars} exceeds maximum_context_characters="
-                f"{self.config.maximum_context_characters}"
+                f"{max_chars}"
             )
 
         context_hash = hashlib.sha256(serialized.encode("utf-8")).hexdigest()

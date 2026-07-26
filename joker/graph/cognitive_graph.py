@@ -247,7 +247,11 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
 
     def after_switch_route(state: CognitiveGraphState) -> str:
         debate_round = int(state.get("debate_round") or 0)
-        if debate_round <= deps.config.max_debate_rounds:
+        from joker.cognition.prompt_overrides import get_active_debate_policy
+
+        policy = get_active_debate_policy() or {}
+        max_rounds = int(policy.get("maximum_rounds", deps.config.max_debate_rounds))
+        if debate_round <= max_rounds:
             return "debate"
         return "meta_decision"
 

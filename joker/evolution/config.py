@@ -76,6 +76,18 @@ class DriftSettings(BaseModel):
     strategic_rollback_requires_agent: bool = True
 
 
+class OrchestratorSettings(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = True
+    minimum_new_completed_episodes: int = 50
+    minimum_new_evaluations: int = 50
+    minimum_holdout_episodes: int = 20
+    maximum_active_challengers: int = 1
+    automatic_cycle_interval_minutes: int = 60
+    pause_under_load: bool = True
+
+
 class EvolutionSettings(BaseModel):
     """Task 3 evolution controls. Default ``enabled=False`` preserves Task 1/2."""
 
@@ -93,3 +105,4 @@ class EvolutionSettings(BaseModel):
     shadow: ShadowSettings = Field(default_factory=ShadowSettings)
     promotion: PromotionSettings = Field(default_factory=PromotionSettings)
     drift: DriftSettings = Field(default_factory=DriftSettings)
+    orchestrator: OrchestratorSettings = Field(default_factory=OrchestratorSettings)

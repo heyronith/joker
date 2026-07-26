@@ -209,6 +209,8 @@ async def test_task3_paper_session_active_path_auto_episode(tmp_path) -> None:
 
     deps.order_action_gateway.submit = _tracking_submit  # type: ignore[method-assign]
 
+    deps.order_action_gateway.submit = _tracking_submit  # type: ignore[method-assign]
+
     evolution = EvolutionRuntime(
         db_path=db,
         settings=EvolutionSettings(enabled=True),
@@ -219,8 +221,11 @@ async def test_task3_paper_session_active_path_auto_episode(tmp_path) -> None:
         model_router=router,
         cognitive_graph_deps=deps,
     )
-    await evolution.start()
-    agent._evolution_runtime = evolution
+    await evolution.prepare()
+    evolution.subscribe_events()
+    agent.bind_evolution_runtime(evolution)
+    await evolution.start_workers()
+    await evolution.resume()
     assert evolution._started is True
     champ = await evolution.configuration_for_new_cycle()
     assert champ is not None

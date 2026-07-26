@@ -24,7 +24,9 @@ from joker.evolution.repositories import (
     EpisodeEvaluationRepository,
 )
 from joker.evolution.schemas import EpisodeEvaluation, TradingEpisode
-from joker.graph.langgraph_checkpointer import CognitiveCheckpointer, ainvoke_config
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+
+from joker.graph.langgraph_checkpointer import ainvoke_config
 from joker.models.router import ModelRouter
 
 EVALUATOR_ROLES = (
@@ -148,12 +150,30 @@ class AgenticEvaluationGraphRunner:
         router: ModelRouter,
         evaluator_version: str = "3.0.0",
         checkpointer_path: Path | None = None,
+        checkpointer_saver: AsyncSqliteSaver | None = None,
     ) -> None:
         self._evaluations = evaluation_repo
         self._traces = trace_repo
         self._router = router
         self._evaluator_version = evaluator_version
         self._checkpointer_path = checkpointer_path
+        self._checkpointer_saver = checkpointer_saver
+        self._compiled = None
+
+    def _thread_id(self, episode: TradingEpisode) -> str:
+        return (
+            f"{episode.session_id}:{episode.episode_id}:{self._evaluator_version}"
+        )
+
+    def _graph(self):
+        if self._compiled is not None:
+            return self._compiled
+        builder = build_evaluation_graph(self._router)
+        if self._checkpointer_saver is not None:
+            self._compiled = builder.compile(checkpointer=self._checkpointer_saver)
+        else:
+            self._compiled = builder.compile()
+        return self._compiled
 
     async def evaluate(
         self,
@@ -161,6 +181,9 @@ class AgenticEvaluationGraphRunner:
         *,
         force_invalid_reasons: tuple[str, ...] = (),
     ) -> EpisodeEvaluation:
+        existing_list = await self._evaluations.list_by_episode(episode.episode_id)
+        if existing_list:
+            return existing_list[0]
         state: AgenticEvaluationState = {
             "episode": episode,
             "session_id": episode.session_id,
@@ -173,23 +196,13 @@ class AgenticEvaluationGraphRunner:
             "agent_scores": {},
             "model_call_ids": [],
         }
-        builder = build_evaluation_graph(self._router)
-        checkpointer: CognitiveCheckpointer | None = None
-        if self._checkpointer_path is not None:
-            checkpointer = CognitiveCheckpointer(self._checkpointer_path)
-            saver = await checkpointer.open()
-            compiled = builder.compile(checkpointer=saver)
-            config = ainvoke_config(
-                session_id=episode.session_id,
-                graph_kind="evaluation",
-                cycle_id=str(episode.episode_id),
-            )
-            try:
-                result_state = await compiled.ainvoke(state, config=config)
-            finally:
-                await checkpointer.close()
+        compiled = self._graph()
+        if self._checkpointer_saver is not None:
+            config = {
+                "configurable": {"thread_id": self._thread_id(episode)}
+            }
+            result_state = await compiled.ainvoke(state, config=config)
         else:
-            compiled = builder.compile()
             result_state = await compiled.ainvoke(state)
 
         evaluation: EpisodeEvaluation = result_state["evaluation"]

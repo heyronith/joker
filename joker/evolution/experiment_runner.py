@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import random
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Awaitable, Callable
@@ -38,11 +39,17 @@ class ExperimentRunner:
         db_path: str | Path | None = None,
         result_store: ExperimentEpisodeResultStore | None = None,
         replay_service: Any | None = None,
+        bootstrap_seed: int = 42,
+        bootstrap_samples: int = 200,
+        confidence_level: Decimal = Decimal("0.95"),
     ) -> None:
         self._experiments = experiment_repo
         self._gate = gate or PromotionEligibilityGate()
         self._repeated_samples = repeated_samples
         self._replay_service = replay_service
+        self._bootstrap_seed = bootstrap_seed
+        self._bootstrap_samples = bootstrap_samples
+        self._confidence_level = confidence_level
         if result_store is not None:
             self._results = result_store
         elif db_path is not None:
@@ -88,6 +95,10 @@ class ExperimentRunner:
         slice_results: list[ExperimentSliceResult] = []
         champ_vals: list[Decimal] = []
         chall_vals: list[Decimal] = []
+        champ_latency: list[Decimal] = []
+        chall_latency: list[Decimal] = []
+        champ_cost = Decimal("0")
+        chall_cost = Decimal("0")
         missing: list[UUID] = []
         model_calls = 0
         cost = Decimal("0")
@@ -132,12 +143,19 @@ class ExperimentRunner:
                                 experiment_id, "running", recovery_cursor=key
                             )
                         pnl = Decimal(str(payload.get("realised_pnl", 0)))
-                        model_calls += int(payload.get("model_calls", 1))
-                        cost += Decimal(str(payload.get("cost_gbp", "0.01")))
+                        calls = int(payload.get("model_calls", 1))
+                        sample_cost = Decimal(str(payload.get("cost_gbp", "0")))
+                        latency = Decimal(str(payload.get("latency_ms", calls * 10)))
+                        model_calls += calls
+                        cost += sample_cost
                         if bucket == "champion":
                             champ_vals.append(pnl)
+                            champ_latency.append(latency)
+                            champ_cost += sample_cost
                         else:
                             chall_vals.append(pnl)
+                            chall_latency.append(latency)
+                            chall_cost += sample_cost
                             if champ_vals:
                                 deltas.append(chall_vals[-1] - champ_vals[-1])
                         if cost > definition.maximum_cost_gbp:
@@ -146,13 +164,21 @@ class ExperimentRunner:
             avg_delta = (
                 sum(deltas) / Decimal(len(deltas)) if deltas else Decimal("0")
             )
+            ci, ci_meta = self._bootstrap_ci(deltas)
             slice_results.append(
                 ExperimentSliceResult(
                     slice_name=slice_name,
-                    metrics={"pnl_delta": avg_delta, "samples": len(deltas)},
+                    metrics={
+                        "pnl_delta": avg_delta,
+                        "samples": len(deltas),
+                        "ci_method": ci_meta["method"],
+                        "ci_seed": ci_meta["seed"],
+                        "ci_sample_count": ci_meta["sample_count"],
+                        "ci_confidence_level": str(ci_meta["confidence_level"]),
+                    },
                     episode_count=len(ids) - missing_count,
                     missing_episode_count=missing_count,
-                    confidence_intervals={"pnl_delta": self._ci(deltas)},
+                    confidence_intervals={"pnl_delta": ci},
                 )
             )
 
@@ -164,6 +190,23 @@ class ExperimentRunner:
         )
         champ_tail = min(champ_vals) if champ_vals else Decimal("0")
         chall_tail = min(chall_vals) if chall_vals else Decimal("0")
+        champ_lat = (
+            sum(champ_latency) / Decimal(len(champ_latency))
+            if champ_latency
+            else Decimal("0")
+        )
+        chall_lat = (
+            sum(chall_latency) / Decimal(len(chall_latency))
+            if chall_latency
+            else Decimal("0")
+        )
+        champ_cal = _mad(champ_vals, champ_mean)
+        chall_cal = _mad(chall_vals, chall_mean)
+        deltas_all = [b - a for a, b in zip(champ_vals, chall_vals)]
+        ci_all, ci_meta = self._bootstrap_ci(deltas_all)
+        required_missing: list[str] = []
+        if not champ_vals or not chall_vals:
+            required_missing.append("missing_replay_pnl_metrics")
         result = ExperimentResult(
             result_id=uuid4(),
             experiment_id=definition.experiment_id,
@@ -172,31 +215,31 @@ class ExperimentRunner:
                 "champion_mean_pnl": champ_mean,
                 "challenger_mean_pnl": chall_mean,
                 "pnl_delta": chall_mean - champ_mean,
+                "ci_method": ci_meta["method"],
+                "ci_seed": ci_meta["seed"],
+                "ci_sample_count": ci_meta["sample_count"],
+                "ci_confidence_level": str(ci_meta["confidence_level"]),
             },
-            confidence_intervals={
-                "pnl_delta": self._ci(
-                    [b - a for a, b in zip(champ_vals, chall_vals)]
-                )
-            },
+            confidence_intervals={"pnl_delta": ci_all},
             cost_gbp=cost,
             model_call_counts={"total": model_calls},
             missing_episodes=tuple(missing),
             champion_metrics={
                 "mean_pnl": champ_mean,
                 "tail_loss": champ_tail,
-                "calibration_error": Decimal("0.10"),
-                "latency_ms": 100,
-                "cost_gbp": cost / Decimal("2") if cost else Decimal("0"),
+                "calibration_error": champ_cal,
+                "latency_ms": champ_lat,
+                "cost_gbp": champ_cost,
             },
             challenger_metrics={
                 "mean_pnl": chall_mean,
                 "tail_loss": chall_tail,
-                "calibration_error": Decimal("0.09"),
-                "latency_ms": 110,
-                "cost_gbp": cost / Decimal("2") if cost else Decimal("0"),
+                "calibration_error": chall_cal,
+                "latency_ms": chall_lat,
+                "cost_gbp": chall_cost,
             },
             eligibility_outcome=False,
-            gate_rejection_codes=(),
+            gate_rejection_codes=tuple(required_missing),
             content_hash="",
         )
         holdout_count = len(partition_map.get("holdout", ()))
@@ -204,12 +247,14 @@ class ExperimentRunner:
             result=result,
             holdout_episode_count=holdout_count,
             completed_episode_count=len(champ_vals),
-            adversarial_passed=adversarial_passed,
+            adversarial_passed=adversarial_passed and not required_missing,
         )
+        gate_codes = list(eligibility.gate_codes)
+        gate_codes.extend(required_missing)
         result = result.model_copy(
             update={
-                "eligibility_outcome": eligibility.eligible,
-                "gate_rejection_codes": eligibility.gate_codes,
+                "eligibility_outcome": eligibility.eligible and not required_missing,
+                "gate_rejection_codes": tuple(dict.fromkeys(gate_codes)),
             }
         )
         result = result.model_copy(
@@ -239,9 +284,31 @@ class ExperimentRunner:
             replay_fn=replay_fn,
         )
 
-    @staticmethod
-    def _ci(values: list[Decimal]) -> tuple[Decimal, Decimal]:
+    def _bootstrap_ci(
+        self, values: list[Decimal]
+    ) -> tuple[tuple[Decimal, Decimal], dict[str, Any]]:
+        meta = {
+            "method": "bootstrap_percentile",
+            "seed": self._bootstrap_seed,
+            "sample_count": self._bootstrap_samples,
+            "confidence_level": self._confidence_level,
+        }
         if not values:
-            return (Decimal("0"), Decimal("0"))
-        ordered = sorted(values)
-        return (ordered[0], ordered[-1])
+            return (Decimal("0"), Decimal("0")), meta
+        rng = random.Random(self._bootstrap_seed)
+        n = len(values)
+        means: list[Decimal] = []
+        for _ in range(self._bootstrap_samples):
+            sample = [values[rng.randrange(n)] for _ in range(n)]
+            means.append(sum(sample) / Decimal(n))
+        means.sort()
+        alpha = (Decimal("1") - self._confidence_level) / Decimal("2")
+        lo_i = int(alpha * Decimal(len(means)))
+        hi_i = max(lo_i, int((Decimal("1") - alpha) * Decimal(len(means))) - 1)
+        return (means[lo_i], means[hi_i]), meta
+
+
+def _mad(values: list[Decimal], mean: Decimal) -> Decimal:
+    if not values:
+        return Decimal("0")
+    return sum(abs(v - mean) for v in values) / Decimal(len(values))

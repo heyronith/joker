@@ -127,6 +127,14 @@ evolution:
     maximum_model_calls: 5000
     maximum_cost_gbp: 25.00
     repeated_samples: 3
+  orchestrator:
+    enabled: true
+    minimum_new_completed_episodes: 50
+    minimum_new_evaluations: 50
+    minimum_holdout_episodes: 20
+    maximum_active_challengers: 1
+    automatic_cycle_interval_minutes: 60
+    pause_under_load: true
   shadow:
     enabled: true
     maximum_challengers: 1

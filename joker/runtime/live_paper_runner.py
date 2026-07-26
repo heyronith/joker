@@ -376,7 +376,6 @@ class LivePaperRunner:
             )
             assert cognitive_graph_deps.execution_runtime is not None
             assert cognitive_graph_deps.order_action_gateway is not None
-            task1_bridge.start_agent()
             if bool(getattr(self.app_settings.evolution, "enabled", False)):
                 from joker.evolution.runtime import EvolutionRuntime
 
@@ -390,9 +389,17 @@ class LivePaperRunner:
                     model_router=model_router,
                     cognitive_graph_deps=cognitive_graph_deps,
                 )
-                task1_bridge.run_coro(evolution_runtime.start())
-                injected_agent_runtime._evolution_runtime = evolution_runtime
+                # Prepare Task 3 before Task 2 recovery so champion/config/applicator
+                # and event subscriptions exist before unfinished cycles resume.
+                task1_bridge.run_coro(evolution_runtime.prepare())
+                evolution_runtime.subscribe_events()
+                injected_agent_runtime.bind_evolution_runtime(evolution_runtime)
+                task1_bridge.start_agent()
+                task1_bridge.run_coro(evolution_runtime.start_workers())
+                task1_bridge.run_coro(evolution_runtime.resume())
                 self._evolution_runtime = evolution_runtime
+            else:
+                task1_bridge.start_agent()
         self._task1_bridge = task1_bridge
         execution_broker = ExecutionDelegatingBroker(
             inner=broker,

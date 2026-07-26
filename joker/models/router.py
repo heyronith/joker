@@ -118,13 +118,37 @@ class ModelRouter:
         if force_profile:
             return force_profile, "forced_profile", False
 
-        from joker.cognition.prompt_overrides import get_override_profile
+        from joker.cognition.prompt_overrides import (
+            get_active_escalation_policy,
+            get_active_routing_policy,
+            get_override_profile,
+        )
 
         override_profile = get_override_profile(request.role)
         if override_profile and override_profile in self._registry.profiles:
             return override_profile, "configuration_role_profile", False
 
-        if escalate or request.context_payload.get("escalate"):
+        routing = get_active_routing_policy() or {}
+        preferred = routing.get("preferred_profile") or routing.get("default_profile")
+        if preferred and preferred in self._registry.profiles and not escalate:
+            return str(preferred), "configuration_routing_policy", False
+
+        escalation = get_active_escalation_policy() or {}
+        escalate_on_conflict = bool(
+            escalation.get("escalate_on_unresolved_conflict", False)
+        )
+        if (
+            escalate
+            or request.context_payload.get("escalate")
+            or (escalate_on_conflict and request.context_payload.get("unresolved_conflict"))
+        ):
+            esc_profile = str(
+                escalation.get("escalation_profile")
+                or routing.get("escalation_profile")
+                or "remote_escalation"
+            )
+            if esc_profile in self._registry.profiles:
+                return esc_profile, "configuration_escalation_policy", False
             return "remote_escalation", "explicit_escalation", False
 
         if request.model_profile in self._registry.profiles:

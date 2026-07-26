@@ -553,7 +553,9 @@ class ShadowAssignment(_Frozen):
 class EvolutionCycleRecord(_Frozen):
     cycle_id: str
     session_id: str
-    status: Literal["pending", "running", "completed", "failed", "abandoned"]
+    status: Literal[
+        "pending", "running", "completed", "failed", "abandoned", "blocked"
+    ]
     stage: str
     payload: dict[str, Any] = Field(default_factory=dict)
     updated_at: datetime = Field(default_factory=_utc_now)

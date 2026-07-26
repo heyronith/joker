@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, TypedDict
 from uuid import UUID, uuid4
 
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.graph import END, START, StateGraph
 
 from joker.evolution.agent_invoke import invoke_evolution_agent
@@ -18,7 +19,6 @@ from joker.evolution.schemas import (
     PromptPatch,
     TradingEpisode,
 )
-from joker.graph.langgraph_checkpointer import CognitiveCheckpointer, ainvoke_config
 from joker.models.router import ModelRouter
 
 
@@ -182,12 +182,25 @@ class ImprovementGraphRunner:
         router: ModelRouter,
         service: ImprovementProposalService,
         checkpointer_path: Path | None = None,
+        checkpointer_saver: AsyncSqliteSaver | None = None,
         session_id: str = "evolution",
     ) -> None:
         self._router = router
         self._service = service
         self._checkpointer_path = checkpointer_path
+        self._checkpointer_saver = checkpointer_saver
         self._session_id = session_id
+        self._compiled = None
+
+    def _graph(self):
+        if self._compiled is not None:
+            return self._compiled
+        builder = build_improvement_graph(self._router, self._service)
+        if self._checkpointer_saver is not None:
+            self._compiled = builder.compile(checkpointer=self._checkpointer_saver)
+        else:
+            self._compiled = builder.compile()
+        return self._compiled
 
     async def run(
         self,
@@ -195,6 +208,7 @@ class ImprovementGraphRunner:
         parent_champion: CognitiveConfigurationVersion,
         episodes: list[TradingEpisode],
         evaluations: list[EpisodeEvaluation],
+        evaluation_window_hash: str | None = None,
     ) -> tuple[ImprovementProposal, CognitiveConfigurationVersion]:
         state: ImprovementGraphState = {
             "session_id": self._session_id,
@@ -203,20 +217,15 @@ class ImprovementGraphRunner:
             "evaluations": evaluations,
             "model_call_ids": [],
         }
-        builder = build_improvement_graph(self._router, self._service)
-        if self._checkpointer_path is not None:
-            checkpointer = CognitiveCheckpointer(self._checkpointer_path)
-            saver = await checkpointer.open()
-            compiled = builder.compile(checkpointer=saver)
-            config = ainvoke_config(
-                session_id=self._session_id,
-                graph_kind="improvement",
-                cycle_id=str(parent_champion.configuration_version_id),
+        compiled = self._graph()
+        if self._checkpointer_saver is not None:
+            window = evaluation_window_hash or "default"
+            thread_id = (
+                f"{self._session_id}:{window}:{parent_champion.configuration_version_id}"
             )
-            try:
-                result = await compiled.ainvoke(state, config=config)
-            finally:
-                await checkpointer.close()
+            result = await compiled.ainvoke(
+                state, config={"configurable": {"thread_id": thread_id}}
+            )
         else:
-            result = await builder.compile().ainvoke(state)
+            result = await compiled.ainvoke(state)
         return result["proposal"], result["challenger"]

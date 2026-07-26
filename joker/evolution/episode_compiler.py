@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-from datetime import date, datetime, timezone
+from datetime import date
 from decimal import Decimal
 from typing import Any, Protocol
 from uuid import UUID, uuid4
 
 from joker.evolution.hashing import hash_model
 from joker.evolution.idempotency import episode_idempotency_key
+from joker.evolution.lifecycle import PositionLifecycleResolver
 from joker.evolution.repositories import (
     DecisionTraceRepository,
     TradingEpisodeRepository,
@@ -28,9 +29,18 @@ class EpisodeCompiler:
         self,
         episode_repo: TradingEpisodeRepository,
         trace_repo: DecisionTraceRepository | None = None,
+        *,
+        lifecycle_resolver: PositionLifecycleResolver | None = None,
+        provenance: Any | None = None,
+        cycle_registry: Any | None = None,
     ) -> None:
         self._episodes = episode_repo
         self._traces = trace_repo
+        self._lifecycle = lifecycle_resolver or PositionLifecycleResolver(
+            provenance=provenance
+        )
+        self._provenance = provenance
+        self._cycle_registry = cycle_registry
 
     async def compile_from_position_closed(
         self,
@@ -53,7 +63,7 @@ class EpisodeCompiler:
         decision_id: UUID | None = None,
         market_regime_tags: tuple[str, ...] = (),
     ) -> TradingEpisode:
-        """Derive a closed-trade episode from POSITION_CLOSED + live projection."""
+        """Derive a closed-trade episode from POSITION_CLOSED + lifecycle resolution."""
         projection = await execution.project_session()
         contract_id = str(event_payload.get("contract_id") or "")
         client_order_id = str(event_payload.get("client_order_id") or "")
@@ -69,59 +79,77 @@ class EpisodeCompiler:
             findings.append("position_still_open_in_projection")
             completed = False
 
-        entry_orders, exit_orders = self._partition_orders(
-            projection, contract_id=contract_id
+        resolved = await self._lifecycle.resolve_closed_lifecycle(
+            session_id=session_id,
+            terminal_event_id=event_id,
+            contract_id=contract_id,
+            client_order_id=client_order_id or None,
+            projection=projection,
+            configuration_version_id=configuration_version_id,
+            known_entry_cycle_id=entry_cycle_id,
+            known_snapshot_id=initial_snapshot_id,
         )
+        findings.extend(resolved.findings)
+        entry_orders = resolved.entry_orders
+        exit_orders = resolved.exit_orders
         if not entry_orders:
-            findings.append("missing_entry_orders_in_projection")
             completed = False
         if not exit_orders and client_order_id:
-            # Closing order may be the event's client_order_id.
             closer = projection.orders.get(client_order_id)
             if closer is not None:
                 exit_orders = (closer,)
 
-        entry_qty = sum((o.filled_qty for o in entry_orders), Decimal("0"))
+        entry_qty = resolved.quantity or sum(
+            (o.filled_qty for o in entry_orders), Decimal("0")
+        )
         exit_qty = sum((o.filled_qty for o in exit_orders), Decimal("0"))
-        remaining = entry_qty - exit_qty
-        if remaining != 0:
+        if entry_qty != exit_qty:
             findings.append("quantity_identity_mismatch")
             completed = False
 
         entry_price = self._vwap(entry_orders)
         exit_price = self._vwap(exit_orders)
-        realised = None
+        realised = resolved.realised_pnl
+        projection_pnl = None
         if "realized_pnl" in event_payload and event_payload["realized_pnl"] is not None:
-            realised = Decimal(str(event_payload["realized_pnl"]))
+            projection_pnl = Decimal(str(event_payload["realized_pnl"]))
         elif position is not None:
-            realised = position.realized_pnl
-        else:
+            projection_pnl = position.realized_pnl
+        if realised is None and projection_pnl is not None:
+            realised = projection_pnl
+        if realised is None:
             findings.append("missing_realised_pnl")
             completed = False
+        elif projection_pnl is not None and abs(realised - projection_pnl) > Decimal("0.01"):
+            findings.append("lifecycle_pnl_mismatch")
+            completed = False
 
-        if initial_snapshot_id is None:
+        snap = resolved.initial_snapshot_id
+        if snap is None:
             findings.append("missing_initial_snapshot")
             completed = False
-            initial_snapshot_id = uuid4()
+            # Do not fabricate random snapshot IDs.
+            snap = UUID(int=0)
 
-        fees = Decimal("0")
-        for order in (*entry_orders, *exit_orders):
-            fees += order.fees
+        fees = resolved.total_fees
+        if fees == 0:
+            for order in (*entry_orders, *exit_orders):
+                fees += order.fees
 
-        lifecycle = f"{contract_id}:{entry_orders[0].client_order_id if entry_orders else client_order_id}"
+        lifecycle = resolved.position_lifecycle_id
         key = episode_idempotency_key(session_id, lifecycle, event_id)
         episode = TradingEpisode(
             episode_id=uuid4(),
             session_id=session_id,
             run_id=run_id,
             trading_date=trading_date,
-            entry_cycle_id=entry_cycle_id,
-            proposal_id=proposal_id,
-            decision_id=decision_id,
-            initial_snapshot_id=initial_snapshot_id,
-            terminal_snapshot_id=initial_snapshot_id,
+            entry_cycle_id=resolved.entry_cycle_id or entry_cycle_id,
+            proposal_id=resolved.proposal_id or proposal_id,
+            decision_id=resolved.decision_id or decision_id,
+            initial_snapshot_id=snap,
+            terminal_snapshot_id=resolved.terminal_snapshot_id or snap,
             contract_id=contract_id or None,
-            direction="none",
+            direction="bullish" if entry_orders else "none",
             action_class="closed_trade",
             entry_order_ids=tuple(o.client_order_id for o in entry_orders),
             exit_order_ids=tuple(o.client_order_id for o in exit_orders),
@@ -138,9 +166,10 @@ class EpisodeCompiler:
             else source_event_ids,
             cognitive_artifact_ids=cognitive_artifact_ids,
             model_call_ids=model_call_ids,
-            configuration_version_id=configuration_version_id,
+            configuration_version_id=resolved.configuration_version_id
+            or configuration_version_id,
             completed=completed,
-            completeness_findings=tuple(findings),
+            completeness_findings=tuple(dict.fromkeys(findings)),
             idempotency_key=key,
         )
         await self._episodes.append(episode)
@@ -165,16 +194,25 @@ class EpisodeCompiler:
         client_order_id = str(event_payload.get("client_order_id") or "")
         order = projection.orders.get(client_order_id)
         findings: list[str] = list(rejection_codes)
+        completed = True
         if order is None:
             findings.append("order_missing_from_projection")
+            completed = False
         elif action_class == "entry_rejected" and order.status is not OrderStatus.REJECTED:
             findings.append("projection_status_not_rejected")
+            completed = False
         elif action_class == "entry_cancelled" and order.status is not OrderStatus.CANCELLED:
             findings.append("projection_status_not_cancelled")
+            completed = False
 
         if initial_snapshot_id is None:
             findings.append("missing_initial_snapshot")
-            initial_snapshot_id = uuid4()
+            completed = False
+            initial_snapshot_id = UUID(int=0)
+
+        if configuration_version_id is None:
+            findings.append("missing_configuration_version")
+            completed = False
 
         lifecycle = f"{action_class}:{client_order_id or event_id}"
         key = episode_idempotency_key(session_id, lifecycle, event_id)
@@ -188,7 +226,7 @@ class EpisodeCompiler:
             entry_order_ids=(client_order_id,) if client_order_id else (),
             quantity=Decimal("0"),
             configuration_version_id=configuration_version_id,
-            completed=True,
+            completed=completed,
             completeness_findings=tuple(findings),
             idempotency_key=key,
             contract_id=order.contract_id if order else None,
@@ -204,7 +242,7 @@ class EpisodeCompiler:
         trading_date: date,
         configuration_version_id: UUID,
         cycle_id: str,
-        snapshot_id: UUID,
+        snapshot_id: UUID | None,
         event_id: str,
         outcome: str,
         decision_rationale: str = "",
@@ -216,8 +254,65 @@ class EpisodeCompiler:
         option_surface_ids: tuple[UUID, ...] = (),
     ) -> TradingEpisode:
         findings: list[str] = []
-        if not snapshot_id:
+        completed = True
+        if snapshot_id is None:
             findings.append("missing_snapshot")
+            completed = False
+            snapshot_id = UUID(int=0)
+
+        # Prefer persisted Task 2 cycle registry / cognitive repos over event-only.
+        if self._cycle_registry is not None and cycle_id:
+            try:
+                record = await self._cycle_registry.get(
+                    session_id=session_id, graph_kind="decision", cycle_id=cycle_id
+                )
+            except Exception:
+                record = None
+            if record is not None:
+                payload = record.payload or {}
+                for key_name, bucket in (
+                    ("world_model_id", "cognitive_artifact_ids"),
+                    ("strategy_ids", "cognitive_artifact_ids"),
+                    ("debate_id", "cognitive_artifact_ids"),
+                    ("decision_id", "cognitive_artifact_ids"),
+                    ("model_call_ids", "model_call_ids"),
+                    ("data_quality_id", "data_quality_ids"),
+                    ("option_surface_id", "option_surface_ids"),
+                ):
+                    raw = payload.get(key_name)
+                    if raw is None:
+                        continue
+                    ids = raw if isinstance(raw, (list, tuple)) else [raw]
+                    collected: list[UUID] = []
+                    for item in ids:
+                        try:
+                            collected.append(UUID(str(item)))
+                        except Exception:
+                            continue
+                    if bucket == "cognitive_artifact_ids" and collected:
+                        cognitive_artifact_ids = tuple(
+                            dict.fromkeys((*cognitive_artifact_ids, *collected))
+                        )
+                    elif bucket == "model_call_ids" and collected:
+                        model_call_ids = tuple(
+                            dict.fromkeys((*model_call_ids, *collected))
+                        )
+                    elif bucket == "data_quality_ids" and collected:
+                        data_quality_ids = tuple(
+                            dict.fromkeys((*data_quality_ids, *collected))
+                        )
+                    elif bucket == "option_surface_ids" and collected:
+                        option_surface_ids = tuple(
+                            dict.fromkeys((*option_surface_ids, *collected))
+                        )
+                if payload.get("confidence_values"):
+                    confidence_values = {
+                        str(k): Decimal(str(v))
+                        for k, v in dict(payload["confidence_values"]).items()
+                    }
+                if payload.get("rejection_codes"):
+                    rejection_codes = tuple(payload["rejection_codes"])
+
         key = episode_idempotency_key(session_id, f"no_trade:{cycle_id}", event_id)
         episode = TradingEpisode(
             episode_id=uuid4(),
@@ -233,7 +328,7 @@ class EpisodeCompiler:
             model_call_ids=model_call_ids,
             data_quality_ids=data_quality_ids,
             option_surface_ids=option_surface_ids,
-            completed=True,
+            completed=completed,
             completeness_findings=tuple(findings),
             idempotency_key=key,
         )
@@ -252,26 +347,6 @@ class EpisodeCompiler:
             )
             await self._traces.append(summary)
         return episode
-
-    @staticmethod
-    def _partition_orders(
-        projection: ProjectionState, *, contract_id: str
-    ) -> tuple[tuple[OrderLifecycle, ...], tuple[OrderLifecycle, ...]]:
-        entries: list[OrderLifecycle] = []
-        exits: list[OrderLifecycle] = []
-        for order in projection.orders.values():
-            if contract_id and order.contract_id != contract_id:
-                continue
-            if order.status not in {
-                OrderStatus.FILLED,
-                OrderStatus.PARTIALLY_FILLED,
-            }:
-                continue
-            if order.side == "buy":
-                entries.append(order)
-            else:
-                exits.append(order)
-        return tuple(entries), tuple(exits)
 
     @staticmethod
     def _vwap(orders: tuple[OrderLifecycle, ...]) -> Decimal | None:

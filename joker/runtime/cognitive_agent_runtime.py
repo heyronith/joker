@@ -133,6 +133,14 @@ class CognitiveAgentRuntime:
     def deps(self) -> CognitiveGraphDeps:
         return self._deps
 
+    def bind_evolution_runtime(self, evolution_runtime: Any) -> None:
+        """Inject Task 3 runtime before workers start (supported public API)."""
+        if self._started and self._evolution_runtime is not None:
+            raise RuntimeError(
+                "cannot rebind evolution runtime after CognitiveAgentRuntime has started"
+            )
+        self._evolution_runtime = evolution_runtime
+
     async def start(self) -> None:
         if self._started:
             return
@@ -227,7 +235,22 @@ class CognitiveAgentRuntime:
                 )
             )
             try:
-                resumed = await graph.ainvoke(None, config=config)
+                from joker.cognition.prompt_overrides import pinned_applied_configuration
+
+                applied = None
+                payload = record.payload or {}
+                cfg_raw = payload.get("configuration_version_id")
+                if self._evolution_runtime is not None and cfg_raw:
+                    from uuid import UUID as _UUID
+
+                    applied = await self._evolution_runtime.apply_configuration_version(
+                        record.cycle_id, _UUID(str(cfg_raw))
+                    )
+                if applied is not None:
+                    with pinned_applied_configuration(applied):
+                        resumed = await graph.ainvoke(None, config=config)
+                else:
+                    resumed = await graph.ainvoke(None, config=config)
                 terminal_ok = self._cycle_reached_terminal_outcome(
                     resumed, graph_kind=record.graph_kind
                 )
@@ -685,17 +708,13 @@ class CognitiveAgentRuntime:
             cycle_id=cycle_id,
         )
         try:
-            from joker.cognition.prompt_overrides import pinned_configuration_overrides
+            from joker.cognition.prompt_overrides import pinned_applied_configuration
 
             applied = None
             if self._evolution_runtime is not None:
                 applied = await self._evolution_runtime.pin_and_apply_for_cycle(cycle_id)
             if applied is not None:
-                with pinned_configuration_overrides(
-                    configuration_version_id=str(applied.configuration_version_id),
-                    prompt_overrides=applied.prompt_overrides,
-                    role_profiles=applied.role_profiles,
-                ):
+                with pinned_applied_configuration(applied):
                     result_state = await asyncio.wait_for(
                         self._decision_graph.ainvoke(state, config=config),
                         timeout=float(self._config.max_cycle_seconds),
@@ -720,6 +739,13 @@ class CognitiveAgentRuntime:
                         snapshot_id=snapshot_id,
                         status="completed" if terminal_ok else "running",
                         checkpoint_thread_id=thread_id,
+                        payload={
+                            "configuration_version_id": (
+                                str(applied.configuration_version_id)
+                                if applied is not None
+                                else None
+                            )
+                        },
                     )
                 )
         except asyncio.TimeoutError:
@@ -868,7 +894,30 @@ class CognitiveAgentRuntime:
             graph_kind="position",
             cycle_id=cycle_id,
         )
-        task = asyncio.create_task(self._position_graph.ainvoke(state, config=config))
+        applied = None
+        if self._evolution_runtime is not None:
+            contract = str(resolved.get("contract_id") or position_id)
+            origin = self._evolution_runtime.originating_configuration_for_contract(
+                contract
+            )
+            if origin is None and parent_entry_cycle_id:
+                origin = self._evolution_runtime.get_pinned(parent_entry_cycle_id)
+            if origin is not None:
+                applied = await self._evolution_runtime.apply_configuration_version(
+                    cycle_id, origin
+                )
+            else:
+                applied = await self._evolution_runtime.pin_and_apply_for_cycle(cycle_id)
+
+        from joker.cognition.prompt_overrides import pinned_applied_configuration
+
+        async def _invoke_position():
+            if applied is not None:
+                with pinned_applied_configuration(applied):
+                    return await self._position_graph.ainvoke(state, config=config)
+            return await self._position_graph.ainvoke(state, config=config)
+
+        task = asyncio.create_task(_invoke_position())
         self._active_position_tasks.add(task)
         try:
             result_state = await task
@@ -886,13 +935,22 @@ class CognitiveAgentRuntime:
                         snapshot_id=snapshot_id,
                         status="completed" if terminal_ok else "running",
                         checkpoint_thread_id=thread_id,
+                        parent_entry_cycle_id=parent_entry_cycle_id,
                         original_strategy_id=str(
                             resolved.get("original_strategy_id")
                             or resolved.get("strategy_id")
                             or ""
                         )
                         or None,
-                        original_proposal_id=str(resolved.get("proposal_id") or "") or None,
+                        original_proposal_id=str(resolved.get("proposal_id") or "")
+                        or None,
+                        payload={
+                            "configuration_version_id": (
+                                str(applied.configuration_version_id)
+                                if applied is not None
+                                else None
+                            )
+                        },
                     )
                 )
         finally:
@@ -976,12 +1034,46 @@ class CognitiveAgentRuntime:
             return
 
         agent = OrderManagerAgent()
-        decision = await agent.manage(
-            context,
-            self._router,
-            client_order_id=client_order_id,
-            order_projection=order_projection,
-        )
+        applied = None
+        if self._evolution_runtime is not None:
+            contract = str(
+                resolved.get("contract_id")
+                or (order_projection or {}).get("contract_id")
+                or ""
+            )
+            origin = None
+            if contract:
+                origin = self._evolution_runtime.originating_configuration_for_contract(
+                    contract
+                )
+            parent_cycle = str(resolved.get("cycle_id") or "")
+            if origin is None and parent_cycle:
+                origin = self._evolution_runtime.get_pinned(parent_cycle)
+            if origin is not None:
+                applied = await self._evolution_runtime.apply_configuration_version(
+                    f"om:{client_order_id}", origin
+                )
+            else:
+                applied = await self._evolution_runtime.pin_and_apply_for_cycle(
+                    f"om:{client_order_id}"
+                )
+        from joker.cognition.prompt_overrides import pinned_applied_configuration
+
+        if applied is not None:
+            with pinned_applied_configuration(applied):
+                decision = await agent.manage(
+                    context,
+                    self._router,
+                    client_order_id=client_order_id,
+                    order_projection=order_projection,
+                )
+        else:
+            decision = await agent.manage(
+                context,
+                self._router,
+                client_order_id=client_order_id,
+                order_projection=order_projection,
+            )
         decision_key = f"{client_order_id}:{decision.action}:{decision.rationale_summary}"
         if decision_key in self._order_decision_ids:
             return
