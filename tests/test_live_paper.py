@@ -232,8 +232,14 @@ def test_live_paper_end_to_end_with_injected_webull(tmp_path: Path, monkeypatch:
     assert result.report_path.exists()
 
 
-def test_live_paper_fails_without_real_warmup(tmp_path: Path) -> None:
+def test_live_paper_fails_without_real_warmup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     from joker.data.webull_errors import WebullApiError
+
+    # Force local PaperBroker — do not pick up real WEBULL_PAPER_* from developer .env
+    monkeypatch.setenv("WEBULL_PAPER_TRADING_ENABLED", "false")
+    monkeypatch.delenv("WEBULL_PAPER_ACCOUNT_ID", raising=False)
 
     market_api = MockWebullMarketApi(
         fail_snapshot=WebullApiError("No snapshot"),

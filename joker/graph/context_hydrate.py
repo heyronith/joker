@@ -9,7 +9,8 @@ from joker.cognition.context import ContextAssembler, ContextAssemblerConfig, Co
 from joker.cognition.schemas import AgentRole
 from joker.graph.graph_deps import CognitiveGraphDeps
 from joker.market.option_surface import OptionContractSnapshot, OptionSurfaceSnapshot
-from joker.market.quality import DataQualityReport, DataQualitySeverity
+from joker.market.data_quality_store import DataQualityRepository
+from joker.market.quality import DataQualityReport
 from joker.market.snapshots import MarketSnapshot
 
 
@@ -57,18 +58,18 @@ async def load_snapshot_truth(
             surface_slice = tuple(surface.contracts)
 
     data_quality: DataQualityReport | None = None
-    # Compact DataQualitySnapshot is embedded by id only; reconstruct a usable
-    # report from projection metadata when a full report repo is unavailable.
     if deps.data_quality_loader is not None:
         data_quality = await deps.data_quality_loader(record.data_quality_id, record)
+    if data_quality is None and deps.data_quality_repo is not None:
+        data_quality = await deps.data_quality_repo.get_by_id(record.data_quality_id)
+    if data_quality is None and deps.db_path is not None:
+        repo = DataQualityRepository(deps.db_path)
+        data_quality = await repo.get_by_id(record.data_quality_id)
     if data_quality is None:
-        data_quality = DataQualityReport(
-            report_id=record.data_quality_id,
+        # Fail closed — never fabricate a healthy report when truth is missing.
+        data_quality = DataQualityRepository.unavailable_report(
+            record.data_quality_id,
             snapshot_id=record.snapshot_id,
-            severity=DataQualitySeverity.OK,
-            findings=(),
-            usable_for_reasoning=True,
-            usable_for_execution=True,
         )
     return record, data_quality, surface, surface_slice
 

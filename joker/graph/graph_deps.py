@@ -15,8 +15,12 @@ from joker.config.settings import CognitiveGraphSettings
 from joker.events.bus import InProcessAsyncEventBus
 from joker.market.option_surface import OptionSurfaceRepository
 from joker.market.quality import DataQualityReport
+from joker.market.data_quality_store import DataQualityRepository
 from joker.market.snapshots import MarketSnapshot, SnapshotRepository
 from joker.models.router import ModelRouter
+from joker.persistence.cognitive_execution_provenance import (
+    CognitiveExecutionProvenanceRegistry,
+)
 from joker.persistence.cognitive_repositories import (
     DebateRepository,
     DecisionRepository,
@@ -51,6 +55,7 @@ class CognitiveGraphDeps:
     context_assembler: ContextAssembler = field(default_factory=ContextAssembler)
     snapshot_repo: SnapshotRepository | None = None
     option_surface_repo: OptionSurfaceRepository | None = None
+    data_quality_repo: DataQualityRepository | None = None
     evidence_repo: EvidenceRepository | None = None
     world_model_repo: WorldModelRepository | None = None
     hypothesis_repo: HypothesisRepository | None = None
@@ -68,6 +73,7 @@ class CognitiveGraphDeps:
     checkpointer: BaseCheckpointSaver | None = None
     data_quality_loader: DataQualityLoader | None = None
     projection_loader: ProjectionLoader | None = None
+    provenance_registry: CognitiveExecutionProvenanceRegistry | None = None
     submitted_proposal_ids: set[str] = field(default_factory=set)
 
     def limits_dict(self) -> dict[str, int]:

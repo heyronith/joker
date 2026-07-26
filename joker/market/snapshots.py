@@ -178,6 +178,30 @@ class SnapshotRepository:
             return None
         return MarketSnapshot.model_validate_json(row[0])
 
+    async def get_latest(self, session_id: str | None = None) -> MarketSnapshot | None:
+        """Load the most recent snapshot by exchange_time.
+
+        ``session_id`` is accepted for API symmetry; snapshots are keyed by
+        trading date / time rather than session in the Task 1 store.
+        """
+        del session_id  # unused — snapshots are global to the Task 1 DB
+        await self._ensure_initialized()
+        try:
+            async with aiosqlite.connect(self._db_path) as db:
+                async with db.execute(
+                    """
+                    SELECT payload_json FROM market_snapshots
+                    ORDER BY exchange_time DESC
+                    LIMIT 1
+                    """
+                ) as cursor:
+                    row = await cursor.fetchone()
+        except aiosqlite.Error as exc:
+            raise SnapshotError("Failed to load latest snapshot") from exc
+        if row is None:
+            return None
+        return MarketSnapshot.model_validate_json(row[0])
+
     async def list_by_trading_date(self, trading_date: date) -> list[MarketSnapshot]:
         """Return all snapshots for a trading date, ordered by exchange_time."""
         await self._ensure_initialized()

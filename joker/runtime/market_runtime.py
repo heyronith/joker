@@ -28,6 +28,7 @@ from joker.market.option_surface import (
     compute_mid,
 )
 from joker.market.quality import DataQualityConfig, DataQualityReport, evaluate_data_quality
+from joker.market.data_quality_store import DataQualityRepository
 from joker.market.snapshots import (
     DataQualitySnapshot,
     MarketSnapshot,
@@ -107,6 +108,7 @@ class MarketRuntime:
         snapshot_repo: SnapshotRepository,
         surface_builder: OptionSurfaceBuilder | None = None,
         surface_repo: OptionSurfaceRepository | None = None,
+        data_quality_repo: DataQualityRepository | None = None,
         session_id: str,
         config: MarketRuntimeConfig | None = None,
     ) -> None:
@@ -116,6 +118,7 @@ class MarketRuntime:
         self._snapshots = snapshot_repo
         self._surface_builder = surface_builder or OptionSurfaceBuilder()
         self._surfaces = surface_repo
+        self._data_quality_repo = data_quality_repo
         self._session_id = session_id
         self._config = config or MarketRuntimeConfig()
         self._quality_config = self._config.to_quality_config()
@@ -433,6 +436,8 @@ class MarketRuntime:
 
         result.quality = quality
         self._latest_quality = quality
+        if self._data_quality_repo is not None:
+            await self._data_quality_repo.save(quality, session_id=self._session_id)
         dq_snap = DataQualitySnapshot(
             data_quality_id=quality.report_id,
             severity=quality.severity.value,

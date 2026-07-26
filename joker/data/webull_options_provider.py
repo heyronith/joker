@@ -205,6 +205,50 @@ class WebullOptionsDataProvider:
         )
         return call_snap, put_snap
 
+    def fetch_surface_snapshots(
+        self,
+        underlying_price: float,
+        expiration: date | None = None,
+        *,
+        max_contracts: int = 40,
+        allow_osi_fallback: bool = True,
+        strike_window: int = 10,
+    ) -> list[OptionSnapshot]:
+        """Fetch a near-ATM 0DTE option surface (not limited to two ATM contracts)."""
+        exp = expiration or self.market_today()
+        try:
+            contracts = self.discover_contracts(ALLOWED_SYMBOL, exp)
+        except OptionEndpointUnverified:
+            if not allow_osi_fallback:
+                raise
+            contracts = self.discover_osi_candidates(underlying_price, exp)
+        if not contracts:
+            return []
+
+        calls = sorted(
+            [c for c in contracts if c.option_type == "call"],
+            key=lambda c: abs(c.strike - underlying_price),
+        )[: max(1, strike_window)]
+        puts = sorted(
+            [c for c in contracts if c.option_type == "put"],
+            key=lambda c: abs(c.strike - underlying_price),
+        )[: max(1, strike_window)]
+        selected = [c for c in (*calls, *puts) if c.contract_id]
+        if not selected:
+            # OSI fallback has no contract_id — cannot fetch live snapshots.
+            return []
+        selected = selected[:max_contracts]
+        try:
+            self._rate_limiter.acquire()
+            snapshots = self.api.get_option_snapshots(selected)
+        except RateLimitExceeded as exc:
+            raise WebullApiError(str(exc), rate_limited=True) from exc
+        for snap in snapshots:
+            key = snap.contract.contract_id or ""
+            if key:
+                self._snapshot_cache.set(key, snap)
+        return list(snapshots)
+
     def to_quote_events(
         self,
         snapshots: list[OptionSnapshot],

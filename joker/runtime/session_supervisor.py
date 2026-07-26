@@ -20,6 +20,7 @@ from joker.ledger.projector import LedgerProjector
 from joker.ledger.reconciliation import BrokerReconciler, ReconciliationReport
 from joker.ledger.store import SqliteLedgerStore
 from joker.market.bars import BarBuilder
+from joker.market.data_quality_store import DataQualityRepository
 from joker.market.option_surface import OptionSurfaceBuilder, OptionSurfaceRepository
 from joker.market.snapshots import SnapshotRepository
 from joker.persistence.migrations import apply_task1_migrations
@@ -80,6 +81,7 @@ class SessionSupervisor:
         self._ledger: SqliteLedgerStore | None = None
         self._snapshots: SnapshotRepository | None = None
         self._surfaces: OptionSurfaceRepository | None = None
+        self._data_quality: DataQualityRepository | None = None
         self._market: MarketRuntime | None = None
         self._execution: ExecutionRuntime | None = None
         self._started = False
@@ -137,6 +139,10 @@ class SessionSupervisor:
         return self._surfaces
 
     @property
+    def data_quality_repository(self) -> DataQualityRepository | None:
+        return self._data_quality
+
+    @property
     def unresolved_reconciliation(self) -> UnresolvedReconciliation | None:
         return self._unresolved
 
@@ -157,6 +163,8 @@ class SessionSupervisor:
         await self._snapshots.initialize()
         self._surfaces = OptionSurfaceRepository(self._config.db_path)
         await self._surfaces.initialize()
+        self._data_quality = DataQualityRepository(self._config.db_path)
+        await self._data_quality.initialize()
 
         restored = await self._checkpoints.load_latest(self._session_id)
         if restored is not None:
@@ -182,6 +190,7 @@ class SessionSupervisor:
             snapshot_repo=self._snapshots,
             surface_builder=OptionSurfaceBuilder(),
             surface_repo=self._surfaces,
+            data_quality_repo=self._data_quality,
             session_id=self._session_id,
             config=self._config.market,
         )

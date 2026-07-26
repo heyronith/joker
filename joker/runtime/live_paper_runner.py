@@ -261,6 +261,7 @@ class LivePaperRunner:
             from joker.cognition.exceptions import CognitiveRuntimeConfigurationError
             from joker.graph.context_hydrate import context_assembler_from_settings
             from joker.graph.graph_deps import CognitiveGraphDeps
+            from joker.market.data_quality_store import DataQualityRepository
             from joker.market.option_surface import OptionSurfaceRepository
             from joker.market.snapshots import SnapshotRepository
             from joker.models.router import ModelRouter
@@ -300,6 +301,7 @@ class LivePaperRunner:
                 ),
                 snapshot_repo=SnapshotRepository(task1_db),
                 option_surface_repo=OptionSurfaceRepository(task1_db),
+                data_quality_repo=DataQualityRepository(task1_db),
                 db_path=task1_db,
                 **repos,
             )
@@ -339,31 +341,29 @@ class LivePaperRunner:
             agent_runtime=injected_agent_runtime,
         )
         if cognitive_mode and cognitive_graph_deps is not None:
-            async def _submit_callback(provenanced: Any) -> Any:
-                execution = task1_bridge.supervisor.execution_runtime
-                if execution is None:
-                    raise RuntimeError("ExecutionRuntime not available")
-                return await execution.submit_execution_command(provenanced.command)
-
-            async def _projection_loader() -> Any:
-                execution = task1_bridge.supervisor.execution_runtime
-                if execution is None:
-                    return None
-                return await execution.project_session()
-
-            cognitive_graph_deps.submit_callback = _submit_callback
-            cognitive_graph_deps.event_bus = task1_bridge.supervisor.event_bus
-            cognitive_graph_deps.execution_runtime = task1_bridge.supervisor.execution_runtime
-            cognitive_graph_deps.projection_loader = _projection_loader
-            if task1_bridge.supervisor.option_surface_repository is not None:
-                cognitive_graph_deps.option_surface_repo = (
-                    task1_bridge.supervisor.option_surface_repository
-                )
-            if task1_bridge.supervisor.snapshot_repository is not None:
-                cognitive_graph_deps.snapshot_repo = (
-                    task1_bridge.supervisor.snapshot_repository
-                )
+            # Callbacks/repos are wired after start() — ExecutionRuntime does not
+            # exist until SessionSupervisor.start() completes.
+            pass
         task1_bridge.start()
+        if cognitive_mode and cognitive_graph_deps is not None:
+            from joker.persistence.cognitive_execution_provenance import (
+                CognitiveExecutionProvenanceRegistry,
+            )
+            from joker.runtime.cognitive_binding import bind_cognitive_graph_to_task1
+
+            provenance = CognitiveExecutionProvenanceRegistry(
+                task1_db.with_name(task1_db.stem + "_cognitive_provenance.db")
+            )
+            import asyncio as _asyncio_bind
+
+            _asyncio_bind.run(provenance.initialize())
+            bind_cognitive_graph_to_task1(
+                cognitive_graph_deps,
+                task1_bridge,
+                data_quality_repo=task1_bridge.supervisor.data_quality_repository,
+                provenance_registry=provenance,
+            )
+            assert cognitive_graph_deps.execution_runtime is not None
         self._task1_bridge = task1_bridge
         execution_broker = ExecutionDelegatingBroker(
             inner=broker,
@@ -873,6 +873,27 @@ class LivePaperRunner:
                                 received_timestamp=datetime.now(timezone.utc),
                                 source="live_paper_poll",
                             )
+                            if options_provider is not None:
+                                try:
+                                    from joker.runtime.option_surface_ingest import (
+                                        option_snapshots_to_surface_rows,
+                                    )
+
+                                    surface_snaps = options_provider.fetch_surface_snapshots(
+                                        float(event.price)
+                                    )
+                                    rows = option_snapshots_to_surface_rows(surface_snaps)
+                                    if rows:
+                                        task1_bridge.ingest_option_quotes(rows)
+                                        log(
+                                            "task1.option_surface_ingested",
+                                            {"contract_count": len(rows)},
+                                        )
+                                except Exception as opt_exc:
+                                    log(
+                                        "task1.option_surface_ingest_failed",
+                                        {"reason": str(opt_exc)},
+                                    )
                             task1_bridge.tick()
                         except Exception as ingest_exc:
                             log(

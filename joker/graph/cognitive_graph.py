@@ -366,8 +366,27 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
                 error_code="no_submit_callback",
                 message="execution submit callback not configured",
             )
-        result = await deps.submit_callback(provenanced)
         command_id = provenanced.command.client_order_id
+        if deps.provenance_registry is not None:
+            from joker.persistence.cognitive_execution_provenance import (
+                ExecutionProvenanceRecord,
+            )
+            from joker.runtime.execution_runtime import contract_id_for
+
+            await deps.provenance_registry.record(
+                ExecutionProvenanceRecord(
+                    client_order_id=command_id,
+                    proposal_id=str(provenanced.proposal_id),
+                    decision_id=str(provenanced.decision_id),
+                    strategy_id=str(provenanced.strategy_id),
+                    cycle_id=str(provenanced.cycle_id),
+                    snapshot_id=str(provenanced.snapshot_id),
+                    contract_id=contract_id_for(provenanced.command.intent.contract),
+                    session_id=deps.session_id,
+                    kind="entry",
+                )
+            )
+        result = await deps.submit_callback(provenanced)
         deps.submitted_proposal_ids.add(str(proposal.proposal_id))
         return {
             "execution_command_id": command_id,

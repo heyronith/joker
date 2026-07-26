@@ -177,7 +177,11 @@ class ExecutionProposalValidator:
             )
 
         dq = truth.data_quality
-        if dq is not None and not dq.usable_for_execution:
+        if dq is None:
+            raise CognitiveValidationError(
+                "data quality report unavailable; execution blocked"
+            )
+        if not dq.usable_for_execution:
             raise CognitiveValidationError(
                 "data quality does not permit execution "
                 f"(severity={dq.severity.value})"
@@ -314,7 +318,9 @@ class ExecutionCommandCompiler:
 
         leg = proposal.legs[0]
         contract = parse_contract_id(leg.contract_id, trading_date=trading_date)
+        order_id = client_order_id or f"cog-{proposal.proposal_id}-{leg.leg_id}"
         intent = OrderIntent(
+            intent_id=order_id,
             candidate_id=str(proposal.proposal_id),
             contract=contract,
             side=leg.side,
@@ -322,7 +328,6 @@ class ExecutionCommandCompiler:
             quantity=leg.quantity,
             limit_price=float(leg.limit_price) if leg.limit_price is not None else None,
         )
-        order_id = client_order_id or f"cog-{proposal.proposal_id}-{leg.leg_id}"
         command = ExecutionCommand(
             client_order_id=order_id,
             intent=intent,

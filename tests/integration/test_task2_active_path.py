@@ -152,6 +152,7 @@ async def test_task2_active_path_full_session(tmp_path) -> None:
             context_assembler=context_assembler_from_settings(CognitiveGraphSettings()),
             snapshot_repo=SnapshotRepository(db),
             option_surface_repo=OptionSurfaceRepository(db),
+            data_quality_repo=supervisor.data_quality_repository,
             submit_callback=submit_callback,
             event_bus=supervisor.event_bus,
             execution_runtime=supervisor.execution_runtime,
@@ -327,9 +328,11 @@ async def test_crash_after_execution_submission_no_duplicate_order(tmp_path) -> 
             run_id=session_id,
             snapshot_repo=SnapshotRepository(db),
             option_surface_repo=OptionSurfaceRepository(db),
+            data_quality_repo=supervisor.data_quality_repository,
             submit_callback=submit_callback,
             execution_runtime=supervisor.execution_runtime,
             checkpointer=saver,
+            db_path=db,
             **repos,
         )
         graph = build_cognitive_graph(deps)

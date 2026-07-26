@@ -202,22 +202,12 @@ class CognitiveAgentRuntime:
         if not self._started or self._shutdown:
             return
 
+        if event.event_type == EventType.MARKET_SNAPSHOT_CREATED:
+            await self._enqueue_snapshot_work(event)
+            return
+
         priority = self._event_priority(event)
         kind = self._classify(event)
-
-        if (
-            kind == "decision"
-            and priority == _Priority.NEW_ENTRY_SNAPSHOT
-            and self._config.market_snapshot_coalescing
-        ):
-            self._pending_new_entry_snapshot = str(
-                event.payload.get("snapshot_id")
-                or event.payload.get("market_snapshot_id")
-                or ""
-            )
-            if self._new_entry_in_flight:
-                return
-
         self._sequence += 1
         work = _QueuedWork(
             priority=priority, sequence=self._sequence, event=event, kind=kind
@@ -229,6 +219,95 @@ class CognitiveAgentRuntime:
         self._counters.queued_events = (
             self._decision_queue.qsize() + self._position_queue.qsize()
         )
+
+    async def _enqueue_snapshot_work(self, event: DomainEvent) -> None:
+        """Route snapshots using authoritative ledger projection, not event metadata."""
+        snapshot_id = str(
+            event.payload.get("snapshot_id")
+            or event.payload.get("market_snapshot_id")
+            or ""
+        )
+        open_positions = await self._open_position_contract_ids()
+        if open_positions and self._config.position.enabled:
+            for contract_id in open_positions:
+                enriched = make_event(
+                    EventType.MARKET_SNAPSHOT_CREATED,
+                    session_id=event.session_id,
+                    source="cognitive_runtime_position_route",
+                    exchange_timestamp=event.exchange_timestamp,
+                    correlation_id=event.correlation_id,
+                    causation_id=event.event_id,
+                    payload={
+                        **dict(event.payload),
+                        "snapshot_id": snapshot_id,
+                        "position_id": contract_id,
+                        "contract_id": contract_id,
+                        "active_position_id": contract_id,
+                    },
+                )
+                self._sequence += 1
+                await self._position_queue.put(
+                    _QueuedWork(
+                        priority=_Priority.POSITION_SNAPSHOT,
+                        sequence=self._sequence,
+                        event=enriched,
+                        kind="position",
+                    )
+                )
+        # New-entry only when flat (operationally appropriate default).
+        if not open_positions:
+            if (
+                self._config.market_snapshot_coalescing
+                and self._new_entry_in_flight
+            ):
+                self._pending_new_entry_snapshot = snapshot_id or self._pending_new_entry_snapshot
+            else:
+                self._sequence += 1
+                await self._decision_queue.put(
+                    _QueuedWork(
+                        priority=_Priority.NEW_ENTRY_SNAPSHOT,
+                        sequence=self._sequence,
+                        event=event,
+                        kind="decision",
+                    )
+                )
+        self._counters.queued_events = (
+            self._decision_queue.qsize() + self._position_queue.qsize()
+        )
+
+    async def _open_position_contract_ids(self) -> list[str]:
+        if self._deps.projection_loader is None:
+            return []
+        try:
+            projection = await self._deps.projection_loader()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("projection_loader_failed", extra={"error": str(exc)})
+            return []
+        if projection is None:
+            return []
+        positions = getattr(projection, "positions", None) or {}
+        open_ids: list[str] = []
+        items = positions.items() if isinstance(positions, dict) else (
+            (getattr(p, "contract_id", None), p) for p in positions
+        )
+        for key, pos in items:
+            qty = getattr(pos, "quantity", None)
+            if qty is None and isinstance(pos, dict):
+                qty = pos.get("quantity") or pos.get("net_quantity")
+            try:
+                from decimal import Decimal
+
+                q = Decimal(str(qty)) if qty is not None else Decimal("0")
+            except Exception:
+                continue
+            if q == 0:
+                continue
+            cid = getattr(pos, "contract_id", None) or key
+            if cid is None and isinstance(pos, dict):
+                cid = pos.get("contract_id")
+            if cid:
+                open_ids.append(str(cid))
+        return open_ids
 
     def _classify(self, event: DomainEvent) -> str:
         if event.event_type in {
@@ -247,7 +326,7 @@ class CognitiveAgentRuntime:
         }:
             return "order"
         if event.event_type == EventType.MARKET_SNAPSHOT_CREATED:
-            if event.payload.get("active_position_id"):
+            if event.payload.get("active_position_id") or event.payload.get("position_id"):
                 return "position"
             return "decision"
         return "decision"
@@ -266,7 +345,7 @@ class CognitiveAgentRuntime:
         }:
             return _Priority.CRITICAL
         if event.event_type == EventType.MARKET_SNAPSHOT_CREATED:
-            if event.payload.get("active_position_id"):
+            if event.payload.get("active_position_id") or event.payload.get("position_id"):
                 return _Priority.POSITION_SNAPSHOT
             return _Priority.NEW_ENTRY_SNAPSHOT
         return _Priority.NEW_ENTRY_SNAPSHOT
@@ -416,25 +495,77 @@ class CognitiveAgentRuntime:
             )
             self._status = "degraded"
 
+    async def _resolve_provenance(
+        self, event: DomainEvent
+    ) -> dict[str, Any]:
+        """Resolve cognitive metadata from registry using Task 1 event fields."""
+        payload = dict(event.payload)
+        client_order_id = str(payload.get("client_order_id") or "")
+        contract_id = str(payload.get("contract_id") or "")
+        registry = self._deps.provenance_registry
+        record = None
+        if registry is not None and client_order_id:
+            record = await registry.get_by_client_order_id(client_order_id)
+        if record is None and registry is not None and contract_id:
+            record = await registry.get_latest_by_contract_id(contract_id)
+        if record is not None:
+            if not contract_id and record.contract_id:
+                contract_id = record.contract_id
+            payload.setdefault("snapshot_id", record.snapshot_id)
+            payload.setdefault("strategy_id", record.strategy_id)
+            payload.setdefault("original_strategy_id", record.strategy_id)
+            payload.setdefault("proposal_id", record.proposal_id)
+            payload.setdefault("decision_id", record.decision_id)
+            payload.setdefault("cycle_id", record.cycle_id)
+            if record.contract_id:
+                payload.setdefault("contract_id", record.contract_id)
+                contract_id = contract_id or record.contract_id
+        # Task 1 uses contract_id as the authoritative position identity.
+        if contract_id:
+            payload.setdefault("position_id", contract_id)
+            payload.setdefault("active_position_id", contract_id)
+            payload.setdefault("contract_id", contract_id)
+        # Fall back to latest market snapshot when provenance lacks snapshot_id.
+        if not payload.get("snapshot_id") and self._deps.snapshot_repo is not None:
+            try:
+                latest = await self._deps.snapshot_repo.get_latest(self._session_id)
+                if latest is not None:
+                    payload["snapshot_id"] = str(latest.snapshot_id)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("latest_snapshot_lookup_failed", extra={"error": str(exc)})
+        return payload
+
     async def _run_position_work(self, event: DomainEvent) -> None:
         if not self._config.position.enabled:
             return
         assert self._position_graph is not None
+        if event.event_type == EventType.POSITION_CLOSED:
+            return
+        resolved = await self._resolve_provenance(event)
         position_id = str(
-            event.payload.get("position_id")
-            or event.payload.get("active_position_id")
+            resolved.get("position_id")
+            or resolved.get("active_position_id")
+            or resolved.get("contract_id")
             or ""
         )
         if not position_id:
+            logger.info(
+                "position_work_skipped_missing_identity",
+                extra={"event_type": event.event_type.value},
+            )
             return
         snapshot_id = str(
-            event.payload.get("snapshot_id")
-            or event.payload.get("market_snapshot_id")
+            resolved.get("snapshot_id")
+            or resolved.get("market_snapshot_id")
             or ""
         )
         if not snapshot_id:
+            logger.info(
+                "position_work_skipped_missing_snapshot",
+                extra={"position_id": position_id},
+            )
             return
-        cycle_id = str(event.payload.get("cycle_id") or uuid4())
+        cycle_id = str(resolved.get("cycle_id") or uuid4())
         self._counters.active_position_cycles += 1
         state: dict[str, Any] = {
             "session_id": self._session_id,
@@ -442,8 +573,9 @@ class CognitiveAgentRuntime:
             "cycle_id": cycle_id,
             "snapshot_id": snapshot_id,
             "_position_id": position_id,
-            "_contract_id": event.payload.get("contract_id"),
-            "_original_strategy_id": event.payload.get("original_strategy_id"),
+            "_contract_id": resolved.get("contract_id") or position_id,
+            "_original_strategy_id": resolved.get("original_strategy_id")
+            or resolved.get("strategy_id"),
         }
         config = ainvoke_config(
             session_id=self._session_id,
@@ -462,19 +594,19 @@ class CognitiveAgentRuntime:
             )
 
     async def _run_order_work(self, event: DomainEvent) -> None:
-        client_order_id = str(event.payload.get("client_order_id") or "")
+        resolved = await self._resolve_provenance(event)
+        client_order_id = str(resolved.get("client_order_id") or "")
         if not client_order_id:
             return
         snapshot_id = str(
-            event.payload.get("snapshot_id")
-            or event.payload.get("market_snapshot_id")
+            resolved.get("snapshot_id")
+            or resolved.get("market_snapshot_id")
             or ""
         )
-        # Build order projection from execution runtime when available.
         order_projection: dict[str, Any] = {
             "client_order_id": client_order_id,
             "event_type": event.event_type.value,
-            **{k: v for k, v in event.payload.items() if k != "client_order_id"},
+            **{k: v for k, v in resolved.items() if k != "client_order_id"},
         }
         if self._deps.execution_runtime is not None:
             try:
@@ -482,15 +614,24 @@ class CognitiveAgentRuntime:
                     client_order_id
                 )
                 if sync is not None:
+                    contract = getattr(sync, "contract", None)
+                    contract_payload = None
+                    if contract is not None:
+                        dump = getattr(contract, "model_dump", None)
+                        contract_payload = (
+                            dump(mode="json") if callable(dump) else str(contract)
+                        )
                     order_projection.update(
                         {
                             "status": sync.status,
                             "quantity": sync.quantity,
                             "filled_quantity": getattr(sync, "filled_quantity", None),
                             "limit_price": getattr(sync, "limit_price", None),
-                            "contract_id": str(
-                                getattr(getattr(sync, "contract", None), "symbol", "")
-                            ),
+                            "side": getattr(sync, "side", None),
+                            "order_type": getattr(sync, "order_type", None)
+                            or getattr(getattr(sync, "intent", None), "order_type", None),
+                            "contract": contract_payload,
+                            "_contract_obj": contract,
                         }
                     )
             except Exception as exc:  # noqa: BLE001
@@ -510,7 +651,11 @@ class CognitiveAgentRuntime:
                     snapshot=snapshot,
                     data_quality=data_quality,
                     option_surface_slice=surface_slice,
-                    order_projection=order_projection,
+                    order_projection={
+                        k: v
+                        for k, v in order_projection.items()
+                        if not str(k).startswith("_")
+                    },
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.warning("order_context_failed", extra={"error": str(exc)})
@@ -529,16 +674,20 @@ class CognitiveAgentRuntime:
             client_order_id=client_order_id,
             order_projection=order_projection,
         )
-        # Duplicate decision idempotency.
         decision_key = f"{client_order_id}:{decision.action}:{decision.rationale_summary}"
         if decision_key in self._order_decision_ids:
             return
         self._order_decision_ids.add(decision_key)
         if self._deps.order_management_repo is not None:
             await self._deps.order_management_repo.append(decision)
-        await self._apply_order_decision(decision)
+        await self._apply_order_decision(decision, order_projection=order_projection)
 
-    async def _apply_order_decision(self, decision: OrderManagementDecision) -> None:
+    async def _apply_order_decision(
+        self,
+        decision: OrderManagementDecision,
+        *,
+        order_projection: dict[str, Any] | None = None,
+    ) -> None:
         runtime = self._deps.execution_runtime
         if runtime is None:
             return
@@ -546,11 +695,99 @@ class CognitiveAgentRuntime:
         if action == "continue_waiting":
             return
         if action in {"cancel", "abandon"}:
-            await runtime.cancel_order(client_order_id=decision.client_order_id)
+            try:
+                await runtime.cancel_order(client_order_id=decision.client_order_id)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "order_cancel_failed",
+                    extra={
+                        "client_order_id": decision.client_order_id,
+                        "error": str(exc),
+                    },
+                )
             return
         if action in {"replace", "reduce_quantity"}:
-            # Cancel then optional replace is operationally supported via cancel today.
-            await runtime.cancel_order(client_order_id=decision.client_order_id)
+            try:
+                await runtime.cancel_order(client_order_id=decision.client_order_id)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "order_replace_cancel_failed",
+                    extra={
+                        "client_order_id": decision.client_order_id,
+                        "error": str(exc),
+                    },
+                )
+                return
+            projection = order_projection or {}
+            contract = projection.get("_contract_obj") or projection.get("contract")
+            if isinstance(contract, dict):
+                from joker.schemas.domain import OptionContract
+
+                contract = OptionContract.model_validate(contract)
+            if contract is None:
+                logger.warning(
+                    "order_replace_skipped_missing_contract",
+                    extra={"client_order_id": decision.client_order_id},
+                )
+                return
+            from joker.runtime.execution_runtime import ExecutionCommand
+            from joker.schemas.domain import OrderIntent
+
+            side = str(projection.get("side") or "buy")
+            qty = int(
+                decision.new_quantity
+                if decision.new_quantity is not None
+                else projection.get("quantity")
+                or 1
+            )
+            if action == "reduce_quantity":
+                open_qty = int(projection.get("quantity") or qty)
+                filled = int(projection.get("filled_quantity") or 0)
+                remaining = max(0, open_qty - filled)
+                if decision.new_quantity is not None:
+                    qty = min(int(decision.new_quantity), remaining)
+                else:
+                    qty = max(1, remaining // 2) if remaining > 1 else remaining
+                if qty <= 0:
+                    return
+            limit = (
+                float(decision.new_limit_price)
+                if decision.new_limit_price is not None
+                else (
+                    float(projection["limit_price"])
+                    if projection.get("limit_price") is not None
+                    else None
+                )
+            )
+            new_client_id = f"{decision.client_order_id}:replace:{decision.decision_id}"
+            intent = OrderIntent(
+                intent_id=new_client_id,
+                candidate_id=str(decision.decision_id),
+                contract=contract,
+                side=side,  # type: ignore[arg-type]
+                order_type="limit" if limit is not None else "market",
+                quantity=qty,
+                limit_price=limit,
+            )
+            await runtime.submit_execution_command(
+                ExecutionCommand(client_order_id=new_client_id, intent=intent)
+            )
+            if self._deps.provenance_registry is not None:
+                from joker.persistence.cognitive_execution_provenance import (
+                    ExecutionProvenanceRecord,
+                )
+                from joker.runtime.execution_runtime import contract_id_for
+
+                await self._deps.provenance_registry.record(
+                    ExecutionProvenanceRecord(
+                        client_order_id=new_client_id,
+                        decision_id=str(decision.decision_id),
+                        snapshot_id=str(decision.snapshot_id),
+                        contract_id=contract_id_for(contract),
+                        session_id=self._session_id,
+                        kind="replace",
+                    )
+                )
             return
 
     async def _provider_available(self, *, local_only: bool) -> bool:

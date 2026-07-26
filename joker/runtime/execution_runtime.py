@@ -135,7 +135,25 @@ class ExecutionRuntime:
         return dict(mapping)
 
     async def submit_execution_command(self, command: ExecutionCommand) -> BrokerOrder:
-        """Submit an explicit command through the broker and append ledger events."""
+        """Submit an explicit command through the broker and append ledger events.
+
+        Idempotent at the ExecutionRuntime boundary: if ``client_order_id`` already
+        maps to an accepted/open/filled/cancelled broker lifecycle, return or
+        reconcile that order instead of calling the broker again.
+        """
+        await self.restore_order_mappings()
+        existing = await self._resolve_existing_submission(command.client_order_id)
+        if existing is not None:
+            logger.info(
+                "execution_submit_idempotent_reuse",
+                extra={
+                    "client_order_id": command.client_order_id,
+                    "broker_order_id": existing.order_id,
+                    "status": existing.status,
+                },
+            )
+            return existing
+
         now = self._now()
         intent = command.intent
         cid = contract_id_for(intent.contract)
@@ -154,6 +172,32 @@ class ExecutionRuntime:
         )
         await self._ledger.append(requested)
         await self._publish_order_event(EventType.ORDER_SUBMITTED, command.client_order_id, now)
+
+        # Broker may already hold the order if we crashed after accept but before
+        # the ACCEPT ledger event was written — reconcile by intent_id.
+        recovered = self._find_broker_order_by_intent(intent.intent_id)
+        if recovered is not None:
+            self._client_to_broker[command.client_order_id] = recovered.order_id
+            accept_key = f"accept:{command.client_order_id}:{recovered.order_id}"
+            accepted = make_ledger_event(
+                LedgerEventType.BROKER_ORDER_ACCEPTED,
+                broker_account_id=command.broker_account_id or self._broker_account_id,
+                client_order_id=command.client_order_id,
+                contract_id=cid,
+                side=intent.side,
+                quantity=Decimal(recovered.quantity),
+                exchange_timestamp=self._now(),
+                idempotency_key=accept_key,
+                session_id=self._session_id,
+                broker_order_id=recovered.order_id,
+                price=(
+                    Decimal(str(recovered.limit_price))
+                    if recovered.limit_price is not None
+                    else None
+                ),
+            )
+            await self._ledger.append(accepted)
+            return recovered
 
         try:
             order = self._broker.submit_order(intent)
@@ -213,6 +257,47 @@ class ExecutionRuntime:
                 )
         return order
 
+    async def _resolve_existing_submission(
+        self, client_order_id: str
+    ) -> BrokerOrder | None:
+        """Return an existing broker lifecycle for client_order_id if recoverable."""
+        broker_order_id = self._client_to_broker.get(client_order_id)
+        if broker_order_id:
+            order = self._broker.get_order(broker_order_id)
+            if order is not None:
+                return order
+
+        events = await self._ledger.get_by_session(self._session_id)
+        recovered_broker_id: str | None = None
+        for event in events:
+            if event.client_order_id != client_order_id:
+                continue
+            if event.broker_order_id:
+                recovered_broker_id = event.broker_order_id
+                self._client_to_broker[client_order_id] = event.broker_order_id
+        if recovered_broker_id:
+            order = self._broker.get_order(recovered_broker_id)
+            if order is not None:
+                return order
+        return None
+
+    def _find_broker_order_by_intent(self, intent_id: str) -> BrokerOrder | None:
+        """Locate a broker order already created for this intent (crash recovery)."""
+        for order in self._broker.list_open_orders():
+            if order.intent_id == intent_id:
+                return order
+        finder = getattr(self._broker, "find_order_by_intent_id", None)
+        if callable(finder):
+            found = finder(intent_id)
+            if found is not None:
+                return found
+        # PaperBroker and similar keep filled orders in an internal map.
+        orders_map = getattr(self._broker, "_orders", None)
+        if isinstance(orders_map, dict):
+            for order in orders_map.values():
+                if getattr(order, "intent_id", None) == intent_id:
+                    return order
+        return None
     async def cancel_order(self, *, client_order_id: str) -> BrokerOrder:
         """Cancel via broker adapter, append ledger cancellation, reconcile."""
         await self.restore_order_mappings()

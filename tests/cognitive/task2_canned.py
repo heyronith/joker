@@ -273,7 +273,7 @@ def register_full_path_canned(
     )
 
     thesis = PositionThesisVersion(
-        position_id="pos-1",
+        position_id=contract_id,
         contract_id=contract_id,
         session_id=session,
         snapshot_id=sid,

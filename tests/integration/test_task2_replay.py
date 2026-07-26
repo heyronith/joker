@@ -126,9 +126,11 @@ async def test_task2_replay_perception_to_execute_provenance(tmp_path) -> None:
             run_id=session_id,
             snapshot_repo=snapshot_repo,
             option_surface_repo=OptionSurfaceRepository(db),
+            data_quality_repo=supervisor.data_quality_repository,
             submit_callback=submit_callback,
             event_bus=supervisor.event_bus,
             execution_runtime=supervisor.execution_runtime,
+            db_path=db,
             **repos,
         )
         graph = build_cognitive_graph(deps)

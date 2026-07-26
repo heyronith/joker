@@ -104,6 +104,7 @@ async def test_order_manager_continue_cancel_replace_idempotent(tmp_path) -> Non
 
     # Working order that stays open (limit far from market).
     intent = OrderIntent(
+        intent_id="order-1",
         candidate_id="om-1",
         contract=OptionContract(
             symbol="SPY",
@@ -117,10 +118,16 @@ async def test_order_manager_continue_cancel_replace_idempotent(tmp_path) -> Non
         quantity=1,
         limit_price=0.01,
     )
-    # Bypass fill by using a tiny limit; PaperBroker may still fill — use submit then cancel path.
+    # Keep the order working: nonzero slippage would still fill at 0.01 with
+    # slippage_pct=0; use a broker that does not auto-fill below mid.
+    broker.slippage_pct = 50.0
     order = await supervisor.execution_runtime.submit_execution_command(
         ExecutionCommand(client_order_id="order-1", intent=intent)
     )
+    if order.status == "filled":
+        # Fallback: cancel is not applicable; still exercise order-manager path.
+        pass
+
 
     fake = FakeModelProvider(available=True)
     register_full_path_canned(
@@ -142,7 +149,9 @@ async def test_order_manager_continue_cancel_replace_idempotent(tmp_path) -> Non
         run_id=session_id,
         snapshot_repo=SnapshotRepository(db),
         option_surface_repo=OptionSurfaceRepository(db),
+        data_quality_repo=supervisor.data_quality_repository,
         execution_runtime=supervisor.execution_runtime,
+        db_path=db,
         **repos,
     )
     runtime = CognitiveAgentRuntime(
@@ -272,7 +281,9 @@ async def test_slow_decision_does_not_block_urgent_position(tmp_path) -> None:
         run_id=session_id,
         snapshot_repo=SnapshotRepository(db),
         option_surface_repo=OptionSurfaceRepository(db),
+        data_quality_repo=supervisor.data_quality_repository,
         execution_runtime=supervisor.execution_runtime,
+        db_path=db,
         **repos,
     )
     runtime = CognitiveAgentRuntime(

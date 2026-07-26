@@ -133,9 +133,11 @@ async def test_decision_graph_checkpoint_resume_after_submit(tmp_path) -> None:
         run_id=session_id,
         snapshot_repo=SnapshotRepository(db),
         option_surface_repo=OptionSurfaceRepository(db),
+        data_quality_repo=supervisor.data_quality_repository,
         submit_callback=submit_callback,
         execution_runtime=supervisor.execution_runtime,
         checkpointer=saver,
+        db_path=db,
         **repos,
     )
     graph = build_cognitive_graph(deps)
