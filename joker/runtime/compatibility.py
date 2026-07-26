@@ -174,6 +174,7 @@ class CompatibilityLivePaperBridge:
         self._supervisor.graph_state["errors"] = errors
 
     def _ingest_ok(self, result: Any) -> Any:
+        """Record recovery only after a complete persisted market snapshot."""
         was_degraded = self.health.degraded
         self.health.record_success()
         if was_degraded:
@@ -185,36 +186,43 @@ class CompatibilityLivePaperBridge:
         self._sync_health_to_graph()
 
     def ingest_underlying_quote(self, **kwargs: Any) -> Any:
+        """Ingest quote observations. Success alone does not restore health."""
         market = self._require_market()
         try:
-            result = self.run_coro(market.ingest_underlying_quote(**kwargs))
-            return self._ingest_ok(result)
+            return self.run_coro(market.ingest_underlying_quote(**kwargs))
         except Exception as exc:
             self._ingest_fail(exc)
             raise
 
     def ingest_trade(self, **kwargs: Any) -> Any:
+        """Ingest trade prints. Success alone does not restore health."""
         market = self._require_market()
         try:
-            result = self.run_coro(market.ingest_trade(**kwargs))
-            return self._ingest_ok(result)
+            return self.run_coro(market.ingest_trade(**kwargs))
         except Exception as exc:
             self._ingest_fail(exc)
             raise
 
     def ingest_option_quotes(self, quotes: Any) -> Any:
+        """Ingest option quotes. Success alone does not restore health."""
         market = self._require_market()
         try:
-            result = self.run_coro(market.ingest_option_quotes(quotes))
-            return self._ingest_ok(result)
+            return self.run_coro(market.ingest_option_quotes(quotes))
         except Exception as exc:
             self._ingest_fail(exc)
             raise
 
     def tick(self, now: datetime | None = None) -> Any:
-        """Advance MarketRuntime clocks/bars without changing truth-layer health."""
+        """Advance MarketRuntime; degrade on failure, recover only on persisted snapshot."""
         market = self._require_market()
-        return self.run_coro(market.tick(now=now))
+        try:
+            result = self.run_coro(market.tick(now=now))
+        except Exception as exc:
+            self._ingest_fail(exc)
+            raise
+        if getattr(result, "snapshot", None) is not None:
+            return self._ingest_ok(result)
+        return result
 
     def submit_execution_command(self, command: ExecutionCommand) -> BrokerOrder:
         if not self.health.allows_execution:

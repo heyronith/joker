@@ -17,6 +17,7 @@ from joker.risk.governor import RiskGovernor
 from joker.runtime.compatibility import CompatibilityLivePaperBridge, ExecutionDelegatingBroker
 from joker.runtime.execution_runtime import contract_id_for
 from joker.runtime.market_handler import MarketEventHandler, PendingEntry, PendingExit
+from joker.runtime.market_runtime import MarketTickResult
 from joker.runtime.reactive_engine import ReactiveEngine
 from joker.schemas.domain import (
     OptionContract,
@@ -26,6 +27,7 @@ from joker.schemas.domain import (
     RiskConfig,
     TradeCandidate,
 )
+from joker.schemas.replay import OptionQuoteEvent
 
 ET = ZoneInfo("America/New_York")
 
@@ -197,6 +199,7 @@ def test_unfilled_exit_keeps_position_and_capital(tmp_path: Path) -> None:
 
 
 def test_rejected_exit_keeps_position(tmp_path: Path) -> None:
+    """Degraded truth layer must not leave a stuck PendingExit via _try_exit."""
     broker = PaperBroker(slippage_pct=0)
     bridge = CompatibilityLivePaperBridge(
         broker=broker, db_path=tmp_path / "r.db", session_id="r1"
@@ -214,36 +217,43 @@ def test_rejected_exit_keeps_position(tmp_path: Path) -> None:
             limit_price=1.0,
         )
         exec_broker.submit_order(buy)
+        now = handler.provider.current_time
         handler.state.open_trade = OpenTradeContext(
             position_id="p1",
             entry_price=1.0,
             stop_price=0.5,
-            take_profit_price=2.0,
-            entry_time=handler.provider.current_time,
+            take_profit_price=1.5,
+            entry_time=now,
             time_stop_minutes=30,
             quantity=1,
             reserved_notional_usd=100.0,
         )
         capital.reserve(100.0)
-        logs: list[str] = []
-        handler._on_log = lambda et, p=None: logs.append(et)
+        logs: list[tuple[str, dict]] = []
+        handler._on_log = lambda et, p=None: logs.append((et, p or {}))
 
-        # Rejected exit via degraded health → no exit.executed
         bridge.health.degraded = True
-        sell = OrderIntent(
-            candidate_id="s",
-            contract=contract,
-            side="sell",
-            order_type="limit",
-            quantity=1,
-            limit_price=1.5,
+        quote = OptionQuoteEvent(
+            timestamp=now,
+            contract_id=contract_id_for(contract),
+            expiration=contract.expiration,
+            strike=contract.strike,
+            option_type="call",
+            bid=1.6,
+            ask=1.7,
+            mid=1.65,
+            spread_pct=6.0,
+            quote_timestamp=now,
         )
-        rejected = exec_broker.submit_order(sell)
-        assert rejected.status == "rejected"
-        bridge.health.degraded = False
+        decision = handler._try_exit(quote)
+        assert decision is None
+        assert handler.state.pending_exit is None
         assert handler.state.open_trade is not None
         assert handler.state.trades_exited == 0
-        assert "exit.executed" not in logs
+        assert capital.reserved_usd == 100.0
+        assert any(et == "exit.order_failed" for et, _ in logs)
+        assert not any(et == "exit.executed" for et, _ in logs)
+        assert not any(et == "exit.order_submitted" for et, _ in logs)
     finally:
         bridge.shutdown()
 
@@ -510,5 +520,190 @@ def test_full_cli_session_buy_sell_via_runtimes(tmp_path: Path) -> None:
         cid = contract_id_for(contract)
         assert proj.positions[cid].quantity == Decimal("0")
         assert proj.positions[cid].realized_pnl == Decimal("40")
+    finally:
+        bridge.shutdown()
+
+
+def test_tick_failure_degrades_and_snapshot_recovers(tmp_path: Path) -> None:
+    broker = PaperBroker(slippage_pct=0)
+    bridge = CompatibilityLivePaperBridge(
+        broker=broker, db_path=tmp_path / "h.db", session_id="h1"
+    )
+    bridge.start()
+    try:
+        market = bridge.market_runtime
+        assert market is not None
+
+        async def boom_tick(now=None):
+            raise RuntimeError("tick boom")
+
+        market.tick = boom_tick  # type: ignore[method-assign]
+        try:
+            bridge.tick()
+            assert False, "expected tick failure"
+        except RuntimeError as exc:
+            assert "tick boom" in str(exc)
+
+        assert bridge.health.degraded is True
+        assert bridge.health.allows_execution is False
+
+        # Quote success alone must not restore health.
+        start = datetime(2026, 7, 1, 10, 0, tzinfo=ET)
+        bridge.ingest_underlying_quote(
+            symbol="SPY",
+            last=Decimal("500"),
+            bid=Decimal("499.9"),
+            ask=Decimal("500.1"),
+            source_timestamp=start,
+            received_timestamp=start,
+        )
+        assert bridge.health.degraded is True
+
+        contract = _contract()
+        exec_broker = ExecutionDelegatingBroker(inner=broker, bridge=bridge)
+        blocked = exec_broker.submit_order(
+            OrderIntent(
+                candidate_id="blocked",
+                contract=contract,
+                side="buy",
+                order_type="limit",
+                quantity=1,
+                limit_price=1.0,
+            )
+        )
+        assert blocked.status == "rejected"
+        assert blocked.order_id.startswith("blocked-")
+
+        async def ok_tick(now=None):
+            return MarketTickResult(snapshot=object())  # type: ignore[arg-type]
+
+        market.tick = ok_tick  # type: ignore[method-assign]
+        bridge.tick()
+        assert bridge.health.degraded is False
+        assert bridge.health.allows_execution is True
+
+        filled = exec_broker.submit_order(
+            OrderIntent(
+                candidate_id="ok",
+                contract=contract,
+                side="buy",
+                order_type="limit",
+                quantity=1,
+                limit_price=1.0,
+            )
+        )
+        assert filled.status == "filled"
+    finally:
+        bridge.shutdown()
+
+
+def test_same_contract_two_round_trips_report_trade_pnl_delta(tmp_path: Path) -> None:
+    broker = PaperBroker(slippage_pct=0)
+    bridge = CompatibilityLivePaperBridge(
+        broker=broker, db_path=tmp_path / "2x.db", session_id="2x"
+    )
+    bridge.start()
+    try:
+        handler, capital, exec_broker = _handler(broker, bridge)
+        contract = _contract()
+        cid = contract_id_for(contract)
+        outcomes: list[dict] = []
+        handler._on_trade_outcome = lambda payload: outcomes.append(dict(payload))
+
+        # Trade 1: +50
+        buy1 = OrderIntent(
+            candidate_id="b1",
+            contract=contract,
+            side="buy",
+            order_type="limit",
+            quantity=1,
+            limit_price=1.0,
+        )
+        exec_broker.submit_order(buy1)
+        handler.state.open_trade = OpenTradeContext(
+            position_id="t1",
+            entry_price=1.0,
+            stop_price=0.5,
+            take_profit_price=2.0,
+            entry_time=handler.provider.current_time,
+            time_stop_minutes=30,
+            quantity=1,
+            reserved_notional_usd=100.0,
+        )
+        capital.reserve(100.0)
+        baseline1 = bridge.project_session().positions[cid].realized_pnl
+        sell1 = OrderIntent(
+            candidate_id="s1",
+            contract=contract,
+            side="sell",
+            order_type="limit",
+            quantity=1,
+            limit_price=1.5,
+        )
+        sell1_order = exec_broker.submit_order(sell1)
+        handler.state.pending_exit = PendingExit(
+            client_order_id=sell1.intent_id,
+            broker_order_id=sell1_order.order_id,
+            position_id="t1",
+            contract_id=cid,
+            requested_quantity=1,
+            reason="take_profit",
+            submitted_at=handler.provider.current_time,
+            realized_pnl_before=baseline1,
+        )
+        handler._reconcile_pending_exit()
+        assert handler.state.trades_exited == 1
+        assert outcomes[-1]["trade_pnl_usd"] == 50.0
+        assert capital.realized_pnl_usd == 50.0
+        assert bridge.project_session().positions[cid].realized_pnl == Decimal("50")
+
+        # Trade 2: +20 (same contract); must not report cumulative 70 as trade PnL.
+        buy2 = OrderIntent(
+            candidate_id="b2",
+            contract=contract,
+            side="buy",
+            order_type="limit",
+            quantity=1,
+            limit_price=1.0,
+        )
+        exec_broker.submit_order(buy2)
+        handler.state.open_trade = OpenTradeContext(
+            position_id="t2",
+            entry_price=1.0,
+            stop_price=0.5,
+            take_profit_price=2.0,
+            entry_time=handler.provider.current_time,
+            time_stop_minutes=30,
+            quantity=1,
+            reserved_notional_usd=100.0,
+        )
+        capital.reserve(100.0)
+        baseline2 = bridge.project_session().positions[cid].realized_pnl
+        assert baseline2 == Decimal("50")
+        sell2 = OrderIntent(
+            candidate_id="s2",
+            contract=contract,
+            side="sell",
+            order_type="limit",
+            quantity=1,
+            limit_price=1.2,
+        )
+        sell2_order = exec_broker.submit_order(sell2)
+        handler.state.pending_exit = PendingExit(
+            client_order_id=sell2.intent_id,
+            broker_order_id=sell2_order.order_id,
+            position_id="t2",
+            contract_id=cid,
+            requested_quantity=1,
+            reason="take_profit",
+            submitted_at=handler.provider.current_time,
+            realized_pnl_before=baseline2,
+        )
+        handler._reconcile_pending_exit()
+        assert handler.state.trades_exited == 2
+        assert outcomes[-1]["trade_pnl_usd"] == 20.0
+        assert capital.realized_pnl_usd == 70.0
+        assert bridge.project_session().positions[cid].realized_pnl == Decimal("70")
+        assert outcomes[-1]["realized_pnl_usd"] == 70.0
     finally:
         bridge.shutdown()

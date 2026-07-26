@@ -55,6 +55,9 @@ class PendingExit:
     requested_quantity: int
     reason: str
     submitted_at: datetime
+    # Contract-level cumulative realised P&L when this exit was submitted.
+    # Trade P&L = projected.realized_pnl - realized_pnl_before.
+    realized_pnl_before: Decimal = Decimal("0")
 
 
 @dataclass
@@ -426,11 +429,12 @@ class MarketEventHandler:
 
         if remaining == 0 and pos is not None:
             exit_price = float(order_state.avg_fill_price) if order_state and order_state.avg_fill_price else open_trade.entry_price
+            trade_realized = float(pos.realized_pnl - pending.realized_pnl_before)
             self._finalize_exit(
                 reason=pending.reason,
                 exit_price=exit_price,
                 quantity=pending.requested_quantity,
-                realized_pnl_usd=float(pos.realized_pnl),
+                realized_pnl_usd=trade_realized,
                 entry_price=open_trade.entry_price if open_trade else None,
                 entry_time=open_trade.entry_time if open_trade else None,
                 reserved=open_trade.reserved_notional_usd if open_trade else 0.0,
@@ -444,11 +448,14 @@ class MarketEventHandler:
             and remaining > 0
         ):
             self.state.pending_exit = None
+            trade_realized = (
+                float(pos.realized_pnl - pending.realized_pnl_before) if pos else 0.0
+            )
             self._log(
                 "exit.partial_complete",
                 {
                     "remaining_qty": int(remaining),
-                    "realized_pnl_usd": float(pos.realized_pnl) if pos else 0.0,
+                    "realized_pnl_usd": trade_realized,
                 },
             )
 
@@ -508,6 +515,34 @@ class MarketEventHandler:
         from joker.runtime.execution_runtime import contract_id_for
 
         contract_id = contract_id_for(pos.contract)
+
+        # Health-blocked / rejected / cancelled: never create PendingExit.
+        if exit_order.status in {"rejected", "cancelled"}:
+            self._log(
+                "exit.order_failed",
+                {
+                    "client_order_id": intent.intent_id,
+                    "broker_order_id": exit_order.order_id,
+                    "status": exit_order.status,
+                    "reason": decision.reason.value,
+                    "truth_degraded": bool(
+                        self._task1_bridge is not None
+                        and self._task1_bridge.health.degraded
+                    ),
+                },
+            )
+            return None
+
+        realized_before = Decimal("0")
+        if self._task1_bridge is not None:
+            try:
+                projection = self._task1_bridge.project_session()
+                projected = projection.positions.get(contract_id)
+                if projected is not None:
+                    realized_before = Decimal(projected.realized_pnl)
+            except Exception as exc:
+                self._log("exit.baseline_failed", {"reason": str(exc)})
+
         self.state.pending_exit = PendingExit(
             client_order_id=intent.intent_id,
             broker_order_id=exit_order.order_id,
@@ -516,6 +551,7 @@ class MarketEventHandler:
             requested_quantity=max(1, int(qty)),
             reason=decision.reason.value,
             submitted_at=self.provider.current_time,
+            realized_pnl_before=realized_before,
         )
         self._log(
             "exit.order_submitted",
@@ -527,6 +563,7 @@ class MarketEventHandler:
                 "limit_price": exit_order.limit_price,
                 "quantity": qty,
                 "reason": decision.reason.value,
+                "realized_pnl_before": str(realized_before),
             },
         )
         # Do not release capital / clear open_trade / increment exits yet.
