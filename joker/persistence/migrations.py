@@ -130,7 +130,8 @@ CREATE TABLE IF NOT EXISTS model_calls (
     input_tokens INTEGER,
     output_tokens INTEGER,
     error_code TEXT,
-    validated_output_artifact_id TEXT
+    validated_output_artifact_id TEXT,
+    validated_output_json TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_model_calls_session
     ON model_calls (session_id, started_at);

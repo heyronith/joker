@@ -11,26 +11,17 @@ from langgraph.graph import END, START, StateGraph
 
 from joker.agents.cognitive.decision import run_meta_decision
 from joker.agents.cognitive.execution import (
+    build_truth_from_deps,
     run_entry_tactician,
     validate_and_compile_proposal,
 )
+from joker.agents.cognitive.world_model import run_world_model_synthesis
 from joker.cognition.context import ContextPackage
-from joker.cognition.schemas import (
-    AgentRole,
-    MarketAnomaly,
-    MarketDirection,
-    MarketStructureAssessment,
-    MarketWorldModel,
-    MetaDecisionAction,
-    OptionsMicrostructureAssessment,
-    RegimeHypothesis,
-    TemporalAssessment,
-    VolatilityAssessment,
-)
+from joker.cognition.schemas import AgentRole, MetaDecisionAction
 from joker.events.schemas import EventType, make_event
 from joker.graph.cognitive_state import CognitiveGraphState
+from joker.graph.context_hydrate import assemble_role_context, load_snapshot_truth
 from joker.graph.debate_graph import build_debate_graph
-from joker.graph.decision_graph import build_decision_graph
 from joker.graph.discovery_graph import build_discovery_graph
 from joker.graph.graph_deps import CognitiveGraphDeps
 from joker.graph.node_helpers import append_error, append_trace, trace_update, utc_now
@@ -78,25 +69,46 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
                 error_code="snapshot_unavailable",
                 message="cannot hydrate context without snapshot repository",
             )
-        record = await deps.snapshot_repo.get_by_id(UUID(str(snapshot_id)))
-        if record is None:
+        try:
+            record, data_quality, _surface, surface_slice = await load_snapshot_truth(
+                deps, snapshot_id
+            )
+        except Exception as exc:
             return append_error(
                 state,
                 node_name="hydrate_context",
                 error_code="snapshot_not_found",
-                message=f"snapshot {snapshot_id} not found",
+                message=str(exc),
             )
         cycle_id = state.get("cycle_id") or str(uuid4())
-        context = deps.context_assembler.assemble(
+        order_projection = None
+        position_projection = None
+        if deps.projection_loader is not None:
+            projection = await deps.projection_loader()
+            if projection is not None:
+                order_projection = {"orders": [str(o) for o in getattr(projection, "orders", ())]}
+                position_projection = {
+                    "positions": [str(p) for p in getattr(projection, "positions", ())]
+                }
+        context = await assemble_role_context(
+            deps,
             agent_role=AgentRole.MARKET_STRUCTURE,
             session_id=state.get("session_id") or deps.session_id,
             cycle_id=cycle_id,
             snapshot=record,
+            data_quality=data_quality,
+            option_surface_slice=surface_slice,
+            order_projection=order_projection,
+            position_projection=position_projection,
         )
         return {
             "cycle_id": cycle_id,
             "context_ref": context.context_id,
             "_context_package": context,
+            "_data_quality": data_quality,
+            "_option_surface_id": str(record.option_surface_id)
+            if record.option_surface_id
+            else None,
             "latest_known_snapshot_id": str(snapshot_id),
             **trace_update(append_trace(state, node_name="hydrate_context", status="completed")),
         }
@@ -110,62 +122,45 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
                 error_code="no_evidence",
                 message="cannot synthesise world model without evidence",
             )
-        snapshot_id = UUID(str(state.get("snapshot_id")))
+        # Idempotent recovery: reuse persisted world model for this cycle when present.
+        if state.get("world_model") is not None:
+            return trace_update(
+                append_trace(
+                    state,
+                    node_name="synthesise_world_model",
+                    status="skipped",
+                    artifact_ids=(state["world_model"].world_model_id,),
+                )
+            )
+        snapshot_id = state.get("snapshot_id")
         cycle_id = state.get("cycle_id") or ""
         session_id = state.get("session_id") or deps.session_id
-        evidence_ids = tuple(e.evidence_id for e in evidence)
-        model_call_id = uuid4()
-        world_model = MarketWorldModel(
+        snapshot, data_quality, _surface, surface_slice = await load_snapshot_truth(
+            deps, str(snapshot_id)
+        )
+        context = await assemble_role_context(
+            deps,
+            agent_role=AgentRole.WORLD_MODEL_SYNTHESISER,
             session_id=session_id,
-            snapshot_id=snapshot_id,
-            prompt_version="task2-v1",
-            model_call_id=model_call_id,
             cycle_id=cycle_id,
-            regime_hypotheses=(
-                RegimeHypothesis(
-                    label="synthesised",
-                    direction=MarketDirection.UNCERTAIN,
-                    confidence=0.5,
-                    supporting_evidence_ids=evidence_ids[:5],
-                    rationale="Deterministic synthesis from perception evidence",
-                ),
-            ),
-            market_structure=MarketStructureAssessment(
-                primary_direction=MarketDirection.UNCERTAIN,
-                structure_summary="Synthesised from perception swarm",
-                supporting_evidence_ids=evidence_ids[:5],
-                confidence=0.5,
-            ),
-            volatility_state=VolatilityAssessment(
-                state=MarketDirection.UNCERTAIN,
-                summary="Synthesised volatility assessment",
-                supporting_evidence_ids=evidence_ids[:5],
-                confidence=0.5,
-            ),
-            options_state=OptionsMicrostructureAssessment(
-                liquidity_summary="Synthesised microstructure",
-                spread_conditions="unknown",
-                supporting_evidence_ids=evidence_ids[:5],
-                confidence=0.5,
-            ),
-            temporal_state=TemporalAssessment(
-                session_phase="regular",
-                time_decay_context="0DTE context",
-                supporting_evidence_ids=evidence_ids[:5],
-                confidence=0.5,
-            ),
-            anomalies=tuple(
-                MarketAnomaly(
-                    description=e.claim,
-                    severity="low",
-                    supporting_evidence_ids=(e.evidence_id,),
-                )
+            snapshot=snapshot,
+            data_quality=data_quality,
+            option_surface_slice=surface_slice,
+            session_artifact_summaries=tuple(
+                {
+                    "evidence_id": str(e.evidence_id),
+                    "agent_role": e.agent_role.value,
+                    "claim": e.claim,
+                    "direction": e.direction.value,
+                    "confidence": e.confidence,
+                }
                 for e in evidence
-                if e.agent_role == AgentRole.ANOMALY
             ),
-            evidence_ids=evidence_ids,
-            overall_uncertainty=0.5,
-            synthesizer_model_call_id=model_call_id,
+        )
+        world_model = await run_world_model_synthesis(
+            router=deps.router,
+            context=context,
+            evidence=evidence,
         )
         if deps.world_model_repo is not None:
             await deps.world_model_repo.append(world_model)
@@ -297,11 +292,23 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
                 error_code="missing_proposal",
                 message="no execution proposal to validate",
             )
-        latest = state.get("latest_known_snapshot_id")
         try:
+            snapshot, data_quality, surface, _slice = await load_snapshot_truth(
+                deps, str(proposal.snapshot_id)
+            )
+            projection = None
+            if deps.projection_loader is not None:
+                projection = await deps.projection_loader()
+            truth = build_truth_from_deps(
+                snapshot=snapshot,
+                data_quality=data_quality,
+                option_surface=surface,
+                projection=projection,
+                already_submitted_proposal_ids=tuple(deps.submitted_proposal_ids),
+            )
             validate_and_compile_proposal(
                 proposal,
-                latest_snapshot_id=latest,
+                truth=truth,
                 evidence_ids=tuple(e.evidence_id for e in state.get("evidence") or []),
             )
         except Exception as exc:
@@ -327,9 +334,22 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
         if state.get("execution_command_id"):
             return trace_update(append_trace(state, node_name="submit_execution_command", status="skipped"))
         try:
+            snapshot, data_quality, surface, _slice = await load_snapshot_truth(
+                deps, str(proposal.snapshot_id)
+            )
+            projection = None
+            if deps.projection_loader is not None:
+                projection = await deps.projection_loader()
+            truth = build_truth_from_deps(
+                snapshot=snapshot,
+                data_quality=data_quality,
+                option_surface=surface,
+                projection=projection,
+                already_submitted_proposal_ids=tuple(deps.submitted_proposal_ids),
+            )
             provenanced = validate_and_compile_proposal(
                 proposal,
-                latest_snapshot_id=state.get("latest_known_snapshot_id"),
+                truth=truth,
                 evidence_ids=tuple(e.evidence_id for e in state.get("evidence") or []),
             )
         except Exception as exc:
@@ -348,6 +368,7 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
             )
         result = await deps.submit_callback(provenanced)
         command_id = provenanced.command.client_order_id
+        deps.submitted_proposal_ids.add(str(proposal.proposal_id))
         return {
             "execution_command_id": command_id,
             "execution_result_ref": str(getattr(result, "order_id", command_id)),
@@ -449,7 +470,10 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
     graph.add_edge("persist_evidence_request", END)
     graph.add_edge("persist_stale", END)
 
-    return graph.compile()
+    compiled_kwargs: dict[str, Any] = {}
+    if deps.checkpointer is not None:
+        compiled_kwargs["checkpointer"] = deps.checkpointer
+    return graph.compile(**compiled_kwargs)
 
 
 async def _publish_cycle_completed(

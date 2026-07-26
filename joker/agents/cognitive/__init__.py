@@ -30,6 +30,11 @@ from joker.agents.cognitive.execution import (
     ProvenancedExecutionCommand,
     parse_contract_id,
 )
+from joker.agents.cognitive.world_model import (
+    WorldModelSynthesiserAgent,
+    run_world_model_synthesis,
+    validate_world_model,
+)
 from joker.agents.cognitive.order_management import OrderManagerAgent
 from joker.agents.cognitive.perception import (
     PERCEPTION_ROLES,
@@ -75,6 +80,9 @@ __all__ = [
     "NOVEL_STRATEGY_NAME_EXAMPLES",
     "NeutralAdvocateAgent",
     "OptionsMicrostructureAgent",
+    "WorldModelSynthesiserAgent",
+    "run_world_model_synthesis",
+    "validate_world_model",
     "OrderManagerAgent",
     "PERCEPTION_ROLES",
     "PatternMinerAgent",

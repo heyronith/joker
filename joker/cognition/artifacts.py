@@ -67,7 +67,8 @@ CREATE TABLE IF NOT EXISTS model_calls (
     input_tokens INTEGER,
     output_tokens INTEGER,
     error_code TEXT,
-    validated_output_artifact_id TEXT
+    validated_output_artifact_id TEXT,
+    validated_output_json TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_model_calls_session
     ON model_calls (session_id, started_at);
@@ -120,6 +121,7 @@ class ModelCallRecord(BaseModel):
     output_tokens: int | None = None
     error_code: str | None = None
     validated_output_artifact_id: UUID | None = None
+    validated_output_json: str | None = None
 
 
 def build_model_call_idempotency_key(
@@ -350,13 +352,11 @@ class CognitiveArtifactStore:
     async def append_model_call(self, record: ModelCallRecord) -> UUID:
         """Record an in-progress or completed model call."""
         await self._ensure_initialized()
+        await self._ensure_output_json_column()
         existing = await self.get_model_call_by_idempotency(record.idempotency_key)
         if existing is not None:
-            if existing.model_dump_json() == record.model_dump_json():
-                return record.request_id
-            raise ArtifactConflictError(
-                f"idempotency_key={record.idempotency_key!r} already used"
-            )
+            # Idempotent recovery: reuse the prior request_id.
+            return existing.request_id
         try:
             async with aiosqlite.connect(self._db_path) as db:
                 await db.execute(
@@ -366,8 +366,8 @@ class CognitiveArtifactStore:
                         agent_role, prompt_id, prompt_version, provider, model, status,
                         attempt_count, escalation_source, started_at, finished_at,
                         latency_ms, input_tokens, output_tokens, error_code,
-                        validated_output_artifact_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        validated_output_artifact_id, validated_output_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         str(record.request_id),
@@ -392,6 +392,7 @@ class CognitiveArtifactStore:
                         str(record.validated_output_artifact_id)
                         if record.validated_output_artifact_id
                         else None,
+                        record.validated_output_json,
                     ),
                 )
                 await db.commit()
@@ -402,6 +403,16 @@ class CognitiveArtifactStore:
         except Exception as exc:
             raise ArtifactPersistenceError(f"model call append failed: {exc}") from exc
         return record.request_id
+
+    async def _ensure_output_json_column(self) -> None:
+        async with aiosqlite.connect(self._db_path) as db:
+            cur = await db.execute("PRAGMA table_info(model_calls)")
+            cols = {row[1] for row in await cur.fetchall()}
+            if "validated_output_json" not in cols:
+                await db.execute(
+                    "ALTER TABLE model_calls ADD COLUMN validated_output_json TEXT"
+                )
+                await db.commit()
 
     def _row_to_model_call(self, row: aiosqlite.Row) -> ModelCallRecord:
         return ModelCallRecord(
@@ -428,6 +439,9 @@ class CognitiveArtifactStore:
             error_code=row["error_code"],
             validated_output_artifact_id=UUID(row["validated_output_artifact_id"])
             if row["validated_output_artifact_id"]
+            else None,
+            validated_output_json=row["validated_output_json"]
+            if "validated_output_json" in row.keys()
             else None,
         )
 
@@ -471,6 +485,7 @@ class CognitiveArtifactStore:
         input_tokens: int | None = None,
         output_tokens: int | None = None,
         validated_output_artifact_id: UUID | None = None,
+        validated_output_json: str | None = None,
         finished_at: datetime | None = None,
     ) -> ModelCallRecord:
         """Mark a model call completed with telemetry."""
@@ -493,6 +508,8 @@ class CognitiveArtifactStore:
                 "input_tokens": input_tokens,
                 "output_tokens": output_tokens,
                 "validated_output_artifact_id": validated_output_artifact_id,
+                "validated_output_json": validated_output_json
+                or record.validated_output_json,
                 "finished_at": done_at,
             }
         )
@@ -529,6 +546,7 @@ class CognitiveArtifactStore:
 
     async def _update_model_call(self, record: ModelCallRecord) -> None:
         await self._ensure_initialized()
+        await self._ensure_output_json_column()
         async with aiosqlite.connect(self._db_path) as db:
             await db.execute(
                 """
@@ -536,7 +554,7 @@ class CognitiveArtifactStore:
                     provider = ?, model = ?, status = ?, attempt_count = ?,
                     escalation_source = ?, finished_at = ?, latency_ms = ?,
                     input_tokens = ?, output_tokens = ?, error_code = ?,
-                    validated_output_artifact_id = ?
+                    validated_output_artifact_id = ?, validated_output_json = ?
                 WHERE request_id = ?
                 """,
                 (
@@ -553,6 +571,7 @@ class CognitiveArtifactStore:
                     str(record.validated_output_artifact_id)
                     if record.validated_output_artifact_id
                     else None,
+                    record.validated_output_json,
                     str(record.request_id),
                 ),
             )

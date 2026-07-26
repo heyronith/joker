@@ -25,6 +25,9 @@ def build_discovery_graph(deps: CognitiveGraphDeps):
                 max_hypotheses=deps.config.max_hypotheses_per_cycle,
             )
         )
+        if deps.hypothesis_repo is not None:
+            for hyp in hypotheses:
+                await deps.hypothesis_repo.append(hyp)
         return {
             "hypotheses": hypotheses,
             **trace_update(

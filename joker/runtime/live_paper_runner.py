@@ -254,33 +254,54 @@ class LivePaperRunner:
 
         injected_agent_runtime = None
         cognitive_graph_deps = None
+        _cognitive_startup_payload: dict[str, Any] | None = None
         if cognitive_mode:
-            from joker.graph.graph_deps import CognitiveGraphDeps
-            from joker.market.snapshots import SnapshotRepository
-            from joker.models.fake_provider import FakeModelProvider
-            from joker.models.registry import ModelRegistry
-            from joker.models.router import ModelRouter
-            from joker.runtime.cognitive_agent_runtime import CognitiveAgentRuntime
+            import asyncio as _asyncio
 
-            registry = ModelRegistry.with_defaults(self.app_settings.models)
-            # Deterministic mock sessions force the fake provider onto all profiles.
-            if self.app_settings.agents.mock_agents or config.mock_agents:
-                fake_provider = FakeModelProvider(available=True)
-                registry.register_provider("fake", fake_provider)
-                remapped = {
-                    name: profile.model_copy(update={"provider": "fake"})
-                    for name, profile in registry.profiles.items()
-                }
-                registry.update_config(
-                    registry.config.model_copy(update={"profiles": remapped})
+            from joker.cognition.exceptions import CognitiveRuntimeConfigurationError
+            from joker.graph.context_hydrate import context_assembler_from_settings
+            from joker.graph.graph_deps import CognitiveGraphDeps
+            from joker.market.option_surface import OptionSurfaceRepository
+            from joker.market.snapshots import SnapshotRepository
+            from joker.models.router import ModelRouter
+            from joker.runtime.cognitive_agent_runtime import (
+                CognitiveAgentRuntime,
+                build_default_repositories,
+            )
+            from joker.runtime.cognitive_startup import validate_cognitive_providers
+
+            try:
+                startup = _asyncio.run(
+                    validate_cognitive_providers(
+                        self.app_settings.models,
+                        mock_agents=bool(
+                            self.app_settings.agents.mock_agents or config.mock_agents
+                        ),
+                    )
                 )
-            model_router = ModelRouter(registry, session_id=run_id)
+            except CognitiveRuntimeConfigurationError as exc:
+                raise LivePaperError(f"cognitive-runtime configuration error: {exc}") from exc
+
+            registry = startup.registry
+            model_router = ModelRouter(
+                registry,
+                session_id=run_id,
+                model_call_repo=None,  # wired after repos below
+            )
+            repos = build_default_repositories(task1_db)
+            model_router.set_model_call_repo(repos["model_call_repo"])
             cognitive_graph_deps = CognitiveGraphDeps(
                 router=model_router,
                 config=self.app_settings.cognitive_graph,
                 session_id=run_id,
                 run_id=run_id,
+                context_assembler=context_assembler_from_settings(
+                    self.app_settings.cognitive_graph
+                ),
                 snapshot_repo=SnapshotRepository(task1_db),
+                option_surface_repo=OptionSurfaceRepository(task1_db),
+                db_path=task1_db,
+                **repos,
             )
             injected_agent_runtime = CognitiveAgentRuntime(
                 session_id=run_id,
@@ -289,7 +310,21 @@ class LivePaperRunner:
                 config=self.app_settings.cognitive_graph,
                 graph_deps=cognitive_graph_deps,
                 registry=registry,
+                checkpointer_path=task1_db.with_name(task1_db.stem + "_cognitive_ckpt.db"),
             )
+            # Startup details are logged after the session log() helper is defined.
+            _cognitive_startup_payload = {
+                "mock_session": startup.mock_session,
+                "remapped_to_fake": startup.remapped_to_fake,
+                "ollama_enabled": startup.availability.ollama_enabled,
+                "ollama_healthy": startup.availability.ollama_healthy,
+                "openai_enabled": startup.availability.openai_enabled,
+                "openai_healthy": startup.availability.openai_healthy,
+                "healthy_mandatory": list(
+                    startup.availability.healthy_mandatory_profiles
+                ),
+                "notes": list(startup.availability.notes),
+            }
         elif null_agent_mode:
             from joker.runtime.compatibility import NullAgentRuntime
 
@@ -310,9 +345,24 @@ class LivePaperRunner:
                     raise RuntimeError("ExecutionRuntime not available")
                 return await execution.submit_execution_command(provenanced.command)
 
+            async def _projection_loader() -> Any:
+                execution = task1_bridge.supervisor.execution_runtime
+                if execution is None:
+                    return None
+                return await execution.project_session()
+
             cognitive_graph_deps.submit_callback = _submit_callback
             cognitive_graph_deps.event_bus = task1_bridge.supervisor.event_bus
             cognitive_graph_deps.execution_runtime = task1_bridge.supervisor.execution_runtime
+            cognitive_graph_deps.projection_loader = _projection_loader
+            if task1_bridge.supervisor.option_surface_repository is not None:
+                cognitive_graph_deps.option_surface_repo = (
+                    task1_bridge.supervisor.option_surface_repository
+                )
+            if task1_bridge.supervisor.snapshot_repository is not None:
+                cognitive_graph_deps.snapshot_repo = (
+                    task1_bridge.supervisor.snapshot_repository
+                )
         task1_bridge.start()
         self._task1_bridge = task1_bridge
         execution_broker = ExecutionDelegatingBroker(
@@ -344,6 +394,8 @@ class LivePaperRunner:
 
         session_memory = SessionMicroMemory()
         capital_budget = config.capital_budget or _default_capital_budget(self.app_settings)
+        if _cognitive_startup_payload is not None:
+            log("cognitive.startup", _cognitive_startup_payload)
 
         def on_trade_outcome(payload: dict) -> None:
             rec = session_memory.record_outcome(
@@ -644,15 +696,25 @@ class LivePaperRunner:
             except StateMachineError as exc:
                 failures.append(f"playbook_arm_failed: {exc}")
         else:
-            if not failures:
-                failures.append("no_active_playbook")
-            log("live_paper.failure", {"error": "no_active_playbook"})
+            if cognitive_mode:
+                # Cognitive mode does not require a legacy playbook to observe/poll.
+                log(
+                    "cognitive.playbook_optional",
+                    {
+                        "playbook_present": playbook is not None,
+                        "approved": bool(playbook and playbook.approved),
+                    },
+                )
+            else:
+                if not failures:
+                    failures.append("no_active_playbook")
+                log("live_paper.failure", {"error": "no_active_playbook"})
 
         daily_state = DailyState(
             trading_day=trading_day,
             run_id=run_id,
             mode=mode.value,
-            playbook_approved=armed,
+            playbook_approved=armed or cognitive_mode,
         )
 
         def on_log(event_type: str, payload: dict) -> None:
@@ -753,7 +815,7 @@ class LivePaperRunner:
             },
         )
 
-        if armed:
+        if armed or cognitive_mode:
             try:
                 import time as _time
 

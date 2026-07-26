@@ -37,3 +37,7 @@ class ModelCallNotFoundError(CognitiveError):
 
 class ModelCallStateError(CognitiveError):
     """Raised when a model call is in an unexpected state for the requested operation."""
+
+
+class CognitiveRuntimeConfigurationError(CognitiveError):
+    """Raised when cognitive mode cannot start due to provider/config problems."""

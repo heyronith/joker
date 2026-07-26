@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import date
 from uuid import uuid4
 
 import pytest
@@ -243,11 +244,14 @@ def test_execution_validator_and_compiler() -> None:
         strategy_id=strategy.strategy_id,
     )
 
-    ExecutionProposalValidator().validate(proposal, trading_mode="PAPER")
+    ExecutionProposalValidator().validate(
+        proposal, trading_mode="PAPER", trading_date=date(2026, 7, 25)
+    )
 
     provenanced = ExecutionCommandCompiler().compile(
         proposal,
         evidence_ids=(uuid4(),),
+        trading_date=date(2026, 7, 25),
     )
     assert provenanced.command.intent.contract.symbol == "SPY"
     assert provenanced.command.intent.quantity == 1

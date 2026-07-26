@@ -129,6 +129,14 @@ class SessionSupervisor:
         return self._ledger
 
     @property
+    def snapshot_repository(self) -> SnapshotRepository | None:
+        return self._snapshots
+
+    @property
+    def option_surface_repository(self) -> OptionSurfaceRepository | None:
+        return self._surfaces
+
+    @property
     def unresolved_reconciliation(self) -> UnresolvedReconciliation | None:
         return self._unresolved
 
@@ -309,6 +317,10 @@ class SessionSupervisor:
         if self._ledger is not None:
             await self._ledger.close()
         await self._checkpoints.close()
+        # Let aiosqlite worker threads observe closed connections before loop teardown.
+        import asyncio
+
+        await asyncio.sleep(0)
         self._started = False
         logger.info(
             "session_shutdown_complete",

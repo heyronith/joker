@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from typing import Any, Sequence
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from joker.agents.cognitive.base import CognitiveAgent
 from joker.cognition.context import ContextPackage
@@ -20,6 +20,26 @@ DEBATE_ROLES: tuple[AgentRole, ...] = (
 )
 
 
+def _enrich_debate_review(
+    output: DebateReview,
+    *,
+    context: ContextPackage,
+    model_call_id: UUID,
+    role: AgentRole,
+    prompt_version: str,
+) -> DebateReview:
+    return output.model_copy(
+        update={
+            "review_id": uuid4(),
+            "snapshot_id": context.snapshot_id,
+            "cycle_id": context.cycle_id,
+            "prompt_version": prompt_version,
+            "model_call_id": model_call_id,
+            "reviewer_role": role,
+        }
+    )
+
+
 class StrategyAdvocateAgent(CognitiveAgent[DebateReview]):
     role = AgentRole.STRATEGY_ADVOCATE
     output_type = DebateReview
@@ -31,14 +51,12 @@ class StrategyAdvocateAgent(CognitiveAgent[DebateReview]):
         context: ContextPackage,
         model_call_id: UUID,
     ) -> DebateReview:
-        return output.model_copy(
-            update={
-                "snapshot_id": context.snapshot_id,
-                "cycle_id": context.cycle_id,
-                "prompt_version": self.prompt_version,
-                "model_call_id": model_call_id,
-                "reviewer_role": self.role,
-            }
+        return _enrich_debate_review(
+            output,
+            context=context,
+            model_call_id=model_call_id,
+            role=self.role,
+            prompt_version=self.prompt_version,
         )
 
 
@@ -53,14 +71,12 @@ class FalsifierAgent(CognitiveAgent[DebateReview]):
         context: ContextPackage,
         model_call_id: UUID,
     ) -> DebateReview:
-        return output.model_copy(
-            update={
-                "snapshot_id": context.snapshot_id,
-                "cycle_id": context.cycle_id,
-                "prompt_version": self.prompt_version,
-                "model_call_id": model_call_id,
-                "reviewer_role": self.role,
-            }
+        return _enrich_debate_review(
+            output,
+            context=context,
+            model_call_id=model_call_id,
+            role=self.role,
+            prompt_version=self.prompt_version,
         )
 
 
@@ -75,14 +91,12 @@ class HistoricalCriticAgent(CognitiveAgent[DebateReview]):
         context: ContextPackage,
         model_call_id: UUID,
     ) -> DebateReview:
-        return output.model_copy(
-            update={
-                "snapshot_id": context.snapshot_id,
-                "cycle_id": context.cycle_id,
-                "prompt_version": self.prompt_version,
-                "model_call_id": model_call_id,
-                "reviewer_role": self.role,
-            }
+        return _enrich_debate_review(
+            output,
+            context=context,
+            model_call_id=model_call_id,
+            role=self.role,
+            prompt_version=self.prompt_version,
         )
 
 
@@ -97,14 +111,12 @@ class ExecutionCriticAgent(CognitiveAgent[DebateReview]):
         context: ContextPackage,
         model_call_id: UUID,
     ) -> DebateReview:
-        return output.model_copy(
-            update={
-                "snapshot_id": context.snapshot_id,
-                "cycle_id": context.cycle_id,
-                "prompt_version": self.prompt_version,
-                "model_call_id": model_call_id,
-                "reviewer_role": self.role,
-            }
+        return _enrich_debate_review(
+            output,
+            context=context,
+            model_call_id=model_call_id,
+            role=self.role,
+            prompt_version=self.prompt_version,
         )
 
 
@@ -119,14 +131,12 @@ class AlternativeExplanationAgent(CognitiveAgent[DebateReview]):
         context: ContextPackage,
         model_call_id: UUID,
     ) -> DebateReview:
-        return output.model_copy(
-            update={
-                "snapshot_id": context.snapshot_id,
-                "cycle_id": context.cycle_id,
-                "prompt_version": self.prompt_version,
-                "model_call_id": model_call_id,
-                "reviewer_role": self.role,
-            }
+        return _enrich_debate_review(
+            output,
+            context=context,
+            model_call_id=model_call_id,
+            role=self.role,
+            prompt_version=self.prompt_version,
         )
 
 

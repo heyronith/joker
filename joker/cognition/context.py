@@ -159,6 +159,10 @@ class ContextAssembler:
             include_bars = True
         elif agent_role == AgentRole.OPTIONS_MICROSTRUCTURE:
             include_surface = True
+        elif agent_role == AgentRole.WORLD_MODEL_SYNTHESISER:
+            include_bars = True
+            include_surface = True
+            include_artifacts = True
         elif agent_role in {
             AgentRole.PATTERN_MINER,
             AgentRole.SEQUENCE_ANALYST,
@@ -190,10 +194,14 @@ class ContextAssembler:
         elif agent_role == AgentRole.ORDER_MANAGER:
             include_orders = True
             include_surface = True
-        elif agent_role in {AgentRole.POSITION_THESIS, AgentRole.POSITION_DECISION}:
+        elif agent_role in {
+            AgentRole.POSITION_THESIS,
+            AgentRole.POSITION_DECISION,
+        }:
             include_positions = True
             include_orders = True
             include_artifacts = True
+            include_surface = True
 
         if self.config.include_legacy_playbook and legacy_playbook_context:
             include_legacy = True

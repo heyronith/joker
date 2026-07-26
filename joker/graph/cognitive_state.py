@@ -18,6 +18,7 @@ from joker.cognition.schemas import (
     MarketWorldModel,
     MetaDecision,
     PatternHypothesis,
+    PositionThesisVersion,
     StrategyHypothesis,
 )
 from joker.graph.reducers import (
@@ -28,6 +29,7 @@ from joker.graph.reducers import (
     merge_strategies,
     merge_traces,
 )
+from joker.market.quality import DataQualityReport
 
 
 class CognitiveGraphState(TypedDict, total=False):
@@ -70,3 +72,20 @@ class CognitiveGraphState(TypedDict, total=False):
 
     # Runtime-only hydrated context (not persisted to checkpoints)
     _context_package: ContextPackage | None
+    _data_quality: DataQualityReport | None
+    _option_surface_id: str | None
+
+    # Position graph channels
+    _position_id: str | None
+    _contract_id: str | None
+    _original_strategy_id: str | None
+    _original_strategy: StrategyHypothesis | None
+    _prior_thesis: PositionThesisVersion | None
+    _position_thesis: PositionThesisVersion | None
+    _position_decision: PositionThesisVersion | None
+    _position_projection: dict | None
+    _order_projection: dict | None
+    _trading_date: str | None
+    _position_critic_notes: dict | None
+    _position_action: str | None
+    _position_command_id: str | None

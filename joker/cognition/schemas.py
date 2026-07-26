@@ -84,6 +84,8 @@ class AgentRole(StrEnum):
     EXECUTION_CRITIC = "execution_critic"
     ALTERNATIVE_EXPLANATION = "alternative_explanation"
 
+    WORLD_MODEL_SYNTHESISER = "world_model_synthesiser"
+
     META_DECISION = "meta_decision"
     ENTRY_TACTICIAN = "entry_tactician"
     ORDER_MANAGER = "order_manager"

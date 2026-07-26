@@ -48,8 +48,6 @@ pythonpath = ["."]
 asyncio_mode = "auto"
 filterwarnings = [
     "ignore::DeprecationWarning",
-    # aiosqlite worker threads may briefly race loop.close() after session shutdown
-    "ignore:.*Event loop is closed.*:pytest.PytestUnhandledThreadExceptionWarning",
 ]
 
 [tool.ruff]

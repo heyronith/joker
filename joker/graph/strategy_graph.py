@@ -20,6 +20,9 @@ def build_strategy_graph(deps: CognitiveGraphDeps):
             return {}
         strategies = list(await run_strategy_inventors(deps.router, context))
         strategies = strategies[: deps.config.max_strategy_candidates]
+        if deps.strategy_repo is not None:
+            for strategy in strategies:
+                await deps.strategy_repo.append(strategy)
         return {
             "strategies": strategies,
             **trace_update(

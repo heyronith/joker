@@ -233,6 +233,23 @@ _PROMPTS: dict[AgentRole, PromptSpec] = {
         required_context_schema="debate_context",
         focus="Alternative narratives with contradicting evidence IDs.",
     ),
+    AgentRole.WORLD_MODEL_SYNTHESISER: _build_prompt(
+        prompt_id="perception.world_model_synthesiser",
+        role=AgentRole.WORLD_MODEL_SYNTHESISER,
+        role_mandate=(
+            "Synthesise a typed MarketWorldModel from the five perception evidence "
+            "artefacts, the data-quality report, and snapshot metadata. Preserve "
+            "disagreement and minority evidence. Identify conflicts and unresolved "
+            "questions. Reference contributing evidence IDs. Do not invent fills, "
+            "historical win rates, or trade recommendations."
+        ),
+        output_schema_name="MarketWorldModel",
+        required_context_schema="world_model_context",
+        focus=(
+            "Construct regime hypotheses, structure/volatility/options/temporal "
+            "assessments, anomalies, conflicts, and uncertainty from evidence only."
+        ),
+    ),
     AgentRole.META_DECISION: _build_prompt(
         prompt_id="decision.meta_decision",
         role=AgentRole.META_DECISION,

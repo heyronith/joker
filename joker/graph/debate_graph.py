@@ -26,6 +26,10 @@ def build_debate_graph(deps: CognitiveGraphDeps):
         for strategy in strategies:
             panel = await run_debate_panel(strategy, context, deps.router)
             reviews.extend(panel)
+        if deps.debate_repo is not None:
+            session_id = state.get("session_id") or deps.session_id
+            for review in reviews:
+                await deps.debate_repo.append(review, session_id=session_id)
         return {
             "reviews": reviews,
             **trace_update(

@@ -6,17 +6,25 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from uuid import UUID
+
+from langgraph.checkpoint.base import BaseCheckpointSaver
 
 from joker.cognition.context import ContextAssembler
 from joker.config.settings import CognitiveGraphSettings
 from joker.events.bus import InProcessAsyncEventBus
-from joker.market.snapshots import SnapshotRepository
+from joker.market.option_surface import OptionSurfaceRepository
+from joker.market.quality import DataQualityReport
+from joker.market.snapshots import MarketSnapshot, SnapshotRepository
 from joker.models.router import ModelRouter
 from joker.persistence.cognitive_repositories import (
     DebateRepository,
     DecisionRepository,
     EvidenceRepository,
     HypothesisRepository,
+    ModelCallRepository,
+    OrderManagementRepository,
+    PositionThesisRepository,
     StrategyRepository,
     WorldModelRepository,
 )
@@ -25,6 +33,11 @@ from joker.time.clock import ExchangeClock
 
 
 SubmitCallback = Callable[..., Awaitable[Any]]
+DataQualityLoader = Callable[
+    [UUID, MarketSnapshot],
+    Awaitable[DataQualityReport | None],
+]
+ProjectionLoader = Callable[[], Awaitable[Any]]
 
 
 @dataclass
@@ -37,17 +50,25 @@ class CognitiveGraphDeps:
     run_id: str
     context_assembler: ContextAssembler = field(default_factory=ContextAssembler)
     snapshot_repo: SnapshotRepository | None = None
+    option_surface_repo: OptionSurfaceRepository | None = None
     evidence_repo: EvidenceRepository | None = None
     world_model_repo: WorldModelRepository | None = None
     hypothesis_repo: HypothesisRepository | None = None
     strategy_repo: StrategyRepository | None = None
     debate_repo: DebateRepository | None = None
     decision_repo: DecisionRepository | None = None
+    position_thesis_repo: PositionThesisRepository | None = None
+    order_management_repo: OrderManagementRepository | None = None
+    model_call_repo: ModelCallRepository | None = None
     execution_runtime: ExecutionRuntime | None = None
     submit_callback: SubmitCallback | None = None
     event_bus: InProcessAsyncEventBus | None = None
     clock: ExchangeClock | None = None
     db_path: Path | None = None
+    checkpointer: BaseCheckpointSaver | None = None
+    data_quality_loader: DataQualityLoader | None = None
+    projection_loader: ProjectionLoader | None = None
+    submitted_proposal_ids: set[str] = field(default_factory=set)
 
     def limits_dict(self) -> dict[str, int]:
         return {

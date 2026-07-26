@@ -14,7 +14,11 @@ from joker.cognition.artifacts import (
     ModelCallRecord,
     artifact_record_from_payload,
 )
-from joker.cognition.exceptions import ArtifactNotFoundError
+from joker.cognition.exceptions import (
+    ArtifactConflictError,
+    ArtifactNotFoundError,
+    ArtifactPersistenceError,
+)
 from joker.cognition.schemas import (
     AgentEvidence,
     CognitiveArtifactType,
@@ -62,10 +66,29 @@ class _TypedArtifactRepository:
     async def append(self, payload: T, **envelope_kwargs) -> UUID:
         """Persist a typed artefact."""
         artifact_id = self._extract_id(payload)
+        session_id = envelope_kwargs.pop("session_id", None) or getattr(
+            payload, "session_id", None
+        )
+        snapshot_id = envelope_kwargs.pop("snapshot_id", None) or getattr(
+            payload, "snapshot_id", None
+        )
+        if session_id is None or snapshot_id is None:
+            raise ArtifactPersistenceError(
+                f"session_id and snapshot_id required to append {self._artifact_type.value}"
+            )
         record = artifact_record_from_payload(
             artifact_id=artifact_id,
             artifact_type=self._artifact_type,
             payload=payload,
+            session_id=str(session_id),
+            snapshot_id=snapshot_id if isinstance(snapshot_id, UUID) else UUID(str(snapshot_id)),
+            cycle_id=envelope_kwargs.pop("cycle_id", None) or getattr(payload, "cycle_id", None),
+            agent_role=envelope_kwargs.pop("agent_role", None)
+            or getattr(payload, "agent_role", None),
+            prompt_version=envelope_kwargs.pop("prompt_version", None)
+            or getattr(payload, "prompt_version", None),
+            model_call_id=envelope_kwargs.pop("model_call_id", None)
+            or getattr(payload, "model_call_id", None),
             **envelope_kwargs,
         )
         return await self._store.append_artifact(record)

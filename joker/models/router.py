@@ -74,6 +74,7 @@ class ModelRouter:
         max_provider_escalations: int | None = None,
         max_parallel_model_calls: int | None = None,
         session_id: str | None = None,
+        model_call_repo: Any | None = None,
     ) -> None:
         self._registry = registry
         config = registry.config
@@ -95,6 +96,11 @@ class ModelRouter:
         self._semaphore = asyncio.Semaphore(limit)
         self._session_id = session_id
         self._routing_logs: list[dict[str, Any]] = []
+        self._model_call_repo = model_call_repo
+
+    def set_model_call_repo(self, repo: Any | None) -> None:
+        """Attach or replace the durable model-call repository."""
+        self._model_call_repo = repo
 
     @property
     def routing_logs(self) -> list[dict[str, Any]]:
@@ -209,6 +215,20 @@ class ModelRouter:
         )
         logger.info("model call started", extra=started_event)
 
+        # Durable idempotency: reuse a completed validated call before invoking provider.
+        reused = await self._try_reuse_completed(request, output_type)
+        if reused is not None:
+            return reused
+
+        await self._record_call_started(
+            routed_request,
+            provider_name=provider.provider_name,
+            model_name=model_name,
+            started_at=started_at,
+            escalated_from=escalated_from,
+            attempt_count=attempt_count,
+        )
+
         try:
             result = await provider.complete_structured(
                 request=routed_request,
@@ -233,6 +253,9 @@ class ModelRouter:
                     repair_attempts=repair_attempts + 1,
                     escalated_from=escalated_from,
                 )
+            await self._record_call_failed(
+                routed_request, error_code=type(exc).__name__
+            )
             return await self._escalate_or_raise(
                 request,
                 output_type,
@@ -242,6 +265,9 @@ class ModelRouter:
                 error=exc,
             )
         except (ModelProviderUnavailable, ModelError) as exc:
+            await self._record_call_failed(
+                routed_request, error_code=type(exc).__name__
+            )
             return await self._escalate_or_raise(
                 request,
                 output_type,
@@ -264,6 +290,7 @@ class ModelRouter:
             escalated_from=escalated_from,
             completed_at=result.completed_at,
         )
+        await self._record_call_completed(routed_request, completed)
         logger.info(
             "model call completed",
             extra=build_model_call_completed(
@@ -375,3 +402,109 @@ class ModelRouter:
         )
         self._routing_logs.append(entry)
         logger.info("model routing decision", extra=entry)
+
+    async def _try_reuse_completed(
+        self,
+        request: ModelRequest,
+        output_type: type[T],
+    ) -> ModelResult[T] | None:
+        if self._model_call_repo is None:
+            return None
+        try:
+            existing = await self._model_call_repo.get_by_idempotency(request.idempotency_key)
+        except Exception:
+            return None
+        if existing is None or existing.status.value != "completed":
+            return None
+        if not existing.validated_output_json:
+            return None
+        try:
+            output = output_type.model_validate_json(existing.validated_output_json)
+        except Exception:
+            return None
+        return ModelResult[T](
+            request_id=existing.request_id,
+            provider_name=existing.provider or "reused",
+            model_name=existing.model or "reused",
+            output=output,
+            prompt_version=existing.prompt_version,
+            input_tokens=existing.input_tokens,
+            output_tokens=existing.output_tokens,
+            latency_ms=existing.latency_ms or 0,
+            attempt_count=existing.attempt_count,
+            escalated_from=existing.escalation_source,
+            completed_at=existing.finished_at or utc_now(),
+        )
+
+    async def _record_call_started(
+        self,
+        request: ModelRequest,
+        *,
+        provider_name: str,
+        model_name: str,
+        started_at,
+        escalated_from: str | None,
+        attempt_count: int,
+    ) -> None:
+        if self._model_call_repo is None:
+            return
+        from joker.cognition.artifacts import ModelCallRecord
+        from joker.cognition.schemas import AgentRole, ModelCallStatus
+
+        try:
+            role = AgentRole(request.role)
+        except ValueError:
+            return
+        try:
+            await self._model_call_repo.append(
+                ModelCallRecord(
+                    request_id=request.request_id,
+                    idempotency_key=request.idempotency_key,
+                    session_id=self._session_id or "unknown",
+                    cycle_id=request.cycle_id,
+                    snapshot_id=request.snapshot_id,
+                    agent_role=role,
+                    prompt_id=request.prompt_id,
+                    prompt_version=request.prompt_version,
+                    provider=provider_name,
+                    model=model_name,
+                    status=ModelCallStatus.IN_PROGRESS,
+                    attempt_count=attempt_count,
+                    escalation_source=escalated_from,
+                    started_at=started_at,
+                )
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("model_call_start_persist_failed", extra={"error": str(exc)})
+
+    async def _record_call_completed(
+        self,
+        request: ModelRequest,
+        result: ModelResult[Any],
+    ) -> None:
+        if self._model_call_repo is None:
+            return
+        try:
+            await self._model_call_repo.mark_complete(
+                result.request_id,
+                provider=result.provider_name,
+                model=result.model_name,
+                latency_ms=result.latency_ms,
+                input_tokens=result.input_tokens,
+                output_tokens=result.output_tokens,
+                validated_output_json=result.output.model_dump_json(),
+                finished_at=result.completed_at,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("model_call_complete_persist_failed", extra={"error": str(exc)})
+
+    async def _record_call_failed(self, request: ModelRequest, *, error_code: str) -> None:
+        if self._model_call_repo is None:
+            return
+        try:
+            await self._model_call_repo.mark_failed(
+                request.request_id,
+                error_code=error_code,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("model_call_fail_persist_failed", extra={"error": str(exc)})
