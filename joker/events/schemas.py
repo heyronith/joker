@@ -46,6 +46,26 @@ class EventType(StrEnum):
     POSITION_THESIS_UPDATED = "position_thesis_updated"
     POSITION_ACTION_PROPOSED = "position_action_proposed"
     COGNITIVE_CYCLE_COMPLETED = "cognitive_cycle_completed"
+    # Task 3 evolution lifecycle
+    EPISODE_COMPLETED = "episode_completed"
+    EPISODE_INCOMPLETE = "episode_incomplete"
+    EPISODE_EVALUATED = "episode_evaluated"
+    DATASET_CREATED = "dataset_created"
+    IMPROVEMENT_PROPOSED = "improvement_proposed"
+    CHALLENGER_REGISTERED = "challenger_registered"
+    EXPERIMENT_STARTED = "experiment_started"
+    EXPERIMENT_PROGRESS = "experiment_progress"
+    EXPERIMENT_COMPLETED = "experiment_completed"
+    CHALLENGER_ELIGIBLE = "challenger_eligible"
+    CHALLENGER_INELIGIBLE = "challenger_ineligible"
+    SHADOW_CYCLE_COMPLETED = "shadow_cycle_completed"
+    PROMOTION_REQUESTED = "promotion_requested"
+    CONFIGURATION_PROMOTED = "configuration_promoted"
+    CONFIGURATION_REJECTED = "configuration_rejected"
+    DRIFT_DETECTED = "drift_detected"
+    ROLLBACK_REQUESTED = "rollback_requested"
+    CONFIGURATION_ROLLED_BACK = "configuration_rolled_back"
+    EVOLUTION_RUNTIME_DEGRADED = "evolution_runtime_degraded"
 
 
 class DomainEvent(BaseModel):

@@ -146,6 +146,9 @@ def apply_task1_migrations(db_path: str | Path) -> Path:
     Does not instantiate ``joker.storage.database.Database`` so legacy SQLModel
     tables cannot shadow Task 1 schemas via ``CREATE TABLE IF NOT EXISTS``.
 
+    Also applies Task 3 evolution DDL idempotently so paper sessions can enable
+    evolution without a separate migration step.
+
     Returns the resolved database path.
     """
     path = Path(db_path)
@@ -156,4 +159,7 @@ def apply_task1_migrations(db_path: str | Path) -> Path:
         conn.commit()
     finally:
         conn.close()
+    from joker.evolution.migrations import apply_task3_migrations
+
+    apply_task3_migrations(path)
     return path

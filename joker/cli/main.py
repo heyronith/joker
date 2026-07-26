@@ -20,6 +20,10 @@ app = typer.Typer(
 config_app = typer.Typer(help="Configuration commands")
 app.add_typer(config_app, name="config")
 
+from joker.cli.evolve import evolve_app
+
+app.add_typer(evolve_app, name="evolve")
+
 console = Console()
 
 

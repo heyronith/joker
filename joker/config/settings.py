@@ -180,6 +180,12 @@ def _default_models_config() -> Any:
     return ModelsConfig()
 
 
+def _default_evolution_settings() -> Any:
+    from joker.evolution.config import EvolutionSettings
+
+    return EvolutionSettings()
+
+
 class AppSettings(BaseModel):
     """Merged application settings from YAML config and environment."""
 
@@ -203,6 +209,20 @@ class AppSettings(BaseModel):
     persistence: PersistenceSettings = Field(default_factory=PersistenceSettings)
     cognitive_graph: CognitiveGraphSettings = Field(default_factory=CognitiveGraphSettings)
     models: Any = Field(default_factory=_default_models_config)
+    evolution: Any = Field(default_factory=_default_evolution_settings)
+
+    @field_validator("evolution", mode="before")
+    @classmethod
+    def _parse_evolution(cls, value: Any) -> Any:
+        from joker.evolution.config import EvolutionSettings
+
+        if value is None:
+            return EvolutionSettings()
+        if isinstance(value, EvolutionSettings):
+            return value
+        if isinstance(value, dict):
+            return EvolutionSettings.model_validate(value)
+        return value
 
     @field_validator("mode", mode="before")
     @classmethod

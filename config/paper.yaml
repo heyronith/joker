@@ -105,6 +105,49 @@ models:
   max_provider_escalations: 1
   max_parallel_model_calls: 5
 
+# Task 3 cognitive evolution — paper-only, default disabled for Task 1/2 safety.
+evolution:
+  enabled: false
+  episode_compiler:
+    enabled: true
+    no_trade_windows_minutes: [5, 15, 30]
+    finalise_at_session_end: true
+  evaluation:
+    enabled: true
+    max_parallel_episodes: 4
+    evaluator_profile: reasoning_local
+    counterfactual_max_per_episode: 3
+  datasets:
+    minimum_episode_count: 50
+    minimum_holdout_count: 20
+    minimum_regime_count: 3
+  experiments:
+    enabled: true
+    max_parallel_replays: 4
+    maximum_model_calls: 5000
+    maximum_cost_gbp: 25.00
+    repeated_samples: 3
+  shadow:
+    enabled: true
+    maximum_challengers: 1
+    queue_size: 128
+    snapshot_coalescing: true
+  promotion:
+    auto_promote_paper_only: true
+    require_agent_recommendation: true
+    require_deterministic_eligibility: true
+    maximum_tail_loss_regression_pct: 5
+    maximum_calibration_regression_pct: 3
+    maximum_latency_regression_pct: 25
+    maximum_cost_regression_pct: 50
+    minimum_completed_episodes: 20
+    minimum_holdout_episodes: 10
+  drift:
+    enabled: true
+    rolling_episode_window: 50
+    safety_rollback_immediate: true
+    strategic_rollback_requires_agent: true
+
 # Daily authorized capital + profit goal (confirmed at session start)
 capital:
   authorized_usd: 500.0
