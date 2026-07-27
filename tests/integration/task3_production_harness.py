@@ -379,6 +379,42 @@ async def _wait_for_position(supervisor, *, want_open: bool, attempts: int = 50)
     raise AssertionError(f"position never became {state}")
 
 
+def _mint_position_exit_canned(
+    fake: FakeModelProvider,
+    *,
+    session_id: str,
+    snapshot_id,
+    trade_index: int,
+) -> None:
+    """Always mint fresh artifact ids so concurrent/repeated position cycles never collide."""
+    exit_thesis = PositionThesisVersion(
+        position_id=CONTRACT_ID,
+        contract_id=CONTRACT_ID,
+        session_id=session_id,
+        snapshot_id=snapshot_id,
+        original_strategy_id=uuid4(),
+        current_thesis=f"exit trade {trade_index}",
+        recommended_action=PositionAction.EXIT,
+        recommended_quantity=1,
+        recommended_limit_price=Decimal("1.20"),
+        confidence=0.7,
+        prompt_version="2.0.0",
+        model_call_id=uuid4(),
+        thesis_version_id=uuid4(),
+    )
+    fake.set_canned_for_role("position_thesis", exit_thesis)
+    fake.set_canned_for_role(
+        "position_decision",
+        exit_thesis.model_copy(
+            update={
+                "thesis_version_id": uuid4(),
+                "model_call_id": uuid4(),
+                "recommended_action": PositionAction.EXIT,
+            }
+        ),
+    )
+
+
 async def run_closed_trade_round_trip(
     stack: dict,
     *,
@@ -390,6 +426,7 @@ async def run_closed_trade_round_trip(
     clock: FrozenExchangeClock = stack["clock"]
     start: datetime = stack["start"]
     session_id = stack["evolution"].session_id
+    exits_before = len(stack["gateway_exit_ids"])
 
     entry_start = start + timedelta(minutes=minute_offset)
     clock.set_now(entry_start)
@@ -397,13 +434,13 @@ async def run_closed_trade_round_trip(
     register_full_path_canned(
         fake,
         snapshot.snapshot_id,
-        f"cycle-entry-{trade_index}",
+        f"cycle-entry-{trade_index}-{uuid4().hex[:8]}",
         session=session_id,
         position_action=PositionAction.HOLD,
     )
     _refresh_trade_canned(fake, trade_index)
     register_evolution_router_canned(fake)
-    await _wait_for_position(supervisor, want_open=True)
+    await _wait_for_position(supervisor, want_open=True, attempts=80)
     assert stack["gateway_entry_ids"], "entry must pass through OrderActionGateway"
 
     exit_start = entry_start + timedelta(minutes=8)
@@ -444,56 +481,27 @@ async def run_closed_trade_round_trip(
             },
         ]
     )
-    exit_mc = uuid4()
-    exit_strategy_id = uuid4()
-    exit_thesis = PositionThesisVersion(
-        position_id=CONTRACT_ID,
-        contract_id=CONTRACT_ID,
+    _mint_position_exit_canned(
+        fake,
         session_id=session_id,
         snapshot_id=snapshot.snapshot_id,
-        original_strategy_id=exit_strategy_id,
-        current_thesis=f"exit trade {trade_index}",
-        recommended_action=PositionAction.EXIT,
-        recommended_quantity=1,
-        recommended_limit_price=Decimal("1.20"),
-        confidence=0.7,
-        prompt_version="2.0.0",
-        model_call_id=exit_mc,
-        thesis_version_id=uuid4(),
-    )
-    fake.set_canned_for_role("position_thesis", exit_thesis)
-    fake.set_canned_for_role(
-        "position_decision",
-        exit_thesis.model_copy(
-            update={
-                "thesis_version_id": uuid4(),
-                "recommended_action": PositionAction.EXIT,
-            }
-        ),
+        trade_index=trade_index,
     )
     register_evolution_router_canned(fake)
     exit_tick = await supervisor.market_runtime.tick(
         now=exit_start + timedelta(seconds=3)
     )
     assert exit_tick.snapshot is not None
-    exit_bound = exit_thesis.model_copy(
-        update={
-            "snapshot_id": exit_tick.snapshot.snapshot_id,
-            "thesis_version_id": uuid4(),
-        }
+    _mint_position_exit_canned(
+        fake,
+        session_id=session_id,
+        snapshot_id=exit_tick.snapshot.snapshot_id,
+        trade_index=trade_index,
     )
-    fake.set_canned_for_role("position_thesis", exit_bound)
-    fake.set_canned_for_role(
-        "position_decision",
-        exit_bound.model_copy(
-            update={
-                "thesis_version_id": uuid4(),
-                "recommended_action": PositionAction.EXIT,
-            }
-        ),
+    await _wait_for_position(supervisor, want_open=False, attempts=80)
+    assert len(stack["gateway_exit_ids"]) > exits_before, (
+        "EXIT must pass through OrderActionGateway"
     )
-    await _wait_for_position(supervisor, want_open=False)
-    assert stack["gateway_exit_ids"], "EXIT must pass through OrderActionGateway"
 
 
 async def wait_for_closed_episodes(evolution: EvolutionRuntime, session_id: str, count: int):
@@ -633,10 +641,11 @@ async def drain_evolution_orchestrator(stack: dict, *, max_rounds: int = 30):
             state = EvolutionCycleState.from_record(rows[0])
 
         if state.stage == "collect_shadow_evidence" and state.status == "running":
-            if shadow_feed_batches < 3:
-                await feed_shadow_snapshots_via_market(stack, cycles=3)
-                await _wait_shadow_threshold(evolution)
+            if shadow_feed_batches < 6:
+                await feed_shadow_snapshots_via_market(stack, cycles=4)
+                await _wait_shadow_threshold(evolution, timeout=30.0)
                 shadow_feed_batches += 1
+            await asyncio.sleep(0.2)
 
         state = await evolution.orchestrator.advance(state)
 
@@ -646,6 +655,10 @@ async def drain_evolution_orchestrator(stack: dict, *, max_rounds: int = 30):
             "blocked",
         }:
             return state
+
+        if state.stage == "collect_shadow_evidence" and state.status == "running":
+            # Keep feeding while the node waits for shadow thresholds.
+            continue
 
     assignments = await evolution._repos["shadow"].list_active()
     observed = traded = 0

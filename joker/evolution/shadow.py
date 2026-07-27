@@ -54,6 +54,7 @@ class ShadowRuntime:
     _results: list[ShadowCycleResult] = field(default_factory=list)
     _configs: dict[UUID, CognitiveConfigurationVersion] = field(default_factory=dict)
     _cursors: dict[str, str] = field(default_factory=dict)
+    _seen_snapshots: dict[str, set[str]] = field(default_factory=dict)
     _restored_runtimes: dict[str, Any] = field(default_factory=dict)
 
     async def start(self) -> None:
@@ -105,7 +106,10 @@ class ShadowRuntime:
         coalesce: bool = True,
     ) -> bool:
         cursor = self._cursors.get(str(assignment_id))
-        if cursor is not None and snapshot_id <= cursor:
+        if cursor is not None and snapshot_id == cursor:
+            return False
+        seen = self._seen_snapshots.get(str(assignment_id))
+        if seen is not None and snapshot_id in seen:
             return False
         if len(self._queue) >= self.queue_size:
             return False
@@ -161,6 +165,9 @@ class ShadowRuntime:
                 self._restored_runtimes[key] = restored.position_runtime
             if restored.last_snapshot_id:
                 self._cursors[str(assignment.assignment_id)] = restored.last_snapshot_id
+                self._seen_snapshots.setdefault(str(assignment.assignment_id), set()).add(
+                    restored.last_snapshot_id
+                )
 
     async def _loop(self) -> None:
         while not self._stopped:
@@ -227,6 +234,9 @@ class ShadowRuntime:
                 },
             )
             self._cursors[str(assignment_id)] = str(item.get("snapshot_id") or "")
+            self._seen_snapshots.setdefault(str(assignment_id), set()).add(
+                str(item.get("snapshot_id") or "")
+            )
             projection = command.get("projection") or {}
             positions = projection.get("positions") or {}
             for contract_id, pos in positions.items():
