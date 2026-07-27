@@ -23,6 +23,16 @@ class _ProvenanceLookup(Protocol):
     async def list_by_lifecycle_id(self, position_lifecycle_id: str) -> list[Any]: ...
 
 
+class _CycleRegistryLookup(Protocol):
+    async def get(
+        self, session_id: str, graph_kind: str, cycle_id: str
+    ) -> Any: ...
+
+
+class _EventIndexLookup(Protocol):
+    async def get_by_event_id(self, event_id: str) -> Any: ...
+
+
 class ResolvedPositionLifecycle(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
@@ -38,6 +48,7 @@ class ResolvedPositionLifecycle(BaseModel):
     exit_replacement_orders: tuple[OrderLifecycle, ...] = ()
     fill_event_ids: tuple[UUID, ...] = ()
     position_event_ids: tuple[UUID, ...] = ()
+    entry_decision_event_id: UUID | None = None
     initial_snapshot_id: UUID | None = None
     terminal_snapshot_id: UUID | None = None
     entry_decision_timestamp: datetime | None = None
@@ -58,6 +69,8 @@ class PositionLifecycleResolver:
     """Resolve closed trades by persisted lifecycle ID and order DAG."""
 
     provenance: _ProvenanceLookup | None = None
+    cycle_registry: _CycleRegistryLookup | None = None
+    event_index: _EventIndexLookup | None = None
 
     async def resolve_closed_lifecycle(
         self,
@@ -231,6 +244,14 @@ class PositionLifecycleResolver:
             # still allow but record for replay truth to expand via event list.
             pass
 
+        entry_eid, entry_ts = await self._resolve_entry_decision(
+            session_id=session_id,
+            entry_cycle_id=entry_cycle_id,
+            entry_orders=entry_orders,
+            originating_entry_id=originating_entry_id,
+            entry_decision_timestamp=entry_decision_timestamp,
+        )
+
         return ResolvedPositionLifecycle(
             position_lifecycle_id=lifecycle_id,
             entry_cycle_id=entry_cycle_id,
@@ -244,7 +265,8 @@ class PositionLifecycleResolver:
             exit_replacement_orders=exit_replacements,
             initial_snapshot_id=snapshot_id,
             terminal_snapshot_id=terminal_snapshot_id,
-            entry_decision_timestamp=entry_decision_timestamp,
+            entry_decision_event_id=entry_eid,
+            entry_decision_timestamp=entry_ts,
             terminal_event_timestamp=terminal_event_timestamp,
             proposal_id=proposal_id,
             decision_id=decision_id,
@@ -313,6 +335,13 @@ class PositionLifecycleResolver:
             findings.append("missing_terminal_snapshot")
         if entry_qty != exit_qty:
             findings.append("quantity_identity_mismatch")
+        entry_eid, entry_ts = await self._resolve_entry_decision(
+            session_id=session_id,
+            entry_cycle_id=kwargs["known_entry_cycle_id"],
+            entry_orders=entry_orders,
+            originating_entry_id=entry_id,
+            entry_decision_timestamp=kwargs.get("entry_decision_timestamp"),
+        )
         return ResolvedPositionLifecycle(
             position_lifecycle_id=lifecycle_id,
             entry_cycle_id=kwargs["known_entry_cycle_id"],
@@ -322,7 +351,8 @@ class PositionLifecycleResolver:
             exit_orders=exit_orders,
             initial_snapshot_id=kwargs["known_snapshot_id"],
             terminal_snapshot_id=kwargs.get("known_terminal_snapshot_id"),
-            entry_decision_timestamp=kwargs.get("entry_decision_timestamp"),
+            entry_decision_event_id=entry_eid,
+            entry_decision_timestamp=entry_ts,
             terminal_event_timestamp=kwargs.get("terminal_event_timestamp"),
             proposal_id=kwargs["proposal_id"],
             decision_id=kwargs["decision_id"],
@@ -334,3 +364,54 @@ class PositionLifecycleResolver:
             findings=tuple(dict.fromkeys(findings)),
             legacy_inferred=True,
         )
+
+    async def _resolve_entry_decision(
+        self,
+        *,
+        session_id: str,
+        entry_cycle_id: str | None,
+        entry_orders: tuple[OrderLifecycle, ...],
+        originating_entry_id: str | None,
+        entry_decision_timestamp: datetime | None,
+    ) -> tuple[UUID | None, datetime | None]:
+        """Resolve entry decision identity from cognitive provenance — never from fills."""
+        entry_event_id: UUID | None = None
+        entry_ts = entry_decision_timestamp
+        entry_order_id = originating_entry_id
+        if not entry_order_id and entry_orders:
+            entry_order_id = entry_orders[0].client_order_id
+
+        if self.provenance is not None and entry_order_id:
+            record = await self.provenance.get_by_client_order_id(entry_order_id)
+            if record is not None:
+                raw_causation = getattr(record, "causation_event_id", None)
+                if raw_causation:
+                    try:
+                        entry_event_id = UUID(str(raw_causation))
+                    except Exception:
+                        pass
+
+        if entry_event_id is None and self.cycle_registry is not None and entry_cycle_id:
+            try:
+                cycle = await self.cycle_registry.get(
+                    session_id=session_id,
+                    graph_kind="decision",
+                    cycle_id=entry_cycle_id,
+                )
+            except Exception:
+                cycle = None
+            if cycle is not None:
+                # Best durable identity when no explicit decision-completed event exists.
+                trigger = getattr(cycle, "trigger_event_id", None)
+                if trigger:
+                    try:
+                        entry_event_id = UUID(str(trigger))
+                    except Exception:
+                        pass
+
+        if entry_event_id is not None and entry_ts is None and self.event_index is not None:
+            indexed = await self.event_index.get_by_event_id(str(entry_event_id))
+            if indexed is not None:
+                entry_ts = indexed.exchange_timestamp
+
+        return entry_event_id, entry_ts

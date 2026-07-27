@@ -256,6 +256,12 @@ class ExperimentRunner:
             definition.champion_version_id,
             definition.challenger_version_id,
         )
+        champ_prov = await self._metric_provenance(
+            experiment_id, definition.champion_version_id
+        )
+        chall_prov = await self._metric_provenance(
+            experiment_id, definition.challenger_version_id
+        )
         # PnL MAD is dispersion only — never substitutes for ECE/Brier.
         deltas_all = [b - a for a, b in zip(champ_vals, chall_vals)]
         ci_all, ci_meta = self._bootstrap_ci(deltas_all)
@@ -303,6 +309,7 @@ class ExperimentRunner:
                 "latency_ms": champ_lat,
                 **({"cost_gbp": champ_cost} if champ_cost_known else {}),
                 "cost_known": champ_cost_known,
+                **champ_prov,
             },
             challenger_metrics={
                 "mean_pnl": chall_mean,
@@ -322,6 +329,7 @@ class ExperimentRunner:
                 "latency_ms": chall_lat,
                 **({"cost_gbp": chall_cost} if chall_cost_known else {}),
                 "cost_known": chall_cost_known,
+                **chall_prov,
             },
             eligibility_outcome=False,
             gate_rejection_codes=tuple(required_missing),
@@ -416,15 +424,41 @@ class ExperimentRunner:
         chall_payloads = await self._results.list_payloads_for_configuration(
             experiment_id, challenger_id
         )
-        champ = any(
-            bool(p.get("cost_known", p.get("cost_gbp") is not None))
-            for p in champ_payloads
-        )
-        chall = any(
-            bool(p.get("cost_known", p.get("cost_gbp") is not None))
-            for p in chall_payloads
-        )
+        champ = any(_payload_cost_known(p) for p in champ_payloads)
+        chall = any(_payload_cost_known(p) for p in chall_payloads)
         return champ, chall
+
+    async def _metric_provenance(
+        self,
+        experiment_id: UUID | str,
+        configuration_version_id: UUID,
+    ) -> dict[str, Any]:
+        payloads = await self._results.list_payloads_for_configuration(
+            experiment_id, configuration_version_id
+        )
+        sample_ids: list[str] = []
+        pricing_version = None
+        cost_source = "missing"
+        for payload in payloads:
+            if _payload_cost_known(payload):
+                cost_source = "persisted_model_calls"
+                pricing_version = payload.get("pricing_version") or pricing_version
+            for sid in payload.get("calibration_sample_ids") or ():
+                sample_ids.append(str(sid))
+        out: dict[str, Any] = {"cost_source": cost_source}
+        if pricing_version is not None:
+            out["pricing_version"] = pricing_version
+        if sample_ids:
+            out["calibration_sample_ids"] = ",".join(sample_ids)
+        return out
+
+
+def _payload_cost_known(payload: dict[str, Any]) -> bool:
+    return (
+        bool(payload.get("cost_known"))
+        and payload.get("cost_source") == "persisted_model_calls"
+        and bool(payload.get("pricing_version"))
+    )
 
 
 def _mad(values: list[Decimal], mean: Decimal) -> Decimal:

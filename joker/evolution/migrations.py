@@ -381,6 +381,43 @@ CREATE TABLE IF NOT EXISTS champion_activations (
 );
 CREATE INDEX IF NOT EXISTS idx_champion_activations_decision
     ON champion_activations (promotion_decision_id);
+
+CREATE TABLE IF NOT EXISTS session_event_index (
+    event_id TEXT PRIMARY KEY NOT NULL,
+    session_id TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    exchange_timestamp TEXT NOT NULL,
+    sequence INTEGER,
+    correlation_id TEXT,
+    cycle_id TEXT,
+    snapshot_id TEXT,
+    data_quality_id TEXT,
+    option_surface_id TEXT,
+    client_order_id TEXT,
+    contract_id TEXT,
+    position_lifecycle_id TEXT,
+    payload_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_session_event_horizon
+    ON session_event_index (session_id, exchange_timestamp, sequence, event_id);
+CREATE INDEX IF NOT EXISTS idx_session_event_cycle
+    ON session_event_index (session_id, cycle_id, event_type);
+
+CREATE TABLE IF NOT EXISTS adversarial_recovery_checkpoints (
+  checkpoint_key TEXT PRIMARY KEY NOT NULL,
+  experiment_id TEXT NOT NULL,
+  scenario_id TEXT NOT NULL,
+  scenario_version TEXT NOT NULL,
+  configuration_version_id TEXT NOT NULL,
+  sample_number INTEGER NOT NULL,
+  crash_point TEXT,
+  graph_thread_ids_json TEXT NOT NULL,
+  cash TEXT NOT NULL,
+  submitted_keys_json TEXT NOT NULL,
+  payload_json TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
 """
 
 

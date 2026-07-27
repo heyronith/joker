@@ -284,3 +284,65 @@ async def test_replay_terminal_time_uses_position_closed_event(tmp_path):
     truth = await loader.load_for_episode(ep)
     assert truth.terminal_event_timestamp == event_ts
     assert truth.terminal_event_timestamp != snap_ts
+
+
+@pytest.mark.asyncio
+async def test_replay_truth_falls_back_to_frame_timestamps_for_event_ids() -> None:
+    """Episodes may record event ids before durable timestamps are indexed."""
+    from datetime import datetime, timezone
+
+    from joker.evolution.replay_truth import ReplayTruthLoader
+    from joker.evolution.schemas import TradingEpisode
+
+    class Snap:
+        def __init__(self, sid, ts):
+            self.snapshot_id = sid
+            self.exchange_timestamp = ts
+            self.data_quality_id = uuid4()
+            self.underlying = type("U", (), {"bid": Decimal("1"), "ask": Decimal("1"), "last": Decimal("1")})()
+            self.option_surface_id = None
+
+        @property
+        def timestamp(self):
+            return self.exchange_timestamp
+
+    class SnapRepo:
+        def __init__(self):
+            self._items = {}
+
+        async def get_by_id(self, sid):
+            return self._items.get(sid)
+
+        async def list_between(self, *a, **k):
+            return []
+
+    repo = SnapRepo()
+    sid0 = uuid4()
+    sid1 = uuid4()
+    start_ts = datetime(2026, 7, 1, 15, 0, tzinfo=timezone.utc)
+    end_ts = datetime(2026, 7, 1, 15, 30, tzinfo=timezone.utc)
+    repo._items[sid0] = Snap(sid0, start_ts)
+    repo._items[sid1] = Snap(sid1, end_ts)
+    loader = ReplayTruthLoader(
+        snapshot_repo=repo,
+        allow_synthetic_starting_cash=True,
+        session_starting_cash=Decimal("1000"),
+    )
+    ep = TradingEpisode(
+        session_id="s",
+        run_id="r",
+        trading_date=start_ts.date(),
+        initial_snapshot_id=sid0,
+        terminal_snapshot_id=sid1,
+        action_class="closed_trade",
+        configuration_version_id=uuid4(),
+        quantity=Decimal("1"),
+        realised_pnl=Decimal("1"),
+        completed=True,
+        idempotency_key=f"t-{uuid4()}",
+        entry_decision_event_id=uuid4(),
+        terminal_event_id=uuid4(),
+    )
+    truth = await loader.load_for_episode(ep)
+    assert truth.entry_decision_timestamp == start_ts
+    assert truth.terminal_event_timestamp == end_ts

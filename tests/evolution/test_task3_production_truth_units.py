@@ -167,13 +167,19 @@ async def test_orchestrator_runs_required_adversarial_suite(tmp_path) -> None:
                         sample_number=kwargs["sample_number"],
                         execution_mode=definition.execution_mode,
                         fixture_loaded=True,
+                        runtime_invoked=True,
                         graph_kind=definition.execution_mode,
                         graph_thread_ids=(f"thread:{definition.scenario_id}",),
                         crash_injected=definition.execution_mode == "execution_recovery",
                         fresh_runtime_created=definition.execution_mode
                         == "execution_recovery",
+                        durable_checkpoint_loaded=definition.execution_mode
+                        == "execution_recovery",
                         checkpoint_resumed=definition.execution_mode
                         == "execution_recovery",
+                        expected_invariants=definition.expected_invariants,
+                        evaluated_invariants=definition.expected_invariants,
+                        satisfied_invariants=definition.expected_invariants,
                         invariants_evaluated=definition.expected_invariants,
                         findings=definition.expected_invariants,
                         passed=True,
@@ -249,11 +255,16 @@ async def test_optional_scenario_failure_is_reported(tmp_path) -> None:
                         sample_number=1,
                         execution_mode=definition.execution_mode,
                         fixture_loaded=True,
+                        runtime_invoked=True,
                         graph_kind=definition.execution_mode,
                         graph_thread_ids=("t",),
                         crash_injected=definition.execution_mode == "execution_recovery",
                         fresh_runtime_created=definition.execution_mode
                         == "execution_recovery",
+                        durable_checkpoint_loaded=definition.execution_mode
+                        == "execution_recovery",
+                        expected_invariants=definition.expected_invariants,
+                        satisfied_invariants=definition.expected_invariants,
                         findings=definition.expected_invariants,
                         passed=True,
                         completed=True,

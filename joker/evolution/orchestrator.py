@@ -787,6 +787,17 @@ class EvolutionOrchestrator:
         await self._rt.decisions.apply_persisted_decision(
             promotion_decision_id=UUID(str(decision_id))
         )
+        activation = None
+        activations = self._rt._repos.get("activations")
+        if activations is not None:
+            activation = await activations.get_by_decision_id(UUID(str(decision_id)))
+        if activation is not None and not activation.completed:
+            return {
+                "status": "running",
+                "stage": "applying_decision",
+                "failure_codes": list(state.get("failure_codes") or [])
+                + list(activation.failure_codes),
+            }
         return {"stage": "finalise_cycle"}
 
     async def _node_finalise(self, state: EvolutionOrchestratorState) -> dict[str, Any]:
@@ -798,6 +809,27 @@ class EvolutionOrchestrator:
                     state["cycle_id"], reason="cycle_failed_pre_dataset"
                 )
         status = state.get("status") or "completed"
+        if status == "running":
+            promotion_id = state.get("promotion_decision_id")
+            if promotion_id:
+                activations = self._rt._repos.get("activations")
+                if activations is not None:
+                    activation = await activations.get_by_decision_id(
+                        UUID(str(promotion_id))
+                    )
+                    if activation is not None and not activation.completed:
+                        return {
+                            "stage": "applying_decision",
+                            "status": "running",
+                            "failure_codes": list(state.get("failure_codes") or [])
+                            + list(activation.failure_codes),
+                        }
+        if status == "running" and state.get("stage") == "applying_decision":
+            return {
+                "stage": "applying_decision",
+                "status": "running",
+                "failure_codes": list(state.get("failure_codes") or []),
+            }
         if status == "running":
             status = "completed"
         return {"stage": "completed", "status": status, "pending_evidence": False}

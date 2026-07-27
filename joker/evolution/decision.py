@@ -374,7 +374,7 @@ class EvolutionDecisionService:
                 experiment_id=decision.experiment_id,
                 promotion_decision_id=decision.promotion_decision_id,
             )
-        registry_ok = True
+            registry_ok = True
 
         history = await self._champions.compare_champion_history(limit=20)
         history_ok = any(
@@ -386,6 +386,25 @@ class EvolutionDecisionService:
             )
             for t in history
         )
+        if registry_ok and not history_ok:
+            repaired = await self._champions.repair_promotion_history_if_missing(
+                previous_version_id=champion.configuration_version_id,
+                new_version_id=challenger.configuration_version_id,
+                reason="agent_promote",
+                experiment_id=decision.experiment_id,
+                promotion_decision_id=decision.promotion_decision_id,
+            )
+            if repaired:
+                history = await self._champions.compare_champion_history(limit=20)
+                history_ok = any(
+                    t.new_version_id == challenger.configuration_version_id
+                    and t.previous_version_id == champion.configuration_version_id
+                    and (
+                        t.promotion_decision_id is None
+                        or t.promotion_decision_id == decision.promotion_decision_id
+                    )
+                    for t in history
+                )
 
         # Always ensure configuration status is champion — never early-return
         # solely because the registry already points at the challenger.
@@ -395,18 +414,24 @@ class EvolutionDecisionService:
             await self._configs.mark_status(
                 champion.configuration_version_id, "retired"
             )
+        configuration_status_applied = True
+
+        failure_codes: tuple[str, ...] = ()
+        if not history_ok:
+            failure_codes = ("history_transition_missing",)
+        completed = (
+            registry_ok and history_ok and configuration_status_applied
+        )
 
         if self._activations is not None and activation is not None:
             activation = activation.model_copy(
                 update={
                     "registry_applied": registry_ok,
                     "history_verified": history_ok,
-                    "configuration_status_applied": True,
-                    "completed": True,
+                    "configuration_status_applied": configuration_status_applied,
+                    "completed": completed,
                     "updated_at": datetime.now(timezone.utc),
-                    "failure_codes": ()
-                    if history_ok
-                    else ("history_transition_missing",),
+                    "failure_codes": failure_codes,
                 }
             )
             await self._activations.upsert(activation)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
@@ -26,6 +27,7 @@ from joker.evolution.configuration_applicator import (
 from joker.evolution.decision import EvolutionDecisionService
 from joker.evolution.drift import DriftMonitor
 from joker.evolution.episode_compiler import EpisodeCompiler
+from joker.evolution.event_horizon import Task1EventHorizonLoader
 from joker.evolution.evidence_claims import EvidenceClaimStore
 from joker.evolution.experiment_runner import ExperimentRunner
 from joker.evolution.improvement import ImprovementProposalService
@@ -34,13 +36,35 @@ from joker.evolution.lifecycle import PositionLifecycleResolver
 from joker.evolution.orchestrator import EvolutionOrchestrator
 from joker.evolution.promotion_gate import PromotionEligibilityGate
 from joker.evolution.replay import CognitiveReplayService
+from joker.evolution.replay_truth import ReplayTruthLoader
 from joker.evolution.repositories import build_evolution_repositories
 from joker.evolution.schemas import CognitiveConfigurationVersion
+from joker.evolution.session_event_index import (
+    SessionEventIndexRecord,
+    SessionEventIndexRepository,
+)
 from joker.evolution.shadow import ShadowRuntime
 from joker.evolution.shadow_ledger import ShadowLedger
 from joker.models.router import ModelRouter
 
 logger = logging.getLogger(__name__)
+
+_INDEX_EVENT_TYPES = frozenset(
+    {
+        EventType.MARKET_SNAPSHOT_CREATED,
+        EventType.ORDER_SUBMITTED,
+        EventType.ORDER_ACCEPTED,
+        EventType.ORDER_PARTIALLY_FILLED,
+        EventType.ORDER_FILLED,
+        EventType.ORDER_CANCELLED,
+        EventType.ORDER_REJECTED,
+        EventType.POSITION_OPENED,
+        EventType.POSITION_CHANGED,
+        EventType.POSITION_CLOSED,
+        EventType.COGNITIVE_CYCLE_STARTED,
+        EventType.COGNITIVE_CYCLE_COMPLETED,
+    }
+)
 
 ProjectionLoader = Callable[[], Awaitable[Any]]
 
@@ -88,6 +112,8 @@ class EvolutionRuntime:
     orchestrator: EvolutionOrchestrator | None = None
     checkpointer_owner: EvolutionCheckpointerOwner | None = None
     lifecycle_resolver: PositionLifecycleResolver | None = None
+    session_event_index: SessionEventIndexRepository | None = None
+    event_horizon_loader: Task1EventHorizonLoader | None = None
     _episode_queue: asyncio.Queue[dict[str, Any]] | None = None
     _eval_queue: asyncio.Queue[UUID] | None = None
     _workers: list[asyncio.Task[None]] = field(default_factory=list)
@@ -98,6 +124,8 @@ class EvolutionRuntime:
     _applied_by_cycle: dict[str, AppliedConfiguration] = field(default_factory=dict)
     _cycle_snapshot: dict[str, UUID] = field(default_factory=dict)
     _contract_entry_snapshot: dict[str, UUID] = field(default_factory=dict)
+    _cycle_exchange_timestamp: dict[str, datetime] = field(default_factory=dict)
+    _contract_entry_timestamp: dict[str, datetime] = field(default_factory=dict)
     _position_origin_config: dict[str, UUID] = field(default_factory=dict)
     _latest_snapshot_id: UUID | None = None
     last_error: str | None = None
@@ -115,19 +143,42 @@ class EvolutionRuntime:
         await self.champion_registry.bootstrap_champion()
         self.applicator = ConfigurationApplicator(self.champion_registry.policy_store)
         provenance = None
+        cycle_registry = None
+        snapshot_repo = None
         if self.cognitive_graph_deps is not None:
             provenance = getattr(self.cognitive_graph_deps, "provenance_registry", None)
-        self.lifecycle_resolver = PositionLifecycleResolver(provenance=provenance)
+            cycle_registry = getattr(self.cognitive_graph_deps, "cycle_registry", None)
+            snapshot_repo = getattr(self.cognitive_graph_deps, "snapshot_repo", None)
+            if snapshot_repo is not None and hasattr(snapshot_repo, "inner"):
+                snapshot_repo = snapshot_repo.inner
+        self.session_event_index = SessionEventIndexRepository(str(self.db_path))
+        await self.session_event_index.initialize()
+        self.event_horizon_loader = Task1EventHorizonLoader(
+            index_repo=self.session_event_index,
+            snapshot_repo=snapshot_repo,
+            data_quality_repo=(
+                getattr(self.cognitive_graph_deps, "data_quality_repo", None)
+                if self.cognitive_graph_deps is not None
+                else None
+            ),
+            option_surface_repo=(
+                getattr(self.cognitive_graph_deps, "option_surface_repo", None)
+                if self.cognitive_graph_deps is not None
+                else None
+            ),
+        )
+        self.lifecycle_resolver = PositionLifecycleResolver(
+            provenance=provenance,
+            cycle_registry=cycle_registry,
+            event_index=self.session_event_index,
+        )
         self.episode_compiler = EpisodeCompiler(
             self._repos["episodes"],
             self._repos["traces"],
             lifecycle_resolver=self.lifecycle_resolver,
             provenance=provenance,
-            cycle_registry=(
-                getattr(self.cognitive_graph_deps, "cycle_registry", None)
-                if self.cognitive_graph_deps is not None
-                else None
-            ),
+            cycle_registry=cycle_registry,
+            event_horizon_loader=self.event_horizon_loader,
         )
         self.checkpointer_owner = EvolutionCheckpointerOwner(self.db_path)
         savers = await self.checkpointer_owner.open_all()
@@ -161,6 +212,13 @@ class EvolutionRuntime:
         if self.cognitive_graph_deps is not None:
             from joker.evolution.replay_store import ReplayExecutionStore
 
+            if (
+                self.model_router is not None
+                and self.cognitive_graph_deps.model_call_repo is not None
+            ):
+                self.model_router.set_model_call_repo(
+                    self.cognitive_graph_deps.model_call_repo
+                )
             exec_store = ReplayExecutionStore(self.db_path)
             await exec_store.initialize()
             session_cash = None
@@ -181,6 +239,15 @@ class EvolutionRuntime:
                 ledger_store=ledger_store,
                 session_starting_cash=session_cash,
                 allow_synthetic_starting_cash=session_cash is None,
+                truth_loader=ReplayTruthLoader(
+                    snapshot_repo=self.cognitive_graph_deps.snapshot_repo,
+                    option_surface_repo=self.cognitive_graph_deps.option_surface_repo,
+                    data_quality_repo=self.cognitive_graph_deps.data_quality_repo,
+                    ledger_store=ledger_store,
+                    session_starting_cash=session_cash,
+                    allow_synthetic_starting_cash=session_cash is None,
+                    event_horizon_loader=self.event_horizon_loader,
+                ),
             )
         self.experiments = ExperimentRunner(
             self._repos["experiments"],
@@ -244,6 +311,8 @@ class EvolutionRuntime:
     def subscribe_events(self) -> None:
         if self.event_bus is None or self._subscribed or not self.settings.enabled:
             return
+        for event_type in _INDEX_EVENT_TYPES:
+            self.event_bus.subscribe(event_type, self._index_domain_event)
         for event_type, handler in (
             (EventType.POSITION_CLOSED, self._on_position_closed),
             (EventType.POSITION_OPENED, self._on_position_opened),
@@ -254,6 +323,37 @@ class EvolutionRuntime:
         ):
             self.event_bus.subscribe(event_type, handler)
         self._subscribed = True
+
+    async def _index_domain_event(self, event: DomainEvent) -> None:
+        """Persist domain events into session_event_index (fail-soft)."""
+        if self.session_event_index is None:
+            return
+        payload = dict(event.payload or {})
+        try:
+            record = SessionEventIndexRecord(
+                event_id=str(event.event_id),
+                session_id=event.session_id,
+                event_type=str(event.event_type.value),
+                exchange_timestamp=event.exchange_timestamp,
+                sequence=getattr(event, "sequence", None),
+                correlation_id=str(event.correlation_id),
+                cycle_id=str(payload.get("cycle_id") or "") or None,
+                snapshot_id=str(payload.get("snapshot_id") or "") or None,
+                data_quality_id=str(payload.get("data_quality_id") or "") or None,
+                option_surface_id=str(payload.get("option_surface_id") or "") or None,
+                client_order_id=str(payload.get("client_order_id") or "") or None,
+                contract_id=str(payload.get("contract_id") or "") or None,
+                position_lifecycle_id=str(payload.get("position_lifecycle_id") or "")
+                or None,
+                payload_json=json.dumps(payload),
+            )
+            await self.session_event_index.record(record)
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "session_event_index_record_failed",
+                exc_info=True,
+                extra={"event_id": str(event.event_id), "event_type": str(event.event_type)},
+            )
 
     async def start_workers(self) -> None:
         if not self.settings.enabled or not self._prepared or self._workers_started:
@@ -414,6 +514,8 @@ class EvolutionRuntime:
                 self._latest_snapshot_id = snap
             except Exception:
                 pass
+        if cycle_id and event.exchange_timestamp is not None:
+            self._cycle_exchange_timestamp[cycle_id] = event.exchange_timestamp
         # New cycles pin champion unless already pinned (recovery path).
         if cycle_id and cycle_id not in self._applied_by_cycle:
             await self.pin_and_apply_for_cycle(cycle_id)
@@ -421,9 +523,28 @@ class EvolutionRuntime:
     async def _on_position_opened(self, event: DomainEvent) -> None:
         contract_id = str(event.payload.get("contract_id") or "")
         cycle_id = str(event.payload.get("cycle_id") or "")
+        client_order_id = str(event.payload.get("client_order_id") or "")
+        # POSITION_OPENED from execution may omit cycle_id; resolve via provenance.
+        if not cycle_id and client_order_id and self.cognitive_graph_deps is not None:
+            provenance = getattr(
+                self.cognitive_graph_deps, "provenance_registry", None
+            )
+            if provenance is not None:
+                try:
+                    record = await provenance.get_by_client_order_id(client_order_id)
+                except Exception:
+                    record = None
+                if record is not None and getattr(record, "cycle_id", None):
+                    cycle_id = str(record.cycle_id)
         if contract_id and self._latest_snapshot_id is not None:
             self._contract_entry_snapshot[contract_id] = self._latest_snapshot_id
+        if contract_id and event.exchange_timestamp is not None:
+            self._contract_entry_timestamp[contract_id] = event.exchange_timestamp
         pinned = self.get_pinned(cycle_id) if cycle_id else None
+        if pinned is None and cycle_id:
+            applied = await self.pin_and_apply_for_cycle(cycle_id)
+            if applied is not None:
+                pinned = applied.configuration_version_id
         if contract_id and pinned is not None:
             self.remember_position_configuration(contract_id, pinned)
 
@@ -545,6 +666,11 @@ class EvolutionRuntime:
             )
             entry_snap = snap
             terminal_snap = self._latest_snapshot_id
+            entry_decision_ts = (
+                payload.get("entry_decision_timestamp")
+                or self._cycle_exchange_timestamp.get(cycle_id)
+                or self._contract_entry_timestamp.get(contract_id)
+            )
             return await self.episode_compiler.compile_from_position_closed(
                 session_id=self.session_id,
                 run_id=self.run_id,
@@ -558,7 +684,7 @@ class EvolutionRuntime:
                 entry_cycle_id=cycle_id or None,
                 terminal_event_timestamp=job.get("exchange_timestamp")
                 or payload.get("exchange_timestamp"),
-                entry_decision_timestamp=payload.get("entry_decision_timestamp"),
+                entry_decision_timestamp=entry_decision_ts,
             )
         if kind in {"entry_rejected", "entry_cancelled"}:
             return await self.episode_compiler.compile_from_order_rejected_or_cancelled(

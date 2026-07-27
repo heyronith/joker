@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import date
+from dataclasses import replace
 from decimal import Decimal
 from uuid import uuid4
 
@@ -124,6 +124,7 @@ async def test_entry_adversarial_fixture_invokes_cognitive_graph(tmp_path, monke
     )
     assert calls["n"] >= 1
     assert evidence.completed
+    assert evidence.runtime_invoked
     assert evidence.graph_kind == "entry"
     assert evidence.graph_thread_ids
     assert suite_executed(evidence)
@@ -202,7 +203,73 @@ async def test_order_management_fixture_invokes_order_manager(tmp_path, monkeypa
     )
     assert calls["n"] >= 1
     assert evidence.graph_kind == "order_management"
+    assert evidence.runtime_invoked
+    assert evidence.passed is False
+    assert evidence.runtime_errors
     assert suite_executed(evidence)
+
+
+@pytest.mark.asyncio
+async def test_entry_graph_exception_does_not_auto_pass(tmp_path, monkeypatch):
+    router, _ = _router()
+    cfg = await _config(tmp_path)
+
+    class BoomGraph:
+        async def ainvoke(self, state, config=None):
+            raise RuntimeError("forced_graph_failure")
+
+    monkeypatch.setattr(
+        "joker.evolution.adversarial_runners.build_cognitive_graph",
+        lambda deps: BoomGraph(),
+    )
+    definition = next(d for d in ADVERSARIAL_DEFINITIONS if d.execution_mode == "entry_graph")
+    fixture = await AdversarialFixtureRepository().load(
+        definition.frozen_truth_fixture_id, expected_version=definition.version
+    )
+    store = PolicyVersionStore(tmp_path / "c.db")
+    runner = EntryGraphAdversarialRunner(
+        template_deps=_deps(router), policy_store=store
+    )
+    evidence = await runner.execute(
+        experiment_id=uuid4(),
+        definition=definition,
+        fixture=fixture,
+        configuration=cfg,
+        sample_number=1,
+    )
+    assert evidence.runtime_invoked
+    assert evidence.passed is False
+    assert any(f.startswith("graph_fail_closed:") for f in evidence.findings)
+    assert evidence.runtime_errors
+    assert definition.expected_invariants
+    assert set(definition.expected_invariants) != set(evidence.findings)
+
+
+@pytest.mark.asyncio
+async def test_full_replay_missing_service_fails_closed(tmp_path):
+    router, _ = _router()
+    cfg = await _config(tmp_path)
+    definition = next(
+        d for d in ADVERSARIAL_DEFINITIONS if d.execution_mode == "full_replay"
+    )
+    fixture = await AdversarialFixtureRepository().load(
+        definition.frozen_truth_fixture_id, expected_version=definition.version
+    )
+    store = PolicyVersionStore(tmp_path / "c.db")
+    runner = FullReplayAdversarialRunner(
+        template_deps=_deps(router), policy_store=store, replay_service=None
+    )
+    evidence = await runner.execute(
+        experiment_id=uuid4(),
+        definition=definition,
+        fixture=fixture,
+        configuration=cfg,
+        sample_number=1,
+    )
+    assert evidence.passed is False
+    assert evidence.runtime_invoked is False
+    assert "replay_service_missing" in evidence.runtime_errors
+    assert suite_executed(evidence) is False
 
 
 @pytest.mark.asyncio
@@ -215,17 +282,10 @@ async def test_recovery_fixture_creates_fresh_runtime(tmp_path, monkeypatch):
     fixture = await AdversarialFixtureRepository().load(
         definition.frozen_truth_fixture_id, expected_version=definition.version
     )
+    deps = replace(_deps(router), db_path=tmp_path / "recovery_runner.db")
     store = PolicyVersionStore(tmp_path / "c.db")
-    created = {"n": 0}
-    real_init = EntryGraphAdversarialRunner.__init__
-
-    def spy_init(self, *a, **k):
-        created["n"] += 1
-        return real_init(self, *a, **k)
-
-    monkeypatch.setattr(EntryGraphAdversarialRunner, "__init__", spy_init)
     runner = ExecutionRecoveryAdversarialRunner(
-        template_deps=_deps(router), policy_store=store
+        template_deps=deps, policy_store=store
     )
     evidence = await runner.execute(
         experiment_id=uuid4(),
@@ -236,7 +296,9 @@ async def test_recovery_fixture_creates_fresh_runtime(tmp_path, monkeypatch):
     )
     assert evidence.crash_injected
     assert evidence.fresh_runtime_created
-    assert created["n"] >= 2
+    assert evidence.durable_checkpoint_loaded
+    assert evidence.checkpoint_resumed
+    assert evidence.runtime_invoked
     assert suite_executed(evidence)
 
 
@@ -276,6 +338,7 @@ async def test_full_replay_fixture_invokes_cognitive_replay_service(tmp_path):
     )
     assert called["n"] == 1
     assert evidence.graph_kind == "full_replay"
+    assert evidence.runtime_invoked
     assert suite_executed(evidence)
 
 
@@ -338,6 +401,7 @@ def test_execution_mode_label_without_trace_is_not_eligible():
         fixture_loaded=True,
         completed=True,
         passed=True,
+        runtime_invoked=False,
         graph_thread_ids=(),
     )
     assert suite_executed(evidence) is False

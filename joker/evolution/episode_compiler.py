@@ -33,6 +33,7 @@ class EpisodeCompiler:
         lifecycle_resolver: PositionLifecycleResolver | None = None,
         provenance: Any | None = None,
         cycle_registry: Any | None = None,
+        event_horizon_loader: Any | None = None,
     ) -> None:
         self._episodes = episode_repo
         self._traces = trace_repo
@@ -41,6 +42,7 @@ class EpisodeCompiler:
         )
         self._provenance = provenance
         self._cycle_registry = cycle_registry
+        self._event_horizon_loader = event_horizon_loader
 
     async def compile_from_position_closed(
         self,
@@ -166,25 +168,39 @@ class EpisodeCompiler:
         lifecycle = resolved.position_lifecycle_id
         key = episode_idempotency_key(session_id, lifecycle, event_id)
         terminal_event_uuid = UUID(event_id) if _is_uuid(event_id) else None
-        entry_event_id = None
-        if resolved.fill_event_ids:
-            entry_event_id = resolved.fill_event_ids[0]
+        # Entry decision identity comes from cognitive provenance/cycle — not fills.
+        entry_event_id = resolved.entry_decision_event_id
+        entry_ts = resolved.entry_decision_timestamp or entry_decision_timestamp
+        terminal_ts = resolved.terminal_event_timestamp or terminal_event_timestamp
         market_ids = source_event_ids
+        if (
+            not market_ids
+            and self._event_horizon_loader is not None
+            and entry_ts is not None
+            and terminal_ts is not None
+        ):
+            try:
+                horizon = await self._event_horizon_loader.load(
+                    session_id=session_id,
+                    start_timestamp=entry_ts,
+                    end_timestamp=terminal_ts,
+                    entry_decision_event_id=entry_event_id,
+                    terminal_event_id=terminal_event_uuid,
+                )
+                if horizon.market_event_ids:
+                    market_ids = horizon.market_event_ids
+            except Exception:
+                pass
         if not market_ids and terminal_event_uuid is not None:
             ordered: list[UUID] = []
             if entry_event_id is not None:
                 ordered.append(entry_event_id)
-            for eid in resolved.fill_event_ids:
-                if eid not in ordered:
-                    ordered.append(eid)
             for eid in resolved.position_event_ids:
                 if eid not in ordered:
                     ordered.append(eid)
             if terminal_event_uuid not in ordered:
                 ordered.append(terminal_event_uuid)
             market_ids = tuple(ordered)
-        entry_ts = resolved.entry_decision_timestamp or entry_decision_timestamp
-        terminal_ts = resolved.terminal_event_timestamp or terminal_event_timestamp
         episode = TradingEpisode(
             episode_id=uuid4(),
             session_id=session_id,

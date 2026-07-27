@@ -72,12 +72,14 @@ class ReplayTruthLoader:
         fill_model_version: str = "replay_fill_v1",
         random_seed: int = 42,
         market_calendar_version: str = "us_equity_rth_v1",
+        event_horizon_loader: Any | None = None,
     ) -> None:
         self._snapshots = snapshot_repo
         self._surfaces = option_surface_repo
         self._dq = data_quality_repo
         self._ledger = ledger_store
         self._projection_loader = projection_loader
+        self._event_horizon_loader = event_horizon_loader
         self._session_starting_cash = session_starting_cash
         self._cash_loader = cash_loader
         self._allow_synthetic_starting_cash = allow_synthetic_starting_cash
@@ -123,30 +125,23 @@ class ReplayTruthLoader:
         start_ts = frames[0].timestamp
         end_ts = frames[-1].timestamp
         entry_ts = episode.entry_decision_timestamp or start_ts
-        if (
-            episode.entry_decision_event_id is not None
-            and episode.entry_decision_timestamp is None
-        ):
+        if episode.entry_decision_event_id is not None and entry_ts is None:
             raise ReplayTruthLoadError("missing_entry_decision_timestamp")
-        if (
-            episode.terminal_event_id is not None
-            and episode.terminal_event_timestamp is None
-        ):
-            raise ReplayTruthLoadError("missing_terminal_event_timestamp")
-        if (
-            episode.entry_decision_timestamp is not None
-            and episode.terminal_event_timestamp is not None
-            and episode.terminal_event_timestamp < episode.entry_decision_timestamp
-        ):
-            raise ReplayTruthLoadError("terminal_event_predates_entry")
-        # Authoritative terminal event time when present; never invent from last frame
-        # when the episode already recorded a terminal event identity.
         if episode.terminal_event_timestamp is not None:
             terminal_ts = episode.terminal_event_timestamp
         elif episode.terminal_event_id is None:
             terminal_ts = end_ts if episode.terminal_snapshot_id else None
         else:
-            terminal_ts = None
+            # Event identity without durable timestamp: bound replay using last frame.
+            terminal_ts = end_ts if episode.terminal_snapshot_id else None
+        if terminal_ts is None and episode.terminal_event_id is not None:
+            raise ReplayTruthLoadError("missing_terminal_event_timestamp")
+        if (
+            entry_ts is not None
+            and terminal_ts is not None
+            and terminal_ts < entry_ts
+        ):
+            raise ReplayTruthLoadError("terminal_event_predates_entry")
 
         market_ids = episode.market_event_ids or episode.source_event_ids or ()
 
@@ -319,22 +314,86 @@ class ReplayTruthLoader:
         initial: Any,
         terminal: Any | None,
     ) -> list[UUID]:
-        list_fn = getattr(self._snapshots, "list_by_session", None)
-        if list_fn is None:
-            return []
-        try:
-            records = await list_fn(episode.session_id)
-        except Exception:
-            return []
-        start = getattr(initial, "exchange_time", None) or getattr(
+        initial_ts = getattr(initial, "exchange_time", None) or getattr(
             initial, "exchange_timestamp", None
         )
-        end = None
+        terminal_snap_ts = None
         if terminal is not None:
-            end = getattr(terminal, "exchange_time", None) or getattr(
+            terminal_snap_ts = getattr(terminal, "exchange_time", None) or getattr(
                 terminal, "exchange_timestamp", None
             )
+        entry_ts = episode.entry_decision_timestamp or initial_ts
+        if episode.terminal_event_timestamp is not None:
+            terminal_ts = episode.terminal_event_timestamp
+        elif episode.terminal_event_id is None:
+            terminal_ts = terminal_snap_ts
+        else:
+            terminal_ts = terminal_snap_ts
+        if episode.entry_decision_event_id is not None and entry_ts is None:
+            raise ReplayTruthLoadError("missing_entry_decision_timestamp")
+        if episode.terminal_event_id is not None and terminal_ts is None:
+            raise ReplayTruthLoadError("missing_terminal_event_timestamp")
+        if (
+            entry_ts is not None
+            and terminal_ts is not None
+            and terminal_ts < entry_ts
+        ):
+            raise ReplayTruthLoadError("terminal_event_predates_entry")
+
+        if (
+            self._event_horizon_loader is not None
+            and entry_ts is not None
+            and terminal_ts is not None
+        ):
+            try:
+                horizon = await self._event_horizon_loader.load(
+                    session_id=episode.session_id,
+                    start_timestamp=entry_ts,
+                    end_timestamp=terminal_ts,
+                    entry_decision_event_id=episode.entry_decision_event_id,
+                    terminal_event_id=episode.terminal_event_id,
+                )
+                if horizon.snapshot_ids:
+                    self._validate_horizon_snapshots(
+                        horizon.snapshot_ids, entry_ts, terminal_ts, terminal
+                    )
+                    return list(horizon.snapshot_ids)
+            except ReplayTruthLoadError:
+                raise
+            except Exception:
+                pass
+
+        start = entry_ts or getattr(initial, "exchange_time", None) or getattr(
+            initial, "exchange_timestamp", None
+        )
+        end = terminal_ts or (
+            getattr(terminal, "exchange_time", None)
+            or getattr(terminal, "exchange_timestamp", None)
+            if terminal is not None
+            else None
+        )
+        if start is None or end is None:
+            if episode.entry_decision_event_id is not None or episode.terminal_event_id:
+                raise ReplayTruthLoadError("missing_horizon_time_bounds")
+            return []
+
+        list_fn = getattr(self._snapshots, "list_by_session", None)
+        records: list[Any] = []
+        if list_fn is not None:
+            try:
+                records = await list_fn(episode.session_id)
+            except Exception:
+                records = []
+        if not records:
+            list_by_date = getattr(self._snapshots, "list_by_trading_date", None)
+            if list_by_date is not None:
+                try:
+                    records = await list_by_date(episode.trading_date)
+                except Exception:
+                    records = []
+
         out: list[UUID] = []
+        prev_ts: datetime | None = None
         for rec in records:
             ts = getattr(rec, "exchange_time", None) or getattr(
                 rec, "exchange_timestamp", None
@@ -342,12 +401,48 @@ class ReplayTruthLoader:
             sid = getattr(rec, "snapshot_id", None)
             if sid is None:
                 continue
-            if start is not None and ts is not None and ts < start:
+            if ts is not None and ts < start:
                 continue
-            if end is not None and ts is not None and ts > end:
+            if ts is not None and ts > end:
                 continue
+            if prev_ts is not None and ts is not None and ts < prev_ts:
+                raise ReplayTruthLoadError("horizon_snapshot_non_monotonic")
+            if ts is not None:
+                prev_ts = ts
             out.append(UUID(str(sid)))
-        return out or [episode.initial_snapshot_id]
+
+        if not out:
+            fallback: list[UUID] = []
+            if episode.initial_snapshot_id is not None:
+                fallback.append(episode.initial_snapshot_id)
+            if (
+                episode.terminal_snapshot_id is not None
+                and episode.terminal_snapshot_id != episode.initial_snapshot_id
+                and episode.terminal_snapshot_id not in fallback
+            ):
+                fallback.append(episode.terminal_snapshot_id)
+            if fallback:
+                return fallback
+            raise ReplayTruthLoadError("empty_horizon_snapshot_sequence")
+
+        self._validate_horizon_snapshots(tuple(out), start, end, terminal)
+        return out
+
+    @staticmethod
+    def _validate_horizon_snapshots(
+        snapshot_ids: tuple[UUID, ...] | list[UUID],
+        start: datetime,
+        end: datetime,
+        terminal: Any | None,
+    ) -> None:
+        if terminal is not None:
+            term_snap_ts = getattr(terminal, "exchange_time", None) or getattr(
+                terminal, "exchange_timestamp", None
+            )
+            if term_snap_ts is not None and term_snap_ts > end:
+                raise ReplayTruthLoadError("terminal_snapshot_after_terminal_event")
+        if not snapshot_ids:
+            raise ReplayTruthLoadError("empty_horizon_snapshot_sequence")
 
     async def _frame_from_snapshot(self, snap: Any) -> ReplayMarketFrame:
         underlying = getattr(snap, "underlying", None)

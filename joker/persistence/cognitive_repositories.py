@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import TypeVar
+from typing import Sequence, TypeVar
 from uuid import UUID
 
 from pydantic import BaseModel
@@ -307,6 +307,12 @@ class ModelCallRepository:
 
     async def get_by_id(self, request_id: UUID | str) -> ModelCallRecord | None:
         return await self._store.get_model_call_by_id(request_id)
+
+    async def list_by_cycle(self, cycle_id: str) -> list[ModelCallRecord]:
+        return await self._store.list_model_calls_by_cycle(cycle_id)
+
+    async def list_by_cycles(self, cycle_ids: Sequence[str]) -> list[ModelCallRecord]:
+        return await self._store.list_model_calls_by_cycles(cycle_ids)
 
     async def mark_complete(self, request_id: UUID | str, **kwargs) -> ModelCallRecord:
         return await self._store.mark_model_call_complete(request_id, **kwargs)

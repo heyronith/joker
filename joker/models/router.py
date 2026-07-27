@@ -484,7 +484,8 @@ class ModelRouter:
         try:
             role = AgentRole(request.role)
         except ValueError:
-            return
+            # Task 3 evolution/evaluation roles share telemetry under meta_decision.
+            role = AgentRole.META_DECISION
         try:
             await self._model_call_repo.append(
                 ModelCallRecord(
@@ -494,7 +495,7 @@ class ModelRouter:
                     cycle_id=request.cycle_id,
                     snapshot_id=request.snapshot_id,
                     agent_role=role,
-                    prompt_id=request.prompt_id,
+                    prompt_id=request.prompt_id or request.role,
                     prompt_version=request.prompt_version,
                     provider=provider_name,
                     model=model_name,

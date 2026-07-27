@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 from uuid import UUID
 
 import aiosqlite
@@ -474,6 +474,44 @@ class CognitiveArtifactStore:
         if row is None:
             return None
         return self._row_to_model_call(row)
+
+    async def list_model_calls_by_cycle(self, cycle_id: str) -> list[ModelCallRecord]:
+        """List model calls for a single cognitive/replay cycle id."""
+        await self._ensure_initialized()
+        async with aiosqlite.connect(self._db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                """
+                SELECT * FROM model_calls
+                WHERE cycle_id = ?
+                ORDER BY started_at ASC, request_id ASC
+                """,
+                (cycle_id,),
+            )
+            rows = await cursor.fetchall()
+        return [self._row_to_model_call(row) for row in rows]
+
+    async def list_model_calls_by_cycles(
+        self, cycle_ids: Sequence[str]
+    ) -> list[ModelCallRecord]:
+        """List model calls for any of the given cycle ids (deduped by request_id)."""
+        await self._ensure_initialized()
+        ids = tuple(dict.fromkeys(str(c) for c in cycle_ids if c))
+        if not ids:
+            return []
+        placeholders = ",".join("?" for _ in ids)
+        async with aiosqlite.connect(self._db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                f"""
+                SELECT * FROM model_calls
+                WHERE cycle_id IN ({placeholders})
+                ORDER BY started_at ASC, request_id ASC
+                """,
+                ids,
+            )
+            rows = await cursor.fetchall()
+        return [self._row_to_model_call(row) for row in rows]
 
     async def mark_model_call_complete(
         self,

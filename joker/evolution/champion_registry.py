@@ -126,6 +126,68 @@ class ChampionRegistry:
             rows = await cur.fetchall()
         return [ChampionTransition.model_validate_json(r["payload_json"]) for r in rows]
 
+    async def repair_promotion_history_if_missing(
+        self,
+        *,
+        previous_version_id: UUID,
+        new_version_id: UUID,
+        reason: str,
+        experiment_id: UUID | None = None,
+        promotion_decision_id: UUID | None = None,
+    ) -> bool:
+        """Idempotently append champion_history when registry already matches challenger."""
+        history = await self.compare_champion_history(limit=50)
+        if any(
+            t.new_version_id == new_version_id
+            and t.previous_version_id == previous_version_id
+            and (
+                promotion_decision_id is None
+                or t.promotion_decision_id is None
+                or t.promotion_decision_id == promotion_decision_id
+            )
+            for t in history
+        ):
+            return True
+        current = await self.get_current_champion()
+        if current is None or current.configuration_version_id != new_version_id:
+            return False
+        now = datetime.now(timezone.utc)
+        transition = ChampionTransition(
+            transition_id=uuid4(),
+            scope_key=self._scope_key,
+            previous_version_id=previous_version_id,
+            new_version_id=new_version_id,
+            reason=reason,
+            experiment_id=experiment_id,
+            promotion_decision_id=promotion_decision_id,
+            activated_at=now,
+            content_hash="",
+        )
+        transition = transition.model_copy(
+            update={"content_hash": hash_model(transition, exclude={"activated_at"})}
+        )
+        await self.initialize()
+        async with aiosqlite.connect(self._db_path) as db:
+            await db.execute(
+                """
+                INSERT INTO champion_history (
+                    transition_id, scope_key, previous_version_id, new_version_id,
+                    activated_at, content_hash, payload_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(transition.transition_id),
+                    self._scope_key,
+                    str(previous_version_id),
+                    str(new_version_id),
+                    now.isoformat(),
+                    transition.content_hash,
+                    transition.model_dump_json(),
+                ),
+            )
+            await db.commit()
+        return True
+
     async def promote(
         self,
         *,

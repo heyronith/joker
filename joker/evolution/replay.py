@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from decimal import Decimal
-from typing import Any
+from typing import Any, Mapping
 from uuid import UUID, uuid4
 
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
@@ -106,6 +106,7 @@ class CognitiveReplayService:
         ledger_store: Any | None = None,
         cost_per_1k_input: Decimal = Decimal("0.001"),
         cost_per_1k_output: Decimal = Decimal("0.002"),
+        pricing_version: str = "task3-fake-v1",
     ) -> None:
         self._template = template_deps
         self._configs = config_repo
@@ -125,6 +126,7 @@ class CognitiveReplayService:
         self._execution_store = execution_store
         self._cost_per_1k_input = cost_per_1k_input
         self._cost_per_1k_output = cost_per_1k_output
+        self._pricing_version = pricing_version
         self.replay_count = 0
         self.shadow_count = 0
         self._shadow_runtimes: dict[str, ReplayPositionRuntime] = {}
@@ -134,6 +136,64 @@ class CognitiveReplayService:
         self.entry_graph_invocations = 0
         self.position_graph_invocations = 0
 
+    def _ensure_router_model_call_repo(self, router: ModelRouter) -> ModelRouter:
+        repo = self._template.model_call_repo
+        if repo is not None and hasattr(router, "set_model_call_repo"):
+            router.set_model_call_repo(repo)
+        return router
+
+    async def _collect_replay_model_records(
+        self,
+        deps: CognitiveGraphDeps,
+        cycle_id: str,
+        workflow: Mapping[str, Any],
+    ) -> list[Any]:
+        if deps.model_call_repo is None:
+            return []
+        cycle_ids: list[str] = [cycle_id]
+        for frame_state in (workflow.get("frames") or {}).values():
+            if not isinstance(frame_state, dict):
+                continue
+            pos_tid = frame_state.get("position_thread_id")
+            if pos_tid:
+                cycle_ids.append(str(pos_tid))
+        list_cycles = getattr(deps.model_call_repo, "list_by_cycles", None)
+        list_one = getattr(deps.model_call_repo, "list_by_cycle", None) or getattr(
+            deps.model_call_repo, "list_for_cycle", None
+        )
+        try:
+            if list_cycles is not None:
+                return await list_cycles(cycle_ids)
+            if list_one is not None:
+                seen: set[str] = set()
+                collected: list[Any] = []
+                for cid in cycle_ids:
+                    for rec in await list_one(cid):
+                        rid = str(getattr(rec, "request_id", "") or "")
+                        if rid and rid in seen:
+                            continue
+                        if rid:
+                            seen.add(rid)
+                        collected.append(rec)
+                return collected
+        except Exception:
+            return []
+        return []
+
+    async def _replay_telemetry(
+        self,
+        deps: CognitiveGraphDeps,
+        cycle_id: str,
+        workflow: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        model_records = await self._collect_replay_model_records(deps, cycle_id, workflow)
+        return aggregate_model_call_telemetry(
+            model_records,
+            cost_per_1k_input=self._cost_per_1k_input,
+            cost_per_1k_output=self._cost_per_1k_output,
+            pricing_version=self._pricing_version,
+        )
+
     def _isolated_deps(
         self,
         *,
@@ -142,8 +202,9 @@ class CognitiveReplayService:
         projection_loader=None,
     ) -> CognitiveGraphDeps:
         base = self._template
+        active_router = self._ensure_router_model_call_repo(router or base.router)
         return CognitiveGraphDeps(
-            router=router or base.router,
+            router=active_router,
             config=base.config,
             session_id=f"replay:{base.session_id}",
             run_id=f"replay:{base.run_id}",
@@ -233,6 +294,9 @@ class CognitiveReplayService:
             configuration_version_id,
             sample,
         )
+        cycle_id = entry_thread_id(
+            experiment_id, episode.episode_id, configuration_version_id, sample
+        )
         prior = None
         if self._execution_store is not None:
             prior = await self._execution_store.load_checkpoint(key)
@@ -245,7 +309,11 @@ class CognitiveReplayService:
                 "model_calls": 0,
                 "cost_gbp": None,
                 "cost_known": False,
-                "latency_ms": Decimal("0"),
+                "cost_source": "missing",
+                "pricing_version": None,
+                "input_tokens": None,
+                "output_tokens": None,
+                "latency_ms": None,
                 "broker_submit": False,
                 "execution_runtime": False,
                 "traded": False,
@@ -256,6 +324,9 @@ class CognitiveReplayService:
                 "sample": sample,
                 "configuration_version_id": str(configuration_version_id),
                 "experiment_id": str(experiment_id),
+                "calibration_pairs": [],
+                "calibration_sample_count": 0,
+                "calibration_sample_ids": (),
             }
 
         execution = ReplayExecutionRuntime(truth=truth)
@@ -296,15 +367,46 @@ class CognitiveReplayService:
             if prior.get("status") == "completed" and payload.get(
                 "final_result_persisted"
             ):
+                cached_cycle = str(prior.get("entry_cycle_id") or cycle_id)
+                gateway = ReplayOrderActionGateway(
+                    execution=execution,
+                    session_id=f"replay:{episode.session_id}",
+                    configuration_version_id=str(configuration_version_id),
+                )
+                deps = self._isolated_deps(gateway=gateway)
+                telemetry = await self._replay_telemetry(deps, cached_cycle, payload)
+                conf_raw = payload.get("entry_confidence")
+                conf_dec = None
+                if conf_raw is not None:
+                    try:
+                        conf_dec = Decimal(str(conf_raw))
+                    except Exception:
+                        conf_dec = None
+                traded = bool(prior.get("entry_order_id"))
+                pnl = prior.get("realised_pnl") or execution.realised_pnl()
+                cal_pairs = extract_confidence_outcome_pairs(
+                    meta_confidence=conf_dec,
+                    traded=traded,
+                    realised_pnl=Decimal(str(pnl)),
+                )
+                calibration_sample_ids = tuple(
+                    f"{experiment_id}:{episode.episode_id}:{configuration_version_id}"
+                    f":{sample}:{idx}"
+                    for idx, _ in enumerate(cal_pairs)
+                )
                 return {
-                    "realised_pnl": prior["realised_pnl"],
-                    "model_calls": 0,
-                    "cost_gbp": None,
-                    "cost_known": False,
-                    "latency_ms": Decimal("0"),
+                    "realised_pnl": pnl,
+                    "model_calls": telemetry["model_calls"],
+                    "cost_gbp": telemetry["cost_gbp"],
+                    "cost_known": telemetry["cost_known"],
+                    "cost_source": telemetry.get("cost_source", "missing"),
+                    "pricing_version": telemetry.get("pricing_version"),
+                    "input_tokens": telemetry.get("input_tokens"),
+                    "output_tokens": telemetry.get("output_tokens"),
+                    "latency_ms": telemetry["latency_ms"],
                     "broker_submit": False,
                     "execution_runtime": False,
-                    "traded": bool(prior.get("entry_order_id")),
+                    "traded": traded,
                     "open_at_end": any(
                         Decimal(str(p.quantity)) > 0
                         for p in execution.positions.values()
@@ -320,6 +422,9 @@ class CognitiveReplayService:
                     "resumed": True,
                     "projection": execution.projection(),
                     "fill_ids": tuple(f.fill_id for f in execution.fills),
+                    "calibration_pairs": [(str(a), b) for a, b in cal_pairs],
+                    "calibration_sample_count": len(cal_pairs),
+                    "calibration_sample_ids": calibration_sample_ids,
                 }
 
         gateway = ReplayOrderActionGateway(
@@ -335,9 +440,6 @@ class CognitiveReplayService:
         if deps.execution_runtime is not None or deps.submit_callback is not None:
             raise CognitiveReplayError("replay deps must not expose production execution")
 
-        cycle_id = entry_thread_id(
-            experiment_id, episode.episode_id, configuration_version_id, sample
-        )
         integrity: list[str] = []
         traded = bool(workflow.get("entry_action_submitted"))
         ran_position = False
@@ -731,39 +833,13 @@ class CognitiveReplayService:
             workflow=workflow,
         )
 
-        model_records = []
-        if deps.model_call_repo is not None:
-            list_fn = getattr(deps.model_call_repo, "list_by_cycle", None) or getattr(
-                deps.model_call_repo, "list_for_cycle", None
-            )
-            if list_fn is not None:
-                try:
-                    model_records = await list_fn(cycle_id)
-                except Exception:
-                    model_records = []
+        model_records = await self._collect_replay_model_records(deps, cycle_id, workflow)
         telemetry = aggregate_model_call_telemetry(
             model_records,
             cost_per_1k_input=self._cost_per_1k_input,
             cost_per_1k_output=self._cost_per_1k_output,
+            pricing_version=self._pricing_version,
         )
-        # Factual fake-provider pricing is always known when configured on the service.
-        if telemetry["model_calls"] == 0:
-            node_trace = result.get("node_trace") or []
-            telemetry["model_calls"] = max(
-                1 if workflow.get("entry_graph_completed") else 1,
-                len(node_trace),
-            )
-            telemetry["latency_ms"] = Decimal("5")
-            telemetry["input_tokens"] = 10
-            telemetry["output_tokens"] = 20
-        if telemetry.get("cost_gbp") is None:
-            inp = Decimal(str(telemetry.get("input_tokens") or 10))
-            out = Decimal(str(telemetry.get("output_tokens") or 20))
-            telemetry["cost_gbp"] = (
-                inp * self._cost_per_1k_input / Decimal("1000")
-                + out * self._cost_per_1k_output / Decimal("1000")
-            )
-        telemetry["cost_known"] = True
 
         pnl = execution.realised_pnl()
         conf_dec = None
@@ -777,17 +853,20 @@ class CognitiveReplayService:
             traded=traded,
             realised_pnl=pnl,
         )
-        if not cal_pairs:
-            # Deterministic calibration evidence for promotion gates when the
-            # meta-decision confidence was not available.
-            cal_pairs = [
-                (Decimal("0.65"), 1 if traded and pnl > 0 else 0)
-            ]
+        calibration_sample_ids = tuple(
+            f"{experiment_id}:{episode.episode_id}:{configuration_version_id}"
+            f":{sample}:{idx}"
+            for idx, _ in enumerate(cal_pairs)
+        )
         return {
             "realised_pnl": pnl,
             "model_calls": telemetry["model_calls"],
             "cost_gbp": telemetry["cost_gbp"],
             "cost_known": telemetry["cost_known"],
+            "cost_source": telemetry.get("cost_source", "missing"),
+            "pricing_version": telemetry.get("pricing_version"),
+            "input_tokens": telemetry.get("input_tokens"),
+            "output_tokens": telemetry.get("output_tokens"),
             "latency_ms": telemetry["latency_ms"],
             "broker_submit": False,
             "execution_runtime": False,
@@ -806,12 +885,19 @@ class CognitiveReplayService:
             "configuration_version_id": str(configuration_version_id),
             "experiment_id": str(experiment_id),
             "calibration_pairs": [(str(a), b) for a, b in cal_pairs],
+            "calibration_sample_count": len(cal_pairs),
+            "calibration_sample_ids": calibration_sample_ids,
             "projection": execution.projection(),
             "fill_model_version": truth.fill_model_version,
             "random_seed": truth.random_seed,
             "fill_ids": tuple(f.fill_id for f in execution.fills),
             "entry_graph_thread_id": cycle_id,
             "replay_key": key,
+            "model_call_ids": tuple(
+                str(getattr(r, "request_id", ""))
+                for r in model_records
+                if getattr(r, "request_id", None) is not None
+            ),
         }
 
     async def run_challenger_shadow(

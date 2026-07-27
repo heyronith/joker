@@ -33,6 +33,7 @@ from joker.evolution.config import (
 from joker.evolution.orchestrator import EvolutionCycleState
 from joker.evolution.runtime import EvolutionRuntime
 from joker.evaluation.agentic_graph import EVALUATOR_ROLES
+from joker.graph.context_hydrate import context_assembler_from_settings
 from joker.graph.graph_deps import CognitiveGraphDeps
 from joker.market.data_quality_store import DataQualityRepository
 from joker.market.option_surface import OptionSurfaceRepository
@@ -266,6 +267,52 @@ def build_acceptance_router(session_id: str) -> tuple[ModelRouter, FakeModelProv
     return ModelRouter(_fake_registry(fake), session_id=session_id), fake
 
 
+def build_router_from_fake(fake: FakeModelProvider, session_id: str) -> ModelRouter:
+    return ModelRouter(_fake_registry(fake), session_id=session_id)
+
+
+async def build_restart_evolution_runtime(
+    db,
+    *,
+    session_id: str,
+    settings: EvolutionSettings | None = None,
+    router: ModelRouter | None = None,
+    fake: FakeModelProvider | None = None,
+) -> tuple[EvolutionRuntime, FakeModelProvider]:
+    """Minimal evolution runtime for restart/recovery tests with model-call persistence."""
+    if fake is None:
+        fake = FakeModelProvider(available=True)
+        register_evolution_router_canned(fake)
+        install_paper_path_factories(fake, session_id=session_id)
+    if router is None:
+        router = build_router_from_fake(fake, session_id)
+    repos = build_default_repositories(db)
+    for repo in repos.values():
+        await repo.initialize()
+    router.set_model_call_repo(repos["model_call_repo"])
+    deps = CognitiveGraphDeps(
+        router=router,
+        config=CognitiveGraphSettings(max_cycle_seconds=30),
+        session_id=session_id,
+        run_id=session_id,
+        context_assembler=context_assembler_from_settings(CognitiveGraphSettings()),
+        snapshot_repo=SnapshotRepository(db),
+        option_surface_repo=OptionSurfaceRepository(db),
+        data_quality_repo=DataQualityRepository(db),
+        db_path=db,
+        **repos,
+    )
+    runtime = EvolutionRuntime(
+        db_path=db,
+        settings=settings or restart_settings(),
+        session_id=session_id,
+        run_id=session_id,
+        model_router=router,
+        cognitive_graph_deps=deps,
+    )
+    return runtime, fake
+
+
 async def seed_market_surface(market, start: datetime, clock: FrozenExchangeClock):
     for i in range(3):
         ts = start + timedelta(minutes=i, seconds=5)
@@ -312,16 +359,35 @@ async def seed_market_surface(market, start: datetime, clock: FrozenExchangeCloc
     return tick.snapshot
 
 
+def restart_settings() -> EvolutionSettings:
+    """Restart/recovery tests skip shadow gating so later orchestrator nodes are reachable."""
+    settings = acceptance_settings()
+    return settings.model_copy(
+        update={
+            "shadow": settings.shadow.model_copy(
+                update={
+                    "minimum_completed_cycles": 0,
+                    "minimum_traded_cycles": 0,
+                    "minimum_regime_coverage": 0,
+                    "minimum_observation_minutes": 0,
+                }
+            )
+        }
+    )
+
+
 async def build_paper_evolution_stack(
     tmp_path,
     *,
     session_id: str,
     settings: EvolutionSettings | None = None,
     start_orchestrator_worker: bool = True,
+    start_workers: bool = True,
+    db_path=None,
 ):
     start = datetime(2026, 7, 1, 10, 0, tzinfo=ET)
     clock = FrozenExchangeClock(start, calendar=MarketCalendar())
-    db = tmp_path / f"{session_id}.db"
+    db = db_path if db_path is not None else tmp_path / f"{session_id}.db"
     broker = PaperBroker(slippage_pct=0)
     gateway_entry_ids: list[str] = []
     gateway_exit_ids: list[str] = []
@@ -330,6 +396,7 @@ async def build_paper_evolution_stack(
     repos = build_default_repositories(db)
     for repo in repos.values():
         await repo.initialize()
+    router.set_model_call_repo(repos["model_call_repo"])
     provenance = CognitiveExecutionProvenanceRegistry(
         db.with_name(f"{session_id}_prov.db")
     )
@@ -417,7 +484,8 @@ async def build_paper_evolution_stack(
     await evolution.prepare()
     evolution.subscribe_events()
     agent.bind_evolution_runtime(evolution)
-    await evolution.start_workers()
+    if start_workers:
+        await evolution.start_workers()
     if not start_orchestrator_worker and evolution.orchestrator is not None:
         evolution.orchestrator.pause()
     await evolution.resume()
@@ -520,6 +588,131 @@ def _mint_position_exit_canned(
     del snapshot_id, trade_index  # snapshot/model ids come from each ModelRequest
     ctl = install_paper_path_factories(fake, session_id=session_id)
     ctl.position_action = PositionAction.EXIT
+
+
+async def ensure_flat_position(stack: dict, *, trade_index: int = 99) -> None:
+    """Exit any open contract position so a subsequent entry proof starts flat."""
+    supervisor = stack["supervisor"]
+    fake = stack["fake"]
+    clock: FrozenExchangeClock = stack["clock"]
+    start: datetime = stack["start"]
+    session_id = stack["evolution"].session_id
+    projection = await supervisor.execution_runtime.project_session()
+    pos = projection.positions.get(CONTRACT_ID)
+    if pos is None or pos.quantity == 0:
+        return
+    exits_before = len(stack["gateway_exit_ids"])
+    exit_start = clock.now() + timedelta(minutes=1)
+    clock.set_now(exit_start)
+    await supervisor.market_runtime.ingest_underlying_quote(
+        symbol="SPY",
+        bid=Decimal("499.50"),
+        ask=Decimal("499.70"),
+        last=Decimal("499.60"),
+        source_timestamp=exit_start,
+        received_timestamp=exit_start,
+    )
+    await supervisor.market_runtime.ingest_option_quotes(
+        [
+            {
+                "contract_id": CONTRACT_ID,
+                "symbol": "SPY",
+                "expiry": date(2026, 7, 1),
+                "strike": "500",
+                "option_type": "call",
+                "bid": "0.80",
+                "ask": "1.00",
+                "last": "0.90",
+                "quote_timestamp": exit_start,
+                "is_0dte": True,
+            },
+            {
+                "contract_id": FAR_CONTRACT_ID,
+                "symbol": "SPY",
+                "expiry": date(2026, 7, 1),
+                "strike": "580",
+                "option_type": "call",
+                "bid": "0.03",
+                "ask": "0.12",
+                "last": "0.08",
+                "quote_timestamp": exit_start,
+                "is_0dte": True,
+            },
+        ]
+    )
+    register_evolution_router_canned(fake)
+    exit_tick = await supervisor.market_runtime.tick(
+        now=exit_start + timedelta(seconds=3)
+    )
+    assert exit_tick.snapshot is not None
+    _mint_position_exit_canned(
+        fake,
+        session_id=session_id,
+        snapshot_id=exit_tick.snapshot.snapshot_id,
+        trade_index=trade_index,
+    )
+    register_evolution_router_canned(fake)
+    await _wait_for_closed_exit(
+        stack,
+        exits_before=exits_before,
+        trade_index=trade_index,
+        attempts=120,
+    )
+
+
+async def run_open_trade_entry_only(
+    stack: dict,
+    *,
+    trade_index: int,
+    minute_offset: int,
+) -> None:
+    """Open a paper position via gateway and stop after entry (no exit leg)."""
+    supervisor = stack["supervisor"]
+    fake = stack["fake"]
+    clock: FrozenExchangeClock = stack["clock"]
+    start: datetime = stack["start"]
+    session_id = stack["evolution"].session_id
+    entries_before = len(stack["gateway_entry_ids"])
+
+    entry_start = start + timedelta(minutes=minute_offset)
+    clock.set_now(entry_start)
+    snapshot = await seed_market_surface(supervisor.market_runtime, entry_start, clock)
+    register_full_path_canned(
+        fake,
+        snapshot.snapshot_id,
+        f"cycle-entry-{trade_index}-{uuid4().hex[:8]}",
+        session=session_id,
+        position_action=PositionAction.HOLD,
+    )
+    _refresh_trade_canned(fake, trade_index)
+    register_evolution_router_canned(fake)
+    await stack["supervisor"].event_bus.drain(timeout=5.0)
+    for i in range(120):
+        if len(stack["gateway_entry_ids"]) > entries_before:
+            break
+        if i > 0 and i % 15 == 0:
+            now = clock.now()
+            tick = await supervisor.market_runtime.tick(now=now + timedelta(seconds=1))
+            clock.set_now(now + timedelta(seconds=1))
+            if tick.snapshot is not None:
+                register_full_path_canned(
+                    fake,
+                    tick.snapshot.snapshot_id,
+                    f"cycle-entry-retry-{trade_index}-{i}",
+                    session=session_id,
+                    position_action=PositionAction.HOLD,
+                )
+                register_evolution_router_canned(fake)
+        await asyncio.sleep(0.15)
+    else:
+        raise AssertionError(
+            "gateway_entry_ids did not progress through OrderActionGateway "
+            f"(before={entries_before}, after={len(stack['gateway_entry_ids'])})"
+        )
+    await _wait_for_position(supervisor, want_open=True, attempts=100)
+    projection = await supervisor.execution_runtime.project_session()
+    pos = projection.positions.get(CONTRACT_ID)
+    assert pos is not None and pos.quantity != 0, "open entry must leave a live position"
 
 
 async def run_closed_trade_round_trip(
@@ -809,6 +1002,26 @@ async def _wait_for_no_aiosqlite_workers(timeout_seconds: float = 5.0) -> None:
     from joker.persistence.aiosqlite_lifecycle import wait_for_no_aiosqlite_workers
 
     await wait_for_no_aiosqlite_workers(timeout_seconds=timeout_seconds)
+
+
+async def rebuild_paper_evolution_stack(
+    tmp_path,
+    *,
+    db,
+    session_id: str,
+    settings: EvolutionSettings | None = None,
+    start_orchestrator_worker: bool = True,
+    start_workers: bool = True,
+):
+    """Fresh process: rebuild supervisor/agent/evolution on an existing session db."""
+    return await build_paper_evolution_stack(
+        tmp_path,
+        session_id=session_id,
+        settings=settings,
+        start_orchestrator_worker=start_orchestrator_worker,
+        start_workers=start_workers,
+        db_path=db,
+    )
 
 
 async def shutdown_stack(stack: dict, *, strict_workers: bool = True) -> None:

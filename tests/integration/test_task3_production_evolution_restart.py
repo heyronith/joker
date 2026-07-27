@@ -11,15 +11,18 @@ from joker.graph.graph_deps import CognitiveGraphDeps
 from joker.market.data_quality_store import DataQualityRepository
 from joker.market.option_surface import OptionSurfaceRepository
 from joker.market.snapshots import SnapshotRepository
+from joker.evolution.orchestrator import EvolutionCycleState
 from joker.persistence.aiosqlite_lifecycle import (
     drain_aiosqlite_workers,
     iter_aiosqlite_worker_threads,
     join_aiosqlite_workers,
 )
 from tests.integration.task3_production_harness import (
-    acceptance_settings,
     build_acceptance_router,
     build_paper_evolution_stack,
+    build_restart_evolution_runtime,
+    build_router_from_fake,
+    restart_settings,
     run_closed_trade_round_trip,
     shutdown_stack,
     wait_for_closed_episodes,
@@ -28,41 +31,15 @@ from tests.integration.task3_production_harness import (
 )
 
 
-def restart_settings():
-    """Restart crash tests skip shadow gating so later orchestrator nodes are reachable."""
-    settings = acceptance_settings()
-    return settings.model_copy(
-        update={
-            "shadow": settings.shadow.model_copy(
-                update={
-                    "minimum_completed_cycles": 0,
-                    "minimum_traded_cycles": 0,
-                    "minimum_regime_coverage": 0,
-                    "minimum_observation_minutes": 0,
-                }
-            )
-        }
-    )
-
-
-def _runtime(db, settings, router, session_id="restart") -> EvolutionRuntime:
-    deps = CognitiveGraphDeps(
-        router=router,
-        config=CognitiveGraphSettings(max_cycle_seconds=30),
+async def _runtime(db, settings, router, session_id="restart", *, fake=None):
+    runtime, _ = await build_restart_evolution_runtime(
+        db,
         session_id=session_id,
-        run_id=session_id,
-        snapshot_repo=SnapshotRepository(db),
-        option_surface_repo=OptionSurfaceRepository(db),
-        data_quality_repo=DataQualityRepository(db),
-    )
-    return EvolutionRuntime(
-        db_path=db,
         settings=settings,
-        session_id=session_id,
-        run_id=session_id,
-        model_router=router,
-        cognitive_graph_deps=deps,
+        router=router,
+        fake=fake,
     )
+    return runtime
 
 
 async def _seed_paper_prerequisites(tmp_path, session_id: str):
@@ -78,9 +55,20 @@ async def _seed_paper_prerequisites(tmp_path, session_id: str):
         await run_closed_trade_round_trip(stack, trade_index=1, minute_offset=20)
         episodes = await wait_for_closed_episodes(stack["evolution"], session_id, count=2)
         await wait_for_evaluations(stack["evolution"], episodes)
-        return stack["db"]
+        return stack["db"], stack["fake"]
     finally:
         await shutdown_stack(stack, strict_workers=False)
+
+
+def _assert_terminal_cycle(state, *, node_name: str, attr: str | None) -> None:
+    assert state.status == "completed", (
+        f"restart after {node_name} must reach completed, got {state.status} "
+        f"stage={state.stage} failures={state.failure_codes}"
+    )
+    if attr is not None:
+        assert getattr(state, attr) is not None, (
+            f"completed cycle after {node_name} must retain durable {attr}"
+        )
 
 
 @pytest.mark.asyncio
@@ -92,18 +80,20 @@ async def _seed_paper_prerequisites(tmp_path, session_id: str):
         ("generate_improvement", "proposal_id"),
         ("register_challenger", "challenger_version_id"),
         ("run_experiment", "experiment_id"),
+        ("run_adversarial_suite", "experiment_id"),
         ("run_promotion_decision", "promotion_decision_id"),
+        ("apply_promotion_decision", "promotion_decision_id"),
     ],
 )
 async def test_production_orchestrator_restart_after_node(
     tmp_path, node_name: str, attr: str | None
 ) -> None:
     session_id = f"restart-{node_name}"
-    db = await _seed_paper_prerequisites(tmp_path, session_id)
+    db, fake = await _seed_paper_prerequisites(tmp_path, session_id)
     settings = restart_settings()
-    router, fake = build_acceptance_router(session_id)
+    router = build_router_from_fake(fake, session_id)
     crash = CrashAfterNode(node_name)
-    runtime = _runtime(db, settings, router, session_id=session_id)
+    runtime = await _runtime(db, settings, router, session_id=session_id, fake=fake)
     try:
         await runtime.prepare()
         await wire_replay_canned_for_episodes(runtime, fake)
@@ -114,55 +104,121 @@ async def test_production_orchestrator_restart_after_node(
         assert crash.hits == 1
         record = await runtime._repos["evolution_cycles"].get(session_id, state.cycle_id)
         assert record is not None
+        if attr:
+            crashed_state = _cycle_from_record(record)
+            assert getattr(crashed_state, attr) is not None, (
+                f"crash after {node_name} must leave durable {attr}"
+            )
     finally:
         await runtime.shutdown()
         await drain_aiosqlite_workers(timeout=5.0)
         join_aiosqlite_workers(timeout=5.0)
 
-    runtime2 = _runtime(db, settings, router, session_id=session_id)
+    runtime2 = await _runtime(db, settings, router, session_id=session_id, fake=fake)
     try:
         await runtime2.prepare()
         await wire_replay_canned_for_episodes(runtime2, fake)
-        resumed = await runtime2.orchestrator.resume_all()
-        assert resumed
-        # Exact expected terminal/progress outcomes — do not accept unresolved running
-        # unless the crash intentionally left the cycle mid-stage after durable progress.
-        if attr:
-            value = getattr(resumed[0], attr)
-            assert value is not None or resumed[0].status in {"completed", "blocked"}
-            if resumed[0].status == "running":
-                assert value is not None, (
-                    f"restart after {node_name} left running without durable {attr}"
-                )
-        assert resumed[0].status in {"completed", "blocked", "running"}
-        if resumed[0].status == "running":
-            assert resumed[0].stage not in {"", "load_or_create_cycle"}
-        if resumed[0].dataset_id is not None:
-            assert str(resumed[0].dataset_id) == str(
-                (record.payload or {}).get("dataset_id") or resumed[0].dataset_id
+        resumed_list = await runtime2.orchestrator.resume_all()
+        assert resumed_list
+        resumed = resumed_list[0]
+        _assert_terminal_cycle(resumed, node_name=node_name, attr=attr)
+        if attr and record is not None:
+            persisted = (record.payload or {}).get(attr)
+            resumed_val = getattr(resumed, attr)
+            if persisted is not None and resumed_val is not None:
+                assert str(resumed_val) == str(persisted)
+        if node_name == "apply_promotion_decision":
+            assert resumed.promotion_decision_id is not None
+            activation = await runtime2._repos["activations"].get_by_decision_id(
+                resumed.promotion_decision_id
             )
+            assert activation is not None
+            assert activation.completed is True
     finally:
         await runtime2.shutdown()
         await drain_aiosqlite_workers(timeout=5.0)
         join_aiosqlite_workers(timeout=5.0)
 
 
+def _cycle_from_record(record):
+    return EvolutionCycleState.from_record(record)
+
+
 @pytest.mark.asyncio
-async def test_evaluation_graph_resumes_after_completed_evaluator_node(tmp_path) -> None:
+async def test_evaluation_graph_resumes_after_evaluator_node_crash(tmp_path) -> None:
+    """Crash after first evaluator node; fresh runtime resumes without duplicate model calls."""
+    from uuid import uuid4
+
+    from joker.evaluation import agentic_graph
+
     session_id = "eval-resume"
-    db = await _seed_paper_prerequisites(tmp_path, session_id)
-    router, fake = build_acceptance_router(session_id)
-    runtime = _runtime(db, restart_settings(), router, session_id=session_id)
+    db, fake = await _seed_paper_prerequisites(tmp_path, session_id)
+    router = build_router_from_fake(fake, session_id)
+    settings = restart_settings()
+    runtime = await _runtime(db, settings, router, session_id=session_id, fake=fake)
     try:
         await runtime.prepare()
         await wire_replay_canned_for_episodes(runtime, fake)
-        episodes = await runtime._repos["episodes"].list_completed(limit=10)
-        assert episodes
-        first = await runtime.evaluation_runner.evaluate(episodes[0])
-        second = await runtime.evaluation_runner.evaluate(episodes[0])
-        assert first.evaluation_id == second.evaluation_id
+        template = (await runtime._repos["episodes"].list_completed(limit=1))[0]
+        episode = template.model_copy(
+            update={
+                "episode_id": uuid4(),
+                "idempotency_key": f"eval-crash-{uuid4().hex}",
+            }
+        )
+        await runtime._repos["episodes"].append(episode)
+        existing = await runtime._repos["evaluations"].list_by_episode(episode.episode_id)
+        assert not existing
+
+        original_invoke = agentic_graph.invoke_evolution_agent
+        crash_role = "evaluator_thesis"
+        hits = {"count": 0}
+
+        async def crashing_invoke(*args, **kwargs):
+            role = kwargs.get("role")
+            result = await original_invoke(*args, **kwargs)
+            if role == crash_role:
+                hits["count"] += 1
+                if hits["count"] == 1:
+                    raise RuntimeError("injected_crash:evaluator_thesis")
+            return result
+
+        agentic_graph.invoke_evolution_agent = crashing_invoke
+        try:
+            with pytest.raises(RuntimeError, match="injected_crash"):
+                await runtime.evaluation_runner.evaluate(episode)
+        finally:
+            agentic_graph.invoke_evolution_agent = original_invoke
+
+        persisted = await runtime._repos["evaluations"].list_by_episode(episode.episode_id)
+        assert not persisted, "evaluation must not persist before graph completes"
     finally:
         await runtime.shutdown()
+        await drain_aiosqlite_workers(timeout=5.0)
+        join_aiosqlite_workers(timeout=5.0)
+
+    runtime2 = await _runtime(db, settings, router, session_id=session_id, fake=fake)
+    try:
+        await runtime2.prepare()
+        await wire_replay_canned_for_episodes(runtime2, fake)
+        episodes = await runtime2._repos["episodes"].list_completed(limit=10)
+        crash_ep = next(
+            e for e in episodes if e.idempotency_key.startswith("eval-crash-")
+        )
+        evaluation = await runtime2.evaluation_runner.evaluate(crash_ep)
+        assert evaluation.valid
+        assert evaluation.evaluation_id is not None
+        repo = runtime2.cognitive_graph_deps.model_call_repo
+        assert repo is not None
+        calls = await repo.list_by_cycle(str(crash_ep.episode_id))
+        assert len(calls) >= 4
+
+        second = await runtime2.evaluation_runner.evaluate(crash_ep)
+        assert second.evaluation_id == evaluation.evaluation_id
+        calls_after = await repo.list_by_cycle(str(crash_ep.episode_id))
+        assert len(calls_after) == len(calls)
+    finally:
+        await runtime2.shutdown()
         await drain_aiosqlite_workers(timeout=5.0)
         join_aiosqlite_workers(timeout=5.0)
         assert not iter_aiosqlite_worker_threads()

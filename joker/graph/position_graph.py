@@ -28,6 +28,18 @@ from joker.runtime.execution_runtime import ExecutionCommand, contract_id_for
 from joker.schemas.domain import OrderIntent
 
 
+async def _append_position_thesis_if_absent(
+    deps: CognitiveGraphDeps,
+    thesis: PositionThesisVersion,
+) -> None:
+    """Persist thesis/decision artifacts once — safe on LangGraph node replay."""
+    if deps.position_thesis_repo is None:
+        return
+    existing = await deps.position_thesis_repo.get_by_id(thesis.thesis_version_id)
+    if existing is None:
+        await deps.position_thesis_repo.append(thesis)
+
+
 def build_position_graph(deps: CognitiveGraphDeps):
     """Compile the full position graph.
 
@@ -140,7 +152,7 @@ def build_position_graph(deps: CognitiveGraphDeps):
             prior_version=prior if isinstance(prior, PositionThesisVersion) else None,
         )
         if deps.position_thesis_repo is not None:
-            await deps.position_thesis_repo.append(thesis)
+            await _append_position_thesis_if_absent(deps, thesis)
         return {
             "_position_thesis": thesis,
             **trace_update(
@@ -268,7 +280,7 @@ def build_position_graph(deps: CognitiveGraphDeps):
             position_projection=state.get("_position_projection"),  # type: ignore[arg-type]
         )
         if deps.position_thesis_repo is not None:
-            await deps.position_thesis_repo.append(decision)
+            await _append_position_thesis_if_absent(deps, decision)
         return {
             "_position_decision": decision,
             **trace_update(

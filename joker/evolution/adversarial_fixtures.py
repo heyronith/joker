@@ -192,6 +192,17 @@ def _build_fixture(scenario_id: str) -> AdversarialFixture:
         ]
         stimulus["partial_fill"] = scenario_id == "adv_07"
         stimulus["replace"] = scenario_id == "adv_09"
+    elif scenario_id == "adv_18":
+        frames = [
+            _frame(
+                scenario_id=scenario_id,
+                index=0,
+                contracts=(
+                    valid,
+                    _contract("SPY:2026-07-01:505.0:call"),
+                ),
+            ),
+        ]
     elif scenario_id == "adv_08":
         frames = [
             _frame(scenario_id=scenario_id, index=0, contracts=(valid,)),

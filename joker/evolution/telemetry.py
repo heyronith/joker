@@ -12,27 +12,41 @@ def aggregate_model_call_telemetry(
     *,
     cost_per_1k_input: Decimal | None = None,
     cost_per_1k_output: Decimal | None = None,
+    pricing_version: str | None = None,
 ) -> dict[str, Any]:
-    """Build factual cost/latency aggregates from ModelCallRecord-like objects."""
+    """Build factual cost/latency aggregates from ModelCallRecord-like objects.
+
+    Missing records never invent tokens, latency, or known cost.
+    """
     if not records:
         return {
             "model_calls": 0,
-            "latency_ms": Decimal("0"),
+            "latency_ms": None,
             "cost_gbp": None,
             "cost_known": False,
-            "input_tokens": 0,
-            "output_tokens": 0,
+            "input_tokens": None,
+            "output_tokens": None,
             "unknown_cost": True,
+            "cost_source": "missing",
+            "pricing_version": None,
         }
     latency = Decimal("0")
+    latency_observed = False
     input_tokens = 0
     output_tokens = 0
     for rec in records:
         if getattr(rec, "latency_ms", None) is not None:
             latency += Decimal(str(rec.latency_ms))
-        input_tokens += int(getattr(rec, "input_tokens", 0) or 0)
-        output_tokens += int(getattr(rec, "output_tokens", 0) or 0)
-    cost_known = cost_per_1k_input is not None and cost_per_1k_output is not None
+            latency_observed = True
+        if getattr(rec, "input_tokens", None) is not None:
+            input_tokens += int(rec.input_tokens)
+        if getattr(rec, "output_tokens", None) is not None:
+            output_tokens += int(rec.output_tokens)
+    cost_known = (
+        cost_per_1k_input is not None
+        and cost_per_1k_output is not None
+        and pricing_version is not None
+    )
     cost = None
     if cost_known:
         cost = (
@@ -41,12 +55,14 @@ def aggregate_model_call_telemetry(
         )
     return {
         "model_calls": len(records),
-        "latency_ms": latency,
+        "latency_ms": latency if latency_observed else None,
         "cost_gbp": cost,
         "cost_known": cost_known,
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
         "unknown_cost": not cost_known,
+        "cost_source": "persisted_model_calls",
+        "pricing_version": pricing_version,
     }
 
 

@@ -155,10 +155,35 @@ class AdversarialResultStore:
 def _executed_from_evidence(evidence: AdversarialExecutionEvidence) -> bool:
     if not evidence.completed or not evidence.fixture_loaded:
         return False
+
     if evidence.execution_mode == "execution_recovery":
-        return bool(evidence.crash_injected and evidence.fresh_runtime_created)
-    if evidence.graph_thread_ids or evidence.execution_mode == "full_replay":
-        return True
+        return bool(
+            evidence.crash_injected
+            and evidence.fresh_runtime_created
+            and (evidence.durable_checkpoint_loaded or evidence.checkpoint_resumed)
+            and evidence.runtime_invoked
+        )
+
+    if evidence.execution_mode == "full_replay":
+        return evidence.runtime_invoked
+
+    if evidence.execution_mode in {
+        "entry_graph",
+        "position_graph",
+        "order_management",
+    }:
+        if not evidence.runtime_invoked:
+            return False
+        if evidence.model_call_ids:
+            return True
+        fail_closed = any(
+            f.startswith("graph_fail_closed:") or f.startswith("om_fail_closed:")
+            for f in evidence.findings
+        )
+        return bool(evidence.graph_thread_ids) and (
+            evidence.completed or fail_closed or bool(evidence.satisfied_invariants)
+        )
+
     return False
 
 

@@ -78,6 +78,11 @@ async def test_task3_production_evolution_acceptance(tmp_path) -> None:
         assert final_state.experiment_id is not None
         assert final_state.promotion_decision_id is not None
 
+        if final_state.promotion_decision_id is not None:
+            await evolution.decisions.apply_persisted_decision(
+                promotion_decision_id=final_state.promotion_decision_id
+            )
+
         definition = await evolution._repos["experiments"].get_definition(
             final_state.experiment_id
         )
@@ -87,9 +92,29 @@ async def test_task3_production_evolution_acceptance(tmp_path) -> None:
         adv_results = await evolution.adversarial_suite._store.list_for_experiment(
             final_state.experiment_id
         )
-        assert len(adv_results) == len(required_scenario_ids()) * 2
-        assert all(r.executed for r in adv_results)
-        assert all(r.graph_thread_ids or r.execution_mode == "full_replay" for r in adv_results)
+        expected_adv_count = len(required_scenario_ids()) * 2
+        assert len(adv_results) == expected_adv_count
+        for result in adv_results:
+            assert result.executed is True
+            evidence = result.evidence
+            assert evidence is not None
+            if evidence.execution_mode == "execution_recovery":
+                assert evidence.runtime_invoked or evidence.durable_checkpoint_loaded
+                assert (
+                    evidence.model_call_ids
+                    or evidence.durable_checkpoint_loaded
+                    or evidence.checkpoint_resumed
+                )
+            else:
+                assert evidence.runtime_invoked is True
+                if evidence.execution_mode == "full_replay":
+                    assert evidence.model_call_ids or result.graph_thread_ids
+                else:
+                    assert evidence.model_call_ids or evidence.graph_thread_ids
+            if result.passed:
+                assert not evidence.failed_invariants
+                assert not evidence.runtime_errors
+            assert evidence.fixture_loaded is True
 
         claims = await evolution.evidence_claims.list_by_cycle(final_state.cycle_id)
         assert claims
@@ -104,15 +129,39 @@ async def test_task3_production_evolution_acceptance(tmp_path) -> None:
         assert final_state.promotion_decision_id == promotion.promotion_decision_id
 
         result = await evolution._repos["experiments"].get_result(final_state.experiment_id)
-        if result is not None:
-            assert bool(result.challenger_metrics.get("cost_known")) is True
-            assert int(result.challenger_metrics.get("calibration_sample_count") or 0) >= 2
-            assert result.challenger_metrics.get("brier_score") is not None
-            assert (
-                result.challenger_metrics.get("expected_calibration_error") is not None
-                or result.challenger_metrics.get("expected_calibration_error") == 0
-                or "expected_calibration_error" in result.challenger_metrics
-            )
+        assert result is not None
+        assert bool(result.challenger_metrics.get("cost_known")) is True
+        assert result.challenger_metrics.get("cost_source") == "persisted_model_calls"
+        assert result.challenger_metrics.get("pricing_version")
+        assert int(result.challenger_metrics.get("calibration_sample_count") or 0) >= 2
+        assert result.challenger_metrics.get("calibration_sample_ids")
+        assert result.challenger_metrics.get("brier_score") is not None
+        assert (
+            result.challenger_metrics.get("expected_calibration_error") is not None
+            or result.challenger_metrics.get("expected_calibration_error") == 0
+            or "expected_calibration_error" in result.challenger_metrics
+        )
+        assert result.champion_metrics.get("cost_source") in {
+            "persisted_model_calls",
+            "missing",
+        }
+        if result.champion_metrics.get("cost_known"):
+            assert result.champion_metrics.get("pricing_version")
+
+        for episode in episodes:
+            if episode.entry_decision_event_id is not None:
+                assert episode.entry_decision_timestamp is not None
+            if episode.market_event_ids:
+                assert all(eid is not None for eid in episode.market_event_ids)
+
+        activation = await evolution._repos["activations"].get_by_decision_id(
+            promotion.promotion_decision_id
+        )
+        assert activation is not None
+        assert activation.registry_applied is True
+        assert activation.history_verified is True
+        assert activation.configuration_status_applied is True
+        assert activation.completed is True
 
         history = await evolution.champion_registry.compare_champion_history(limit=5)
         promoted = [
