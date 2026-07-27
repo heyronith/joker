@@ -9,7 +9,11 @@ from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 from joker.broker.interface import PaperBroker
-from joker.cognition.schemas import PositionAction, PositionThesisVersion
+from joker.cognition.schemas import (
+    OrderManagementDecision,
+    PositionAction,
+    PositionThesisVersion,
+)
 from joker.config.settings import CognitiveGraphSettings
 from joker.evolution.agent_schemas import (
     EvolutionDecisionAgentOutput,
@@ -34,7 +38,7 @@ from joker.market.snapshots import SnapshotRepository
 from joker.models.fake_provider import FakeModelProvider
 from joker.models.registry import ModelRegistry
 from joker.models.router import ModelRouter
-from joker.models.schemas import ModelsConfig, default_model_profiles
+from joker.models.schemas import ModelRequest, ModelsConfig, default_model_profiles
 from joker.persistence.cognitive_execution_provenance import (
     CognitiveExecutionProvenanceRegistry,
 )
@@ -108,8 +112,32 @@ def _fake_registry(fake: FakeModelProvider) -> ModelRegistry:
     return ModelRegistry(models_config, providers={"fake": fake})
 
 
+def make_order_manager_decision(request: ModelRequest) -> OrderManagementDecision:
+    """Mint a fresh OrderManagementDecision for every distinct model invocation."""
+    client_order_id = str(
+        request.context_payload.get("client_order_id") or "unknown-order"
+    )
+    return OrderManagementDecision(
+        decision_id=uuid4(),
+        session_id="placeholder",  # enriched by CognitiveAgent
+        snapshot_id=request.snapshot_id,
+        prompt_version=request.prompt_version,
+        model_call_id=request.request_id,
+        cycle_id=request.cycle_id,
+        client_order_id=client_order_id,
+        action="continue_waiting",
+        rationale_summary="continue waiting in paper-path test",
+    )
+
+
+def install_order_manager_factory(fake: FakeModelProvider) -> None:
+    """Ensure order-manager responses never reuse a static decision_id."""
+    fake.set_role_factory("order_manager", make_order_manager_decision)
+
+
 def _refresh_trade_canned(fake: FakeModelProvider, trade_index: int) -> None:
     """Ensure repeated paper round-trips do not reuse immutable artifact ids."""
+    del trade_index  # retained for call-site clarity; OM factory is per-invocation
     for role in ("position_thesis", "position_decision"):
         val = fake._by_role.get(role)
         if val is not None and hasattr(val, "model_copy"):
@@ -122,17 +150,8 @@ def _refresh_trade_canned(fake: FakeModelProvider, trade_index: int) -> None:
                     }
                 ),
             )
-    order_mgr = fake._by_role.get("order_manager")
-    if order_mgr is not None and hasattr(order_mgr, "model_copy"):
-        fake.set_canned_for_role(
-            "order_manager",
-            order_mgr.model_copy(
-                update={
-                    "client_order_id": f"order-{trade_index}",
-                    "model_call_id": uuid4(),
-                }
-            ),
-        )
+    # Static canned OM decisions collide under enrichment; always use a factory.
+    install_order_manager_factory(fake)
 
 
 async def wire_replay_canned_for_episodes(
@@ -152,6 +171,7 @@ async def wire_replay_canned_for_episodes(
                 position_action=PositionAction.HOLD,
             )
     register_evolution_router_canned(fake)
+    install_order_manager_factory(fake)
 
 
 def register_evolution_router_canned(fake: FakeModelProvider) -> None:
@@ -190,6 +210,7 @@ def register_evolution_router_canned(fake: FakeModelProvider) -> None:
 def build_acceptance_router(session_id: str) -> tuple[ModelRouter, FakeModelProvider]:
     fake = FakeModelProvider(available=True)
     register_evolution_router_canned(fake)
+    install_order_manager_factory(fake)
     return ModelRouter(_fake_registry(fake), session_id=session_id), fake
 
 
@@ -695,17 +716,32 @@ async def drain_evolution_orchestrator(stack: dict, *, max_rounds: int = 30):
     )
 
 
-async def shutdown_stack(stack: dict, *, strict_workers: bool = True) -> None:
-    await stack["evolution"].shutdown()
-    await stack["agent"].shutdown()
-    await stack["supervisor"].shutdown()
+async def _wait_for_no_aiosqlite_workers(timeout_seconds: float = 5.0) -> None:
+    """Drain/join until no aiosqlite workers remain, or fail with their names."""
     from joker.persistence.aiosqlite_lifecycle import (
         drain_aiosqlite_workers,
         iter_aiosqlite_worker_threads,
         join_aiosqlite_workers,
     )
 
-    await drain_aiosqlite_workers()
-    join_aiosqlite_workers()
+    deadline = asyncio.get_running_loop().time() + timeout_seconds
+    while True:
+        await drain_aiosqlite_workers(timeout=0.25)
+        join_aiosqlite_workers(timeout=0.25)
+        if not iter_aiosqlite_worker_threads():
+            return
+        if asyncio.get_running_loop().time() >= deadline:
+            names = [t.name for t in iter_aiosqlite_worker_threads()]
+            raise AssertionError(f"aiosqlite workers still alive: {names}")
+        await asyncio.sleep(0.02)
+
+
+async def shutdown_stack(stack: dict, *, strict_workers: bool = True) -> None:
+    await stack["evolution"].shutdown()
+    await stack["agent"].shutdown()
+    await stack["supervisor"].shutdown()
+    await _wait_for_no_aiosqlite_workers(timeout_seconds=5.0)
     if strict_workers:
+        from joker.persistence.aiosqlite_lifecycle import iter_aiosqlite_worker_threads
+
         assert not iter_aiosqlite_worker_threads()

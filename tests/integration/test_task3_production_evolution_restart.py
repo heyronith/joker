@@ -6,7 +6,6 @@ import pytest
 
 from joker.config.settings import CognitiveGraphSettings
 from joker.evolution.crash_injector import CrashAfterNode
-from joker.evolution.migrations import apply_task3_migrations
 from joker.evolution.runtime import EvolutionRuntime
 from joker.graph.graph_deps import CognitiveGraphDeps
 from joker.market.data_quality_store import DataQualityRepository
@@ -74,13 +73,14 @@ async def _seed_paper_prerequisites(tmp_path, session_id: str):
         settings=restart_settings(),
         start_orchestrator_worker=False,
     )
-    await run_closed_trade_round_trip(stack, trade_index=0, minute_offset=0)
-    await run_closed_trade_round_trip(stack, trade_index=1, minute_offset=20)
-    episodes = await wait_for_closed_episodes(stack["evolution"], session_id, count=2)
-    await wait_for_evaluations(stack["evolution"], episodes)
-    db = stack["db"]
-    await shutdown_stack(stack, strict_workers=False)
-    return db
+    try:
+        await run_closed_trade_round_trip(stack, trade_index=0, minute_offset=0)
+        await run_closed_trade_round_trip(stack, trade_index=1, minute_offset=20)
+        episodes = await wait_for_closed_episodes(stack["evolution"], session_id, count=2)
+        await wait_for_evaluations(stack["evolution"], episodes)
+        return stack["db"]
+    finally:
+        await shutdown_stack(stack, strict_workers=False)
 
 
 @pytest.mark.asyncio
@@ -104,43 +104,47 @@ async def test_production_orchestrator_restart_after_node(
     router, fake = build_acceptance_router(session_id)
     crash = CrashAfterNode(node_name)
     runtime = _runtime(db, settings, router, session_id=session_id)
-    await runtime.prepare()
-    await wire_replay_canned_for_episodes(runtime, fake)
-    runtime.orchestrator._crash = crash
-    state = await runtime.orchestrator.maybe_start_cycle()
-    assert state is not None
-    await runtime.orchestrator.advance(state)
-    assert crash.hits == 1
-    record = await runtime._repos["evolution_cycles"].get(session_id, state.cycle_id)
-    assert record is not None
-    await runtime.shutdown()
-    await drain_aiosqlite_workers(timeout=5.0)
-    join_aiosqlite_workers(timeout=5.0)
+    try:
+        await runtime.prepare()
+        await wire_replay_canned_for_episodes(runtime, fake)
+        runtime.orchestrator._crash = crash
+        state = await runtime.orchestrator.maybe_start_cycle()
+        assert state is not None
+        await runtime.orchestrator.advance(state)
+        assert crash.hits == 1
+        record = await runtime._repos["evolution_cycles"].get(session_id, state.cycle_id)
+        assert record is not None
+    finally:
+        await runtime.shutdown()
+        await drain_aiosqlite_workers(timeout=5.0)
+        join_aiosqlite_workers(timeout=5.0)
 
     runtime2 = _runtime(db, settings, router, session_id=session_id)
-    await runtime2.prepare()
-    await wire_replay_canned_for_episodes(runtime2, fake)
-    resumed = await runtime2.orchestrator.resume_all()
-    assert resumed
-    # Exact expected terminal/progress outcomes — do not accept unresolved running
-    # unless the crash intentionally left the cycle mid-stage after durable progress.
-    if attr:
-        value = getattr(resumed[0], attr)
-        assert value is not None or resumed[0].status in {"completed", "blocked"}
+    try:
+        await runtime2.prepare()
+        await wire_replay_canned_for_episodes(runtime2, fake)
+        resumed = await runtime2.orchestrator.resume_all()
+        assert resumed
+        # Exact expected terminal/progress outcomes — do not accept unresolved running
+        # unless the crash intentionally left the cycle mid-stage after durable progress.
+        if attr:
+            value = getattr(resumed[0], attr)
+            assert value is not None or resumed[0].status in {"completed", "blocked"}
+            if resumed[0].status == "running":
+                assert value is not None, (
+                    f"restart after {node_name} left running without durable {attr}"
+                )
+        assert resumed[0].status in {"completed", "blocked", "running"}
         if resumed[0].status == "running":
-            assert value is not None, (
-                f"restart after {node_name} left running without durable {attr}"
+            assert resumed[0].stage not in {"", "load_or_create_cycle"}
+        if resumed[0].dataset_id is not None:
+            assert str(resumed[0].dataset_id) == str(
+                (record.payload or {}).get("dataset_id") or resumed[0].dataset_id
             )
-    assert resumed[0].status in {"completed", "blocked", "running"}
-    if resumed[0].status == "running":
-        assert resumed[0].stage not in {"", "load_or_create_cycle"}
-    if resumed[0].dataset_id is not None:
-        assert str(resumed[0].dataset_id) == str(
-            (record.payload or {}).get("dataset_id") or resumed[0].dataset_id
-        )
-    await runtime2.shutdown()
-    await drain_aiosqlite_workers(timeout=5.0)
-    join_aiosqlite_workers(timeout=5.0)
+    finally:
+        await runtime2.shutdown()
+        await drain_aiosqlite_workers(timeout=5.0)
+        join_aiosqlite_workers(timeout=5.0)
 
 
 @pytest.mark.asyncio
@@ -149,14 +153,16 @@ async def test_evaluation_graph_resumes_after_completed_evaluator_node(tmp_path)
     db = await _seed_paper_prerequisites(tmp_path, session_id)
     router, fake = build_acceptance_router(session_id)
     runtime = _runtime(db, restart_settings(), router, session_id=session_id)
-    await runtime.prepare()
-    await wire_replay_canned_for_episodes(runtime, fake)
-    episodes = await runtime._repos["episodes"].list_completed(limit=10)
-    assert episodes
-    first = await runtime.evaluation_runner.evaluate(episodes[0])
-    second = await runtime.evaluation_runner.evaluate(episodes[0])
-    assert first.evaluation_id == second.evaluation_id
-    await runtime.shutdown()
-    await drain_aiosqlite_workers()
-    join_aiosqlite_workers()
-    assert not iter_aiosqlite_worker_threads()
+    try:
+        await runtime.prepare()
+        await wire_replay_canned_for_episodes(runtime, fake)
+        episodes = await runtime._repos["episodes"].list_completed(limit=10)
+        assert episodes
+        first = await runtime.evaluation_runner.evaluate(episodes[0])
+        second = await runtime.evaluation_runner.evaluate(episodes[0])
+        assert first.evaluation_id == second.evaluation_id
+    finally:
+        await runtime.shutdown()
+        await drain_aiosqlite_workers(timeout=5.0)
+        join_aiosqlite_workers(timeout=5.0)
+        assert not iter_aiosqlite_worker_threads()

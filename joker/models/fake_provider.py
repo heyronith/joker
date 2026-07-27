@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, TypeVar
@@ -21,6 +22,7 @@ from joker.models.schemas import ModelRequest, ModelResult, ProviderHealth, utc_
 from joker.models.provider import ModelProvider
 
 T = TypeVar("T", bound=BaseModel)
+RoleResponseFactory = Callable[[ModelRequest], BaseModel | dict[str, Any] | str]
 
 
 @dataclass
@@ -49,13 +51,29 @@ class FakeModelProvider:
     simulate_refusal: bool = False
     failure_message: str = "simulated provider failure"
     _by_role: dict[str, Any] = field(default_factory=dict)
+    _role_factories: dict[str, RoleResponseFactory] = field(default_factory=dict)
     _by_request_id: dict[UUID, Any] = field(default_factory=dict)
     _idempotency_cache: dict[str, ModelResult[Any]] = field(default_factory=dict)
     _calls: list[FakeCallRecord] = field(default_factory=list)
 
     def set_canned_for_role(self, role: str, value: BaseModel | dict[str, Any] | str) -> None:
-        """Register a canned response for an agent role."""
+        """Register a canned response for an agent role.
+
+        Clears any role factory for the same role so static and factory
+        registrations do not silently compete.
+        """
+        self._role_factories.pop(role, None)
         self._by_role[role] = value
+
+    def set_role_factory(self, role: str, factory: RoleResponseFactory) -> None:
+        """Register a per-invocation factory for an agent role.
+
+        The factory receives the current :class:`ModelRequest` and must return a
+        fresh response object. Exact request idempotency is still enforced by the
+        provider cache before the factory runs.
+        """
+        self._by_role.pop(role, None)
+        self._role_factories[role] = factory
 
     def set_canned_for_request_id(
         self,
@@ -179,6 +197,9 @@ class FakeModelProvider:
     def _lookup_raw(self, request: ModelRequest) -> Any:
         if request.request_id in self._by_request_id:
             return self._by_request_id[request.request_id]
+        factory = self._role_factories.get(request.role)
+        if factory is not None:
+            return factory(request)
         if request.role in self._by_role:
             return self._by_role[request.role]
         return request.context_payload.get("canned_output")
