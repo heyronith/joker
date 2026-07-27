@@ -71,6 +71,10 @@ class PromotionSettings(BaseModel):
     maximum_cost_regression_pct: Decimal = Decimal("50")
     minimum_completed_episodes: int = 20
     minimum_holdout_episodes: int = 10
+    require_known_cost: bool = True
+    minimum_calibration_samples: int = 20
+    require_brier_score: bool = True
+    require_expected_calibration_error: bool = True
 
 
 class DriftSettings(BaseModel):

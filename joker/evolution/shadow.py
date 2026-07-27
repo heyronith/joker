@@ -47,11 +47,14 @@ class ShadowRuntime:
     challenger_runner: ChallengerRunner | None = None
     ledger: ShadowLedger | None = None
     config_repo: ConfigurationVersionRepository | None = None
+    replay_service: Any | None = None
     _queue: deque[dict[str, Any]] = field(default_factory=deque)
     _worker: asyncio.Task[None] | None = None
     _stopped: bool = True
     _results: list[ShadowCycleResult] = field(default_factory=list)
     _configs: dict[UUID, CognitiveConfigurationVersion] = field(default_factory=dict)
+    _cursors: dict[str, str] = field(default_factory=dict)
+    _restored_runtimes: dict[str, Any] = field(default_factory=dict)
 
     async def start(self) -> None:
         self._stopped = False
@@ -101,6 +104,9 @@ class ShadowRuntime:
         payload: dict[str, Any],
         coalesce: bool = True,
     ) -> bool:
+        cursor = self._cursors.get(str(assignment_id))
+        if cursor is not None and snapshot_id <= cursor:
+            return False
         if len(self._queue) >= self.queue_size:
             return False
         if coalesce:
@@ -130,21 +136,31 @@ class ShadowRuntime:
         )
 
     async def restore_from_ledger(self) -> None:
-        """Reload active assignments, configs, and open positions after restart."""
+        """Reload active assignments, configs, and simulated execution after restart."""
         if self.ledger is not None:
             await self.ledger.initialize()
+        from joker.evolution.shadow_restore import ShadowExecutionRestorer
+
         active = await self.assignment_repo.list_active()
+        restorer = ShadowExecutionRestorer(self.ledger) if self.ledger else None
         for assignment in active:
             cfg_id = assignment.challenger_version_id
             if cfg_id not in self._configs and self.config_repo is not None:
                 cfg = await self.config_repo.get_by_id(cfg_id)
                 if cfg is not None:
                     self._configs[cfg_id] = cfg
-            if self.ledger is not None:
-                checkpoint = await self.ledger.load_checkpoint(assignment.assignment_id)
-                if checkpoint and checkpoint.get("last_snapshot_id"):
-                    # Cursor restored; subsequent snapshots resume after this id.
-                    pass
+            if restorer is None:
+                continue
+            restored = await restorer.restore_assignment(assignment)
+            key = f"{cfg_id}:{assignment.assignment_id}"
+            if self.replay_service is not None:
+                self.replay_service.restore_shadow_runtime(key, restored.position_runtime)
+                if restored.last_snapshot_id:
+                    self.replay_service.set_shadow_cursor(key, restored.last_snapshot_id)
+            else:
+                self._restored_runtimes[key] = restored.position_runtime
+            if restored.last_snapshot_id:
+                self._cursors[str(assignment.assignment_id)] = restored.last_snapshot_id
 
     async def _loop(self) -> None:
         while not self._stopped:
@@ -201,14 +217,20 @@ class ShadowRuntime:
             await self.ledger.save_checkpoint(
                 assignment_id,
                 last_snapshot_id=item.get("snapshot_id"),
-                cursor={"last_command_id": command_id},
+                cursor={
+                    "last_command_id": command_id,
+                    "cash": (command.get("projection") or {}).get("cash"),
+                    "realised_pnl": command.get("realised_pnl"),
+                    "submitted_keys": list(
+                        ((command.get("projection") or {}).get("orders") or {}).keys()
+                    ),
+                },
             )
+            self._cursors[str(assignment_id)] = str(item.get("snapshot_id") or "")
             projection = command.get("projection") or {}
             positions = projection.get("positions") or {}
             for contract_id, pos in positions.items():
                 qty = Decimal(str(pos.get("quantity", 0)))
-                if qty <= 0:
-                    continue
                 lifecycle = str(
                     pos.get("position_lifecycle_id")
                     or f"shadow:{assignment_id}:{contract_id}"
@@ -221,10 +243,21 @@ class ShadowRuntime:
                     configuration_version_id=challenger_id,
                     quantity=qty,
                     average_price=Decimal(str(pos.get("avg_price", 0))),
-                    realised_pnl=Decimal(str(command.get("realised_pnl", 0))),
-                    status="open",
+                    realised_pnl=Decimal(str(pos.get("realised_pnl", 0))),
+                    status="open" if qty > 0 else "closed",
                     last_snapshot_id=item.get("snapshot_id"),
                     payload=pos if isinstance(pos, dict) else {},
+                )
+            for oid, order in (projection.get("orders") or {}).items():
+                await self.ledger.upsert_order(
+                    assignment_id=assignment_id,
+                    challenger_version_id=challenger_id,
+                    client_order_id=str(oid),
+                    contract_id=str(order.get("contract_id") or ""),
+                    side=str(order.get("side") or "buy"),
+                    quantity=Decimal(str(order.get("filled_qty") or 0)),
+                    status=str(order.get("status") or "unknown"),
+                    payload=order if isinstance(order, dict) else {},
                 )
             for fill in projection.get("fills") or []:
                 fill_id = str(fill.get("fill_id") or uuid4())
@@ -232,9 +265,9 @@ class ShadowRuntime:
                     fill_id=fill_id,
                     client_order_id=str(fill.get("client_order_id") or fill_id),
                     assignment_id=assignment_id,
-                    quantity=Decimal(str(fill.get("quantity", 0))),
-                    price=Decimal(str(fill.get("price", 0))),
-                    fee=Decimal(str(fill.get("fee", 0))),
+                    quantity=Decimal(str(fill.get("qty") or fill.get("quantity") or 0)),
+                    price=Decimal(str(fill.get("price") or 0)),
+                    fee=Decimal(str(fill.get("fees") or fill.get("fee") or 0)),
                     payload=fill if isinstance(fill, dict) else {},
                 )
         self._results.append(

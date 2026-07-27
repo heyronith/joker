@@ -73,6 +73,7 @@ async def test_task3_evolution_closed_loop(tmp_path) -> None:
                 )
             ),
             initial_snapshot_id=snap,
+            terminal_snapshot_id=uuid4(),
             market_regime_tags=("trending_up" if i < 12 else "high_volatility",),
         )
         evaluation = await evaluator.evaluate(
@@ -174,6 +175,11 @@ async def test_task3_evolution_closed_loop(tmp_path) -> None:
         registry,
         gate=PromotionEligibilityGate(
             PromotionSettings(
+
+            require_known_cost=False,
+            minimum_calibration_samples=0,
+            require_brier_score=False,
+            require_expected_calibration_error=False,
                 minimum_completed_episodes=10,
                 minimum_holdout_episodes=2,
                 maximum_tail_loss_regression_pct=Decimal("50"),
@@ -202,6 +208,8 @@ async def test_task3_evolution_closed_loop(tmp_path) -> None:
             "aggregate_metrics": {"pnl_delta": Decimal("1")},
             "safety_failures": (),
             "data_integrity_failures": (),
+            "gate_rejection_codes": (),
+            "eligibility_outcome": True,
         }
     )
     decision = await decisions.decide_and_apply(

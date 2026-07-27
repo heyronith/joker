@@ -41,9 +41,7 @@ HARD_VETO_CODES = frozenset(
 # Metrics that must be present on both champion and challenger.
 CRITICAL_METRICS: tuple[tuple[str, Literal["higher", "lower"]], ...] = (
     ("tail_loss", "lower"),  # more negative is worse
-    ("calibration_error", "higher"),
     ("latency_ms", "higher"),
-    ("cost_gbp", "higher"),
 )
 
 
@@ -78,7 +76,7 @@ class PromotionEligibilityGate:
         if result.data_integrity_failures:
             codes.append("execution_integrity_violation")
         for failure in result.gate_rejection_codes:
-            if failure in HARD_VETO_CODES or str(failure).startswith("missing_"):
+            if failure in HARD_VETO_CODES:
                 codes.append(str(failure))
         if not adversarial_passed:
             codes.append("adversarial_scenario_failure")
@@ -100,9 +98,10 @@ class PromotionEligibilityGate:
         chall = result.challenger_metrics
         thresholds = {
             "tail_loss": self._settings.maximum_tail_loss_regression_pct,
-            "calibration_error": self._settings.maximum_calibration_regression_pct,
             "latency_ms": self._settings.maximum_latency_regression_pct,
             "cost_gbp": self._settings.maximum_cost_regression_pct,
+            "brier_score": self._settings.maximum_calibration_regression_pct,
+            "expected_calibration_error": self._settings.maximum_calibration_regression_pct,
         }
         for metric, worse_direction in CRITICAL_METRICS:
             codes.extend(
@@ -115,6 +114,63 @@ class PromotionEligibilityGate:
                     required=True,
                 )
             )
+
+        # Fail-closed cost / calibration requirements.
+        if self._settings.require_known_cost:
+            champ_known = bool(champ.get("cost_known", False))
+            chall_known = bool(chall.get("cost_known", False))
+            if not champ_known or not chall_known:
+                codes.append("unknown_required_cost")
+            else:
+                codes.extend(
+                    self._regression_codes(
+                        champ,
+                        chall,
+                        "cost_gbp",
+                        thresholds["cost_gbp"],
+                        worse_direction="higher",
+                        required=True,
+                    )
+                )
+
+        champ_cal_n = int(champ.get("calibration_sample_count") or 0)
+        chall_cal_n = int(chall.get("calibration_sample_count") or 0)
+        if (
+            champ_cal_n < self._settings.minimum_calibration_samples
+            or chall_cal_n < self._settings.minimum_calibration_samples
+        ):
+            codes.append("insufficient_calibration_samples")
+        if self._settings.require_brier_score:
+            if "brier_score" not in champ or "brier_score" not in chall:
+                codes.append("missing_brier_score")
+            else:
+                codes.extend(
+                    self._regression_codes(
+                        champ,
+                        chall,
+                        "brier_score",
+                        thresholds["brier_score"],
+                        worse_direction="higher",
+                        required=True,
+                    )
+                )
+        if self._settings.require_expected_calibration_error:
+            if (
+                "expected_calibration_error" not in champ
+                or "expected_calibration_error" not in chall
+            ):
+                codes.append("missing_expected_calibration_error")
+            else:
+                codes.extend(
+                    self._regression_codes(
+                        champ,
+                        chall,
+                        "expected_calibration_error",
+                        thresholds["expected_calibration_error"],
+                        worse_direction="higher",
+                        required=True,
+                    )
+                )
 
         seen: set[str] = set()
         ordered: list[str] = []
@@ -129,6 +185,13 @@ class PromotionEligibilityGate:
             if c in HARD_VETO_CODES
             or c.startswith("missing_critical_metric")
             or c.endswith("_regression")
+            or c
+            in {
+                "unknown_required_cost",
+                "insufficient_calibration_samples",
+                "missing_brier_score",
+                "missing_expected_calibration_error",
+            }
         ]
         eligible = not hard and "insufficient_completed_episodes" not in ordered
         if "insufficient_holdout_episodes" in ordered:

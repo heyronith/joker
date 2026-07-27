@@ -16,6 +16,8 @@ from joker.evolution.replay_gateway import ReplayOrderActionGateway
 from joker.evolution.replay_market import ReplayEpisodeTruth
 from joker.evolution.replay_position_runtime import ReplayPositionRuntime
 from joker.evolution.replay_truth import ReplayTruthLoadError, ReplayTruthLoader
+from joker.evolution.replay_order_management import ReplayOrderManagementRunner
+from joker.evolution.replay_store import ReplayExecutionStore, replay_key
 from joker.evolution.repositories import ConfigurationVersionRepository
 from joker.evolution.schemas import CognitiveConfigurationVersion, TradingEpisode
 from joker.evolution.telemetry import (
@@ -28,6 +30,21 @@ from joker.graph.langgraph_checkpointer import ainvoke_config
 from joker.graph.position_graph import build_position_graph
 from joker.models.router import ModelRouter
 from joker.runtime.order_action_gateway import OrderActionKind, OrderActionRequest
+
+
+def _proposal_contract_id(proposal: Any) -> str | None:
+    if proposal is None:
+        return None
+    selected = getattr(proposal, "contract_id", None) or getattr(
+        proposal, "selected_contract_id", None
+    )
+    if selected:
+        return str(selected)
+    for leg in getattr(proposal, "legs", None) or ():
+        cid = getattr(leg, "contract_id", None)
+        if cid:
+            return str(cid)
+    return None
 
 
 class CognitiveReplayError(RuntimeError):
@@ -48,6 +65,10 @@ class CognitiveReplayService:
         random_seed: int = 42,
         truth_loader: ReplayTruthLoader | None = None,
         force_terminal_liquidation: bool = False,
+        execution_store: Any | None = None,
+        allow_synthetic_starting_cash: bool = False,
+        session_starting_cash: Decimal | None = None,
+        ledger_store: Any | None = None,
     ) -> None:
         self._template = template_deps
         self._configs = config_repo
@@ -58,12 +79,18 @@ class CognitiveReplayService:
             snapshot_repo=template_deps.snapshot_repo,
             option_surface_repo=template_deps.option_surface_repo,
             data_quality_repo=template_deps.data_quality_repo,
+            ledger_store=ledger_store,
+            session_starting_cash=session_starting_cash,
+            allow_synthetic_starting_cash=allow_synthetic_starting_cash,
             random_seed=random_seed,
         )
         self._force_terminal_liquidation = force_terminal_liquidation
+        self._execution_store = execution_store
         self.replay_count = 0
         self.shadow_count = 0
         self._shadow_runtimes: dict[str, ReplayPositionRuntime] = {}
+        self._shadow_cursors: dict[str, str] = {}
+        self.order_management_runs = 0
 
     def _isolated_deps(
         self,
@@ -185,9 +212,7 @@ class CognitiveReplayService:
         quantity = Decimal("1")
         limit_price = None
         if proposal is not None:
-            selected = getattr(proposal, "contract_id", None) or getattr(
-                proposal, "selected_contract_id", None
-            )
+            selected = _proposal_contract_id(proposal)
             if getattr(proposal, "quantity", None) is not None:
                 quantity = Decimal(str(proposal.quantity))
             if getattr(proposal, "limit_price", None) is not None:
@@ -196,8 +221,52 @@ class CognitiveReplayService:
         integrity: list[str] = []
         traded = False
         ran_position = False
+        ran_order_management = False
         entry_order_id = None
-        if action_value in {"execute", "probe", "EXECUTE", "PROBE"}:
+        key = replay_key(
+            episode.episode_id,
+            episode.episode_id,
+            configuration_version_id,
+            sample,
+        )
+        if self._execution_store is not None:
+            prior = await self._execution_store.load_checkpoint(key)
+            if prior is not None:
+                execution.restore_state(
+                    cash=prior["cash"],
+                    orders=prior["orders"],
+                    positions=prior["positions"],
+                    fills=prior["fills"],
+                    submitted_keys=prior["submitted_keys"],
+                )
+                entry_order_id = prior.get("entry_order_id")
+                traded = bool(prior.get("entry_decision_completed") and entry_order_id)
+                if prior.get("status") == "completed":
+                    return {
+                        "realised_pnl": prior["realised_pnl"],
+                        "model_calls": 0,
+                        "cost_gbp": None,
+                        "cost_known": False,
+                        "latency_ms": Decimal("0"),
+                        "broker_submit": False,
+                        "execution_runtime": False,
+                        "traded": traded,
+                        "open_at_end": any(
+                            Decimal(str(p.quantity)) > 0
+                            for p in execution.positions.values()
+                        ),
+                        "ran_task2_graph": True,
+                        "ran_position_graph": True,
+                        "ran_order_management": True,
+                        "integrity_findings": (),
+                        "historical_pnl_attributed": False,
+                        "sample": sample,
+                        "configuration_version_id": str(configuration_version_id),
+                        "resumed": True,
+                        "projection": execution.projection(),
+                    }
+
+        if action_value in {"execute", "probe", "EXECUTE", "PROBE"} and not traded:
             if not selected:
                 integrity.append("missing_valid_contract_selection")
             elif str(selected) not in first_quotes:
@@ -219,6 +288,44 @@ class CognitiveReplayService:
                 entry_order_id = submit.client_order_id
                 if not traded:
                     integrity.append(submit.blocked_reason or "entry_not_submitted")
+                else:
+                    entry_order = execution.orders.get(str(entry_order_id))
+                    if entry_order is not None:
+                        om = ReplayOrderManagementRunner(deps=deps)
+                        frame0 = truth.frames[0] if truth.frames else None
+                        try:
+                            await om.manage(
+                                frame=frame0,
+                                order=entry_order,
+                                execution=execution,
+                                applied_configuration=applied,
+                                parent_cycle_id=cycle_id,
+                                gateway=gateway,
+                            )
+                            ran_order_management = True
+                            self.order_management_runs += 1
+                        except RuntimeError as exc:
+                            # Without snapshot context OM cannot run; record finding.
+                            integrity.append(str(exc))
+                    if self._execution_store is not None:
+                        await self._execution_store.save_checkpoint(
+                            key=key,
+                            experiment_id=str(episode.episode_id),
+                            episode_id=str(episode.episode_id),
+                            configuration_version_id=str(configuration_version_id),
+                            sample_number=sample,
+                            status="entry_filled",
+                            frame_index=0,
+                            cash=execution.cash,
+                            realised_pnl=execution.realised_pnl(),
+                            orders=execution.orders,
+                            fills=execution.fills,
+                            positions=execution.positions,
+                            submitted_keys=execution._submitted_keys,
+                            entry_cycle_id=cycle_id,
+                            entry_order_id=entry_order_id,
+                            entry_decision_completed=True,
+                        )
 
         # Advance frames with actual position cognition while open.
         if traded and selected and len(truth.frames) > 1:
@@ -232,6 +339,23 @@ class CognitiveReplayService:
                     execution.allow_contract(
                         cid, bid=Decimal(q["bid"]), ask=Decimal(q["ask"])
                     )
+                # Manage any still-working orders before position cognition.
+                for order in list(execution.orders.values()):
+                    if order.status in {"partially_filled", "accepted", "submitted"}:
+                        om = ReplayOrderManagementRunner(deps=deps)
+                        try:
+                            await om.manage(
+                                frame=frame,
+                                order=order,
+                                execution=execution,
+                                applied_configuration=applied,
+                                parent_cycle_id=cycle_id,
+                                gateway=gateway,
+                            )
+                            ran_order_management = True
+                            self.order_management_runs += 1
+                        except RuntimeError as exc:
+                            integrity.append(str(exc))
                 pos_cycle = f"{cycle_id}:pos:{frame.snapshot_id}"
                 pos_state = {
                     "session_id": deps.session_id,
@@ -293,6 +417,25 @@ class CognitiveReplayService:
                             cycle_id=pos_cycle,
                         )
                     )
+                if self._execution_store is not None:
+                    await self._execution_store.save_checkpoint(
+                        key=key,
+                        experiment_id=str(episode.episode_id),
+                        episode_id=str(episode.episode_id),
+                        configuration_version_id=str(configuration_version_id),
+                        sample_number=sample,
+                        status="position_frame",
+                        frame_index=frame_index,
+                        cash=execution.cash,
+                        realised_pnl=execution.realised_pnl(),
+                        orders=execution.orders,
+                        fills=execution.fills,
+                        positions=execution.positions,
+                        submitted_keys=execution._submitted_keys,
+                        entry_cycle_id=cycle_id,
+                        entry_order_id=entry_order_id,
+                        entry_decision_completed=True,
+                    )
 
         open_at_end = False
         if selected:
@@ -313,6 +456,26 @@ class CognitiveReplayService:
                     )
                 )
                 open_at_end = False
+
+        if self._execution_store is not None:
+            await self._execution_store.save_checkpoint(
+                key=key,
+                experiment_id=str(episode.episode_id),
+                episode_id=str(episode.episode_id),
+                configuration_version_id=str(configuration_version_id),
+                sample_number=sample,
+                status="completed",
+                frame_index=max(0, len(truth.frames) - 1),
+                cash=execution.cash,
+                realised_pnl=execution.realised_pnl(),
+                orders=execution.orders,
+                fills=execution.fills,
+                positions=execution.positions,
+                submitted_keys=execution._submitted_keys,
+                entry_cycle_id=cycle_id,
+                entry_order_id=entry_order_id,
+                entry_decision_completed=True,
+            )
 
         # Telemetry from model-call repo when available.
         model_records = []
@@ -355,6 +518,7 @@ class CognitiveReplayService:
             "open_at_end": open_at_end,
             "ran_task2_graph": True,
             "ran_position_graph": ran_position,
+            "ran_order_management": ran_order_management,
             "integrity_findings": tuple(integrity),
             "historical_pnl_attributed": False,
             "historical_contract_fallback": False,
@@ -364,6 +528,7 @@ class CognitiveReplayService:
             "projection": execution.projection(),
             "fill_model_version": truth.fill_model_version,
             "random_seed": truth.random_seed,
+            "fill_ids": tuple(f.fill_id for f in execution.fills),
         }
 
     async def run_challenger_shadow(
@@ -445,9 +610,7 @@ class CognitiveReplayService:
         meta = result.get("meta_decision")
         action_value = getattr(getattr(meta, "action", None), "value", None)
         proposal = result.get("execution_proposal")
-        selected = None
-        if proposal is not None:
-            selected = getattr(proposal, "contract_id", None)
+        selected = _proposal_contract_id(proposal)
         if (
             not runtime.traded
             and action_value in {"execute", "probe", "EXECUTE", "PROBE"}
@@ -490,3 +653,9 @@ class CognitiveReplayService:
         self, key: str, runtime: ReplayPositionRuntime
     ) -> None:
         self._shadow_runtimes[key] = runtime
+
+    def set_shadow_cursor(self, key: str, snapshot_id: str) -> None:
+        self._shadow_cursors[key] = snapshot_id
+
+    def shadow_cursor(self, key: str) -> str | None:
+        return self._shadow_cursors.get(key)

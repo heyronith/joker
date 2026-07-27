@@ -117,6 +117,7 @@ async def test_task3_active_path_with_task1_task2_surface(tmp_path) -> None:
             )
         ),
         initial_snapshot_id=tick.snapshot.snapshot_id,
+            terminal_snapshot_id=uuid4(),
     )
     assert episode.completed is True
     evaluation = await evaluator.evaluate(episode)

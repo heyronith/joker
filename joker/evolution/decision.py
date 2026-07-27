@@ -201,7 +201,7 @@ class EvolutionDecisionService:
             self._compiled = builder.compile()
         return self._compiled
 
-    async def decide_and_apply(
+    async def decide(
         self,
         *,
         experiment_id: UUID,
@@ -214,6 +214,10 @@ class EvolutionDecisionService:
         adversarial_passed: bool = True,
         agent_override_action: AgentAction | None = None,
     ) -> PromotionDecision:
+        """Persist strategic decision only — does not mutate champion registry."""
+        existing = await self._promotions.get_by_experiment(experiment_id)
+        if existing is not None:
+            return existing
         eligibility = self._gate.evaluate(
             result=result,
             proposal=proposal,
@@ -294,24 +298,70 @@ class EvolutionDecisionService:
             existing = await self._promotions.get_by_experiment(experiment_id)
             if existing is not None:
                 return existing
-
-        if decision.final_status == "promoted":
-            await self._champions.promote(
-                challenger=challenger,
-                expected_champion_id=champion.configuration_version_id,
-                reason="agent_promote",
-                experiment_id=experiment_id,
-                promotion_decision_id=decision.promotion_decision_id,
-            )
-            await self._configs.mark_status(
-                challenger.configuration_version_id, "champion"
-            )
-        elif decision.final_status == "rejected":
-            await self._configs.mark_status(
-                challenger.configuration_version_id, "rejected"
-            )
-        elif decision.final_status == "pending_evidence":
-            await self._configs.mark_status(
-                challenger.configuration_version_id, "shadow"
-            )
         return decision
+
+    async def apply_persisted_decision(
+        self, *, promotion_decision_id: UUID
+    ) -> PromotionDecision:
+        """Idempotent champion CAS activation for a persisted promote decision."""
+        decision = await self._promotions.get_by_id(promotion_decision_id)
+        if decision is None:
+            raise RuntimeError(f"promotion_decision_not_found:{promotion_decision_id}")
+        if decision.final_status != "promoted":
+            if decision.final_status == "rejected":
+                await self._configs.mark_status(
+                    decision.challenger_version_id, "rejected"
+                )
+            elif decision.final_status == "pending_evidence":
+                await self._configs.mark_status(
+                    decision.challenger_version_id, "shadow"
+                )
+            return decision
+        challenger = await self._configs.get_by_id(decision.challenger_version_id)
+        champion = await self._configs.get_by_id(decision.champion_version_id)
+        if challenger is None or champion is None:
+            raise RuntimeError("promotion_configuration_missing")
+        current = await self._champions.get_current_champion()
+        if (
+            current is not None
+            and current.configuration_version_id == challenger.configuration_version_id
+        ):
+            return decision  # already activated
+        await self._champions.promote(
+            challenger=challenger,
+            expected_champion_id=champion.configuration_version_id,
+            reason="agent_promote",
+            experiment_id=decision.experiment_id,
+            promotion_decision_id=decision.promotion_decision_id,
+        )
+        await self._configs.mark_status(challenger.configuration_version_id, "champion")
+        return decision
+
+    async def decide_and_apply(
+        self,
+        *,
+        experiment_id: UUID,
+        result: ExperimentResult,
+        challenger: CognitiveConfigurationVersion,
+        champion: CognitiveConfigurationVersion,
+        proposal: ImprovementProposal | None = None,
+        holdout_episode_count: int = 0,
+        completed_episode_count: int = 0,
+        adversarial_passed: bool = True,
+        agent_override_action: AgentAction | None = None,
+    ) -> PromotionDecision:
+        """Compatibility wrapper: decide then apply. Prefer separate nodes in orchestrator."""
+        decision = await self.decide(
+            experiment_id=experiment_id,
+            result=result,
+            challenger=challenger,
+            champion=champion,
+            proposal=proposal,
+            holdout_episode_count=holdout_episode_count,
+            completed_episode_count=completed_episode_count,
+            adversarial_passed=adversarial_passed,
+            agent_override_action=agent_override_action,
+        )
+        return await self.apply_persisted_decision(
+            promotion_decision_id=decision.promotion_decision_id
+        )

@@ -173,6 +173,8 @@ async def test_production_cognitive_replay_and_shadow_challenger(tmp_path) -> No
         config_repo=evo_repos["configurations"],
         policy_store=champ_registry.policy_store,
         checkpointer_path=None,
+        allow_synthetic_starting_cash=True,
+        session_starting_cash=Decimal("25000"),
     )
     # Isolation contract: production replay never sees broker write paths.
     isolated = replay._isolated_deps()
@@ -220,6 +222,11 @@ async def test_production_cognitive_replay_and_shadow_challenger(tmp_path) -> No
         replay_service=replay,
         gate=PromotionEligibilityGate(
             PromotionSettings(
+
+            require_known_cost=False,
+            minimum_calibration_samples=0,
+            require_brier_score=False,
+            require_expected_calibration_error=False,
                 minimum_completed_episodes=2,
                 minimum_holdout_episodes=1,
                 maximum_tail_loss_regression_pct=Decimal("100"),
@@ -271,6 +278,10 @@ async def test_production_cognitive_replay_and_shadow_challenger(tmp_path) -> No
         champ_registry,
         gate=PromotionEligibilityGate(
             PromotionSettings(
+                require_known_cost=False,
+                minimum_calibration_samples=0,
+                require_brier_score=False,
+                require_expected_calibration_error=False,
                 minimum_completed_episodes=2,
                 minimum_holdout_episodes=1,
                 maximum_tail_loss_regression_pct=Decimal("100"),

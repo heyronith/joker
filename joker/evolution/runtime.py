@@ -157,11 +157,28 @@ class EvolutionRuntime:
                 session_id=self.session_id or "evolution",
             )
         if self.cognitive_graph_deps is not None:
+            from joker.evolution.replay_store import ReplayExecutionStore
+
+            exec_store = ReplayExecutionStore(self.db_path)
+            await exec_store.initialize()
+            session_cash = None
+            ledger_store = None
+            if self.execution_runtime is not None:
+                ledger_store = getattr(self.execution_runtime, "_ledger", None)
+                broker = getattr(self.execution_runtime, "_broker", None)
+                if broker is not None and hasattr(broker, "initial_balance"):
+                    from decimal import Decimal as _D
+
+                    session_cash = _D(str(broker.initial_balance))
             self.replay = CognitiveReplayService(
                 template_deps=self.cognitive_graph_deps,
                 config_repo=self._repos["configurations"],
                 policy_store=self.champion_registry.policy_store,
                 checkpointer_saver=savers.replay,
+                execution_store=exec_store,
+                ledger_store=ledger_store,
+                session_starting_cash=session_cash,
+                allow_synthetic_starting_cash=session_cash is None,
             )
         self.experiments = ExperimentRunner(
             self._repos["experiments"],
@@ -194,6 +211,7 @@ class EvolutionRuntime:
             challenger_runner=challenger_runner,
             ledger=self.shadow_ledger,
             config_repo=self._repos["configurations"],
+            replay_service=self.replay,
         )
         self.drift = DriftMonitor(
             self._repos["drift"],
@@ -510,6 +528,8 @@ class EvolutionRuntime:
                 or self.originating_configuration_for_contract(contract_id)
                 or champ_id
             )
+            entry_snap = snap
+            terminal_snap = self._latest_snapshot_id
             return await self.episode_compiler.compile_from_position_closed(
                 session_id=self.session_id,
                 run_id=self.run_id,
@@ -518,7 +538,8 @@ class EvolutionRuntime:
                 event_payload=payload,
                 event_id=job["event_id"],
                 execution=self.execution_runtime,
-                initial_snapshot_id=snap,
+                initial_snapshot_id=entry_snap,
+                terminal_snapshot_id=terminal_snap,
                 entry_cycle_id=cycle_id or None,
             )
         if kind in {"entry_rejected", "entry_cancelled"}:

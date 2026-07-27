@@ -156,6 +156,10 @@ evolution:
     maximum_cost_regression_pct: 50
     minimum_completed_episodes: 20
     minimum_holdout_episodes: 10
+    require_known_cost: true
+    minimum_calibration_samples: 20
+    require_brier_score: true
+    require_expected_calibration_error: true
   drift:
     enabled: true
     rolling_episode_window: 50

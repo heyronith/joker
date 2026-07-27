@@ -322,6 +322,98 @@ class ShadowLedger:
             row = await cur.fetchone()
         return int(row[0]) if row else 0
 
+    async def list_orders(self, assignment_id: UUID) -> list[dict[str, Any]]:
+        await self.initialize()
+        async with aiosqlite.connect(self._db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                "SELECT * FROM shadow_orders WHERE assignment_id = ?",
+                (str(assignment_id),),
+            )
+            rows = await cur.fetchall()
+        out = []
+        for r in rows:
+            d = dict(r)
+            d["payload"] = json.loads(d.pop("payload_json"))
+            out.append(d)
+        return out
+
+    async def upsert_order(
+        self,
+        *,
+        assignment_id: UUID,
+        challenger_version_id: UUID,
+        client_order_id: str,
+        contract_id: str,
+        side: str,
+        quantity: Decimal,
+        status: str,
+        position_lifecycle_id: str | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> None:
+        await self.initialize()
+        async with aiosqlite.connect(self._db_path) as db:
+            await db.execute(
+                """
+                INSERT OR REPLACE INTO shadow_orders (
+                    client_order_id, assignment_id, challenger_version_id,
+                    position_lifecycle_id, contract_id, side, quantity, status,
+                    payload_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    client_order_id,
+                    str(assignment_id),
+                    str(challenger_version_id),
+                    position_lifecycle_id,
+                    contract_id,
+                    side,
+                    str(quantity),
+                    status,
+                    json.dumps(payload or {}, default=str),
+                    datetime.now(timezone.utc).isoformat(),
+                ),
+            )
+            await db.commit()
+
+    async def list_fills(self, assignment_id: UUID) -> list[dict[str, Any]]:
+        await self.initialize()
+        async with aiosqlite.connect(self._db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                "SELECT * FROM shadow_fills WHERE assignment_id = ?",
+                (str(assignment_id),),
+            )
+            rows = await cur.fetchall()
+        out = []
+        for r in rows:
+            d = dict(r)
+            d["payload"] = json.loads(d.pop("payload_json"))
+            out.append(d)
+        return out
+
+    async def list_positions(
+        self, assignment_id: UUID, *, status: str | None = None
+    ) -> list[dict[str, Any]]:
+        await self.initialize()
+        async with aiosqlite.connect(self._db_path) as db:
+            db.row_factory = aiosqlite.Row
+            if status is None:
+                cur = await db.execute(
+                    "SELECT * FROM shadow_positions WHERE assignment_id = ?",
+                    (str(assignment_id),),
+                )
+            else:
+                cur = await db.execute(
+                    """
+                    SELECT * FROM shadow_positions
+                    WHERE assignment_id = ? AND status = ?
+                    """,
+                    (str(assignment_id), status),
+                )
+            rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+
     async def save_evidence_summary(self, summary: ShadowEvidenceSummary) -> None:
         await self.initialize()
         async with aiosqlite.connect(self._db_path) as db:

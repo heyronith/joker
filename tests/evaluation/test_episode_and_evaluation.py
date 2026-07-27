@@ -53,6 +53,7 @@ async def test_closed_trade_and_no_trade_episodes(tmp_path) -> None:
             )
         ),
         initial_snapshot_id=snap,
+            terminal_snapshot_id=uuid4(),
     )
     assert closed.completed is True
     assert closed.action_class == "closed_trade"
@@ -83,6 +84,7 @@ async def test_closed_trade_and_no_trade_episodes(tmp_path) -> None:
             )
         ),
         initial_snapshot_id=snap,
+            terminal_snapshot_id=uuid4(),
     )
     assert incomplete.completed is False
     assert "quantity_identity_mismatch" in incomplete.completeness_findings
@@ -119,6 +121,7 @@ async def test_profitable_unsupported_vs_losing_calibrated(tmp_path) -> None:
         run_id="r",
         trading_date=date(2026, 7, 1),
         initial_snapshot_id=uuid4(),
+            terminal_snapshot_id=uuid4(),
         action_class="closed_trade",
         configuration_version_id=cfg,
         quantity=Decimal("1"),
@@ -144,6 +147,7 @@ async def test_profitable_unsupported_vs_losing_calibrated(tmp_path) -> None:
         run_id="r",
         trading_date=date(2026, 7, 1),
         initial_snapshot_id=uuid4(),
+            terminal_snapshot_id=uuid4(),
         action_class="closed_trade",
         configuration_version_id=cfg,
         quantity=Decimal("1"),
@@ -178,6 +182,7 @@ async def test_dataset_no_overlap_and_leakage_rejection(tmp_path) -> None:
             run_id="r",
             trading_date=date(2026, 7, 1),
             initial_snapshot_id=uuid4(),
+            terminal_snapshot_id=uuid4(),
             action_class="no_trade",
             configuration_version_id=cfg,
             completed=True,
@@ -198,6 +203,7 @@ async def test_dataset_no_overlap_and_leakage_rejection(tmp_path) -> None:
         run_id="r",
         trading_date=date(2026, 7, 2),
         initial_snapshot_id=uuid4(),
+            terminal_snapshot_id=uuid4(),
         action_class="no_trade",
         configuration_version_id=cfg,
         completed=True,

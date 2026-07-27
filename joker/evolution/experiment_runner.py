@@ -230,13 +230,18 @@ class ExperimentRunner:
             definition.champion_version_id,
             definition.challenger_version_id,
         )
-        champ_cal_metric = champ_ece if champ_ece is not None else champ_cal
-        chall_cal_metric = chall_ece if chall_ece is not None else chall_cal
+        # PnL MAD is dispersion only — never substitutes for ECE/Brier.
         deltas_all = [b - a for a, b in zip(champ_vals, chall_vals)]
         ci_all, ci_meta = self._bootstrap_ci(deltas_all)
         required_missing: list[str] = []
         if not champ_vals or not chall_vals:
             required_missing.append("missing_replay_pnl_metrics")
+        # Aggregate cost is None when either side has unknown cost.
+        aggregate_cost: Decimal | None
+        if champ_cost_known and chall_cost_known:
+            aggregate_cost = cost
+        else:
+            aggregate_cost = None
         result = ExperimentResult(
             result_id=uuid4(),
             experiment_id=definition.experiment_id,
@@ -251,13 +256,12 @@ class ExperimentRunner:
                 "ci_confidence_level": str(ci_meta["confidence_level"]),
             },
             confidence_intervals={"pnl_delta": ci_all},
-            cost_gbp=cost,
+            cost_gbp=aggregate_cost,
             model_call_counts={"total": model_calls},
             missing_episodes=tuple(missing),
             champion_metrics={
                 "mean_pnl": champ_mean,
                 "tail_loss": champ_tail,
-                "calibration_error": champ_cal_metric,
                 "pnl_mean_absolute_deviation": champ_cal,
                 **(
                     {"brier_score": champ_brier}
@@ -271,13 +275,12 @@ class ExperimentRunner:
                 ),
                 "calibration_sample_count": Decimal(champ_cal_n),
                 "latency_ms": champ_lat,
-                "cost_gbp": champ_cost,
+                **({"cost_gbp": champ_cost} if champ_cost_known else {}),
                 "cost_known": champ_cost_known,
             },
             challenger_metrics={
                 "mean_pnl": chall_mean,
                 "tail_loss": chall_tail,
-                "calibration_error": chall_cal_metric,
                 "pnl_mean_absolute_deviation": chall_cal,
                 **(
                     {"brier_score": chall_brier}
@@ -291,7 +294,7 @@ class ExperimentRunner:
                 ),
                 "calibration_sample_count": Decimal(chall_cal_n),
                 "latency_ms": chall_lat,
-                "cost_gbp": chall_cost,
+                **({"cost_gbp": chall_cost} if chall_cost_known else {}),
                 "cost_known": chall_cost_known,
             },
             eligibility_outcome=False,

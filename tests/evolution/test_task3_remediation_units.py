@@ -134,6 +134,7 @@ async def test_two_round_trips_same_contract_create_two_independent_episodes(
         event_id=str(uuid4()),
         execution=exec_proj,
         initial_snapshot_id=snap1,
+            terminal_snapshot_id=uuid4(),
     )
     ep2 = await compiler.compile_from_position_closed(
         session_id="s",
@@ -148,6 +149,7 @@ async def test_two_round_trips_same_contract_create_two_independent_episodes(
         event_id=str(uuid4()),
         execution=exec_proj,
         initial_snapshot_id=snap2,
+            terminal_snapshot_id=uuid4(),
     )
     assert ep1.idempotency_key != ep2.idempotency_key
     assert ep1.quantity == Decimal("1")
@@ -179,6 +181,7 @@ async def test_missing_snapshot_creates_incomplete_episode_without_random_id(
             closed_trade_projection(contract_id=contract, realised_pnl=Decimal("50"))
         ),
         initial_snapshot_id=None,
+            terminal_snapshot_id=None,
     )
     assert ep.completed is False
     assert "missing_initial_snapshot" in ep.completeness_findings
@@ -189,8 +192,10 @@ async def test_missing_snapshot_creates_incomplete_episode_without_random_id(
 @pytest.mark.asyncio
 async def test_replay_wrong_contract_does_not_receive_historical_pnl() -> None:
     truth = ReplayEpisodeTruth(
+        starting_cash=__import__("decimal").Decimal("100000"),
         episode_id=uuid4(),
         initial_snapshot_id=uuid4(),
+            terminal_snapshot_id=uuid4(),
         contract_quotes={
             "GOOD": {"bid": "1.00", "ask": "1.02", "mid": "1.01"},
         },
@@ -209,8 +214,10 @@ async def test_replay_wrong_contract_does_not_receive_historical_pnl() -> None:
 @pytest.mark.asyncio
 async def test_replay_no_trade_has_zero_position_and_pnl() -> None:
     truth = ReplayEpisodeTruth(
+        starting_cash=__import__("decimal").Decimal("100000"),
         episode_id=uuid4(),
         initial_snapshot_id=uuid4(),
+            terminal_snapshot_id=uuid4(),
         contract_quotes={"C": {"bid": "1.00", "ask": "1.02", "mid": "1.01"}},
     )
     pos = ReplayPositionRuntime(
@@ -226,8 +233,10 @@ async def test_replay_no_trade_has_zero_position_and_pnl() -> None:
 @pytest.mark.asyncio
 async def test_replay_partial_fill_and_replace() -> None:
     truth = ReplayEpisodeTruth(
+        starting_cash=__import__("decimal").Decimal("100000"),
         episode_id=uuid4(),
         initial_snapshot_id=uuid4(),
+            terminal_snapshot_id=uuid4(),
         contract_quotes={"C": {"bid": "1.00", "ask": "1.02", "mid": "1.01"}},
     )
     rt = ReplayExecutionRuntime(truth=truth)
@@ -250,8 +259,10 @@ async def test_replay_partial_fill_and_replace() -> None:
 @pytest.mark.asyncio
 async def test_replay_restart_does_not_duplicate_fill() -> None:
     truth = ReplayEpisodeTruth(
+        starting_cash=__import__("decimal").Decimal("100000"),
         episode_id=uuid4(),
         initial_snapshot_id=uuid4(),
+            terminal_snapshot_id=uuid4(),
         contract_quotes={"C": {"bid": "1.00", "ask": "1.02", "mid": "1.01"}},
     )
     rt = ReplayExecutionRuntime(truth=truth)

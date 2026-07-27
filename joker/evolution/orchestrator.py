@@ -620,22 +620,10 @@ class EvolutionOrchestrator:
                 "failure_codes": list(state.get("failure_codes") or [])
                 + ["adversarial_suite_missing"],
             }
-        # Collect integrity findings from experiment episode results when available.
-        integrity: list[str] = []
-        result = await self._rt._repos["experiments"].get_result(
-            UUID(state["experiment_id"])
-        )
-        if result is not None:
-            for code in result.gate_rejection_codes:
-                if "integrity" in code or "missing" in code:
-                    integrity.append(code)
         passed, _results = await suite.run_for_experiment(
             experiment_id=UUID(state["experiment_id"]),
             champion_version_id=UUID(state["champion_version_id"]),
             challenger_version_id=UUID(state["challenger_version_id"]),
-            integrity_findings=tuple(integrity),
-            replay_finished=result is not None,
-            frozen_truth_loaded=True,
         )
         return {
             "adversarial_passed": passed,
@@ -747,41 +735,6 @@ class EvolutionOrchestrator:
                 "promotion_decision_id": str(existing.promotion_decision_id),
                 "stage": "applying_decision",
             }
-        if not state.get("deterministic_eligible"):
-            # Persist a reject without activating.
-            result = await self._rt._repos["experiments"].get_result(
-                UUID(state["experiment_id"])
-            )
-            challenger = await self._rt._repos["configurations"].get_by_id(
-                UUID(state["challenger_version_id"])
-            )
-            champion = await self._rt._repos["configurations"].get_by_id(
-                UUID(state["champion_version_id"])
-            )
-            proposal = await self._rt._repos["proposals"].get_by_id(
-                UUID(state["proposal_id"])
-            )
-            if result and challenger and champion:
-                decision = await self._rt.decisions.decide_and_apply(
-                    experiment_id=UUID(state["experiment_id"]),
-                    result=result,
-                    challenger=challenger,
-                    champion=champion,
-                    proposal=proposal,
-                    holdout_episode_count=0,
-                    completed_episode_count=len(state.get("source_episode_ids") or []),
-                    adversarial_passed=bool(state.get("adversarial_passed")),
-                )
-                return {
-                    "promotion_decision_id": str(decision.promotion_decision_id),
-                    "stage": "applying_decision",
-                }
-            return {
-                "status": "blocked",
-                "stage": "finalise_cycle",
-                "failure_codes": list(state.get("failure_codes") or [])
-                + list(state.get("deterministic_gate_codes") or []),
-            }
         result = await self._rt._repos["experiments"].get_result(
             UUID(state["experiment_id"])
         )
@@ -792,14 +745,20 @@ class EvolutionOrchestrator:
             UUID(state["champion_version_id"])
         )
         proposal = await self._rt._repos["proposals"].get_by_id(UUID(state["proposal_id"]))
-        assert result is not None and challenger is not None and champion is not None
+        if result is None or challenger is None or champion is None:
+            return {
+                "status": "blocked",
+                "stage": "finalise_cycle",
+                "failure_codes": list(state.get("failure_codes") or [])
+                + list(state.get("deterministic_gate_codes") or [])
+                + ["missing_promotion_inputs"],
+            }
         holdout = 0
         if state.get("dataset_id"):
             dataset = await self._rt._repos["datasets"].get_by_id(UUID(state["dataset_id"]))
             if dataset is not None:
                 holdout = len(dataset.partition_map.get("holdout", ()))
-        # Persist decision but defer CAS activation to apply node when crash testing.
-        decision = await self._rt.decisions.decide_and_apply(
+        decision = await self._rt.decisions.decide(
             experiment_id=UUID(state["experiment_id"]),
             result=result,
             challenger=challenger,
@@ -817,8 +776,17 @@ class EvolutionOrchestrator:
     async def _node_apply_decision(
         self, state: EvolutionOrchestratorState
     ) -> dict[str, Any]:
-        # Activation already performed inside decide_and_apply; node exists for
-        # crash-recovery boundary before finalise.
+        decision_id = state.get("promotion_decision_id")
+        if not decision_id:
+            return {
+                "status": "blocked",
+                "stage": "finalise_cycle",
+                "failure_codes": list(state.get("failure_codes") or [])
+                + ["missing_promotion_decision"],
+            }
+        await self._rt.decisions.apply_persisted_decision(
+            promotion_decision_id=UUID(str(decision_id))
+        )
         return {"stage": "finalise_cycle"}
 
     async def _node_finalise(self, state: EvolutionOrchestratorState) -> dict[str, Any]:

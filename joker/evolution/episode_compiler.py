@@ -53,6 +53,7 @@ class EpisodeCompiler:
         event_id: str,
         execution: _ExecutionProjection,
         initial_snapshot_id: UUID | None = None,
+        terminal_snapshot_id: UUID | None = None,
         cognitive_artifact_ids: tuple[UUID, ...] = (),
         model_call_ids: tuple[UUID, ...] = (),
         data_quality_ids: tuple[UUID, ...] = (),
@@ -62,6 +63,8 @@ class EpisodeCompiler:
         proposal_id: UUID | None = None,
         decision_id: UUID | None = None,
         market_regime_tags: tuple[str, ...] = (),
+        entry_decision_timestamp: Any | None = None,
+        terminal_event_timestamp: Any | None = None,
     ) -> TradingEpisode:
         """Derive a closed-trade episode from POSITION_CLOSED + lifecycle resolution."""
         projection = await execution.project_session()
@@ -88,8 +91,11 @@ class EpisodeCompiler:
             configuration_version_id=configuration_version_id,
             known_entry_cycle_id=entry_cycle_id,
             known_snapshot_id=initial_snapshot_id,
+            known_terminal_snapshot_id=terminal_snapshot_id,
             position_lifecycle_id=str(event_payload.get("position_lifecycle_id") or "")
             or None,
+            entry_decision_timestamp=entry_decision_timestamp,
+            terminal_event_timestamp=terminal_event_timestamp,
         )
         findings.extend(resolved.findings)
         if resolved.legacy_inferred:
@@ -136,11 +142,21 @@ class EpisodeCompiler:
             completed = False
 
         snap = resolved.initial_snapshot_id
+        terminal_snap = resolved.terminal_snapshot_id
         snapshot_status: str = "verified"
         if snap is None:
             findings.append("missing_initial_snapshot")
             completed = False
             snapshot_status = "missing"
+        if terminal_snap is None:
+            findings.append("missing_terminal_snapshot")
+            completed = False
+            if snapshot_status != "missing":
+                snapshot_status = "missing"
+        elif snap is not None and terminal_snap == snap:
+            # One-frame horizon is only acceptable when explicitly single-snapshot;
+            # still mark for replay expansion via event sequence.
+            findings.append("terminal_equals_initial_snapshot")
 
         fees = resolved.total_fees
         if fees == 0:
@@ -158,7 +174,7 @@ class EpisodeCompiler:
             proposal_id=resolved.proposal_id or proposal_id,
             decision_id=resolved.decision_id or decision_id,
             initial_snapshot_id=snap,
-            terminal_snapshot_id=resolved.terminal_snapshot_id or snap,
+            terminal_snapshot_id=terminal_snap,
             snapshot_identity_status=snapshot_status,  # type: ignore[arg-type]
             position_lifecycle_id=lifecycle,
             contract_id=contract_id or None,

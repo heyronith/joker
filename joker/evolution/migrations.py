@@ -250,7 +250,8 @@ CREATE TABLE IF NOT EXISTS shadow_hypothetical_commands (
 );
 
 CREATE TABLE IF NOT EXISTS evolution_evidence_claims (
-    evaluation_id TEXT PRIMARY KEY,
+    claim_id TEXT PRIMARY KEY NOT NULL,
+    evaluation_id TEXT NOT NULL,
     episode_id TEXT NOT NULL,
     evolution_cycle_id TEXT NOT NULL,
     dataset_id TEXT,
@@ -258,12 +259,16 @@ CREATE TABLE IF NOT EXISTS evolution_evidence_claims (
     claimed_at TEXT NOT NULL,
     released_at TEXT,
     claim_reason TEXT NOT NULL,
-    reuse_reason TEXT
+    reuse_reason TEXT,
+    prior_claim_id TEXT,
+    actor TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_evidence_claims_cycle
     ON evolution_evidence_claims (evolution_cycle_id, claim_status);
 CREATE INDEX IF NOT EXISTS idx_evidence_claims_status
     ON evolution_evidence_claims (claim_status, claimed_at);
+CREATE INDEX IF NOT EXISTS idx_evidence_claims_evaluation
+    ON evolution_evidence_claims (evaluation_id, claim_status);
 
 CREATE TABLE IF NOT EXISTS adversarial_scenario_results (
     result_key TEXT PRIMARY KEY NOT NULL,

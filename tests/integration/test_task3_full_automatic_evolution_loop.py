@@ -93,6 +93,11 @@ def _settings() -> EvolutionSettings:
         ),
         experiments=ExperimentSettings(repeated_samples=1, maximum_model_calls=5000),
         promotion=PromotionSettings(
+
+            require_known_cost=False,
+            minimum_calibration_samples=0,
+            require_brier_score=False,
+            require_expected_calibration_error=False,
             minimum_completed_episodes=4,
             minimum_holdout_episodes=1,
             maximum_tail_loss_regression_pct=Decimal("100"),

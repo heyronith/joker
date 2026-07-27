@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -20,6 +20,21 @@ class ReplayPositionSeed(BaseModel):
     quantity: Decimal
     avg_price: Decimal
     side: str = "long"
+    position_lifecycle_id: str | None = None
+
+
+class ReplayWorkingOrderSeed(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    client_order_id: str
+    contract_id: str
+    side: Literal["buy", "sell"]
+    quantity: Decimal
+    filled_qty: Decimal = Decimal("0")
+    limit_price: Decimal | None = None
+    status: str = "accepted"
+    parent_client_order_id: str | None = None
+    position_lifecycle_id: str | None = None
 
 
 class ReplayEpisodeTruth(BaseModel):
@@ -28,6 +43,8 @@ class ReplayEpisodeTruth(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     episode_id: UUID
+    session_id: str = ""
+    trading_date: date | None = None
     initial_snapshot_id: UUID
     terminal_snapshot_id: UUID | None = None
     snapshot_sequence: tuple[UUID, ...] = ()
@@ -36,8 +53,13 @@ class ReplayEpisodeTruth(BaseModel):
     market_event_ids: tuple[UUID, ...] = ()
     start_timestamp: datetime | None = None
     end_timestamp: datetime | None = None
-    starting_cash: Decimal = Decimal("100000")
+    entry_decision_timestamp: datetime | None = None
+    terminal_event_timestamp: datetime | None = None
+    position_lifecycle_id: str | None = None
+    starting_cash: Decimal
     starting_positions: tuple[ReplayPositionSeed, ...] = ()
+    starting_working_orders: tuple[ReplayWorkingOrderSeed, ...] = ()
+    market_calendar_version: str = "us_equity_rth_v1"
     fill_model_version: str = "replay_fill_v1"
     random_seed: int = 42
     # Deprecated — production path uses frames; kept for legacy unit tests only.

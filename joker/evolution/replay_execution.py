@@ -74,9 +74,37 @@ class ReplayExecutionRuntime:
                 contract_id=seed.contract_id,
                 quantity=seed.quantity,
                 avg_price=seed.avg_price,
+                position_lifecycle_id=getattr(seed, "position_lifecycle_id", None),
+            )
+        for order_seed in getattr(self.truth, "starting_working_orders", ()) or ():
+            self.orders[order_seed.client_order_id] = ReplayOrder(
+                client_order_id=order_seed.client_order_id,
+                contract_id=order_seed.contract_id,
+                side=order_seed.side,
+                quantity=order_seed.quantity,
+                limit_price=order_seed.limit_price,
+                status=order_seed.status,
+                filled_qty=order_seed.filled_qty,
+                parent_order_id=order_seed.parent_client_order_id,
             )
         self._allowed_contracts = set(self.quotes.keys())
         self._surface_locked = bool(self._allowed_contracts)
+
+    def restore_state(
+        self,
+        *,
+        cash: Decimal,
+        orders: dict[str, ReplayOrder],
+        positions: dict[str, ReplayPosition],
+        fills: list[ReplayFill],
+        submitted_keys: set[str],
+    ) -> None:
+        """Rebuild durable execution state after restart."""
+        self.cash = Decimal(cash)
+        self.orders = dict(orders)
+        self.positions = dict(positions)
+        self.fills = list(fills)
+        self._submitted_keys = set(submitted_keys)
 
     def allow_contract(self, contract_id: str, *, bid: Decimal, ask: Decimal) -> None:
         mid = (bid + ask) / Decimal("2")

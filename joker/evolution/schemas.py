@@ -450,7 +450,7 @@ class ExperimentResult(_Frozen):
     bootstrap_summaries: dict[str, tuple[Decimal, ...]] = Field(default_factory=dict)
     safety_failures: tuple[str, ...] = ()
     data_integrity_failures: tuple[str, ...] = ()
-    cost_gbp: Decimal = Decimal("0")
+    cost_gbp: Decimal | None = None
     latency_ms_total: int = 0
     model_call_counts: dict[str, int] = Field(default_factory=dict)
     missing_episodes: tuple[UUID, ...] = ()

@@ -158,9 +158,6 @@ async def test_orchestrator_runs_required_adversarial_suite(tmp_path) -> None:
         experiment_id=experiment_id,
         champion_version_id=champ,
         challenger_version_id=chall,
-        integrity_findings=(),
-        replay_finished=True,
-        frozen_truth_loaded=True,
     )
     assert passed is True
     assert len(results) == 50  # 25 scenarios × 2 configs
@@ -176,17 +173,34 @@ async def test_missing_adversarial_result_blocks_promotion(tmp_path) -> None:
 @pytest.mark.asyncio
 async def test_failed_required_scenario_blocks_promotion(tmp_path) -> None:
     db = tmp_path / "fail_adv.db"
-    runner = AdversarialSuiteRunner(AdversarialResultStore(str(db)))
+    store = AdversarialResultStore(str(db))
+    runner = AdversarialSuiteRunner(store)
     experiment_id = uuid4()
-    passed, _ = await runner.run_for_experiment(
+    champ = uuid4()
+    chall = uuid4()
+    await runner.run_for_experiment(
         experiment_id=experiment_id,
-        champion_version_id=uuid4(),
-        challenger_version_id=uuid4(),
-        integrity_findings=("invented_contract",),
-        replay_finished=True,
-        frozen_truth_loaded=True,
+        champion_version_id=champ,
+        challenger_version_id=chall,
     )
-    assert passed is False
+    # Inject a failed executed result for a required scenario.
+    from joker.evolution.adversarial_suite import AdversarialScenarioResult
+    from datetime import datetime, timezone
+
+    bad = AdversarialScenarioResult(
+        result_id=uuid4(),
+        experiment_id=experiment_id,
+        scenario_id="adv_03",
+        scenario_version="3.1.0",
+        configuration_version_id=champ,
+        passed=False,
+        executed=True,
+        frozen_truth_loaded=True,
+        replay_finished=True,
+        findings=("invented_contract_accepted",),
+    )
+    await store.upsert(bad)
+    assert await runner.adversarial_passed(experiment_id) is False
 
 
 @pytest.mark.asyncio
@@ -290,15 +304,13 @@ def test_calibration_is_confidence_versus_outcome() -> None:
 
 @pytest.mark.asyncio
 async def test_optional_scenario_failure_is_reported(tmp_path) -> None:
-    # Optional scenarios are not in the required corpus today; ensure suite
-    # reports required failures distinctly from optional absence.
+    # Required suite executes; optional scenarios are absent from the corpus.
     runner = AdversarialSuiteRunner(AdversarialResultStore(str(tmp_path / "opt.db")))
     passed, results = await runner.run_for_experiment(
         experiment_id=uuid4(),
         champion_version_id=uuid4(),
         challenger_version_id=uuid4(),
-        integrity_findings=("unsupported_reasoning_with_profit",),
     )
-    assert passed is False
-    failed = [r for r in results if not r.passed]
-    assert any("unsupported_reasoning_with_profit" in f for r in failed for f in r.findings)
+    assert passed is True
+    assert all(r.executed and r.frozen_truth_loaded for r in results)
+    assert not any(r.scenario_id.startswith("optional_") for r in results)
