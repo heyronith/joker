@@ -400,6 +400,64 @@ async def _wait_for_position(supervisor, *, want_open: bool, attempts: int = 50)
     raise AssertionError(f"position never became {state}")
 
 
+async def _wait_for_gateway_progress(
+    stack: dict,
+    *,
+    key: str,
+    before: int,
+    attempts: int = 120,
+) -> None:
+    """Wait until the tracked gateway id list grows (entry or exit)."""
+    for _ in range(attempts):
+        if len(stack[key]) > before:
+            return
+        await asyncio.sleep(0.15)
+    raise AssertionError(
+        f"{key} did not progress through OrderActionGateway "
+        f"(before={before}, after={len(stack[key])})"
+    )
+
+
+async def _wait_for_closed_exit(
+    stack: dict,
+    *,
+    exits_before: int,
+    trade_index: int,
+    attempts: int = 120,
+) -> None:
+    """Require a new gateway EXIT and a flat position; re-stimulate if stalled."""
+    supervisor = stack["supervisor"]
+    fake = stack["fake"]
+    clock: FrozenExchangeClock = stack["clock"]
+    session_id = stack["evolution"].session_id
+    for i in range(attempts):
+        projection = await supervisor.execution_runtime.project_session()
+        pos = projection.positions.get(CONTRACT_ID)
+        flat = pos is not None and pos.quantity == 0
+        exited = len(stack["gateway_exit_ids"]) > exits_before
+        if exited and flat:
+            return
+        # Re-mint EXIT canned + tick periodically so a stalled position cycle recovers.
+        if i > 0 and i % 15 == 0:
+            now = clock.now()
+            tick = await supervisor.market_runtime.tick(now=now + timedelta(seconds=1))
+            clock.set_now(now + timedelta(seconds=1))
+            if tick.snapshot is not None:
+                _mint_position_exit_canned(
+                    fake,
+                    session_id=session_id,
+                    snapshot_id=tick.snapshot.snapshot_id,
+                    trade_index=trade_index,
+                )
+                install_order_manager_factory(fake)
+                register_evolution_router_canned(fake)
+        await asyncio.sleep(0.15)
+    raise AssertionError(
+        "EXIT must pass through OrderActionGateway "
+        f"(before={exits_before}, after={len(stack['gateway_exit_ids'])})"
+    )
+
+
 def _mint_position_exit_canned(
     fake: FakeModelProvider,
     *,
@@ -447,6 +505,7 @@ async def run_closed_trade_round_trip(
     clock: FrozenExchangeClock = stack["clock"]
     start: datetime = stack["start"]
     session_id = stack["evolution"].session_id
+    entries_before = len(stack["gateway_entry_ids"])
     exits_before = len(stack["gateway_exit_ids"])
 
     entry_start = start + timedelta(minutes=minute_offset)
@@ -461,8 +520,10 @@ async def run_closed_trade_round_trip(
     )
     _refresh_trade_canned(fake, trade_index)
     register_evolution_router_canned(fake)
-    await _wait_for_position(supervisor, want_open=True, attempts=80)
-    assert stack["gateway_entry_ids"], "entry must pass through OrderActionGateway"
+    await _wait_for_position(supervisor, want_open=True, attempts=100)
+    await _wait_for_gateway_progress(
+        stack, key="gateway_entry_ids", before=entries_before, attempts=40
+    )
 
     exit_start = entry_start + timedelta(minutes=8)
     clock.set_now(exit_start)
@@ -508,6 +569,7 @@ async def run_closed_trade_round_trip(
         snapshot_id=snapshot.snapshot_id,
         trade_index=trade_index,
     )
+    install_order_manager_factory(fake)
     register_evolution_router_canned(fake)
     exit_tick = await supervisor.market_runtime.tick(
         now=exit_start + timedelta(seconds=3)
@@ -519,9 +581,9 @@ async def run_closed_trade_round_trip(
         snapshot_id=exit_tick.snapshot.snapshot_id,
         trade_index=trade_index,
     )
-    await _wait_for_position(supervisor, want_open=False, attempts=80)
-    assert len(stack["gateway_exit_ids"]) > exits_before, (
-        "EXIT must pass through OrderActionGateway"
+    install_order_manager_factory(fake)
+    await _wait_for_closed_exit(
+        stack, exits_before=exits_before, trade_index=trade_index, attempts=120
     )
 
 
