@@ -54,6 +54,7 @@ class ShadowRuntime:
     _results: list[ShadowCycleResult] = field(default_factory=list)
     _configs: dict[UUID, CognitiveConfigurationVersion] = field(default_factory=dict)
     _cursors: dict[str, str] = field(default_factory=dict)
+    _cursor_keys: dict[str, tuple] = field(default_factory=dict)
     _seen_snapshots: dict[str, set[str]] = field(default_factory=dict)
     _restored_runtimes: dict[str, Any] = field(default_factory=dict)
 
@@ -104,11 +105,34 @@ class ShadowRuntime:
         snapshot_id: str,
         payload: dict[str, Any],
         coalesce: bool = True,
+        exchange_timestamp: datetime | None = None,
+        event_sequence: int | None = None,
     ) -> bool:
-        cursor = self._cursors.get(str(assignment_id))
+        aid = str(assignment_id)
+        # Authoritative monotonic cursor: (exchange_timestamp, event_sequence, snapshot_id).
+        # Reject older-or-equal ordering keys; never compare UUID strings lexicographically.
+        ts_key = (
+            exchange_timestamp.astimezone(timezone.utc)
+            if exchange_timestamp is not None
+            else None
+        )
+        seq_key = event_sequence if event_sequence is not None else -1
+        ordering_key = (ts_key, seq_key, snapshot_id)
+        prior_key = self._cursor_keys.get(aid)
+        if prior_key is not None:
+            prior_ts, prior_seq, prior_sid = prior_key
+            if ts_key is not None and prior_ts is not None:
+                if ordering_key <= (prior_ts, prior_seq, prior_sid):
+                    return False
+            elif ts_key is None and prior_ts is not None:
+                # Unseen older snapshot without timestamp cannot outrank timed cursor.
+                return False
+            elif snapshot_id == prior_sid:
+                return False
+        cursor = self._cursors.get(aid)
         if cursor is not None and snapshot_id == cursor:
             return False
-        seen = self._seen_snapshots.get(str(assignment_id))
+        seen = self._seen_snapshots.get(aid)
         if seen is not None and snapshot_id in seen:
             return False
         if len(self._queue) >= self.queue_size:
@@ -118,18 +142,26 @@ class ShadowRuntime:
                 item
                 for item in self._queue
                 if not (
-                    item.get("assignment_id") == str(assignment_id)
+                    item.get("assignment_id") == aid
                     and item.get("kind") == "snapshot"
                 )
             )
         self._queue.append(
             {
                 "kind": "snapshot",
-                "assignment_id": str(assignment_id),
+                "assignment_id": aid,
                 "challenger_version_id": str(challenger_version_id),
                 "snapshot_id": snapshot_id,
-                # Payload must not be the source of market truth — snapshot_id only.
                 "payload": {"snapshot_id": snapshot_id},
+                "exchange_timestamp": (
+                    exchange_timestamp.isoformat() if exchange_timestamp else None
+                ),
+                "event_sequence": event_sequence,
+                "ordering_key": (
+                    ts_key.isoformat() if ts_key is not None else None,
+                    seq_key,
+                    snapshot_id,
+                ),
             }
         )
         return True
@@ -168,6 +200,20 @@ class ShadowRuntime:
                 self._seen_snapshots.setdefault(str(assignment.assignment_id), set()).add(
                     restored.last_snapshot_id
                 )
+                cursor_payload = restored.cursor or {}
+                ordering = cursor_payload.get("ordering_key")
+                if ordering is not None:
+                    ts_raw, seq, sid = ordering
+                    ts_parsed = (
+                        datetime.fromisoformat(ts_raw)
+                        if isinstance(ts_raw, str)
+                        else ts_raw
+                    )
+                    self._cursor_keys[str(assignment.assignment_id)] = (
+                        ts_parsed,
+                        seq,
+                        sid,
+                    )
 
     async def _loop(self) -> None:
         while not self._stopped:
@@ -231,9 +277,19 @@ class ShadowRuntime:
                     "submitted_keys": list(
                         ((command.get("projection") or {}).get("orders") or {}).keys()
                     ),
+                    "ordering_key": item.get("ordering_key"),
+                    "exchange_timestamp": item.get("exchange_timestamp"),
+                    "event_sequence": item.get("event_sequence"),
                 },
             )
             self._cursors[str(assignment_id)] = str(item.get("snapshot_id") or "")
+            ordering = item.get("ordering_key")
+            if ordering is not None:
+                ts_raw, seq, sid = ordering
+                ts_parsed = (
+                    datetime.fromisoformat(ts_raw) if isinstance(ts_raw, str) else ts_raw
+                )
+                self._cursor_keys[str(assignment_id)] = (ts_parsed, seq, sid)
             self._seen_snapshots.setdefault(str(assignment_id), set()).add(
                 str(item.get("snapshot_id") or "")
             )

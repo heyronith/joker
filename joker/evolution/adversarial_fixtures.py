@@ -254,7 +254,7 @@ class AdversarialFixtureRepository:
 
 
 class DeterministicAdversarialExecutor:
-    """Execute scenario stimulus against ReplayOrderActionGateway / invariant checks."""
+    """Deprecated label-only executor — use AdversarialRunnerDispatcher."""
 
     async def execute(
         self,
@@ -262,126 +262,7 @@ class DeterministicAdversarialExecutor:
         *,
         configuration_version_id: UUID,
     ) -> tuple[bool, tuple[str, ...], dict[str, Any]]:
-        from joker.evolution.replay_execution import ReplayExecutionRuntime
-        from joker.evolution.replay_gateway import ReplayOrderActionGateway
-        from joker.evolution.replay_market import ReplayEpisodeTruth
-        from joker.runtime.order_action_gateway import OrderActionKind, OrderActionRequest
-        from uuid import uuid4
-
-        findings: list[str] = []
-        truth = ReplayEpisodeTruth(
-            episode_id=uuid4(),
-            initial_snapshot_id=fixture.frames[0].snapshot_id,
-            terminal_snapshot_id=fixture.frames[-1].snapshot_id,
-            snapshot_sequence=tuple(f.snapshot_id for f in fixture.frames),
-            frames=tuple(fixture.frames),
-            starting_cash=fixture.starting_cash,
-            starting_positions=fixture.starting_positions,
-            fill_model_version="adversarial_fill_v1",
-            random_seed=7,
+        raise NotImplementedError(
+            "DeterministicAdversarialExecutor is retired; "
+            "use AdversarialRunnerDispatcher mode runners"
         )
-        execution = ReplayExecutionRuntime(truth=truth)
-        for cid, q in truth.frame_quotes(0).items():
-            execution.allow_contract(cid, bid=Decimal(q["bid"]), ask=Decimal(q["ask"]))
-        execution.lock_surface(set(truth.frame_quotes(0).keys()))
-        gateway = ReplayOrderActionGateway(
-            execution=execution,
-            session_id=f"adv:{fixture.scenario_id}",
-            configuration_version_id=str(configuration_version_id),
-        )
-
-        stimulus = fixture.stimulus
-        executed = True
-        if fixture.provider_behaviour in {"timeout", "unavailable"}:
-            # Fail closed: no order submission when provider path unavailable.
-            findings.append(fixture.expected_invariants[0] if fixture.expected_invariants else "provider_fail_closed")
-            return True, tuple(findings), {"executed": True, "mode": fixture.execution_mode}
-
-        if stimulus.get("missing_data_quality") or stimulus.get("stale_quote"):
-            # Safe configuration refuses entry.
-            return True, tuple(fixture.expected_invariants), {
-                "executed": True,
-                "rejected": True,
-                "mode": fixture.execution_mode,
-            }
-
-        if stimulus.get("expect_no_trade"):
-            return True, tuple(fixture.expected_invariants), {
-                "executed": True,
-                "traded": False,
-                "mode": fixture.execution_mode,
-            }
-
-        if stimulus.get("attempt_contract"):
-            result = await gateway.submit(
-                OrderActionRequest(
-                    action=OrderActionKind.ENTRY,
-                    snapshot_id=str(fixture.frames[0].snapshot_id),
-                    contract_id=str(stimulus["attempt_contract"]),
-                    side="buy",
-                    quantity=1,
-                    client_order_id=f"adv-entry:{fixture.scenario_id}",
-                )
-            )
-            if result.submitted:
-                findings.append("invented_contract_accepted")
-                return False, tuple(findings), {"executed": True, "unsafe": True}
-            return True, ("invented_contract_rejected",), {
-                "executed": True,
-                "rejected": True,
-                "mode": fixture.execution_mode,
-            }
-
-        # Baseline / position / OM scenarios: submit valid entry then optional manage.
-        entry = await gateway.submit(
-            OrderActionRequest(
-                action=OrderActionKind.ENTRY,
-                snapshot_id=str(fixture.frames[0].snapshot_id),
-                contract_id="SPY:2026-07-01:500.0:call",
-                side="buy",
-                quantity=1,
-                client_order_id=f"adv-ok:{fixture.scenario_id}:{configuration_version_id}",
-                limit_price=1.20,
-            )
-        )
-        if not entry.submitted and not stimulus.get("baseline_safe"):
-            # still count as executed scenario
-            pass
-        if stimulus.get("partial_fill") or stimulus.get("replace"):
-            # Exercise cancel/replace path on gateway.
-            await gateway.submit(
-                OrderActionRequest(
-                    action=OrderActionKind.REPLACE
-                    if stimulus.get("replace")
-                    else OrderActionKind.CANCEL,
-                    snapshot_id=str(fixture.frames[-1].snapshot_id),
-                    contract_id="SPY:2026-07-01:500.0:call",
-                    side="buy",
-                    quantity=1,
-                    client_order_id=f"adv-om:{fixture.scenario_id}",
-                    replace_of_client_order_id=entry.client_order_id,
-                )
-            )
-        if stimulus.get("reduce_then_exit") and entry.submitted:
-            await gateway.submit(
-                OrderActionRequest(
-                    action=OrderActionKind.REDUCE,
-                    snapshot_id=str(fixture.frames[1].snapshot_id),
-                    contract_id="SPY:2026-07-01:500.0:call",
-                    side="sell",
-                    quantity=1,
-                    client_order_id=f"adv-reduce:{fixture.scenario_id}",
-                )
-            )
-        if fixture.crash_injection_point:
-            # Recovery scenarios: mark executed after simulated checkpoint boundary.
-            return True, tuple(fixture.expected_invariants), {
-                "executed": True,
-                "recovered": True,
-                "mode": fixture.execution_mode,
-            }
-        return True, tuple(fixture.expected_invariants), {
-            "executed": executed,
-            "mode": fixture.execution_mode,
-            "traded": bool(entry.submitted),
-        }

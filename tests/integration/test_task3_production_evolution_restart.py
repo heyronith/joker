@@ -122,12 +122,18 @@ async def test_production_orchestrator_restart_after_node(
     await wire_replay_canned_for_episodes(runtime2, fake)
     resumed = await runtime2.orchestrator.resume_all()
     assert resumed
+    # Exact expected terminal/progress outcomes — do not accept unresolved running
+    # unless the crash intentionally left the cycle mid-stage after durable progress.
     if attr:
-        assert getattr(resumed[0], attr) is not None or resumed[0].status in {
-            "completed",
-            "blocked",
-            "running",
-        }
+        value = getattr(resumed[0], attr)
+        assert value is not None or resumed[0].status in {"completed", "blocked"}
+        if resumed[0].status == "running":
+            assert value is not None, (
+                f"restart after {node_name} left running without durable {attr}"
+            )
+    assert resumed[0].status in {"completed", "blocked", "running"}
+    if resumed[0].status == "running":
+        assert resumed[0].stage not in {"", "load_or_create_cycle"}
     if resumed[0].dataset_id is not None:
         assert str(resumed[0].dataset_id) == str(
             (record.payload or {}).get("dataset_id") or resumed[0].dataset_id

@@ -200,6 +200,11 @@ class TradingEpisode(_Frozen):
     data_quality_ids: tuple[UUID, ...] = ()
     option_surface_ids: tuple[UUID, ...] = ()
     source_event_ids: tuple[UUID, ...] = ()
+    entry_decision_event_id: UUID | None = None
+    entry_decision_timestamp: datetime | None = None
+    terminal_event_id: UUID | None = None
+    terminal_event_timestamp: datetime | None = None
+    market_event_ids: tuple[UUID, ...] = ()
     cognitive_artifact_ids: tuple[UUID, ...] = ()
     model_call_ids: tuple[UUID, ...] = ()
     prompt_version_ids: tuple[UUID, ...] = ()
@@ -209,9 +214,11 @@ class TradingEpisode(_Frozen):
     created_at: datetime = Field(default_factory=_utc_now)
     idempotency_key: str = ""
 
-    @field_validator("created_at")
+    @field_validator("created_at", "entry_decision_timestamp", "terminal_event_timestamp")
     @classmethod
-    def _tz(cls, value: datetime) -> datetime:
+    def _tz(cls, value: datetime | None) -> datetime | None:
+        if value is None:
+            return None
         return _require_tz(value)
 
     @model_validator(mode="after")
@@ -526,6 +533,39 @@ class ChampionTransition(_Frozen):
     promotion_decision_id: UUID | None = None
     activated_at: datetime = Field(default_factory=_utc_now)
     content_hash: str = ""
+
+
+class ChampionActivationRecord(_Frozen):
+    activation_id: UUID = Field(default_factory=uuid4)
+    promotion_decision_id: UUID
+    experiment_id: UUID
+    challenger_version_id: UUID
+    previous_champion_version_id: UUID
+    registry_applied: bool = False
+    history_verified: bool = False
+    configuration_status_applied: bool = False
+    completed: bool = False
+    created_at: datetime = Field(default_factory=_utc_now)
+    updated_at: datetime = Field(default_factory=_utc_now)
+    failure_codes: tuple[str, ...] = ()
+
+    @field_validator("created_at", "updated_at")
+    @classmethod
+    def _tz(cls, value: datetime) -> datetime:
+        return _require_tz(value)
+
+
+class ReplayFrameCheckpoint(_Frozen):
+    replay_key: str
+    frame_index: int
+    snapshot_id: UUID
+    order_management_completed: bool = False
+    position_graph_completed: bool = False
+    action_submitted: bool = False
+    execution_checkpointed: bool = False
+    position_thread_id: str | None = None
+    order_management_thread_ids: tuple[str, ...] = ()
+    model_call_ids: tuple[UUID, ...] = ()
 
 
 class DriftObservation(_Frozen):

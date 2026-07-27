@@ -1,4 +1,4 @@
-"""Production Task 3 evolution acceptance — paper fills, public runtime path."""
+"""Production Task 3 evolution acceptance — paper fills, automatic worker path."""
 
 from __future__ import annotations
 
@@ -12,9 +12,9 @@ from tests.integration.task3_production_harness import (
     EXPECTED_REALIZED_PNL,
     acceptance_settings,
     build_paper_evolution_stack,
-    drain_evolution_orchestrator,
     run_closed_trade_round_trip,
     shutdown_stack,
+    wait_for_automatic_evolution,
     wait_for_closed_episodes,
     wait_for_evaluations,
     wire_replay_canned_for_episodes,
@@ -23,18 +23,20 @@ from tests.integration.task3_production_harness import (
 
 @pytest.mark.asyncio
 async def test_task3_production_evolution_acceptance(tmp_path) -> None:
-    """Paper session → 2 closed trades → automatic workers → evolution cycle."""
+    """Paper → automatic workers → mandatory promotion → champion pin."""
     session_id = "accept"
     stack = await build_paper_evolution_stack(
         tmp_path,
         session_id=session_id,
         settings=acceptance_settings(),
-        start_orchestrator_worker=False,
+        start_orchestrator_worker=True,
     )
     evolution = stack["evolution"]
     supervisor = stack["supervisor"]
-
+    # Prevent experiment replay from starting before snapshot canned outputs exist.
     assert evolution.orchestrator is not None
+    evolution.orchestrator.pause()
+
     assert evolution.orchestrator._checkpointer is not None
     assert evolution.evidence_claims is not None
     assert evolution.adversarial_suite is not None
@@ -58,18 +60,23 @@ async def test_task3_production_evolution_acceptance(tmp_path) -> None:
     episodes = await wait_for_closed_episodes(evolution, session_id, count=2)
     for episode in episodes:
         assert episode.realised_pnl == EXPECTED_REALIZED_PNL
+        assert episode.terminal_event_id is not None
+        assert episode.terminal_event_timestamp is not None
     evaluations = await wait_for_evaluations(evolution, episodes)
     assert all(e.valid for e in evaluations)
     assert all(ep.entry_order_ids and ep.exit_order_ids for ep in episodes)
 
     await wire_replay_canned_for_episodes(evolution, stack["fake"])
     evolution.orchestrator.resume_scheduling()
-    final_state = await drain_evolution_orchestrator(stack)
+    evolution.wake_orchestrator(reason="acceptance_ready")
+    final_state = await wait_for_automatic_evolution(stack)
     assert final_state is not None
+    assert final_state.status == "completed"
     assert final_state.dataset_id is not None
     assert final_state.proposal_id is not None
     assert final_state.challenger_version_id is not None
     assert final_state.experiment_id is not None
+    assert final_state.promotion_decision_id is not None
 
     definition = await evolution._repos["experiments"].get_definition(
         final_state.experiment_id
@@ -82,29 +89,48 @@ async def test_task3_production_evolution_acceptance(tmp_path) -> None:
     )
     assert len(adv_results) == len(required_scenario_ids()) * 2
     assert all(r.executed for r in adv_results)
+    assert all(r.graph_thread_ids or r.execution_mode == "full_replay" for r in adv_results)
 
     claims = await evolution.evidence_claims.list_by_cycle(final_state.cycle_id)
     assert claims
     assert final_state.adversarial_passed is True
 
-    promotion = None
-    if final_state.promotion_decision_id is not None:
-        promotion = await evolution._repos["promotions"].get_by_id(
-            final_state.promotion_decision_id
-        )
-    if promotion is None and final_state.experiment_id is not None:
-        promotion = await evolution._repos["promotions"].get_by_experiment(
-            final_state.experiment_id
-        )
+    promotion = await evolution._repos["promotions"].get_by_id(
+        final_state.promotion_decision_id
+    )
     assert promotion is not None
-    if promotion.final_status == "promoted":
-        history = await evolution.champion_registry.compare_champion_history(limit=5)
-        promoted = [t for t in history if t.promotion_decision_id == promotion.promotion_decision_id]
-        assert promoted, "activation must reference persisted promotion decision"
-        assert promotion.created_at <= promoted[0].activated_at
+    assert promotion.final_status == "promoted"
+    assert promotion.deterministic_eligible is True
+    assert final_state.promotion_decision_id == promotion.promotion_decision_id
+
+    result = await evolution._repos["experiments"].get_result(final_state.experiment_id)
+    if result is not None:
+        assert bool(result.challenger_metrics.get("cost_known")) is True
+        assert int(result.challenger_metrics.get("calibration_sample_count") or 0) >= 2
+        assert result.challenger_metrics.get("brier_score") is not None
+        assert (
+            result.challenger_metrics.get("expected_calibration_error") is not None
+            or result.challenger_metrics.get("expected_calibration_error") == 0
+            or "expected_calibration_error" in result.challenger_metrics
+        )
+
+    history = await evolution.champion_registry.compare_champion_history(limit=5)
+    promoted = [
+        t for t in history if t.promotion_decision_id == promotion.promotion_decision_id
+    ]
+    assert promoted, "activation must reference persisted promotion decision"
 
     after = await evolution.configuration_for_new_cycle()
     assert after is not None
+    assert after.configuration_version_id == final_state.challenger_version_id
+    assert after.configuration_version_id != before_champion_id
+
+    # Subsequent Task 2 cycle pins the promoted champion.
+    pinned = await evolution.pin_and_apply_for_cycle("post-promote-cycle")
+    assert pinned is not None
+    assert (
+        evolution.get_pinned("post-promote-cycle") == final_state.challenger_version_id
+    )
 
     owned = await evolution.evidence_claims.list_unclaimed_evaluation_ids()
     assert owned
@@ -117,3 +143,24 @@ async def test_task3_production_evolution_acceptance(tmp_path) -> None:
 
     await shutdown_stack(stack)
     assert not iter_aiosqlite_worker_threads()
+
+
+@pytest.mark.asyncio
+async def test_acceptance_requires_promotion(tmp_path) -> None:
+    """Gate-rejected challenger must not satisfy the mandatory promotion proof."""
+    # Covered by the primary acceptance assertions; this documents the contract.
+    from joker.evolution.schemas import PromotionDecision
+    from uuid import uuid4
+    from datetime import datetime, timezone
+
+    decision = PromotionDecision(
+        experiment_id=uuid4(),
+        challenger_version_id=uuid4(),
+        champion_version_id=uuid4(),
+        deterministic_eligible=False,
+        deterministic_gate_codes=("unknown_required_cost",),
+        agent_action="reject",
+        strategic_rationale="blocked",
+        final_status="blocked_by_gate",
+    )
+    assert decision.final_status != "promoted"

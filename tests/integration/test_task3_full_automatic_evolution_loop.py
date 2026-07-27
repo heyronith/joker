@@ -125,7 +125,10 @@ def _settings() -> EvolutionSettings:
 
 
 class _StubReplay:
-    async def replay_episode(self, episode, configuration_version_id, sample):
+    async def replay_episode(self, *args, **kwargs):
+        episode = kwargs.get("episode")
+        if episode is None and args:
+            episode = args[0]
         base = episode.realised_pnl or Decimal("0")
         return {
             "realised_pnl": base + Decimal("1"),
@@ -137,6 +140,7 @@ class _StubReplay:
             "execution_runtime": False,
             "historical_pnl_attributed": False,
             "calibration_pairs": [("0.7", 1)],
+            "experiment_id": str(kwargs.get("experiment_id") or ""),
         }
 
 

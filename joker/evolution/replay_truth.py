@@ -122,8 +122,33 @@ class ReplayTruthLoader:
 
         start_ts = frames[0].timestamp
         end_ts = frames[-1].timestamp
-        entry_ts = start_ts
-        terminal_ts = end_ts if episode.terminal_snapshot_id else None
+        entry_ts = episode.entry_decision_timestamp or start_ts
+        if (
+            episode.entry_decision_event_id is not None
+            and episode.entry_decision_timestamp is None
+        ):
+            raise ReplayTruthLoadError("missing_entry_decision_timestamp")
+        if (
+            episode.terminal_event_id is not None
+            and episode.terminal_event_timestamp is None
+        ):
+            raise ReplayTruthLoadError("missing_terminal_event_timestamp")
+        if (
+            episode.entry_decision_timestamp is not None
+            and episode.terminal_event_timestamp is not None
+            and episode.terminal_event_timestamp < episode.entry_decision_timestamp
+        ):
+            raise ReplayTruthLoadError("terminal_event_predates_entry")
+        # Authoritative terminal event time when present; never invent from last frame
+        # when the episode already recorded a terminal event identity.
+        if episode.terminal_event_timestamp is not None:
+            terminal_ts = episode.terminal_event_timestamp
+        elif episode.terminal_event_id is None:
+            terminal_ts = end_ts if episode.terminal_snapshot_id else None
+        else:
+            terminal_ts = None
+
+        market_ids = episode.market_event_ids or episode.source_event_ids or ()
 
         starting_cash, positions, working = await self._load_starting_ledger(
             episode, as_of=entry_ts
@@ -141,7 +166,7 @@ class ReplayTruthLoader:
                 f.option_surface_id for f in frames if f.option_surface_id is not None
             ),
             data_quality_sequence=tuple(f.data_quality_id for f in frames),
-            market_event_ids=tuple(episode.source_event_ids or ()),
+            market_event_ids=tuple(market_ids),
             start_timestamp=start_ts,
             end_timestamp=end_ts,
             entry_decision_timestamp=entry_ts,

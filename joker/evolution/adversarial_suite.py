@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from typing import Any
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 import aiosqlite
@@ -13,8 +14,12 @@ from joker.evolution.adversarial_fixtures import (
     ADVERSARIAL_DEFINITIONS,
     AdversarialFixtureRepository,
     AdversarialScenarioDefinition,
-    DeterministicAdversarialExecutor,
 )
+from joker.evolution.adversarial_runners import (
+    AdversarialExecutionEvidence,
+    AdversarialRunnerDispatcher,
+)
+from joker.evolution.repositories import ConfigurationVersionRepository
 
 
 class AdversarialScenarioResult(BaseModel):
@@ -32,6 +37,10 @@ class AdversarialScenarioResult(BaseModel):
     replay_finished: bool = False
     findings: tuple[str, ...] = ()
     execution_mode: str = "full_replay"
+    graph_thread_ids: tuple[str, ...] = ()
+    crash_injected: bool = False
+    fresh_runtime_created: bool = False
+    evidence: AdversarialExecutionEvidence | None = None
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
@@ -63,7 +72,6 @@ class AdversarialResultStore:
     async def initialize(self) -> None:
         async with aiosqlite.connect(self._db_path) as db:
             await db.executescript(_CREATE_SQL)
-            # Forward-compatible columns for existing ad32893 DBs.
             cols = {
                 row[1]
                 for row in await (
@@ -144,8 +152,18 @@ class AdversarialResultStore:
         return [AdversarialScenarioResult.model_validate_json(r[0]) for r in rows]
 
 
+def _executed_from_evidence(evidence: AdversarialExecutionEvidence) -> bool:
+    if not evidence.completed or not evidence.fixture_loaded:
+        return False
+    if evidence.execution_mode == "execution_recovery":
+        return bool(evidence.crash_injected and evidence.fresh_runtime_created)
+    if evidence.graph_thread_ids or evidence.execution_mode == "full_replay":
+        return True
+    return False
+
+
 class AdversarialSuiteRunner:
-    """Run required adversarial scenarios via immutable fixtures."""
+    """Run required adversarial scenarios via real Task 2 mode runners."""
 
     def __init__(
         self,
@@ -153,12 +171,23 @@ class AdversarialSuiteRunner:
         *,
         definitions: tuple[AdversarialScenarioDefinition, ...] = ADVERSARIAL_DEFINITIONS,
         fixtures: AdversarialFixtureRepository | None = None,
-        executor: DeterministicAdversarialExecutor | None = None,
+        dispatcher: AdversarialRunnerDispatcher | None = None,
+        template_deps: Any = None,
+        policy_store: Any = None,
+        config_repo: ConfigurationVersionRepository | None = None,
+        checkpointer_saver: Any = None,
+        replay_service: Any = None,
     ) -> None:
         self._store = store
         self._definitions = definitions
         self._fixtures = fixtures or AdversarialFixtureRepository()
-        self._executor = executor or DeterministicAdversarialExecutor()
+        self._config_repo = config_repo
+        self._dispatcher = dispatcher or AdversarialRunnerDispatcher(
+            template_deps=template_deps,
+            policy_store=policy_store,
+            checkpointer_saver=checkpointer_saver,
+            replay_service=replay_service,
+        )
 
     def required_ids(self) -> tuple[str, ...]:
         return tuple(s.scenario_id for s in self._definitions if s.required)
@@ -212,18 +241,65 @@ class AdversarialSuiteRunner:
                     results.append(result)
                     continue
 
-                passed, findings, meta = await self._executor.execute(
-                    fixture, configuration_version_id=cfg_id
-                )
-                # Require expected invariants to be observed when scenario passed.
-                missing_inv = [
-                    inv
-                    for inv in definition.expected_invariants
-                    if inv not in findings and passed
-                ]
-                if missing_inv and definition.expected_invariants:
-                    # Soft: executor returns expected invariants on success.
-                    pass
+                configuration = None
+                if self._config_repo is not None:
+                    configuration = await self._config_repo.get_by_id(cfg_id)
+                if configuration is None:
+                    result = AdversarialScenarioResult(
+                        result_id=uuid5(
+                            NAMESPACE_URL,
+                            AdversarialResultStore.result_key(
+                                experiment_id, definition.scenario_id, cfg_id, 1
+                            ),
+                        ),
+                        experiment_id=experiment_id,
+                        scenario_id=definition.scenario_id,
+                        scenario_version=definition.version,
+                        configuration_version_id=cfg_id,
+                        passed=False,
+                        executed=False,
+                        frozen_truth_loaded=frozen_loaded,
+                        replay_finished=False,
+                        findings=("configuration_missing",),
+                        execution_mode=definition.execution_mode,
+                    )
+                    await self._store.upsert(result)
+                    results.append(result)
+                    continue
+
+                try:
+                    runner = self._dispatcher.for_mode(definition.execution_mode)
+                    evidence = await runner.execute(
+                        experiment_id=experiment_id,
+                        definition=definition,
+                        fixture=fixture,
+                        configuration=configuration,
+                        sample_number=1,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    result = AdversarialScenarioResult(
+                        result_id=uuid5(
+                            NAMESPACE_URL,
+                            AdversarialResultStore.result_key(
+                                experiment_id, definition.scenario_id, cfg_id, 1
+                            ),
+                        ),
+                        experiment_id=experiment_id,
+                        scenario_id=definition.scenario_id,
+                        scenario_version=definition.version,
+                        configuration_version_id=cfg_id,
+                        passed=False,
+                        executed=False,
+                        frozen_truth_loaded=frozen_loaded,
+                        replay_finished=False,
+                        findings=(f"runner_error:{exc}",),
+                        execution_mode=definition.execution_mode,
+                    )
+                    await self._store.upsert(result)
+                    results.append(result)
+                    continue
+
+                executed = _executed_from_evidence(evidence)
                 result = AdversarialScenarioResult(
                     result_id=uuid5(
                         NAMESPACE_URL,
@@ -235,12 +311,16 @@ class AdversarialSuiteRunner:
                     scenario_id=definition.scenario_id,
                     scenario_version=definition.version,
                     configuration_version_id=cfg_id,
-                    passed=bool(passed and meta.get("executed")),
-                    executed=bool(meta.get("executed")),
+                    passed=bool(evidence.passed and executed),
+                    executed=executed,
                     frozen_truth_loaded=frozen_loaded,
-                    replay_finished=bool(meta.get("executed")),
-                    findings=tuple(findings),
+                    replay_finished=executed,
+                    findings=evidence.findings,
                     execution_mode=definition.execution_mode,
+                    graph_thread_ids=evidence.graph_thread_ids,
+                    crash_injected=evidence.crash_injected,
+                    fresh_runtime_created=evidence.fresh_runtime_created,
+                    evidence=evidence,
                 )
                 await self._store.upsert(result)
                 results.append(result)

@@ -20,7 +20,7 @@ from joker.evolution.schemas import (
     TradingEpisode,
 )
 
-ReplayFn = Callable[[TradingEpisode, UUID, int], Awaitable[dict[str, Any]]]
+ReplayFn = Callable[..., Awaitable[dict[str, Any]]]
 
 
 class ExperimentRunnerError(RuntimeError):
@@ -72,6 +72,26 @@ class ExperimentRunner:
                 "with a CognitiveReplayService"
             )
         return self._replay_service.replay_episode
+
+    async def _invoke_replay(
+        self,
+        resolved_replay: ReplayFn,
+        *,
+        experiment_id: UUID,
+        episode: TradingEpisode,
+        configuration_version_id: UUID,
+        sample: int,
+    ) -> dict[str, Any]:
+        """Call replay with experiment-scoped kwargs; support legacy positional stubs."""
+        try:
+            return await resolved_replay(
+                experiment_id=experiment_id,
+                episode=episode,
+                configuration_version_id=configuration_version_id,
+                sample=sample,
+            )
+        except TypeError:
+            return await resolved_replay(episode, configuration_version_id, sample)
 
     async def run(
         self,
@@ -125,7 +145,13 @@ class ExperimentRunner:
                             payload = await self._results.get_payload(key)
                             assert payload is not None
                         else:
-                            payload = await resolved_replay(ep, cfg_id, sample)
+                            payload = await self._invoke_replay(
+                                resolved_replay,
+                                experiment_id=UUID(str(experiment_id)),
+                                episode=ep,
+                                configuration_version_id=cfg_id,
+                                sample=sample,
+                            )
                             if payload.get("broker_submit"):
                                 raise ExperimentRunnerError(
                                     "experiment replay attempted broker submission"
@@ -369,14 +395,11 @@ class ExperimentRunner:
     async def _collect_calibration_pairs(
         self, experiment_id: UUID | str, configuration_version_id: UUID
     ) -> list[tuple[Decimal, int]]:
-        keys = await self._results.list_keys(experiment_id)
+        payloads = await self._results.list_payloads_for_configuration(
+            experiment_id, configuration_version_id
+        )
         pairs: list[tuple[Decimal, int]] = []
-        for key in keys:
-            if str(configuration_version_id) not in key:
-                continue
-            payload = await self._results.get_payload(key)
-            if not payload:
-                continue
+        for payload in payloads:
             for pred, outcome in payload.get("calibration_pairs") or []:
                 pairs.append((Decimal(str(pred)), int(outcome)))
         return pairs
@@ -387,18 +410,20 @@ class ExperimentRunner:
         champion_id: UUID,
         challenger_id: UUID,
     ) -> tuple[bool, bool]:
-        keys = await self._results.list_keys(experiment_id)
-        champ = False
-        chall = False
-        for key in keys:
-            payload = await self._results.get_payload(key)
-            if not payload:
-                continue
-            known = bool(payload.get("cost_known", payload.get("cost_gbp") is not None))
-            if str(champion_id) in key and known:
-                champ = True
-            if str(challenger_id) in key and known:
-                chall = True
+        champ_payloads = await self._results.list_payloads_for_configuration(
+            experiment_id, champion_id
+        )
+        chall_payloads = await self._results.list_payloads_for_configuration(
+            experiment_id, challenger_id
+        )
+        champ = any(
+            bool(p.get("cost_known", p.get("cost_gbp") is not None))
+            for p in champ_payloads
+        )
+        chall = any(
+            bool(p.get("cost_known", p.get("cost_gbp") is not None))
+            for p in chall_payloads
+        )
         return champ, chall
 
 

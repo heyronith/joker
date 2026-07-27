@@ -165,6 +165,26 @@ class EpisodeCompiler:
 
         lifecycle = resolved.position_lifecycle_id
         key = episode_idempotency_key(session_id, lifecycle, event_id)
+        terminal_event_uuid = UUID(event_id) if _is_uuid(event_id) else None
+        entry_event_id = None
+        if resolved.fill_event_ids:
+            entry_event_id = resolved.fill_event_ids[0]
+        market_ids = source_event_ids
+        if not market_ids and terminal_event_uuid is not None:
+            ordered: list[UUID] = []
+            if entry_event_id is not None:
+                ordered.append(entry_event_id)
+            for eid in resolved.fill_event_ids:
+                if eid not in ordered:
+                    ordered.append(eid)
+            for eid in resolved.position_event_ids:
+                if eid not in ordered:
+                    ordered.append(eid)
+            if terminal_event_uuid not in ordered:
+                ordered.append(terminal_event_uuid)
+            market_ids = tuple(ordered)
+        entry_ts = resolved.entry_decision_timestamp or entry_decision_timestamp
+        terminal_ts = resolved.terminal_event_timestamp or terminal_event_timestamp
         episode = TradingEpisode(
             episode_id=uuid4(),
             session_id=session_id,
@@ -192,9 +212,14 @@ class EpisodeCompiler:
             market_regime_tags=market_regime_tags,
             data_quality_ids=data_quality_ids,
             option_surface_ids=option_surface_ids,
-            source_event_ids=source_event_ids or (UUID(event_id),)
-            if _is_uuid(event_id)
-            else source_event_ids,
+            source_event_ids=source_event_ids or (
+                (terminal_event_uuid,) if terminal_event_uuid is not None else ()
+            ),
+            entry_decision_event_id=entry_event_id,
+            entry_decision_timestamp=entry_ts,
+            terminal_event_id=terminal_event_uuid,
+            terminal_event_timestamp=terminal_ts,
+            market_event_ids=market_ids,
             cognitive_artifact_ids=cognitive_artifact_ids,
             model_call_ids=model_call_ids,
             configuration_version_id=resolved.configuration_version_id

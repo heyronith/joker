@@ -28,6 +28,7 @@ class RestoredShadowRuntime:
         submitted_keys: set[str],
         cash: Decimal,
         realised_pnl: Decimal,
+        cursor: dict[str, Any] | None = None,
     ) -> None:
         self.assignment_id = assignment_id
         self.challenger_version_id = challenger_version_id
@@ -36,6 +37,7 @@ class RestoredShadowRuntime:
         self.submitted_keys = submitted_keys
         self.cash = cash
         self.realised_pnl = realised_pnl
+        self.cursor = cursor or {}
 
 
 class ShadowExecutionRestorer:
@@ -151,4 +153,5 @@ class ShadowExecutionRestorer:
             submitted_keys=submitted,
             cash=cash,
             realised_pnl=realised,
+            cursor=cursor if isinstance(cursor, dict) else {},
         )

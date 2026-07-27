@@ -363,6 +363,24 @@ CREATE TABLE IF NOT EXISTS shadow_evidence_summaries (
     payload_json TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS champion_activations (
+    activation_id TEXT PRIMARY KEY NOT NULL,
+    promotion_decision_id TEXT NOT NULL UNIQUE,
+    experiment_id TEXT NOT NULL,
+    challenger_version_id TEXT NOT NULL,
+    previous_champion_version_id TEXT NOT NULL,
+    registry_applied INTEGER NOT NULL DEFAULT 0,
+    history_verified INTEGER NOT NULL DEFAULT 0,
+    configuration_status_applied INTEGER NOT NULL DEFAULT 0,
+    completed INTEGER NOT NULL DEFAULT 0,
+    failure_codes_json TEXT NOT NULL DEFAULT '[]',
+    payload_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_champion_activations_decision
+    ON champion_activations (promotion_decision_id);
 """
 
 

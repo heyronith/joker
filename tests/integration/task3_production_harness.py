@@ -64,10 +64,10 @@ def acceptance_settings() -> EvolutionSettings:
         ),
         experiments=ExperimentSettings(repeated_samples=1, maximum_model_calls=5000),
         promotion=PromotionSettings(
-            require_known_cost=False,
-            minimum_calibration_samples=0,
-            require_brier_score=False,
-            require_expected_calibration_error=False,
+            require_known_cost=True,
+            minimum_calibration_samples=2,
+            require_brier_score=True,
+            require_expected_calibration_error=True,
             minimum_completed_episodes=2,
             minimum_holdout_episodes=1,
             maximum_tail_loss_regression_pct=Decimal("100"),
@@ -623,7 +623,37 @@ async def _wait_shadow_threshold(
         await asyncio.sleep(0.1)
 
 
+async def wait_for_automatic_evolution(
+    stack: dict, *, timeout: float = 180.0, poll_interval: float = 0.25
+):
+    """Wait for the orchestrator worker to reach a terminal cycle without manual advance."""
+    evolution: EvolutionRuntime = stack["evolution"]
+    assert evolution.orchestrator is not None
+    evolution.orchestrator.resume_scheduling()
+    evolution.wake_orchestrator(reason="acceptance_start")
+    deadline = asyncio.get_event_loop().time() + timeout
+    shadow_feeds = 0
+    while asyncio.get_event_loop().time() < deadline:
+        records = await evolution._repos["evolution_cycles"].list_by_session(
+            evolution.session_id
+        )
+        for record in records:
+            state = EvolutionCycleState.from_record(record)
+            if state.stage == "collect_shadow_evidence" and state.status == "running":
+                if shadow_feeds < 8:
+                    await feed_shadow_snapshots_via_market(stack, cycles=3)
+                    await _wait_shadow_threshold(evolution, timeout=20.0)
+                    shadow_feeds += 1
+                    evolution.wake_orchestrator(reason="shadow_progress")
+            if state.status in {"completed", "failed", "blocked"}:
+                return state
+        evolution.wake_orchestrator(reason="acceptance_poll")
+        await asyncio.sleep(poll_interval)
+    raise AssertionError("automatic orchestrator did not reach a terminal cycle")
+
+
 async def drain_evolution_orchestrator(stack: dict, *, max_rounds: int = 30):
+    """Legacy manual drain retained for restart tests; prefer wait_for_automatic_evolution."""
     evolution: EvolutionRuntime = stack["evolution"]
     assert evolution.orchestrator is not None
     evolution.orchestrator.resume_scheduling()
@@ -657,20 +687,11 @@ async def drain_evolution_orchestrator(stack: dict, *, max_rounds: int = 30):
             return state
 
         if state.stage == "collect_shadow_evidence" and state.status == "running":
-            # Keep feeding while the node waits for shadow thresholds.
             continue
 
-    assignments = await evolution._repos["shadow"].list_active()
-    observed = traded = 0
-    if assignments and evolution.shadow_ledger is not None:
-        observed = await evolution.shadow_ledger.count_cycles(assignments[0].assignment_id)
-        traded = await evolution.shadow_ledger.count_traded_cycles(
-            assignments[0].assignment_id
-        )
     raise AssertionError(
         "orchestrator did not reach terminal state "
-        f"(stage={state.stage}, status={state.status}, shadow_cycles={observed}, "
-        f"shadow_traded={traded})"
+        f"(stage={state.stage}, status={state.status})"
     )
 
 

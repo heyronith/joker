@@ -15,16 +15,19 @@ from joker.evolution.champion_registry import ChampionRegistry
 from joker.evolution.idempotency import promotion_idempotency_key
 from joker.evolution.promotion_gate import EligibilityResult, PromotionEligibilityGate
 from joker.evolution.repositories import (
+    ChampionActivationRepository,
     ConfigurationVersionRepository,
     PromotionDecisionRepository,
 )
 from joker.evolution.schemas import (
+    ChampionActivationRecord,
     CognitiveConfigurationVersion,
     ExperimentResult,
     ImprovementProposal,
     PromotionDecision,
 )
 from joker.models.router import ModelRouter
+from datetime import datetime, timezone
 
 
 AgentAction = Literal["promote", "reject", "extend_shadow", "request_more_evidence"]
@@ -180,6 +183,7 @@ class EvolutionDecisionService:
         checkpointer_path: Path | None = None,
         checkpointer_saver: AsyncSqliteSaver | None = None,
         session_id: str = "evolution",
+        activation_repo: ChampionActivationRepository | None = None,
     ) -> None:
         self._promotions = promotion_repo
         self._configs = config_repo
@@ -189,6 +193,7 @@ class EvolutionDecisionService:
         self._checkpointer_path = checkpointer_path
         self._checkpointer_saver = checkpointer_saver
         self._session_id = session_id
+        self._activations = activation_repo
         self._compiled = None
 
     def _graph(self):
@@ -303,7 +308,7 @@ class EvolutionDecisionService:
     async def apply_persisted_decision(
         self, *, promotion_decision_id: UUID
     ) -> PromotionDecision:
-        """Idempotent champion CAS activation for a persisted promote decision."""
+        """Idempotent champion activation with durable reconciliation."""
         decision = await self._promotions.get_by_id(promotion_decision_id)
         if decision is None:
             raise RuntimeError(f"promotion_decision_not_found:{promotion_decision_id}")
@@ -321,20 +326,90 @@ class EvolutionDecisionService:
         champion = await self._configs.get_by_id(decision.champion_version_id)
         if challenger is None or champion is None:
             raise RuntimeError("promotion_configuration_missing")
+
+        now = datetime.now(timezone.utc)
+        activation = None
+        if self._activations is not None:
+            activation = await self._activations.get_by_decision_id(
+                decision.promotion_decision_id
+            )
+            if activation is None:
+                activation = ChampionActivationRecord(
+                    promotion_decision_id=decision.promotion_decision_id,
+                    experiment_id=decision.experiment_id,
+                    challenger_version_id=challenger.configuration_version_id,
+                    previous_champion_version_id=champion.configuration_version_id,
+                    created_at=now,
+                    updated_at=now,
+                )
+                await self._activations.upsert(activation)
+            if activation.completed:
+                # Still reconcile status in case of divergence.
+                challenger_cfg = await self._configs.get_by_id(
+                    challenger.configuration_version_id
+                )
+                if challenger_cfg is not None and challenger_cfg.status != "champion":
+                    await self._configs.mark_status(
+                        challenger.configuration_version_id, "champion"
+                    )
+                    activation = activation.model_copy(
+                        update={
+                            "configuration_status_applied": True,
+                            "updated_at": now,
+                        }
+                    )
+                    await self._activations.upsert(activation)
+                return decision
+
         current = await self._champions.get_current_champion()
-        if (
+        registry_ok = (
             current is not None
             and current.configuration_version_id == challenger.configuration_version_id
-        ):
-            return decision  # already activated
-        await self._champions.promote(
-            challenger=challenger,
-            expected_champion_id=champion.configuration_version_id,
-            reason="agent_promote",
-            experiment_id=decision.experiment_id,
-            promotion_decision_id=decision.promotion_decision_id,
         )
+        if not registry_ok:
+            await self._champions.promote(
+                challenger=challenger,
+                expected_champion_id=champion.configuration_version_id,
+                reason="agent_promote",
+                experiment_id=decision.experiment_id,
+                promotion_decision_id=decision.promotion_decision_id,
+            )
+        registry_ok = True
+
+        history = await self._champions.compare_champion_history(limit=20)
+        history_ok = any(
+            t.new_version_id == challenger.configuration_version_id
+            and t.previous_version_id == champion.configuration_version_id
+            and (
+                t.promotion_decision_id is None
+                or t.promotion_decision_id == decision.promotion_decision_id
+            )
+            for t in history
+        )
+
+        # Always ensure configuration status is champion — never early-return
+        # solely because the registry already points at the challenger.
         await self._configs.mark_status(challenger.configuration_version_id, "champion")
+        previous = await self._configs.get_by_id(champion.configuration_version_id)
+        if previous is not None and previous.status == "champion":
+            await self._configs.mark_status(
+                champion.configuration_version_id, "retired"
+            )
+
+        if self._activations is not None and activation is not None:
+            activation = activation.model_copy(
+                update={
+                    "registry_applied": registry_ok,
+                    "history_verified": history_ok,
+                    "configuration_status_applied": True,
+                    "completed": True,
+                    "updated_at": datetime.now(timezone.utc),
+                    "failure_codes": ()
+                    if history_ok
+                    else ("history_transition_missing",),
+                }
+            )
+            await self._activations.upsert(activation)
         return decision
 
     async def decide_and_apply(

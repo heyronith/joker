@@ -14,6 +14,7 @@ from pydantic import BaseModel
 from joker.evolution.hashing import content_hash, hash_model, stable_json_dumps
 from joker.evolution.migrations import apply_task3_migrations
 from joker.evolution.schemas import (
+    ChampionActivationRecord,
     ChampionTransition,
     CognitiveConfigurationVersion,
     DecisionTraceSummary,
@@ -598,6 +599,64 @@ class RollbackRepository(EvolutionRepository):
         return [RollbackRecord.model_validate_json(r["payload_json"]) for r in rows]
 
 
+class ChampionActivationRepository(EvolutionRepository):
+    async def upsert(self, record: ChampionActivationRecord) -> ChampionActivationRecord:
+        await self._ensure()
+        now = record.updated_at.isoformat()
+        async with aiosqlite.connect(self._db_path) as db:
+            await db.execute(
+                """
+                INSERT INTO champion_activations (
+                    activation_id, promotion_decision_id, experiment_id,
+                    challenger_version_id, previous_champion_version_id,
+                    registry_applied, history_verified, configuration_status_applied,
+                    completed, failure_codes_json, payload_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(promotion_decision_id) DO UPDATE SET
+                    registry_applied=excluded.registry_applied,
+                    history_verified=excluded.history_verified,
+                    configuration_status_applied=excluded.configuration_status_applied,
+                    completed=excluded.completed,
+                    failure_codes_json=excluded.failure_codes_json,
+                    payload_json=excluded.payload_json,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    str(record.activation_id),
+                    str(record.promotion_decision_id),
+                    str(record.experiment_id),
+                    str(record.challenger_version_id),
+                    str(record.previous_champion_version_id),
+                    1 if record.registry_applied else 0,
+                    1 if record.history_verified else 0,
+                    1 if record.configuration_status_applied else 0,
+                    1 if record.completed else 0,
+                    json.dumps(list(record.failure_codes)),
+                    record.model_dump_json(),
+                    record.created_at.isoformat(),
+                    now,
+                ),
+            )
+            await db.commit()
+        return record
+
+    async def get_by_decision_id(
+        self, promotion_decision_id: UUID | str
+    ) -> ChampionActivationRecord | None:
+        row = await self._fetchone(
+            """
+            SELECT payload_json FROM champion_activations
+            WHERE promotion_decision_id = ?
+            """,
+            (str(promotion_decision_id),),
+        )
+        return (
+            ChampionActivationRecord.model_validate_json(row["payload_json"])
+            if row
+            else None
+        )
+
+
 class ShadowAssignmentRepository(EvolutionRepository):
     async def append(self, assignment: ShadowAssignment) -> bool:
         return await self._insert_ignore(
@@ -754,6 +813,30 @@ class EvolutionCycleRepository(EvolutionRepository):
             )
         return out
 
+    async def list_by_session(self, session_id: str) -> list[EvolutionCycleRecord]:
+        rows = await self._fetchall(
+            """
+            SELECT cycle_id, session_id, status, stage, payload_json, updated_at
+            FROM evolution_cycles
+            WHERE session_id = ?
+            ORDER BY updated_at
+            """,
+            (session_id,),
+        )
+        out: list[EvolutionCycleRecord] = []
+        for row in rows:
+            out.append(
+                EvolutionCycleRecord(
+                    cycle_id=row["cycle_id"],
+                    session_id=row["session_id"],
+                    status=row["status"],
+                    stage=row["stage"],
+                    payload=json.loads(row["payload_json"] or "{}"),
+                    updated_at=row["updated_at"],
+                )
+            )
+        return out
+
     async def get(self, session_id: str, cycle_id: str) -> EvolutionCycleRecord | None:
         rows = await self._fetchall(
             """
@@ -789,6 +872,7 @@ def build_evolution_repositories(db_path: str | Path) -> dict[str, EvolutionRepo
         "proposals": ImprovementProposalRepository(path),
         "experiments": ExperimentRepository(path),
         "promotions": PromotionDecisionRepository(path),
+        "activations": ChampionActivationRepository(path),
         "drift": DriftRepository(path),
         "rollbacks": RollbackRepository(path),
         "shadow": ShadowAssignmentRepository(path),

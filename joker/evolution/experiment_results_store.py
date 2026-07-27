@@ -109,3 +109,21 @@ class ExperimentEpisodeResultStore:
             )
             row = await cur.fetchone()
         return json.loads(row[0]) if row else None
+
+    async def list_payloads_for_configuration(
+        self,
+        experiment_id: UUID | str,
+        configuration_version_id: UUID | str,
+    ) -> list[dict[str, Any]]:
+        """Return payloads for one configuration — keys are content hashes, not IDs."""
+        await self.initialize()
+        async with aiosqlite.connect(self._db_path) as db:
+            cur = await db.execute(
+                """
+                SELECT payload_json FROM experiment_episode_results
+                WHERE experiment_id = ? AND configuration_version_id = ?
+                """,
+                (str(experiment_id), str(configuration_version_id)),
+            )
+            rows = await cur.fetchall()
+        return [json.loads(r[0]) for r in rows]

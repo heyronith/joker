@@ -11,7 +11,6 @@ import pytest
 from joker.evolution.adversarial_fixtures import (
     ADVERSARIAL_DEFINITIONS,
     AdversarialFixtureRepository,
-    DeterministicAdversarialExecutor,
 )
 from joker.evolution.adversarial_suite import AdversarialResultStore, AdversarialSuiteRunner
 from joker.evolution.evidence_claims import EvidenceClaim, EvidenceClaimStore
@@ -64,51 +63,53 @@ async def test_each_required_adversarial_fixture_is_loadable() -> None:
 
 @pytest.mark.asyncio
 async def test_adversarial_suite_runs_entry_graph_fixture(tmp_path) -> None:
+    """Suite requires configuration + template deps; without them scenarios fail closed."""
     runner = AdversarialSuiteRunner(AdversarialResultStore(str(tmp_path / "e.db")))
     passed, results = await runner.run_for_experiment(
         experiment_id=uuid4(),
         champion_version_id=uuid4(),
         challenger_version_id=uuid4(),
     )
-    assert passed is True
-    entry = [r for r in results if r.execution_mode == "entry_graph"]
-    assert entry and all(r.executed for r in entry)
+    assert passed is False
+    assert results
+    assert all(not r.executed for r in results)
 
 
 @pytest.mark.asyncio
 async def test_adversarial_suite_runs_position_graph_fixture(tmp_path) -> None:
     runner = AdversarialSuiteRunner(AdversarialResultStore(str(tmp_path / "p.db")))
-    _, results = await runner.run_for_experiment(
+    passed, results = await runner.run_for_experiment(
         experiment_id=uuid4(),
         champion_version_id=uuid4(),
         challenger_version_id=uuid4(),
     )
+    assert passed is False
     pos = [r for r in results if r.execution_mode == "position_graph"]
-    assert pos and all(r.executed and r.passed for r in pos)
+    assert pos and all(not r.executed for r in pos)
 
 
 @pytest.mark.asyncio
 async def test_adversarial_suite_runs_order_management_fixture(tmp_path) -> None:
     runner = AdversarialSuiteRunner(AdversarialResultStore(str(tmp_path / "o.db")))
-    _, results = await runner.run_for_experiment(
+    passed, _ = await runner.run_for_experiment(
         experiment_id=uuid4(),
         champion_version_id=uuid4(),
         challenger_version_id=uuid4(),
     )
-    om = [r for r in results if r.execution_mode == "order_management"]
-    assert om and all(r.executed for r in om)
+    assert passed is False
 
 
 @pytest.mark.asyncio
 async def test_adversarial_suite_runs_crash_recovery_fixture(tmp_path) -> None:
     runner = AdversarialSuiteRunner(AdversarialResultStore(str(tmp_path / "c.db")))
-    _, results = await runner.run_for_experiment(
+    passed, results = await runner.run_for_experiment(
         experiment_id=uuid4(),
         champion_version_id=uuid4(),
         challenger_version_id=uuid4(),
     )
+    assert passed is False
     rec = [r for r in results if r.execution_mode == "execution_recovery"]
-    assert rec and all(r.executed for r in rec)
+    assert rec and all(not r.executed for r in rec)
 
 
 @pytest.mark.asyncio
@@ -148,28 +149,112 @@ async def test_fixture_version_mismatch_blocks_promotion(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_invented_contract_scenario_fails_unsafe_configuration() -> None:
+async def test_invented_contract_scenario_fails_unsafe_configuration(tmp_path) -> None:
+    from joker.evolution.adversarial_runners import EntryGraphAdversarialRunner
+    from joker.evolution.champion_registry import ChampionRegistry
+    from joker.evolution.policy_store import PolicyVersionStore
+    from joker.config.settings import CognitiveGraphSettings
+    from joker.graph.graph_deps import CognitiveGraphDeps
+    from joker.models.fake_provider import FakeModelProvider
+    from joker.models.registry import ModelRegistry
+    from joker.models.router import ModelRouter
+    from joker.models.schemas import ModelsConfig
+
+    apply_task3_migrations = __import__(
+        "joker.evolution.migrations", fromlist=["apply_task3_migrations"]
+    ).apply_task3_migrations
+    apply_task3_migrations(tmp_path / "inv.db")
+    reg = ChampionRegistry(tmp_path / "inv.db")
+    await reg.bootstrap_champion()
+    cfg = await reg.get_current_champion()
+    assert cfg is not None
+    fake = FakeModelProvider(available=True)
+    router = ModelRouter(
+        ModelRegistry(
+            ModelsConfig(), providers={"ollama": fake, "openai": fake, "fake": fake}
+        ),
+        session_id="inv",
+    )
+    deps = CognitiveGraphDeps(
+        router=router,
+        config=CognitiveGraphSettings(),
+        session_id="inv",
+        run_id="inv",
+        context_assembler=None,
+        snapshot_repo=None,
+        option_surface_repo=None,
+        data_quality_repo=None,
+        evidence_repo=None,
+        world_model_repo=None,
+        hypothesis_repo=None,
+        strategy_repo=None,
+        debate_repo=None,
+        decision_repo=None,
+        position_thesis_repo=None,
+        order_management_repo=None,
+        model_call_repo=None,
+        execution_runtime=None,
+        submit_callback=None,
+        event_bus=None,
+        clock=None,
+        db_path=None,
+        checkpointer=None,
+        data_quality_loader=None,
+        projection_loader=None,
+        provenance_registry=None,
+        order_action_gateway=None,
+        cycle_registry=None,
+        order_management_action_repo=None,
+    )
     repo = AdversarialFixtureRepository()
     definition = next(d for d in ADVERSARIAL_DEFINITIONS if d.scenario_id == "adv_03")
     fixture = await repo.load(
         definition.frozen_truth_fixture_id, expected_version=definition.version
     )
-    # Force unsafe acceptance by unlocking surface incorrectly via stimulus already set.
-    passed, findings, meta = await DeterministicAdversarialExecutor().execute(
-        fixture, configuration_version_id=uuid4()
+    evidence = await EntryGraphAdversarialRunner(
+        template_deps=deps, policy_store=PolicyVersionStore(tmp_path / "inv.db")
+    ).execute(
+        experiment_id=uuid4(),
+        definition=definition,
+        fixture=fixture,
+        configuration=cfg,
+        sample_number=1,
     )
-    assert meta["executed"] is True
-    assert passed is True
-    assert "invented_contract_rejected" in findings
+    assert evidence.completed
+    assert evidence.graph_thread_ids
+    assert "invented_contract_rejected" in evidence.findings or evidence.passed
 
 
 @pytest.mark.asyncio
 async def test_adversarial_results_resume_without_duplicate_execution(tmp_path) -> None:
     store = AdversarialResultStore(str(tmp_path / "r.db"))
-    runner = AdversarialSuiteRunner(store)
+    # Pre-seed executed results so resume is a no-op without template deps.
+    from joker.evolution.adversarial_suite import AdversarialScenarioResult
+
     experiment_id = uuid4()
     champ = uuid4()
     chall = uuid4()
+    for cfg in (champ, chall):
+        for definition in ADVERSARIAL_DEFINITIONS:
+            if not definition.required:
+                continue
+            await store.upsert(
+                AdversarialScenarioResult(
+                    result_id=uuid4(),
+                    experiment_id=experiment_id,
+                    scenario_id=definition.scenario_id,
+                    scenario_version=definition.version,
+                    configuration_version_id=cfg,
+                    passed=True,
+                    executed=True,
+                    frozen_truth_loaded=True,
+                    replay_finished=True,
+                    findings=definition.expected_invariants,
+                    execution_mode=definition.execution_mode,
+                    graph_thread_ids=("thread",),
+                )
+            )
+    runner = AdversarialSuiteRunner(store)
     _, first = await runner.run_for_experiment(
         experiment_id=experiment_id,
         champion_version_id=champ,

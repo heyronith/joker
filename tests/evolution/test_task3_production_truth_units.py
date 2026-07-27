@@ -150,18 +150,148 @@ async def test_concurrent_orchestrators_cannot_claim_same_evaluation(tmp_path) -
 async def test_orchestrator_runs_required_adversarial_suite(tmp_path) -> None:
     db = tmp_path / "adv.db"
     apply_task3_migrations(db)
-    runner = AdversarialSuiteRunner(AdversarialResultStore(str(db)))
+    from joker.evolution.adversarial_runners import AdversarialExecutionEvidence
+    from joker.evolution.adversarial_suite import AdversarialRunnerDispatcher
+
+    class _PassDispatcher:
+        def for_mode(self, mode: str):
+            class _R:
+                async def execute(self, **kwargs):
+                    definition = kwargs["definition"]
+                    configuration = kwargs["configuration"]
+                    return AdversarialExecutionEvidence(
+                        experiment_id=kwargs["experiment_id"],
+                        scenario_id=definition.scenario_id,
+                        scenario_version=definition.version,
+                        configuration_version_id=configuration.configuration_version_id,
+                        sample_number=kwargs["sample_number"],
+                        execution_mode=definition.execution_mode,
+                        fixture_loaded=True,
+                        graph_kind=definition.execution_mode,
+                        graph_thread_ids=(f"thread:{definition.scenario_id}",),
+                        crash_injected=definition.execution_mode == "execution_recovery",
+                        fresh_runtime_created=definition.execution_mode
+                        == "execution_recovery",
+                        checkpoint_resumed=definition.execution_mode
+                        == "execution_recovery",
+                        invariants_evaluated=definition.expected_invariants,
+                        findings=definition.expected_invariants,
+                        passed=True,
+                        completed=True,
+                    )
+
+            return _R()
+
+    # Seed configurations so suite can resolve champion/challenger.
+    from joker.evolution.champion_registry import ChampionRegistry
+
+    registry = ChampionRegistry(db)
+    champ = await registry.bootstrap_champion()
+    from joker.evolution.improvement import ImprovementProposalService
+    from joker.evolution.schemas import PromptPatch
+    from joker.evolution.repositories import build_evolution_repositories
+
+    repos = build_evolution_repositories(db)
+    for r in repos.values():
+        await r.initialize()
+    improvement = ImprovementProposalService(
+        repos["proposals"], repos["configurations"], registry.policy_store
+    )
+    _, chall = await improvement.propose(
+        parent_champion=champ,
+        weakness="w",
+        hypothesis="h",
+        patch=PromptPatch(
+            role="falsifier",
+            parent_prompt_version_id=uuid4(),
+            replacement_template="t",
+            change_rationale="r",
+        ),
+    )
+    runner = AdversarialSuiteRunner(
+        AdversarialResultStore(str(db)),
+        dispatcher=_PassDispatcher(),
+        config_repo=repos["configurations"],
+    )
     experiment_id = uuid4()
-    champ = uuid4()
-    chall = uuid4()
     passed, results = await runner.run_for_experiment(
         experiment_id=experiment_id,
-        champion_version_id=champ,
-        challenger_version_id=chall,
+        champion_version_id=champ.configuration_version_id,
+        challenger_version_id=chall.configuration_version_id,
     )
     assert passed is True
     assert len(results) == 50  # 25 scenarios × 2 configs
     assert await runner.adversarial_passed(experiment_id) is True
+
+
+@pytest.mark.asyncio
+async def test_optional_scenario_failure_is_reported(tmp_path) -> None:
+    # Required suite executes via mode runners; optional scenarios are absent.
+    db = tmp_path / "opt.db"
+    apply_task3_migrations(db)
+    from joker.evolution.adversarial_runners import AdversarialExecutionEvidence
+    from joker.evolution.champion_registry import ChampionRegistry
+    from joker.evolution.improvement import ImprovementProposalService
+    from joker.evolution.repositories import build_evolution_repositories
+    from joker.evolution.schemas import PromptPatch
+
+    class _PassDispatcher:
+        def for_mode(self, mode: str):
+            class _R:
+                async def execute(self, **kwargs):
+                    definition = kwargs["definition"]
+                    configuration = kwargs["configuration"]
+                    return AdversarialExecutionEvidence(
+                        experiment_id=kwargs["experiment_id"],
+                        scenario_id=definition.scenario_id,
+                        scenario_version=definition.version,
+                        configuration_version_id=configuration.configuration_version_id,
+                        sample_number=1,
+                        execution_mode=definition.execution_mode,
+                        fixture_loaded=True,
+                        graph_kind=definition.execution_mode,
+                        graph_thread_ids=("t",),
+                        crash_injected=definition.execution_mode == "execution_recovery",
+                        fresh_runtime_created=definition.execution_mode
+                        == "execution_recovery",
+                        findings=definition.expected_invariants,
+                        passed=True,
+                        completed=True,
+                    )
+
+            return _R()
+
+    registry = ChampionRegistry(db)
+    champ = await registry.bootstrap_champion()
+    repos = build_evolution_repositories(db)
+    for r in repos.values():
+        await r.initialize()
+    _, chall = await ImprovementProposalService(
+        repos["proposals"], repos["configurations"], registry.policy_store
+    ).propose(
+        parent_champion=champ,
+        weakness="w",
+        hypothesis="h",
+        patch=PromptPatch(
+            role="falsifier",
+            parent_prompt_version_id=uuid4(),
+            replacement_template="t",
+            change_rationale="r",
+        ),
+    )
+    runner = AdversarialSuiteRunner(
+        AdversarialResultStore(str(db)),
+        dispatcher=_PassDispatcher(),
+        config_repo=repos["configurations"],
+    )
+    passed, results = await runner.run_for_experiment(
+        experiment_id=uuid4(),
+        champion_version_id=champ.configuration_version_id,
+        challenger_version_id=chall.configuration_version_id,
+    )
+    assert passed is True
+    assert all(r.executed and r.frozen_truth_loaded for r in results)
+    assert not any(r.scenario_id.startswith("optional_") for r in results)
 
 
 @pytest.mark.asyncio
@@ -300,17 +430,3 @@ def test_calibration_is_confidence_versus_outcome() -> None:
     ece = expected_calibration_error(pairs)
     assert brier is not None and brier > 0
     assert ece is not None
-
-
-@pytest.mark.asyncio
-async def test_optional_scenario_failure_is_reported(tmp_path) -> None:
-    # Required suite executes; optional scenarios are absent from the corpus.
-    runner = AdversarialSuiteRunner(AdversarialResultStore(str(tmp_path / "opt.db")))
-    passed, results = await runner.run_for_experiment(
-        experiment_id=uuid4(),
-        champion_version_id=uuid4(),
-        challenger_version_id=uuid4(),
-    )
-    assert passed is True
-    assert all(r.executed and r.frozen_truth_loaded for r in results)
-    assert not any(r.scenario_id.startswith("optional_") for r in results)

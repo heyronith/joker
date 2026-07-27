@@ -32,6 +32,7 @@ from joker.evolution.improvement import ImprovementProposalService
 from joker.evolution.improvement_graph import ImprovementGraphRunner
 from joker.evolution.lifecycle import PositionLifecycleResolver
 from joker.evolution.orchestrator import EvolutionOrchestrator
+from joker.evolution.promotion_gate import PromotionEligibilityGate
 from joker.evolution.replay import CognitiveReplayService
 from joker.evolution.repositories import build_evolution_repositories
 from joker.evolution.schemas import CognitiveConfigurationVersion
@@ -101,6 +102,7 @@ class EvolutionRuntime:
     _latest_snapshot_id: UUID | None = None
     last_error: str | None = None
     _unsubscribe: list[Callable[[], None]] = field(default_factory=list)
+    _orchestrator_wake: asyncio.Event | None = None
 
     async def prepare(self) -> None:
         """Open stores, champion registry, and durable Task 3 checkpointers."""
@@ -185,6 +187,7 @@ class EvolutionRuntime:
             db_path=self.db_path,
             repeated_samples=self.settings.experiments.repeated_samples,
             replay_service=self.replay,
+            gate=PromotionEligibilityGate(self.settings.promotion),
         )
         self.decisions = EvolutionDecisionService(
             self._repos["promotions"],
@@ -193,6 +196,8 @@ class EvolutionRuntime:
             router=self.model_router,
             checkpointer_saver=savers.decision,
             session_id=self.session_id or "evolution",
+            activation_repo=self._repos.get("activations"),
+            gate=PromotionEligibilityGate(self.settings.promotion),
         )
         challenger_runner = None
         if self.replay is not None:
@@ -202,7 +207,12 @@ class EvolutionRuntime:
         self.evidence_claims = EvidenceClaimStore(self.db_path)
         await self.evidence_claims.initialize()
         self.adversarial_suite = AdversarialSuiteRunner(
-            AdversarialResultStore(str(self.db_path))
+            AdversarialResultStore(str(self.db_path)),
+            template_deps=self.cognitive_graph_deps,
+            policy_store=self.champion_registry.policy_store,
+            config_repo=self._repos["configurations"],
+            checkpointer_saver=savers.replay,
+            replay_service=self.replay,
         )
         self.shadow = ShadowRuntime(
             self._repos["shadow"],
@@ -227,6 +237,7 @@ class EvolutionRuntime:
         )
         self._episode_queue = asyncio.Queue(maxsize=256)
         self._eval_queue = asyncio.Queue(maxsize=256)
+        self._orchestrator_wake = asyncio.Event()
         self._prepared = True
         self._started = True  # compatibility alias for prepare-complete
 
@@ -466,7 +477,10 @@ class EvolutionRuntime:
                     snapshot_id=snapshot_id,
                     payload={"source_event": str(event.event_id)},
                     coalesce=self.settings.shadow.snapshot_coalescing,
+                    exchange_timestamp=event.exchange_timestamp,
+                    event_sequence=getattr(event, "sequence", None),
                 )
+                self.wake_orchestrator(reason="shadow_snapshot_enqueued")
 
     def _trading_date_from_job(self, job: dict[str, Any]) -> date | None:
         ts = job.get("exchange_timestamp")
@@ -484,6 +498,7 @@ class EvolutionRuntime:
                 episode = await self._compile_job(job)
                 if episode is not None:
                     await self._eval_queue.put(episode.episode_id)
+                    self.wake_orchestrator(reason="episode_compiled")
             except Exception as exc:  # noqa: BLE001
                 self.last_error = str(exc)
                 logger.exception("evolution_episode_worker_failed")
@@ -541,6 +556,9 @@ class EvolutionRuntime:
                 initial_snapshot_id=entry_snap,
                 terminal_snapshot_id=terminal_snap,
                 entry_cycle_id=cycle_id or None,
+                terminal_event_timestamp=job.get("exchange_timestamp")
+                or payload.get("exchange_timestamp"),
+                entry_decision_timestamp=payload.get("entry_decision_timestamp"),
             )
         if kind in {"entry_rejected", "entry_cancelled"}:
             return await self.episode_compiler.compile_from_order_rejected_or_cancelled(
@@ -582,25 +600,64 @@ class EvolutionRuntime:
                 episode = await self._repos["episodes"].get_by_id(episode_id)
                 if episode is not None:
                     await self.evaluation_runner.evaluate(episode)
+                    self.wake_orchestrator(reason="evaluation_persisted")
             except Exception as exc:  # noqa: BLE001
                 self.last_error = str(exc)
                 logger.exception("evolution_evaluation_worker_failed")
             finally:
                 self._eval_queue.task_done()
 
+    def wake_orchestrator(self, *, reason: str = "progress") -> None:
+        """Event-driven wake for the orchestrator worker (non-blocking)."""
+        if self._orchestrator_wake is not None:
+            self._orchestrator_wake.set()
+            logger.debug("evolution_orchestrator_wake reason=%s", reason)
+
+    async def wait_for_evolution_cycle_terminal(
+        self,
+        *,
+        session_id: str | None = None,
+        timeout: float = 120.0,
+        poll_interval: float = 0.25,
+    ) -> Any:
+        """Poll persisted cycle status until a terminal outcome or timeout."""
+        from joker.evolution.orchestrator import EvolutionCycleState
+
+        sid = session_id or self.session_id
+        deadline = asyncio.get_event_loop().time() + timeout
+        terminal = {"completed", "failed", "blocked"}
+        while asyncio.get_event_loop().time() < deadline:
+            records = await self._repos["evolution_cycles"].list_by_session(sid)
+            for record in records:
+                if record.status in terminal:
+                    return EvolutionCycleState.from_record(record)
+            await asyncio.sleep(poll_interval)
+        raise TimeoutError("wait_for_evolution_cycle_terminal timed out")
+
     async def _orchestrator_worker(self) -> None:
         assert self.orchestrator is not None
-        interval = max(1, int(self.settings.orchestrator.automatic_cycle_interval_minutes) * 60)
-        # Fast tick in tests when interval is very small via monkeypatched settings.
+        # Bounded recovery interval (seconds). Primary trigger is _orchestrator_wake.
+        recovery = max(
+            1, int(self.settings.orchestrator.automatic_cycle_interval_minutes) * 60
+        )
         if self.settings.orchestrator.automatic_cycle_interval_minutes <= 0:
-            interval = 1
+            recovery = 2
+        assert self._orchestrator_wake is not None
+        # Kick once on startup for resumable cycles.
+        self._orchestrator_wake.set()
         while True:
             try:
+                try:
+                    await asyncio.wait_for(
+                        self._orchestrator_wake.wait(), timeout=recovery
+                    )
+                except asyncio.TimeoutError:
+                    pass
+                self._orchestrator_wake.clear()
                 await self.orchestrator.tick()
             except Exception as exc:  # noqa: BLE001
                 self.last_error = str(exc)
                 logger.exception("evolution_orchestrator_tick_failed")
-            await asyncio.sleep(interval)
 
 
 async def build_status_report(runtime: EvolutionRuntime) -> dict[str, Any]:
