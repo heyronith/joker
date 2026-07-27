@@ -806,22 +806,9 @@ async def drain_evolution_orchestrator(stack: dict, *, max_rounds: int = 30):
 
 async def _wait_for_no_aiosqlite_workers(timeout_seconds: float = 5.0) -> None:
     """Drain/join until no aiosqlite workers remain, or fail with their names."""
-    from joker.persistence.aiosqlite_lifecycle import (
-        drain_aiosqlite_workers,
-        iter_aiosqlite_worker_threads,
-        join_aiosqlite_workers,
-    )
+    from joker.persistence.aiosqlite_lifecycle import wait_for_no_aiosqlite_workers
 
-    deadline = asyncio.get_running_loop().time() + timeout_seconds
-    while True:
-        await drain_aiosqlite_workers(timeout=0.25)
-        join_aiosqlite_workers(timeout=0.25)
-        if not iter_aiosqlite_worker_threads():
-            return
-        if asyncio.get_running_loop().time() >= deadline:
-            names = [t.name for t in iter_aiosqlite_worker_threads()]
-            raise AssertionError(f"aiosqlite workers still alive: {names}")
-        await asyncio.sleep(0.02)
+    await wait_for_no_aiosqlite_workers(timeout_seconds=timeout_seconds)
 
 
 async def shutdown_stack(stack: dict, *, strict_workers: bool = True) -> None:

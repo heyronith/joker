@@ -74,6 +74,20 @@ async def drain_aiosqlite_workers(*, timeout: float = _JOIN_TIMEOUT_SECONDS) -> 
     await asyncio.sleep(0)
 
 
+async def wait_for_no_aiosqlite_workers(*, timeout_seconds: float = 5.0) -> None:
+    """Drain/join until no aiosqlite workers remain, or raise with their names."""
+    deadline = asyncio.get_running_loop().time() + timeout_seconds
+    while True:
+        await drain_aiosqlite_workers(timeout=0.25)
+        join_aiosqlite_workers(timeout=0.25)
+        if not iter_aiosqlite_worker_threads():
+            return
+        if asyncio.get_running_loop().time() >= deadline:
+            names = [t.name for t in iter_aiosqlite_worker_threads()]
+            raise AssertionError(f"aiosqlite workers still alive: {names}")
+        await asyncio.sleep(0.02)
+
+
 async def close_aiosqlite_connection(
     conn: aiosqlite.Connection | None,
     *,

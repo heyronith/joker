@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from joker.data.synthetic_replay import write_synthetic_replay
+from joker.persistence.aiosqlite_lifecycle import join_aiosqlite_workers
 
 
 @pytest.fixture
@@ -25,3 +26,10 @@ def _default_test_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("OPENAI_API_KEY", "sk-test-key-for-unit-tests-only")
     monkeypatch.setenv("OPENAI_MODEL", "gpt-5.4-mini")
     monkeypatch.setenv("JOKER_CONFIG", "config/paper.yaml")
+
+
+@pytest.fixture(autouse=True)
+def _join_aiosqlite_workers_between_tests() -> None:
+    """Join exiting aiosqlite workers between tests (sync-safe teardown)."""
+    yield
+    join_aiosqlite_workers(timeout=2.0)

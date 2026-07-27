@@ -46,6 +46,10 @@ packages = ["joker"]
 testpaths = ["tests"]
 pythonpath = ["."]
 asyncio_mode = "auto"
+# Keep one event loop for the whole session so short-lived aiosqlite workers are
+# not racing pytest-asyncio function-scoped loop.close() (CPython 3.11/3.12 CI).
+asyncio_default_fixture_loop_scope = "session"
+asyncio_default_test_loop_scope = "session"
 filterwarnings = [
     "ignore::DeprecationWarning",
     # aiosqlite worker must not outlive the owning loop (CPython 3.12 CI gate).
