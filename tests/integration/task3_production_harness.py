@@ -8,6 +8,8 @@ from decimal import Decimal
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
+from dataclasses import dataclass
+
 from joker.broker.interface import PaperBroker
 from joker.cognition.schemas import (
     OrderManagementDecision,
@@ -130,28 +132,78 @@ def make_order_manager_decision(request: ModelRequest) -> OrderManagementDecisio
     )
 
 
+@dataclass
+class PaperPathCannedState:
+    """Mutable HOLD/EXIT switch for per-invocation position factories."""
+
+    position_action: PositionAction = PositionAction.HOLD
+    contract_id: str = CONTRACT_ID
+    session_id: str = "placeholder"
+
+
+def _position_thesis_from_state(
+    state: PaperPathCannedState, request: ModelRequest
+) -> PositionThesisVersion:
+    action = state.position_action
+    return PositionThesisVersion(
+        thesis_version_id=uuid4(),
+        position_id=state.contract_id,
+        contract_id=state.contract_id,
+        session_id=state.session_id,
+        snapshot_id=request.snapshot_id,
+        original_strategy_id=uuid4(),
+        current_thesis="exit now" if action == PositionAction.EXIT else "thesis holds",
+        recommended_action=action,
+        recommended_quantity=1,
+        recommended_limit_price=Decimal("1.20"),
+        confidence=0.7,
+        prompt_version=request.prompt_version or "2.0.0",
+        model_call_id=request.request_id,
+    )
+
+
 def install_order_manager_factory(fake: FakeModelProvider) -> None:
     """Ensure order-manager responses never reuse a static decision_id."""
     fake.set_role_factory("order_manager", make_order_manager_decision)
 
 
+def install_paper_path_factories(
+    fake: FakeModelProvider,
+    *,
+    session_id: str | None = None,
+    state: PaperPathCannedState | None = None,
+) -> PaperPathCannedState:
+    """Install OM + position factories that mint fresh immutable artifact ids."""
+    ctl = state or getattr(fake, "_paper_path_state", None)
+    if not isinstance(ctl, PaperPathCannedState):
+        ctl = PaperPathCannedState()
+    if session_id is not None:
+        ctl.session_id = session_id
+    fake._paper_path_state = ctl  # type: ignore[attr-defined]
+
+    def make_thesis(request: ModelRequest) -> PositionThesisVersion:
+        return _position_thesis_from_state(ctl, request)
+
+    def make_decision(request: ModelRequest) -> PositionThesisVersion:
+        return _position_thesis_from_state(ctl, request)
+
+    fake.set_role_factory("position_thesis", make_thesis)
+    fake.set_role_factory("position_decision", make_decision)
+    install_order_manager_factory(fake)
+    return ctl
+
+
+def set_position_action(fake: FakeModelProvider, action: PositionAction) -> None:
+    """Flip HOLD/EXIT for subsequent position-factory invocations."""
+    ctl = install_paper_path_factories(fake)
+    ctl.position_action = action
+
+
 def _refresh_trade_canned(fake: FakeModelProvider, trade_index: int) -> None:
     """Ensure repeated paper round-trips do not reuse immutable artifact ids."""
-    del trade_index  # retained for call-site clarity; OM factory is per-invocation
-    for role in ("position_thesis", "position_decision"):
-        val = fake._by_role.get(role)
-        if val is not None and hasattr(val, "model_copy"):
-            fake.set_canned_for_role(
-                role,
-                val.model_copy(
-                    update={
-                        "thesis_version_id": uuid4(),
-                        "model_call_id": uuid4(),
-                    }
-                ),
-            )
-    # Static canned OM decisions collide under enrichment; always use a factory.
-    install_order_manager_factory(fake)
+    del trade_index  # retained for call-site clarity; factories mint per invocation
+    ctl = install_paper_path_factories(fake)
+    ctl.position_action = PositionAction.HOLD
 
 
 async def wire_replay_canned_for_episodes(
@@ -171,7 +223,7 @@ async def wire_replay_canned_for_episodes(
                 position_action=PositionAction.HOLD,
             )
     register_evolution_router_canned(fake)
-    install_order_manager_factory(fake)
+    install_paper_path_factories(fake, session_id=evolution.session_id)
 
 
 def register_evolution_router_canned(fake: FakeModelProvider) -> None:
@@ -210,7 +262,7 @@ def register_evolution_router_canned(fake: FakeModelProvider) -> None:
 def build_acceptance_router(session_id: str) -> tuple[ModelRouter, FakeModelProvider]:
     fake = FakeModelProvider(available=True)
     register_evolution_router_canned(fake)
-    install_order_manager_factory(fake)
+    install_paper_path_factories(fake, session_id=session_id)
     return ModelRouter(_fake_registry(fake), session_id=session_id), fake
 
 
@@ -449,7 +501,6 @@ async def _wait_for_closed_exit(
                     snapshot_id=tick.snapshot.snapshot_id,
                     trade_index=trade_index,
                 )
-                install_order_manager_factory(fake)
                 register_evolution_router_canned(fake)
         await asyncio.sleep(0.15)
     raise AssertionError(
@@ -465,33 +516,10 @@ def _mint_position_exit_canned(
     snapshot_id,
     trade_index: int,
 ) -> None:
-    """Always mint fresh artifact ids so concurrent/repeated position cycles never collide."""
-    exit_thesis = PositionThesisVersion(
-        position_id=CONTRACT_ID,
-        contract_id=CONTRACT_ID,
-        session_id=session_id,
-        snapshot_id=snapshot_id,
-        original_strategy_id=uuid4(),
-        current_thesis=f"exit trade {trade_index}",
-        recommended_action=PositionAction.EXIT,
-        recommended_quantity=1,
-        recommended_limit_price=Decimal("1.20"),
-        confidence=0.7,
-        prompt_version="2.0.0",
-        model_call_id=uuid4(),
-        thesis_version_id=uuid4(),
-    )
-    fake.set_canned_for_role("position_thesis", exit_thesis)
-    fake.set_canned_for_role(
-        "position_decision",
-        exit_thesis.model_copy(
-            update={
-                "thesis_version_id": uuid4(),
-                "model_call_id": uuid4(),
-                "recommended_action": PositionAction.EXIT,
-            }
-        ),
-    )
+    """Switch position factories to EXIT with fresh per-invocation artifact ids."""
+    del snapshot_id, trade_index  # snapshot/model ids come from each ModelRequest
+    ctl = install_paper_path_factories(fake, session_id=session_id)
+    ctl.position_action = PositionAction.EXIT
 
 
 async def run_closed_trade_round_trip(
@@ -569,7 +597,6 @@ async def run_closed_trade_round_trip(
         snapshot_id=snapshot.snapshot_id,
         trade_index=trade_index,
     )
-    install_order_manager_factory(fake)
     register_evolution_router_canned(fake)
     exit_tick = await supervisor.market_runtime.tick(
         now=exit_start + timedelta(seconds=3)
@@ -581,7 +608,6 @@ async def run_closed_trade_round_trip(
         snapshot_id=exit_tick.snapshot.snapshot_id,
         trade_index=trade_index,
     )
-    install_order_manager_factory(fake)
     await _wait_for_closed_exit(
         stack, exits_before=exits_before, trade_index=trade_index, attempts=120
     )
@@ -802,8 +828,16 @@ async def shutdown_stack(stack: dict, *, strict_workers: bool = True) -> None:
     await stack["evolution"].shutdown()
     await stack["agent"].shutdown()
     await stack["supervisor"].shutdown()
-    await _wait_for_no_aiosqlite_workers(timeout_seconds=5.0)
     if strict_workers:
+        await _wait_for_no_aiosqlite_workers(timeout_seconds=5.0)
         from joker.persistence.aiosqlite_lifecycle import iter_aiosqlite_worker_threads
 
         assert not iter_aiosqlite_worker_threads()
+    else:
+        from joker.persistence.aiosqlite_lifecycle import (
+            drain_aiosqlite_workers,
+            join_aiosqlite_workers,
+        )
+
+        await drain_aiosqlite_workers(timeout=5.0)
+        join_aiosqlite_workers(timeout=5.0)

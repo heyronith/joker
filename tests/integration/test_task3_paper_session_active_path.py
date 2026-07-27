@@ -5,13 +5,12 @@ from __future__ import annotations
 import asyncio
 from datetime import date, datetime, timedelta
 from decimal import Decimal
-from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 import pytest
 
 from joker.broker.interface import PaperBroker
-from joker.cognition.schemas import PositionAction, PositionThesisVersion
+from joker.cognition.schemas import PositionAction
 from joker.config.settings import CognitiveGraphSettings
 from joker.evaluation.agentic_graph import EVALUATOR_ROLES
 from joker.evolution.agent_schemas import EvaluatorAgentScores
@@ -38,6 +37,10 @@ from joker.runtime.session_supervisor import SessionSupervisor, SessionSuperviso
 from joker.time.calendar import MarketCalendar
 from joker.time.clock import FrozenExchangeClock
 from tests.cognitive.task2_canned import CONTRACT_ID, register_full_path_canned
+from tests.integration.task3_production_harness import (
+    install_paper_path_factories,
+    set_position_action,
+)
 
 ET = ZoneInfo("America/New_York")
 FAR_CONTRACT_ID = "SPY:2026-07-01:580.0:call"
@@ -238,19 +241,22 @@ async def test_task3_paper_session_active_path_auto_episode(tmp_path) -> None:
         session=session_id,
         position_action=PositionAction.HOLD,
     )
+    install_paper_path_factories(fake, session_id=session_id)
+    set_position_action(fake, PositionAction.HOLD)
     _register_evaluators(fake)
 
-    for _ in range(40):
+    entries_before = len(gateway_entry_ids)
+    for _ in range(80):
         projection = await supervisor.execution_runtime.project_session()
         pos = projection.positions.get(CONTRACT_ID)
-        if pos is not None and pos.quantity != 0:
+        if pos is not None and pos.quantity != 0 and len(gateway_entry_ids) > entries_before:
             break
         await asyncio.sleep(0.15)
     else:
         await evolution.shutdown()
         await agent.shutdown()
         await supervisor.shutdown()
-        pytest.fail("entry fill never opened a position")
+        pytest.fail("entry fill never opened a position via OrderActionGateway")
 
     assert gateway_entry_ids, "entry must pass through OrderActionGateway"
 
@@ -292,52 +298,13 @@ async def test_task3_paper_session_active_path_auto_episode(tmp_path) -> None:
             },
         ]
     )
-    exit_mc = uuid4()
-    exit_thesis = PositionThesisVersion(
-        position_id=CONTRACT_ID,
-        contract_id=CONTRACT_ID,
-        session_id=session_id,
-        snapshot_id=snapshot.snapshot_id,
-        original_strategy_id=uuid4(),
-        current_thesis="exit now",
-        recommended_action=PositionAction.EXIT,
-        recommended_quantity=1,
-        recommended_limit_price=Decimal("1.20"),
-        confidence=0.7,
-        prompt_version="2.0.0",
-        model_call_id=exit_mc,
-    )
-    fake.set_canned_for_role("position_thesis", exit_thesis)
-    fake.set_canned_for_role(
-        "position_decision",
-        exit_thesis.model_copy(
-            update={
-                "thesis_version_id": uuid4(),
-                "recommended_action": PositionAction.EXIT,
-            }
-        ),
-    )
+    set_position_action(fake, PositionAction.EXIT)
     _register_evaluators(fake)
     exit_tick = await supervisor.market_runtime.tick(
         now=exit_start + timedelta(seconds=3)
     )
     assert exit_tick.snapshot is not None
-    exit_bound = exit_thesis.model_copy(
-        update={
-            "snapshot_id": exit_tick.snapshot.snapshot_id,
-            "thesis_version_id": uuid4(),
-        }
-    )
-    fake.set_canned_for_role("position_thesis", exit_bound)
-    fake.set_canned_for_role(
-        "position_decision",
-        exit_bound.model_copy(
-            update={
-                "thesis_version_id": uuid4(),
-                "recommended_action": PositionAction.EXIT,
-            }
-        ),
-    )
+    set_position_action(fake, PositionAction.EXIT)
 
     for _ in range(50):
         projection = await supervisor.execution_runtime.project_session()
