@@ -1,19 +1,24 @@
-
 """Ledger store append + idempotency."""
 
 from __future__ import annotations
 
-import asyncio
 from datetime import datetime, timezone
 from decimal import Decimal
 
+import pytest
+
 from joker.ledger.schemas import LedgerEventType, make_ledger_event
 from joker.ledger.store import SqliteLedgerStore
+from joker.persistence.aiosqlite_lifecycle import (
+    iter_aiosqlite_worker_threads,
+    wait_for_no_aiosqlite_workers,
+)
 
 
-def test_ledger_append_idempotent(tmp_path) -> None:
-    async def _run() -> None:
-        store = SqliteLedgerStore(tmp_path / "ledger.db")
+@pytest.mark.asyncio
+async def test_ledger_append_idempotent(tmp_path) -> None:
+    store = SqliteLedgerStore(tmp_path / "ledger.db")
+    try:
         await store.initialize()
         now = datetime.now(timezone.utc)
         evt = make_ledger_event(
@@ -32,5 +37,7 @@ def test_ledger_append_idempotent(tmp_path) -> None:
         assert await store.append(evt) is False
         rows = await store.get_by_session("s1")
         assert len(rows) == 1
-
-    asyncio.run(_run())
+    finally:
+        await store.close()
+        await wait_for_no_aiosqlite_workers(timeout_seconds=5.0)
+        assert not iter_aiosqlite_worker_threads()
