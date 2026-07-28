@@ -961,7 +961,6 @@ async def feed_shadow_snapshots_via_market(stack: dict, *, cycles: int = 3) -> N
                 await _wait_shadow_idle()
     finally:
         agent.suppress_new_entry_snapshots(False)
-        await ensure_flat_position(stack, trade_index=97)
 
 
 async def _wait_shadow_threshold(
