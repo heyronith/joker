@@ -20,7 +20,7 @@ from joker.persistence.aiosqlite_lifecycle import (
 )
 
 
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="function")
 async def test_close_aiosqlite_connection_joins_worker(tmp_path: Path) -> None:
     conn = await aiosqlite.connect(tmp_path / "t.db")
     worker = conn._thread
@@ -32,7 +32,7 @@ async def test_close_aiosqlite_connection_joins_worker(tmp_path: Path) -> None:
     assert not iter_aiosqlite_worker_threads()
 
 
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="function")
 async def test_owned_stores_leave_no_workers_after_close(tmp_path: Path) -> None:
     ledger = SqliteLedgerStore(tmp_path / "ledger.db")
     await ledger.initialize()

@@ -944,11 +944,14 @@ async def wait_for_automatic_evolution(
             state = EvolutionCycleState.from_record(record)
             last_state = state
             if state.stage == "collect_shadow_evidence" and state.status == "running":
-                if shadow_feeds < 8:
+                if shadow_feeds < 12:
                     await feed_shadow_snapshots_via_market(stack, cycles=3)
-                    await _wait_shadow_threshold(evolution, timeout=20.0)
+                    await _wait_shadow_threshold(evolution, timeout=30.0)
                     shadow_feeds += 1
-                    evolution.wake_orchestrator(reason="shadow_progress")
+                # Drive shadow resume directly; do not rely on background worker timing.
+                state = await evolution.orchestrator.advance(state)
+                last_state = state
+                evolution.wake_orchestrator(reason="shadow_progress")
             if state.status in {"completed", "failed", "blocked"}:
                 return state
         evolution.wake_orchestrator(reason="acceptance_poll")

@@ -68,9 +68,15 @@ class ShadowRuntime:
         if self._worker is not None:
             self._worker.cancel()
             try:
-                await self._worker
+                await asyncio.wait_for(self._worker, timeout=5.0)
             except asyncio.CancelledError:
                 pass
+            except TimeoutError:
+                pass
+            except Exception:
+                # Worker may be mid-graph when cancelled during runtime shutdown.
+                if not self._worker.cancelled():
+                    raise
             self._worker = None
 
     async def register_challenger(
