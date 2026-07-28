@@ -935,12 +935,14 @@ async def wait_for_automatic_evolution(
     evolution.wake_orchestrator(reason="acceptance_start")
     deadline = asyncio.get_event_loop().time() + timeout
     shadow_feeds = 0
+    last_state: EvolutionCycleState | None = None
     while asyncio.get_event_loop().time() < deadline:
         records = await evolution._repos["evolution_cycles"].list_by_session(
             evolution.session_id
         )
         for record in records:
             state = EvolutionCycleState.from_record(record)
+            last_state = state
             if state.stage == "collect_shadow_evidence" and state.status == "running":
                 if shadow_feeds < 8:
                     await feed_shadow_snapshots_via_market(stack, cycles=3)
@@ -951,7 +953,15 @@ async def wait_for_automatic_evolution(
                 return state
         evolution.wake_orchestrator(reason="acceptance_poll")
         await asyncio.sleep(poll_interval)
-    raise AssertionError("automatic orchestrator did not reach a terminal cycle")
+    detail = "no cycle"
+    if last_state is not None:
+        detail = (
+            f"stage={last_state.stage} status={last_state.status} "
+            f"failures={last_state.failure_codes}"
+        )
+    raise AssertionError(
+        f"automatic orchestrator did not reach a terminal cycle ({detail})"
+    )
 
 
 async def drain_evolution_orchestrator(stack: dict, *, max_rounds: int = 30):

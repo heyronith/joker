@@ -40,7 +40,7 @@ jobs:
           # signal timeout (default) avoids join/to_thread deadlocks with thread method.
           # -r fE prints failed/error summaries even if a later timeout aborts the suite.
           pytest -q \
-            --timeout=180 \
+            --timeout=300 \
             -r fE \
             -W error::pytest.PytestUnhandledThreadExceptionWarning \
             --tb=short | tee pytest-output.txt

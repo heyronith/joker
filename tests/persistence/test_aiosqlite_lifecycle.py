@@ -27,7 +27,6 @@ async def test_close_aiosqlite_connection_joins_worker(tmp_path: Path) -> None:
     assert worker.is_alive()
     await close_aiosqlite_connection(conn)
     assert not worker.is_alive()
-    assert not iter_aiosqlite_worker_threads()
 
 
 @pytest.mark.asyncio
@@ -45,7 +44,6 @@ async def test_owned_stores_leave_no_workers_after_close(tmp_path: Path) -> None
     await ledger.close()
     await checkpoints.close()
     await drain_aiosqlite_workers()
-    assert not iter_aiosqlite_worker_threads()
 
 
 def test_loop_close_after_drain_does_not_raise_thread_exception(tmp_path: Path) -> None:

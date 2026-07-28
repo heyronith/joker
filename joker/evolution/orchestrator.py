@@ -304,10 +304,10 @@ class EvolutionOrchestrator:
         await self._rt._repos["evolution_cycles"].upsert(state.to_record())
         return state
 
-    async def advance(self, state: EvolutionCycleState) -> EvolutionCycleState:
-        if state.status in {"completed", "failed"} and state.stage == "completed":
-            return state
-        graph_state: EvolutionOrchestratorState = {
+    def _cycle_to_graph_state(
+        self, state: EvolutionCycleState
+    ) -> EvolutionOrchestratorState:
+        return {
             "cycle_id": state.cycle_id,
             "session_id": state.session_id,
             "champion_version_id": str(state.champion_version_id),
@@ -331,8 +331,109 @@ class EvolutionOrchestrator:
             "stage": state.stage,
             "status": state.status,
             "failure_codes": list(state.failure_codes),
-            "pending_evidence": False,
+            "pending_evidence": state.stage == "collect_shadow_evidence",
         }
+
+    async def _state_after_graph(
+        self,
+        state: EvolutionCycleState,
+        result: dict[str, Any],
+    ) -> EvolutionCycleState:
+        record = await self._rt._repos["evolution_cycles"].get(
+            state.session_id, state.cycle_id
+        )
+        if record is not None:
+            return EvolutionCycleState.from_record(record)
+        return EvolutionCycleState(
+            cycle_id=result["cycle_id"],
+            session_id=result["session_id"],
+            status=result.get("status") or "running",  # type: ignore[arg-type]
+            stage=result.get("stage") or "completed",
+            champion_version_id=UUID(result["champion_version_id"]),
+            dataset_id=_uuid(result.get("dataset_id")),
+            proposal_id=_uuid(result.get("proposal_id")),
+            challenger_version_id=_uuid(result.get("challenger_version_id")),
+            experiment_id=_uuid(result.get("experiment_id")),
+            promotion_decision_id=_uuid(result.get("promotion_decision_id")),
+            shadow_evidence_id=_uuid(result.get("shadow_evidence_id")),
+            source_episode_ids=tuple(
+                UUID(x) for x in result.get("source_episode_ids") or []
+            ),
+            source_evaluation_ids=tuple(
+                UUID(x) for x in result.get("source_evaluation_ids") or []
+            ),
+            deterministic_eligible=result.get("deterministic_eligible"),
+            deterministic_gate_codes=tuple(
+                result.get("deterministic_gate_codes") or ()
+            ),
+            adversarial_passed=result.get("adversarial_passed"),
+            failure_codes=tuple(result.get("failure_codes") or ()),
+        )
+
+    async def _run_nodes(
+        self,
+        merged: EvolutionOrchestratorState,
+        nodes: list[tuple[str, Any]],
+    ) -> EvolutionOrchestratorState:
+        for name, fn in nodes:
+            updates = await fn(merged)
+            merged = {**merged, **updates}
+            await self._sync_audit(merged)
+            await self._crash.after_node(name, merged)
+            if merged.get("pending_evidence"):
+                break
+            if merged.get("status") in {"failed", "blocked"} and name == "finalise_cycle":
+                break
+        return merged
+
+    async def _advance_from_shadow_pause(
+        self, state: EvolutionCycleState
+    ) -> EvolutionCycleState:
+        """Resume after soft-pause at shadow evidence without replaying experiment/adversarial."""
+        merged = self._cycle_to_graph_state(state)
+        merged = await self._run_nodes(
+            merged,
+            [
+                ("collect_shadow_evidence", self._node_shadow_evidence),
+            ],
+        )
+        if merged.get("pending_evidence"):
+            return await self._state_after_graph(state, merged)
+        merged = await self._run_nodes(
+            merged,
+            [
+                ("run_promotion_decision", self._node_promotion_decision),
+                ("apply_promotion_decision", self._node_apply_decision),
+                ("finalise_cycle", self._node_finalise),
+            ],
+        )
+        return await self._state_after_graph(state, merged)
+
+    async def _advance_from_activation_pause(
+        self, state: EvolutionCycleState
+    ) -> EvolutionCycleState:
+        """Retry activation apply without replaying earlier orchestrator nodes."""
+        merged = self._cycle_to_graph_state(state)
+        merged = await self._run_nodes(
+            merged,
+            [
+                ("apply_promotion_decision", self._node_apply_decision),
+                ("finalise_cycle", self._node_finalise),
+            ],
+        )
+        return await self._state_after_graph(state, merged)
+
+    async def advance(self, state: EvolutionCycleState) -> EvolutionCycleState:
+        if state.status in {"completed", "failed"} and state.stage == "completed":
+            return state
+        # Soft-pauses end the LangGraph run at END. Re-ainvoke from START would
+        # replay experiment + adversarial on every tick — hang CI under load.
+        if state.stage == "collect_shadow_evidence" and state.status == "running":
+            return await self._advance_from_shadow_pause(state)
+        if state.stage == "applying_decision" and state.status == "running":
+            return await self._advance_from_activation_pause(state)
+        graph_state = self._cycle_to_graph_state(state)
+        graph_state["pending_evidence"] = False
         thread = self.thread_id(
             session_id=state.session_id,
             cycle_id=state.cycle_id,
@@ -361,32 +462,7 @@ class EvolutionOrchestrator:
                     return EvolutionCycleState.from_record(record)
             await self._rt._repos["evolution_cycles"].upsert(failed.to_record())
             return failed
-        record = await self._rt._repos["evolution_cycles"].get(
-            state.session_id, state.cycle_id
-        )
-        if record is not None:
-            return EvolutionCycleState.from_record(record)
-        return EvolutionCycleState(
-            cycle_id=result["cycle_id"],
-            session_id=result["session_id"],
-            status=result.get("status") or "running",  # type: ignore[arg-type]
-            stage=result.get("stage") or "completed",
-            champion_version_id=UUID(result["champion_version_id"]),
-            dataset_id=_uuid(result.get("dataset_id")),
-            proposal_id=_uuid(result.get("proposal_id")),
-            challenger_version_id=_uuid(result.get("challenger_version_id")),
-            experiment_id=_uuid(result.get("experiment_id")),
-            promotion_decision_id=_uuid(result.get("promotion_decision_id")),
-            shadow_evidence_id=_uuid(result.get("shadow_evidence_id")),
-            source_episode_ids=tuple(UUID(x) for x in result.get("source_episode_ids") or []),
-            source_evaluation_ids=tuple(
-                UUID(x) for x in result.get("source_evaluation_ids") or []
-            ),
-            deterministic_eligible=result.get("deterministic_eligible"),
-            deterministic_gate_codes=tuple(result.get("deterministic_gate_codes") or ()),
-            adversarial_passed=result.get("adversarial_passed"),
-            failure_codes=tuple(result.get("failure_codes") or ()),
-        )
+        return await self._state_after_graph(state, result)
 
     async def resume_all(self) -> list[EvolutionCycleState]:
         out: list[EvolutionCycleState] = []
@@ -792,11 +868,13 @@ class EvolutionOrchestrator:
         if activations is not None:
             activation = await activations.get_by_decision_id(UUID(str(decision_id)))
         if activation is not None and not activation.completed:
+            # Fail closed: never leave the cycle running forever waiting on activation.
             return {
-                "status": "running",
-                "stage": "applying_decision",
+                "status": "blocked",
+                "stage": "finalise_cycle",
                 "failure_codes": list(state.get("failure_codes") or [])
-                + list(activation.failure_codes),
+                + list(activation.failure_codes)
+                + ["activation_incomplete"],
             }
         return {"stage": "finalise_cycle"}
 
@@ -819,17 +897,13 @@ class EvolutionOrchestrator:
                     )
                     if activation is not None and not activation.completed:
                         return {
-                            "stage": "applying_decision",
-                            "status": "running",
+                            "stage": "completed",
+                            "status": "blocked",
                             "failure_codes": list(state.get("failure_codes") or [])
-                            + list(activation.failure_codes),
+                            + list(activation.failure_codes)
+                            + ["activation_incomplete"],
+                            "pending_evidence": False,
                         }
-        if status == "running" and state.get("stage") == "applying_decision":
-            return {
-                "stage": "applying_decision",
-                "status": "running",
-                "failure_codes": list(state.get("failure_codes") or []),
-            }
         if status == "running":
             status = "completed"
         return {"stage": "completed", "status": status, "pending_evidence": False}

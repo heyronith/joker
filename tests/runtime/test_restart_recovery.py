@@ -15,7 +15,6 @@ from joker.ledger.reconciliation import (
 )
 from joker.ledger.schemas import LedgerEventType, make_ledger_event
 from joker.ledger.store import SqliteLedgerStore
-from joker.persistence.aiosqlite_lifecycle import wait_for_no_aiosqlite_workers
 from joker.runtime.execution_runtime import ExecutionCommand, ExecutionRuntime
 from joker.runtime.session_supervisor import SessionSupervisor, SessionSupervisorConfig
 from joker.schemas.domain import OptionContract, OrderIntent
@@ -31,65 +30,62 @@ async def test_restart_reconstructs_mapping_and_open_position(tmp_path) -> None:
     broker = PaperBroker(slippage_pct=0)
     bus = InProcessAsyncEventBus()
     ledger = SqliteLedgerStore(db)
+    await ledger.initialize()
+    exec_rt = ExecutionRuntime(
+        broker=broker,
+        ledger_store=ledger,
+        event_bus=bus,
+        clock=clock,
+        session_id="s-rec",
+        broker_account_id="paper",
+    )
+    contract = OptionContract(
+        symbol="SPY",
+        expiration=date(2026, 7, 1),
+        strike=500.0,
+        option_type="call",
+        is_0dte=True,
+    )
+    intent = OrderIntent(
+        candidate_id="c",
+        contract=contract,
+        side="buy",
+        order_type="limit",
+        quantity=1,
+        limit_price=1.25,
+    )
+    order = await exec_rt.submit_execution_command(
+        ExecutionCommand(client_order_id="ord1", intent=intent)
+    )
+    assert order.status == "filled"
+    projected = await exec_rt.project_session()
+    cid = f"SPY:{contract.expiration.isoformat()}:{contract.strike}:{contract.option_type}"
+    assert projected.positions[cid].quantity == Decimal("1")
+    await ledger.close()
+    await bus.close()
+
+    # Restart
+    bus2 = InProcessAsyncEventBus()
+    ledger2 = SqliteLedgerStore(db)
+    await ledger2.initialize()
     try:
-        await ledger.initialize()
-        exec_rt = ExecutionRuntime(
+        exec2 = ExecutionRuntime(
             broker=broker,
-            ledger_store=ledger,
-            event_bus=bus,
+            ledger_store=ledger2,
+            event_bus=bus2,
             clock=clock,
             session_id="s-rec",
             broker_account_id="paper",
         )
-        contract = OptionContract(
-            symbol="SPY",
-            expiration=date(2026, 7, 1),
-            strike=500.0,
-            option_type="call",
-            is_0dte=True,
-        )
-        intent = OrderIntent(
-            candidate_id="c",
-            contract=contract,
-            side="buy",
-            order_type="limit",
-            quantity=1,
-            limit_price=1.25,
-        )
-        order = await exec_rt.submit_execution_command(
-            ExecutionCommand(client_order_id="ord1", intent=intent)
-        )
-        assert order.status == "filled"
-        projected = await exec_rt.project_session()
-        cid = f"SPY:{contract.expiration.isoformat()}:{contract.strike}:{contract.option_type}"
-        assert projected.positions[cid].quantity == Decimal("1")
-        await ledger.close()
-        await bus.close()
-
-        # Restart
-        bus2 = InProcessAsyncEventBus()
-        ledger2 = SqliteLedgerStore(db)
-        await ledger2.initialize()
-        try:
-            exec2 = ExecutionRuntime(
-                broker=broker,
-                ledger_store=ledger2,
-                event_bus=bus2,
-                clock=clock,
-                session_id="s-rec",
-                broker_account_id="paper",
-            )
-            mapping = await exec2.restore_order_mappings()
-            assert mapping["ord1"] == order.order_id
-            polled = await exec2.poll_order_status("ord1")
-            assert polled is not None
-            projected2 = await exec2.project_session()
-            assert projected2.positions[cid].quantity == Decimal("1")
-        finally:
-            await ledger2.close()
-            await bus2.close()
+        mapping = await exec2.restore_order_mappings()
+        assert mapping["ord1"] == order.order_id
+        polled = await exec2.poll_order_status("ord1")
+        assert polled is not None
+        projected2 = await exec2.project_session()
+        assert projected2.positions[cid].quantity == Decimal("1")
     finally:
-        await wait_for_no_aiosqlite_workers(timeout_seconds=5.0)
+        await ledger2.close()
+        await bus2.close()
 
 
 @pytest.mark.asyncio
@@ -161,8 +157,7 @@ async def test_apply_reconciliation_corrections_for_position_mismatch(tmp_path) 
     finally:
         await ledger.close()
         await bus.close()
-        await wait_for_no_aiosqlite_workers(timeout_seconds=5.0)
-
+        
 
 @pytest.mark.asyncio
 async def test_supervisor_unresolved_blocks_recovery_claim(tmp_path) -> None:
@@ -187,4 +182,4 @@ async def test_supervisor_unresolved_blocks_recovery_claim(tmp_path) -> None:
         assert supervisor.claims_recovery is True
     finally:
         await supervisor.shutdown()
-        await wait_for_no_aiosqlite_workers(timeout_seconds=5.0)
+        

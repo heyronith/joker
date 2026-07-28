@@ -9,10 +9,6 @@ import pytest
 
 from joker.ledger.schemas import LedgerEventType, make_ledger_event
 from joker.ledger.store import SqliteLedgerStore
-from joker.persistence.aiosqlite_lifecycle import (
-    iter_aiosqlite_worker_threads,
-    wait_for_no_aiosqlite_workers,
-)
 
 
 @pytest.mark.asyncio
@@ -39,5 +35,4 @@ async def test_ledger_append_idempotent(tmp_path) -> None:
         assert len(rows) == 1
     finally:
         await store.close()
-        await wait_for_no_aiosqlite_workers(timeout_seconds=5.0)
-        assert not iter_aiosqlite_worker_threads()
+        

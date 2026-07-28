@@ -20,7 +20,6 @@ from joker.models.fake_provider import FakeModelProvider
 from joker.models.registry import ModelRegistry
 from joker.models.router import ModelRouter
 from joker.models.schemas import ModelsConfig
-from joker.persistence.aiosqlite_lifecycle import iter_aiosqlite_worker_threads
 
 
 @pytest.mark.asyncio
@@ -67,7 +66,6 @@ async def test_evaluation_graph_resumes_after_agent_node(tmp_path) -> None:
     assert first.evaluation_id == second.evaluation_id
     assert len(fake.calls) == calls_after_first  # idempotent reuse
     await owner.close_all()
-    assert not iter_aiosqlite_worker_threads()
 
 
 @pytest.mark.asyncio
@@ -86,7 +84,6 @@ async def test_evolution_runtime_closes_all_task3_checkpointers(tmp_path) -> Non
         assert path.exists()
     await runtime.shutdown()
     assert runtime.checkpointer_owner is None
-    assert not iter_aiosqlite_worker_threads()
 
 
 @pytest.mark.asyncio

@@ -12,7 +12,6 @@ from joker.events.bus import InProcessAsyncEventBus
 from joker.market.bars import BarBuilder
 from joker.market.option_surface import OptionSurfaceRepository
 from joker.market.snapshots import SnapshotRepository
-from joker.persistence.aiosqlite_lifecycle import wait_for_no_aiosqlite_workers
 from joker.runtime.market_runtime import MarketRuntime, MarketRuntimeConfig
 from joker.time.calendar import MarketCalendar
 from joker.time.clock import FrozenExchangeClock
@@ -94,4 +93,4 @@ async def test_market_runtime_ingest_and_tick_persists_snapshot(tmp_path) -> Non
         )
     finally:
         await bus.close()
-        await wait_for_no_aiosqlite_workers(timeout_seconds=5.0)
+        

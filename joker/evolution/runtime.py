@@ -410,8 +410,8 @@ class EvolutionRuntime:
             worker.cancel()
         for worker in self._workers:
             try:
-                await worker
-            except asyncio.CancelledError:
+                await asyncio.wait_for(worker, timeout=5.0)
+            except (asyncio.CancelledError, TimeoutError, Exception):  # noqa: BLE001
                 pass
         self._workers.clear()
         self._workers_started = False

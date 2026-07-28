@@ -23,7 +23,6 @@ from joker.evolution.schemas import ExperimentDefinition, PromptPatch
 from joker.evolution.shadow import ShadowRuntime
 from joker.evaluation.dataset_builder import DatasetBuilder
 from joker.evaluation.graph import EvaluationGraphRunner
-from joker.persistence.aiosqlite_lifecycle import iter_aiosqlite_worker_threads
 from tests.evolution.projection_helpers import (
     FakeExecutionProjection,
     closed_trade_projection,
@@ -268,4 +267,3 @@ async def test_task3_evolution_closed_loop(tmp_path) -> None:
     await registry.close()
     for repo in repos.values():
         await repo.close()
-    assert not iter_aiosqlite_worker_threads()

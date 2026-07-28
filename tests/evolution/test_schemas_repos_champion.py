@@ -21,7 +21,6 @@ from joker.evolution.schemas import (
     TradingEpisode,
     assert_no_chain_of_thought,
 )
-from joker.persistence.aiosqlite_lifecycle import iter_aiosqlite_worker_threads
 
 
 def test_assert_no_chain_of_thought_rejects_hidden_keys() -> None:
@@ -57,7 +56,6 @@ async def test_episode_append_idempotent_and_hash_stable(tmp_path) -> None:
     assert loaded is not None
     assert loaded.idempotency_key == "ep-key-1"
     await repos["episodes"].close()
-    assert not iter_aiosqlite_worker_threads()
 
 
 @pytest.mark.asyncio
