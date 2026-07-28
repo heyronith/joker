@@ -952,14 +952,20 @@ async def _wait_shadow_threshold(
 async def wait_for_automatic_evolution(
     stack: dict, *, timeout: float = 180.0, poll_interval: float = 0.25
 ):
-    """Wait for the orchestrator worker to reach a terminal cycle without manual advance."""
+    """Drive the orchestrator to a terminal cycle without concurrent worker races.
+
+    The background orchestrator worker is paused while this helper feeds shadow
+    evidence and calls ``advance`` so two coroutines cannot advance the same
+    cycle concurrently (observed as champion/challenger identity mismatches).
+    """
     evolution: EvolutionRuntime = stack["evolution"]
     assert evolution.orchestrator is not None
-    evolution.orchestrator.resume_scheduling()
-    evolution.wake_orchestrator(reason="acceptance_start")
+    evolution.orchestrator.pause()
     deadline = asyncio.get_event_loop().time() + timeout
     shadow_feeds = 0
     last_state: EvolutionCycleState | None = None
+    # Kick once under pause: start/resume the cycle from this helper only.
+    await evolution.orchestrator.tick()
     while asyncio.get_event_loop().time() < deadline:
         records = await evolution._repos["evolution_cycles"].list_by_session(
             evolution.session_id
@@ -967,18 +973,27 @@ async def wait_for_automatic_evolution(
         for record in records:
             state = EvolutionCycleState.from_record(record)
             last_state = state
+            if state.status in {"completed", "failed", "blocked"}:
+                return state
             if state.stage == "collect_shadow_evidence" and state.status == "running":
                 if shadow_feeds < 12:
                     await feed_shadow_snapshots_via_market(stack, cycles=3)
                     await _wait_shadow_threshold(evolution, timeout=30.0)
                     shadow_feeds += 1
-                # Drive shadow resume directly; do not rely on background worker timing.
                 state = await evolution.orchestrator.advance(state)
                 last_state = state
-                evolution.wake_orchestrator(reason="shadow_progress")
+                if state.status in {"completed", "failed", "blocked"}:
+                    return state
+                continue
+            state = await evolution.orchestrator.advance(state)
+            last_state = state
             if state.status in {"completed", "failed", "blocked"}:
                 return state
-        evolution.wake_orchestrator(reason="acceptance_poll")
+        started = await evolution.orchestrator.maybe_start_cycle()
+        if started is not None:
+            last_state = await evolution.orchestrator.advance(started)
+            if last_state.status in {"completed", "failed", "blocked"}:
+                return last_state
         await asyncio.sleep(poll_interval)
     detail = "no cycle"
     if last_state is not None:

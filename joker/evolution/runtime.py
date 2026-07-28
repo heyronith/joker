@@ -557,6 +557,11 @@ class EvolutionRuntime:
             applied = await self.pin_and_apply_for_cycle(cycle_id)
             if applied is not None:
                 pinned = applied.configuration_version_id
+        if pinned is None:
+            # No cycle pin (missing cycle_id / provenance): attribute to current champion.
+            champ = await self.configuration_for_new_cycle()
+            if champ is not None:
+                pinned = champ.configuration_version_id
         if contract_id and pinned is not None:
             self.remember_position_configuration(contract_id, pinned)
 

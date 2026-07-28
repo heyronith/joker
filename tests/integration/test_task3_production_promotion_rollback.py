@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from decimal import Decimal
+from uuid import uuid4
 
 import pytest
 
@@ -63,11 +64,18 @@ async def test_full_loop_drift_and_rollback(tmp_path) -> None:
         final = await wait_for_automatic_evolution(stack)
         assert final.status == "completed"
         assert final.challenger_version_id is not None
+        assert final.promotion_decision_id is not None
 
-        if final.promotion_decision_id is not None:
-            await evolution.decisions.apply_persisted_decision(
-                promotion_decision_id=final.promotion_decision_id
-            )
+        promotion = await evolution._repos["promotions"].get_by_id(
+            final.promotion_decision_id
+        )
+        assert promotion is not None
+        assert promotion.final_status == "promoted"
+        assert promotion.challenger_version_id == final.challenger_version_id
+
+        await evolution.decisions.apply_persisted_decision(
+            promotion_decision_id=final.promotion_decision_id
+        )
 
         champ_b = await evolution.configuration_for_new_cycle()
         assert champ_b is not None
@@ -82,6 +90,7 @@ async def test_full_loop_drift_and_rollback(tmp_path) -> None:
         await ensure_flat_position(stack, trade_index=99)
 
         # Real paper entry under promoted champion B (via _on_position_opened pin path).
+        await evolution.pin_and_apply_for_cycle(f"post-promote-entry-{uuid4().hex[:8]}")
         await run_open_trade_entry_only(stack, trade_index=2, minute_offset=40)
         await stack["supervisor"].event_bus.drain(timeout=10.0)
         projection = await stack["supervisor"].execution_runtime.project_session()

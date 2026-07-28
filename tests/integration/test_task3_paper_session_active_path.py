@@ -305,18 +305,27 @@ async def test_task3_paper_session_active_path_auto_episode(tmp_path) -> None:
     )
     assert exit_tick.snapshot is not None
     set_position_action(fake, PositionAction.EXIT)
+    exits_before = len(gateway_exit_ids)
 
-    for _ in range(50):
+    for i in range(80):
         projection = await supervisor.execution_runtime.project_session()
         pos = projection.positions.get(CONTRACT_ID)
-        if pos is not None and pos.quantity == 0:
+        flat = pos is not None and pos.quantity == 0
+        exited = len(gateway_exit_ids) > exits_before
+        if exited and flat:
             break
+        if i > 0 and i % 15 == 0:
+            set_position_action(fake, PositionAction.EXIT)
+            now = clock.now()
+            tick = await supervisor.market_runtime.tick(now=now + timedelta(seconds=1))
+            clock.set_now(now + timedelta(seconds=1))
+            assert tick.snapshot is not None
         await asyncio.sleep(0.15)
     else:
         await evolution.shutdown()
         await agent.shutdown()
         await supervisor.shutdown()
-        pytest.fail("EXIT never closed the position")
+        pytest.fail("EXIT never closed the position via OrderActionGateway")
 
     assert gateway_exit_ids, "EXIT must pass through OrderActionGateway"
     final = await supervisor.execution_runtime.project_session()

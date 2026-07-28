@@ -305,27 +305,35 @@ def register_full_path_canned(
         prompt_version="2.0.0",
         model_call_id=mc,
     )
-    fake.set_canned_for_role("position_thesis", thesis)
-    fake.set_canned_for_role(
-        "position_decision",
-        thesis.model_copy(
-            update={
-                "thesis_version_id": uuid4(),
-                "recommended_action": position_action,
-            }
-        ),
-    )
-    fake.set_canned_for_role(
-        "order_manager",
-        OrderManagementDecision(
-            session_id=session,
-            snapshot_id=sid,
-            prompt_version="2.0.0",
-            model_call_id=mc,
-            cycle_id=cycle_id,
-            client_order_id="order-1",
-            action=order_action,  # type: ignore[arg-type]
-            rationale_summary=f"order action {order_action}",
-        ),
-    )
+    # Preserve paper-path role factories when present. Static canned responses would
+    # clear factories (set_canned_for_role pops them) and break EXIT/OM tracking.
+    paper_ctl = getattr(fake, "_paper_path_state", None)
+    if paper_ctl is not None:
+        paper_ctl.session_id = session
+        paper_ctl.contract_id = contract_id
+        paper_ctl.position_action = position_action
+    else:
+        fake.set_canned_for_role("position_thesis", thesis)
+        fake.set_canned_for_role(
+            "position_decision",
+            thesis.model_copy(
+                update={
+                    "thesis_version_id": uuid4(),
+                    "recommended_action": position_action,
+                }
+            ),
+        )
+        fake.set_canned_for_role(
+            "order_manager",
+            OrderManagementDecision(
+                session_id=session,
+                snapshot_id=sid,
+                prompt_version="2.0.0",
+                model_call_id=mc,
+                cycle_id=cycle_id,
+                client_order_id="order-1",
+                action=order_action,  # type: ignore[arg-type]
+                rationale_summary=f"order action {order_action}",
+            ),
+        )
     return strategy_id
