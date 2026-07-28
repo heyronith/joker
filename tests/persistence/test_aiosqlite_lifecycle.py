@@ -22,6 +22,7 @@ from joker.persistence.aiosqlite_lifecycle import (
 
 @pytest.mark.asyncio(loop_scope="function")
 async def test_close_aiosqlite_connection_joins_worker(tmp_path: Path) -> None:
+    """Owned connection worker must exit; ignore unrelated process-wide leaks."""
     conn = await aiosqlite.connect(tmp_path / "t.db")
     worker = conn._thread
     assert worker.is_alive()
@@ -29,11 +30,13 @@ async def test_close_aiosqlite_connection_joins_worker(tmp_path: Path) -> None:
     assert not worker.is_alive()
     await drain_aiosqlite_workers()
     join_aiosqlite_workers()
-    assert not iter_aiosqlite_worker_threads()
+    assert not worker.is_alive()
 
 
 @pytest.mark.asyncio(loop_scope="function")
 async def test_owned_stores_leave_no_workers_after_close(tmp_path: Path) -> None:
+    """Stores opened by this test must leave no live workers after close."""
+    before = set(iter_aiosqlite_worker_threads())
     ledger = SqliteLedgerStore(tmp_path / "ledger.db")
     await ledger.initialize()
     checkpoints = SqliteCheckpointStore(tmp_path / "ckpt_store.db")
@@ -41,14 +44,16 @@ async def test_owned_stores_leave_no_workers_after_close(tmp_path: Path) -> None
     cognitive = CognitiveCheckpointer(tmp_path / "lg.db")
     await cognitive.open()
 
-    assert iter_aiosqlite_worker_threads()
+    owned = [t for t in iter_aiosqlite_worker_threads() if t not in before]
+    assert owned, "expected this test to create aiosqlite workers"
 
     await cognitive.close()
     await ledger.close()
     await checkpoints.close()
     await drain_aiosqlite_workers()
     join_aiosqlite_workers()
-    assert not iter_aiosqlite_worker_threads()
+    alive_owned = [t for t in owned if t.is_alive()]
+    assert not alive_owned, f"owned aiosqlite workers still alive: {alive_owned}"
 
 
 def test_loop_close_after_drain_does_not_raise_thread_exception(tmp_path: Path) -> None:

@@ -34,7 +34,7 @@ from joker.cognition.schemas import (
     OrderManagementDecision,
 )
 from joker.models.fake_provider import FakeModelProvider
-from joker.models.schemas import utc_now
+from joker.models.schemas import ModelRequest, utc_now
 
 CONTRACT_ID = "SPY:2026-07-01:500.0:call"
 
@@ -226,27 +226,40 @@ def register_full_path_canned(
             ),
         )
 
-    decision_id = uuid4()
-    fake.set_canned_for_role(
-        "meta_decision",
-        MetaDecision(
+    # Bind meta_decision to the strategies in *this* request. Concurrent
+    # register_full_path_canned calls otherwise race static selected_strategy_id
+    # against a different inventor response mid-graph.
+    def _meta_decision_from_request(request: ModelRequest) -> MetaDecision:
+        candidates = request.context_payload.get("candidate_strategies") or []
+        selected: UUID | None = None
+        for raw in candidates:
+            if isinstance(raw, dict) and raw.get("strategy_id"):
+                selected = UUID(str(raw["strategy_id"]))
+                break
+        action = (
+            MetaDecisionAction.EXECUTE
+            if selected is not None
+            else MetaDecisionAction.ABANDON
+        )
+        return MetaDecision(
             session_id=session,
-            snapshot_id=sid,
-            decision_id=decision_id,
-            prompt_version="2.0.0",
-            model_call_id=mc,
-            cycle_id=cycle_id,
-            action=MetaDecisionAction.EXECUTE,
-            selected_strategy_id=strategy_id,
+            snapshot_id=request.snapshot_id or sid,
+            decision_id=uuid4(),
+            prompt_version=request.prompt_version or "2.0.0",
+            model_call_id=request.request_id,
+            cycle_id=request.cycle_id or cycle_id,
+            action=action,
+            selected_strategy_id=selected,
             confidence=0.7,
-            rationale_summary="execute test",
-        ),
-    )
+            rationale_summary="execute test" if selected is not None else "abandon test",
+        )
+
+    fake.set_role_factory("meta_decision", _meta_decision_from_request)
     fake.set_canned_for_role(
         "entry_tactician",
         ExecutionProposal(
             proposal_id=uuid4(),
-            decision_id=decision_id,
+            decision_id=uuid4(),
             strategy_id=strategy_id,
             session_id=session,
             cycle_id=cycle_id,
