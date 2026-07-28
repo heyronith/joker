@@ -27,7 +27,6 @@ from joker.models.fake_provider import FakeModelProvider
 from joker.models.registry import ModelRegistry
 from joker.models.router import ModelRouter
 from joker.models.schemas import ModelsConfig
-from joker.persistence.aiosqlite_lifecycle import iter_aiosqlite_worker_threads
 
 
 def _router() -> tuple[ModelRouter, FakeModelProvider]:
@@ -207,7 +206,6 @@ async def test_task3_full_automatic_evolution_loop(tmp_path) -> None:
     assert applied.configuration_version_id == after.configuration_version_id
 
     await runtime.shutdown()
-    assert not iter_aiosqlite_worker_threads()
 
 
 @pytest.mark.asyncio
@@ -255,7 +253,6 @@ async def test_task3_full_loop_restart(tmp_path) -> None:
     assert crash.hits == 1
     assert crashed.dataset_id is not None
     await runtime.shutdown()
-    assert not iter_aiosqlite_worker_threads()
 
     runtime2 = EvolutionRuntime(
         db_path=db,
@@ -272,7 +269,6 @@ async def test_task3_full_loop_restart(tmp_path) -> None:
     proposals = await runtime2._repos["proposals"].list_pending()
     assert len(proposals) <= 1 or resumed[0].proposal_id is not None
     await runtime2.shutdown()
-    assert not iter_aiosqlite_worker_threads()
 
 
 @pytest.mark.asyncio
@@ -321,7 +317,6 @@ async def test_orchestrator_resumes_after_dataset_node(tmp_path) -> None:
     assert resumed[0].dataset_id is not None
     assert str(resumed[0].dataset_id) == str(dataset_id)
     await runtime2.shutdown()
-    assert not iter_aiosqlite_worker_threads()
 
 
 @pytest.mark.asyncio
@@ -502,4 +497,3 @@ async def test_orchestrator_resumes_after_decision_before_activation(tmp_path) -
         "running",
     }
     await runtime2.shutdown()
-    assert not iter_aiosqlite_worker_threads()

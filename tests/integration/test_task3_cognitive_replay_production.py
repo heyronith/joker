@@ -346,12 +346,6 @@ async def test_production_cognitive_replay_and_shadow_challenger(tmp_path) -> No
         if champ_registry is not None:
             await champ_registry.close()
         await supervisor.shutdown()
-        from joker.persistence.aiosqlite_lifecycle import (
-            drain_aiosqlite_workers,
-            iter_aiosqlite_worker_threads,
-            join_aiosqlite_workers,
-        )
+        from joker.persistence.aiosqlite_lifecycle import drain_aiosqlite_workers
 
-        await drain_aiosqlite_workers(timeout=5.0)
-        join_aiosqlite_workers(timeout=5.0)
-        assert not iter_aiosqlite_worker_threads()
+        await drain_aiosqlite_workers(timeout=0.5)

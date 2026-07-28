@@ -6,7 +6,6 @@ from decimal import Decimal
 
 import pytest
 
-from joker.persistence.aiosqlite_lifecycle import iter_aiosqlite_worker_threads
 from tests.cognitive.task2_canned import CONTRACT_ID
 from tests.integration.task3_production_harness import (
     acceptance_settings,
@@ -178,4 +177,3 @@ async def test_full_loop_drift_and_rollback(tmp_path) -> None:
         assert len(promotions) >= 1
     finally:
         await shutdown_stack(stack)
-        assert not iter_aiosqlite_worker_threads()

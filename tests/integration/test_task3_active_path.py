@@ -171,10 +171,6 @@ async def test_task3_active_path_with_task1_task2_surface(tmp_path) -> None:
         if registry is not None:
             await registry.close()
         await supervisor.shutdown()
-        from joker.persistence.aiosqlite_lifecycle import (
-            drain_aiosqlite_workers,
-            join_aiosqlite_workers,
-        )
+        from joker.persistence.aiosqlite_lifecycle import drain_aiosqlite_workers
 
-        await drain_aiosqlite_workers(timeout=5.0)
-        join_aiosqlite_workers(timeout=5.0)
+        await drain_aiosqlite_workers(timeout=0.5)

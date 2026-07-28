@@ -37,9 +37,11 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
+          # signal timeout (default) avoids join/to_thread deadlocks with thread method.
+          # -r fE prints failed/error summaries even if a later timeout aborts the suite.
           pytest -q \
-            --timeout=240 \
-            --timeout-method=thread \
+            --timeout=180 \
+            -r fE \
             -W error::pytest.PytestUnhandledThreadExceptionWarning \
             --tb=short | tee pytest-output.txt
       - name: Upload pytest output

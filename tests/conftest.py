@@ -32,4 +32,4 @@ def _default_test_env(monkeypatch: pytest.MonkeyPatch) -> None:
 def _join_aiosqlite_workers_between_tests() -> None:
     """Join exiting aiosqlite workers between tests (sync-safe teardown)."""
     yield
-    join_aiosqlite_workers(timeout=2.0)
+    join_aiosqlite_workers(timeout=0.25)

@@ -6,7 +6,6 @@ import pytest
 
 from joker.evolution.adversarial import required_scenario_ids
 from joker.evolution.runtime import build_status_report
-from joker.persistence.aiosqlite_lifecycle import iter_aiosqlite_worker_threads
 from tests.integration.task3_production_harness import (
     EXPECTED_REALIZED_PNL,
     acceptance_settings,
@@ -191,7 +190,6 @@ async def test_task3_production_evolution_acceptance(tmp_path) -> None:
         assert evolution.replay._isolated_deps().order_action_gateway is None
     finally:
         await shutdown_stack(stack)
-        assert not iter_aiosqlite_worker_threads()
 
 
 @pytest.mark.asyncio

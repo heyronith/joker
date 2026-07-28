@@ -51,14 +51,22 @@ def iter_aiosqlite_worker_threads() -> list[threading.Thread]:
 
 
 def join_aiosqlite_workers(*, timeout: float = _JOIN_TIMEOUT_SECONDS) -> None:
-    """Block until known aiosqlite workers exit (or timeout).
+    """Block until known aiosqlite workers exit (or overall timeout elapses).
 
     Only call after every owned connection has been closed; joining a live
     worker that is still serving an open connection simply burns the timeout.
+    Uses a single overall deadline so many leaked workers cannot stall CI for
+    ``N * timeout`` seconds.
     """
+    import time
+
+    deadline = time.monotonic() + max(0.0, timeout)
     for thread in iter_aiosqlite_worker_threads():
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
         try:
-            thread.join(timeout)
+            thread.join(remaining)
         except Exception:  # noqa: BLE001 — best-effort teardown
             logger.debug(
                 "aiosqlite_worker_join_failed",
@@ -68,24 +76,39 @@ def join_aiosqlite_workers(*, timeout: float = _JOIN_TIMEOUT_SECONDS) -> None:
 
 
 async def drain_aiosqlite_workers(*, timeout: float = _JOIN_TIMEOUT_SECONDS) -> None:
-    """Yield to the loop, then join any remaining aiosqlite workers."""
-    await asyncio.sleep(0)
-    await asyncio.to_thread(join_aiosqlite_workers, timeout=timeout)
-    await asyncio.sleep(0)
+    """Yield to the loop so close callbacks can finish, then briefly join workers.
+
+    Must not block the running loop inside a long ``thread.join``: aiosqlite
+    workers exit only after the loop processes their stop Future. Joining from
+    ``asyncio.to_thread`` while the loop waits on that thread deadlocks CI.
+    """
+    import time
+
+    deadline = time.monotonic() + max(0.0, timeout)
+    while time.monotonic() < deadline:
+        await asyncio.sleep(0)
+        if not iter_aiosqlite_worker_threads():
+            return
+        # Short sync joins only — keep yielding so stop callbacks can run.
+        join_aiosqlite_workers(timeout=0.05)
 
 
 async def wait_for_no_aiosqlite_workers(*, timeout_seconds: float = 5.0) -> None:
     """Drain/join until no aiosqlite workers remain, or raise with their names."""
     deadline = asyncio.get_running_loop().time() + timeout_seconds
     while True:
-        await drain_aiosqlite_workers(timeout=0.25)
-        join_aiosqlite_workers(timeout=0.25)
+        remaining = max(0.0, deadline - asyncio.get_running_loop().time())
+        if remaining <= 0:
+            break
+        await drain_aiosqlite_workers(timeout=min(0.25, remaining))
         if not iter_aiosqlite_worker_threads():
             return
         if asyncio.get_running_loop().time() >= deadline:
-            names = [t.name for t in iter_aiosqlite_worker_threads()]
-            raise AssertionError(f"aiosqlite workers still alive: {names}")
+            break
         await asyncio.sleep(0.02)
+    names = [t.name for t in iter_aiosqlite_worker_threads()]
+    if names:
+        raise AssertionError(f"aiosqlite workers still alive: {names}")
 
 
 async def close_aiosqlite_connection(

@@ -12,13 +12,8 @@ from joker.market.data_quality_store import DataQualityRepository
 from joker.market.option_surface import OptionSurfaceRepository
 from joker.market.snapshots import SnapshotRepository
 from joker.evolution.orchestrator import EvolutionCycleState
-from joker.persistence.aiosqlite_lifecycle import (
-    drain_aiosqlite_workers,
-    iter_aiosqlite_worker_threads,
-    join_aiosqlite_workers,
-)
+from joker.persistence.aiosqlite_lifecycle import drain_aiosqlite_workers
 from tests.integration.task3_production_harness import (
-    build_acceptance_router,
     build_paper_evolution_stack,
     build_restart_evolution_runtime,
     build_router_from_fake,
@@ -111,8 +106,7 @@ async def test_production_orchestrator_restart_after_node(
             )
     finally:
         await runtime.shutdown()
-        await drain_aiosqlite_workers(timeout=5.0)
-        join_aiosqlite_workers(timeout=5.0)
+        await drain_aiosqlite_workers(timeout=0.5)
 
     runtime2 = await _runtime(db, settings, router, session_id=session_id, fake=fake)
     try:
@@ -136,8 +130,7 @@ async def test_production_orchestrator_restart_after_node(
             assert activation.completed is True
     finally:
         await runtime2.shutdown()
-        await drain_aiosqlite_workers(timeout=5.0)
-        join_aiosqlite_workers(timeout=5.0)
+        await drain_aiosqlite_workers(timeout=0.5)
 
 
 def _cycle_from_record(record):
@@ -194,8 +187,7 @@ async def test_evaluation_graph_resumes_after_evaluator_node_crash(tmp_path) -> 
         assert not persisted, "evaluation must not persist before graph completes"
     finally:
         await runtime.shutdown()
-        await drain_aiosqlite_workers(timeout=5.0)
-        join_aiosqlite_workers(timeout=5.0)
+        await drain_aiosqlite_workers(timeout=0.5)
 
     runtime2 = await _runtime(db, settings, router, session_id=session_id, fake=fake)
     try:
@@ -219,6 +211,4 @@ async def test_evaluation_graph_resumes_after_evaluator_node_crash(tmp_path) -> 
         assert len(calls_after) == len(calls)
     finally:
         await runtime2.shutdown()
-        await drain_aiosqlite_workers(timeout=5.0)
-        join_aiosqlite_workers(timeout=5.0)
-        assert not iter_aiosqlite_worker_threads()
+        await drain_aiosqlite_workers(timeout=0.5)

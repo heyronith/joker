@@ -14,10 +14,7 @@ from joker.graph.graph_deps import CognitiveGraphDeps
 from joker.market.data_quality_store import DataQualityRepository
 from joker.market.option_surface import OptionSurfaceRepository
 from joker.market.snapshots import SnapshotRepository
-from joker.persistence.aiosqlite_lifecycle import (
-    drain_aiosqlite_workers,
-    join_aiosqlite_workers,
-)
+from joker.persistence.aiosqlite_lifecycle import drain_aiosqlite_workers
 from tests.integration.task3_production_harness import (
     acceptance_settings,
     build_paper_evolution_stack,
@@ -92,8 +89,7 @@ async def _crash_and_resume_orchestrator(
             assert getattr(crashed, attr) is not None
     finally:
         await runtime.shutdown()
-        await drain_aiosqlite_workers(timeout=5.0)
-        join_aiosqlite_workers(timeout=5.0)
+        await drain_aiosqlite_workers(timeout=0.5)
 
     runtime2 = await _runtime(db, settings, router, session_id, fake=fake)
     try:
@@ -110,8 +106,7 @@ async def _crash_and_resume_orchestrator(
         return terminal
     finally:
         await runtime2.shutdown()
-        await drain_aiosqlite_workers(timeout=5.0)
-        join_aiosqlite_workers(timeout=5.0)
+        await drain_aiosqlite_workers(timeout=0.5)
 
 
 ORCHESTRATOR_RECOVERY_CASES = [
@@ -177,8 +172,7 @@ async def test_recovery_matrix_evaluation_model_call_dedupe(tmp_path) -> None:
             agentic_graph.invoke_evolution_agent = original_invoke
     finally:
         await runtime.shutdown()
-        await drain_aiosqlite_workers(timeout=5.0)
-        join_aiosqlite_workers(timeout=5.0)
+        await drain_aiosqlite_workers(timeout=0.5)
 
     runtime2 = await _runtime(db, settings, router, session_id, fake=fake)
     try:
@@ -197,8 +191,7 @@ async def test_recovery_matrix_evaluation_model_call_dedupe(tmp_path) -> None:
         assert len(calls) >= 4
     finally:
         await runtime2.shutdown()
-        await drain_aiosqlite_workers(timeout=5.0)
-        join_aiosqlite_workers(timeout=5.0)
+        await drain_aiosqlite_workers(timeout=0.5)
 
 
 @pytest.mark.asyncio

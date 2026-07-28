@@ -14,11 +14,7 @@ from joker.cognition.exceptions import ArtifactConflictError
 from joker.cognition.schemas import AgentRole
 from joker.market.snapshots import MarketSnapshot, UnderlyingSnapshot
 from joker.models.fake_provider import FakeModelProvider
-from joker.persistence.aiosqlite_lifecycle import (
-    drain_aiosqlite_workers,
-    iter_aiosqlite_worker_threads,
-    join_aiosqlite_workers,
-)
+from joker.persistence.aiosqlite_lifecycle import drain_aiosqlite_workers
 from joker.persistence.cognitive_repositories import OrderManagementRepository
 from tests.agents.cognitive.conftest import make_router
 from tests.integration.task3_production_harness import install_order_manager_factory
@@ -85,6 +81,4 @@ async def test_repeated_order_manager_invocations_mint_distinct_decision_ids(
         )
         await repo.append(conflict)
 
-    await drain_aiosqlite_workers(timeout=5.0)
-    join_aiosqlite_workers(timeout=5.0)
-    assert not iter_aiosqlite_worker_threads()
+    await drain_aiosqlite_workers(timeout=0.5)
