@@ -120,6 +120,9 @@ class CognitiveAgentRuntime:
         self._new_entry_lock = asyncio.Lock()
         self._new_entry_in_flight = False
         self._pending_new_entry_snapshot: str | None = None
+        # When True, market snapshots still drive open-position management but do
+        # not enqueue new-entry decision cycles (shadow evidence collection).
+        self._suppress_new_entry_snapshots = False
         self._counters = _RuntimeCounters()
         self._status: str = "healthy"
         self._received_events: list[DomainEvent] = []
@@ -132,6 +135,12 @@ class CognitiveAgentRuntime:
     @property
     def deps(self) -> CognitiveGraphDeps:
         return self._deps
+
+    def suppress_new_entry_snapshots(self, suppressed: bool = True) -> None:
+        """Block new-entry decision enqueue while still allowing position cycles."""
+        self._suppress_new_entry_snapshots = bool(suppressed)
+        if suppressed:
+            self._pending_new_entry_snapshot = None
 
     def bind_evolution_runtime(self, evolution_runtime: Any) -> None:
         """Inject Task 3 runtime before workers start (supported public API)."""
@@ -450,8 +459,12 @@ class CognitiveAgentRuntime:
                         kind="position",
                     )
                 )
-        # New-entry only when flat and no working entry order.
-        if not open_positions and not working_entry:
+        # New-entry only when flat, no working entry, and not suppressed (shadow).
+        if (
+            not open_positions
+            and not working_entry
+            and not self._suppress_new_entry_snapshots
+        ):
             if (
                 self._config.market_snapshot_coalescing
                 and self._new_entry_in_flight

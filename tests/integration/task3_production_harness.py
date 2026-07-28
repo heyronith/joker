@@ -660,6 +660,34 @@ async def ensure_flat_position(stack: dict, *, trade_index: int = 99) -> None:
     )
 
 
+async def wait_ready_for_new_entry(
+    stack: dict, *, trade_index: int = 98, timeout: float = 30.0
+) -> None:
+    """Ensure flat book, no working entry, and agent idle enough for a new entry."""
+    from joker.runtime.order_action_gateway import (
+        has_working_entry_order,
+        working_orders_from_projection,
+    )
+
+    await ensure_flat_position(stack, trade_index=trade_index)
+    agent: CognitiveAgentRuntime = stack["agent"]
+    supervisor = stack["supervisor"]
+    deadline = asyncio.get_event_loop().time() + timeout
+    while asyncio.get_event_loop().time() < deadline:
+        await supervisor.event_bus.drain(timeout=2.0)
+        projection = await supervisor.execution_runtime.project_session()
+        pos = projection.positions.get(CONTRACT_ID)
+        open_pos = pos is not None and pos.quantity != 0
+        working = has_working_entry_order(working_orders_from_projection(projection))
+        in_flight = bool(getattr(agent, "_new_entry_in_flight", False))
+        if not open_pos and not working and not in_flight:
+            return
+        if open_pos:
+            await ensure_flat_position(stack, trade_index=trade_index)
+        await asyncio.sleep(0.1)
+    raise AssertionError("session never became ready for a new paper entry")
+
+
 async def run_open_trade_entry_only(
     stack: dict,
     *,
@@ -672,6 +700,9 @@ async def run_open_trade_entry_only(
     clock: FrozenExchangeClock = stack["clock"]
     start: datetime = stack["start"]
     session_id = stack["evolution"].session_id
+    await wait_ready_for_new_entry(stack, trade_index=trade_index)
+    install_paper_path_factories(fake, session_id=session_id)
+    set_position_action(fake, PositionAction.HOLD)
     entries_before = len(stack["gateway_entry_ids"])
 
     entry_start = start + timedelta(minutes=minute_offset)
@@ -691,6 +722,12 @@ async def run_open_trade_entry_only(
         if len(stack["gateway_entry_ids"]) > entries_before:
             break
         if i > 0 and i % 15 == 0:
+            # Stale open position routes snapshots to the position graph, not entry.
+            projection = await supervisor.execution_runtime.project_session()
+            pos = projection.positions.get(CONTRACT_ID)
+            if pos is not None and pos.quantity != 0:
+                await ensure_flat_position(stack, trade_index=trade_index)
+                set_position_action(fake, PositionAction.HOLD)
             now = clock.now()
             tick = await supervisor.market_runtime.tick(now=now + timedelta(seconds=1))
             clock.set_now(now + timedelta(seconds=1))
@@ -841,6 +878,7 @@ async def feed_shadow_snapshots_via_market(stack: dict, *, cycles: int = 3) -> N
     if not assignments:
         return
     supervisor = stack["supervisor"]
+    agent: CognitiveAgentRuntime = stack["agent"]
     fake = stack["fake"]
     clock: FrozenExchangeClock = stack["clock"]
     start: datetime = stack["start"]
@@ -856,67 +894,74 @@ async def feed_shadow_snapshots_via_market(stack: dict, *, cycles: int = 3) -> N
                 return
             await asyncio.sleep(0.05)
 
-    for i in range(cycles):
-        # Do not re-register canned outputs while a prior shadow cycle is mid-graph.
-        await _wait_shadow_idle()
-        ts = base + timedelta(minutes=i * 4)
-        clock.set_now(ts)
-        await supervisor.market_runtime.ingest_underlying_quote(
-            symbol="SPY",
-            bid=Decimal("499.80"),
-            ask=Decimal("500.00"),
-            last=Decimal("499.90"),
-            source_timestamp=ts,
-            received_timestamp=ts,
-        )
-        await supervisor.market_runtime.ingest_option_quotes(
-            [
-                {
-                    "contract_id": CONTRACT_ID,
-                    "symbol": "SPY",
-                    "expiry": date(2026, 7, 1),
-                    "strike": "500",
-                    "option_type": "call",
-                    "bid": "1.00",
-                    "ask": "1.20",
-                    "last": "1.10",
-                    "quote_timestamp": ts,
-                    "is_0dte": True,
-                }
-            ]
-        )
-        tick = await supervisor.market_runtime.tick(now=ts + timedelta(seconds=3))
-        assert tick.snapshot is not None
-        register_full_path_canned(
-            fake,
-            tick.snapshot.snapshot_id,
-            f"shadow-feed-{i}",
-            session=session_id,
-            position_action=PositionAction.HOLD,
-        )
-        register_evolution_router_canned(fake)
-        before = len(evolution.shadow.results) if evolution.shadow is not None else 0
-        for assignment in assignments:
-            await evolution.shadow.enqueue_snapshot(
-                assignment_id=assignment.assignment_id,
-                challenger_version_id=assignment.challenger_version_id,
-                snapshot_id=str(tick.snapshot.snapshot_id),
-                payload={"snapshot_id": str(tick.snapshot.snapshot_id)},
-                coalesce=False,
-            )
-        await supervisor.event_bus.drain(timeout=5.0)
-        deadline = asyncio.get_event_loop().time() + 30.0
-        while asyncio.get_event_loop().time() < deadline:
-            if evolution.shadow is None:
-                break
-            if (
-                evolution.shadow.backlog == 0
-                and len(evolution.shadow.results) >= before + len(assignments)
-            ):
-                break
-            await asyncio.sleep(0.05)
-        else:
+    # Market ticks create real Task 1 snapshots for shadow, but must not open live
+    # paper entries (that pollutes gateway counts and blocks later entry proofs).
+    agent.suppress_new_entry_snapshots(True)
+    try:
+        for i in range(cycles):
+            # Do not re-register canned outputs while a prior shadow cycle is mid-graph.
             await _wait_shadow_idle()
+            ts = base + timedelta(minutes=i * 4)
+            clock.set_now(ts)
+            await supervisor.market_runtime.ingest_underlying_quote(
+                symbol="SPY",
+                bid=Decimal("499.80"),
+                ask=Decimal("500.00"),
+                last=Decimal("499.90"),
+                source_timestamp=ts,
+                received_timestamp=ts,
+            )
+            await supervisor.market_runtime.ingest_option_quotes(
+                [
+                    {
+                        "contract_id": CONTRACT_ID,
+                        "symbol": "SPY",
+                        "expiry": date(2026, 7, 1),
+                        "strike": "500",
+                        "option_type": "call",
+                        "bid": "1.00",
+                        "ask": "1.20",
+                        "last": "1.10",
+                        "quote_timestamp": ts,
+                        "is_0dte": True,
+                    }
+                ]
+            )
+            tick = await supervisor.market_runtime.tick(now=ts + timedelta(seconds=3))
+            assert tick.snapshot is not None
+            register_full_path_canned(
+                fake,
+                tick.snapshot.snapshot_id,
+                f"shadow-feed-{i}",
+                session=session_id,
+                position_action=PositionAction.HOLD,
+            )
+            register_evolution_router_canned(fake)
+            before = len(evolution.shadow.results) if evolution.shadow is not None else 0
+            for assignment in assignments:
+                await evolution.shadow.enqueue_snapshot(
+                    assignment_id=assignment.assignment_id,
+                    challenger_version_id=assignment.challenger_version_id,
+                    snapshot_id=str(tick.snapshot.snapshot_id),
+                    payload={"snapshot_id": str(tick.snapshot.snapshot_id)},
+                    coalesce=False,
+                )
+            await supervisor.event_bus.drain(timeout=5.0)
+            deadline = asyncio.get_event_loop().time() + 30.0
+            while asyncio.get_event_loop().time() < deadline:
+                if evolution.shadow is None:
+                    break
+                if (
+                    evolution.shadow.backlog == 0
+                    and len(evolution.shadow.results) >= before + len(assignments)
+                ):
+                    break
+                await asyncio.sleep(0.05)
+            else:
+                await _wait_shadow_idle()
+    finally:
+        agent.suppress_new_entry_snapshots(False)
+        await ensure_flat_position(stack, trade_index=97)
 
 
 async def _wait_shadow_threshold(
