@@ -87,52 +87,58 @@ def register_full_path_canned(
         fake.set_canned_for_role(role.value, ev)
 
     eids = tuple(evidence_ids)
-    fake.set_canned_for_role(
-        AgentRole.WORLD_MODEL_SYNTHESISER.value,
-        MarketWorldModel(
+
+    def _world_model_from_request(request: ModelRequest) -> MarketWorldModel:
+        raw_ids = request.context_payload.get("evidence_ids") or []
+        bound: tuple[UUID, ...] = tuple(UUID(str(x)) for x in raw_ids) or eids
+        refs = bound[:3] if bound else eids[:3]
+        return MarketWorldModel(
             session_id=session,
-            snapshot_id=sid,
-            prompt_version="2.0.0",
-            model_call_id=mc,
-            cycle_id=cycle_id,
+            snapshot_id=request.snapshot_id or sid,
+            prompt_version=request.prompt_version or "2.0.0",
+            model_call_id=request.request_id,
+            cycle_id=request.cycle_id or cycle_id,
             regime_hypotheses=(
                 RegimeHypothesis(
                     label="bullish-continuation",
                     direction=MarketDirection.BULLISH,
                     confidence=0.62,
-                    supporting_evidence_ids=eids[:3],
+                    supporting_evidence_ids=refs,
                     rationale="Structure and volatility evidence align bullish",
                 ),
             ),
             market_structure=MarketStructureAssessment(
                 primary_direction=MarketDirection.BULLISH,
                 structure_summary="Higher lows with reclaim of VWAP",
-                supporting_evidence_ids=eids[:2],
+                supporting_evidence_ids=refs[:2] if refs else (),
                 confidence=0.6,
             ),
             volatility_state=VolatilityAssessment(
                 state=MarketDirection.VOLATILITY_COMPRESSION,
                 summary="IV compressed vs morning",
-                supporting_evidence_ids=eids[1:3],
+                supporting_evidence_ids=refs[1:3] if len(refs) > 1 else refs,
                 confidence=0.55,
             ),
             options_state=OptionsMicrostructureAssessment(
                 liquidity_summary="ATM spreads acceptable",
                 spread_conditions="tight",
-                supporting_evidence_ids=eids[2:4],
+                supporting_evidence_ids=refs[2:4] if len(refs) > 2 else refs,
                 confidence=0.58,
             ),
             temporal_state=TemporalAssessment(
                 session_phase="regular",
                 time_decay_context="mid-session 0DTE",
-                supporting_evidence_ids=eids[3:5],
+                supporting_evidence_ids=refs[3:5] if len(refs) > 3 else refs,
                 confidence=0.5,
             ),
-            evidence_ids=eids,
+            evidence_ids=bound,
             unresolved_questions=("Does volume confirm breakout?",),
             overall_uncertainty=0.4,
-            synthesizer_model_call_id=mc,
-        ),
+            synthesizer_model_call_id=request.request_id,
+        )
+
+    fake.set_role_factory(
+        AgentRole.WORLD_MODEL_SYNTHESISER.value, _world_model_from_request
     )
 
     for role, name in (

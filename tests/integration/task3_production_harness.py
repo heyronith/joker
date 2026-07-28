@@ -846,7 +846,19 @@ async def feed_shadow_snapshots_via_market(stack: dict, *, cycles: int = 3) -> N
     start: datetime = stack["start"]
     session_id = evolution.session_id
     base = start + timedelta(minutes=40)
+
+    async def _wait_shadow_idle(*, timeout: float = 30.0) -> None:
+        if evolution.shadow is None:
+            return
+        deadline = asyncio.get_event_loop().time() + timeout
+        while asyncio.get_event_loop().time() < deadline:
+            if evolution.shadow.backlog == 0:
+                return
+            await asyncio.sleep(0.05)
+
     for i in range(cycles):
+        # Do not re-register canned outputs while a prior shadow cycle is mid-graph.
+        await _wait_shadow_idle()
         ts = base + timedelta(minutes=i * 4)
         clock.set_now(ts)
         await supervisor.market_runtime.ingest_underlying_quote(
@@ -883,6 +895,7 @@ async def feed_shadow_snapshots_via_market(stack: dict, *, cycles: int = 3) -> N
             position_action=PositionAction.HOLD,
         )
         register_evolution_router_canned(fake)
+        before = len(evolution.shadow.results) if evolution.shadow is not None else 0
         for assignment in assignments:
             await evolution.shadow.enqueue_snapshot(
                 assignment_id=assignment.assignment_id,
@@ -892,7 +905,18 @@ async def feed_shadow_snapshots_via_market(stack: dict, *, cycles: int = 3) -> N
                 coalesce=False,
             )
         await supervisor.event_bus.drain(timeout=5.0)
-        await asyncio.sleep(0.5)
+        deadline = asyncio.get_event_loop().time() + 30.0
+        while asyncio.get_event_loop().time() < deadline:
+            if evolution.shadow is None:
+                break
+            if (
+                evolution.shadow.backlog == 0
+                and len(evolution.shadow.results) >= before + len(assignments)
+            ):
+                break
+            await asyncio.sleep(0.05)
+        else:
+            await _wait_shadow_idle()
 
 
 async def _wait_shadow_threshold(
