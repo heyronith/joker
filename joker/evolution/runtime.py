@@ -411,8 +411,20 @@ class EvolutionRuntime:
         for worker in self._workers:
             try:
                 await asyncio.wait_for(worker, timeout=5.0)
-            except (asyncio.CancelledError, TimeoutError, Exception):  # noqa: BLE001
-                pass
+            except asyncio.CancelledError:
+                continue
+            except TimeoutError:
+                logger.warning(
+                    "evolution_worker_shutdown_timeout",
+                    extra={"worker": repr(worker)},
+                )
+                continue
+            except Exception:
+                logger.exception(
+                    "evolution_worker_shutdown_failed",
+                    extra={"worker": repr(worker)},
+                )
+                raise
         self._workers.clear()
         self._workers_started = False
         if self.shadow is not None:
