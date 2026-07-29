@@ -15,7 +15,10 @@ from joker.evolution.adversarial_fixtures import (
     AdversarialFixture,
     AdversarialScenarioDefinition,
 )
-from joker.evolution.adversarial_model_path import install_adversarial_model_path
+from joker.evolution.adversarial_model_path import (
+    install_adversarial_model_path,
+    install_scenario_specific_observations,
+)
 from joker.evolution.adversarial_recovery import (
     AdversarialRecoveryCheckpoint,
     AdversarialRecoveryStore,
@@ -577,6 +580,7 @@ def _evaluate_replay_invariants(
     """Satisfy full-replay invariants only from concrete replay payload fields.
 
     Never treat expected fixture labels as observed evidence.
+    Never invent ran_task2_graph / ran_position_graph / calibration confidence.
     """
     satisfied: list[str] = []
     failed: list[str] = []
@@ -586,6 +590,7 @@ def _evaluate_replay_invariants(
     broker = bool(payload.get("broker_submit"))
     open_at_end = bool(payload.get("open_at_end"))
     ran_position = bool(payload.get("ran_position_graph"))
+    entry_confidence = payload.get("entry_confidence")
     try:
         pnl = Decimal(str(payload.get("realised_pnl") or "0"))
     except Exception:
@@ -599,8 +604,13 @@ def _evaluate_replay_invariants(
     if not ran:
         return (), tuple(f"unevaluated:{inv}" for inv in expected) + tuple(failed)
     if integrity:
-        # Integrity findings block label satisfaction; they are fail-closed evidence.
         failed.append("replay_integrity")
+
+    conf_from_persisted_decision = (
+        entry_confidence is not None
+        and cal_pairs
+        and any(str(pair[0]) == str(entry_confidence) for pair in cal_pairs)
+    )
 
     for inv in expected:
         if inv == "calibrated_loss_accepted":
@@ -608,7 +618,7 @@ def _evaluate_replay_invariants(
                 traded
                 and pnl < 0
                 and cal_count > 0
-                and cal_pairs
+                and conf_from_persisted_decision
                 and not integrity
                 and not broker
             ):
@@ -636,6 +646,90 @@ def _evaluate_replay_invariants(
         # No catch-all: unknown labels remain unsatisfied.
 
     return tuple(dict.fromkeys(satisfied)), tuple(dict.fromkeys(failed))
+
+
+def _fixture_has_thin_surface(fixture: AdversarialFixture) -> bool:
+    from joker.market.option_surface import compute_relative_spread
+
+    for frame in fixture.frames:
+        for quote in frame.contracts:
+            rel = compute_relative_spread(quote.bid, quote.ask)
+            if rel is not None and rel > Decimal("0.25"):
+                return True
+    return False
+
+
+def _observe_entry_findings_from_graph(
+    result: dict[str, Any],
+    *,
+    fixture: AdversarialFixture,
+    entry_submitted: bool,
+) -> list[str]:
+    """Derive scenario findings from graph artefacts — never from fixture flags alone."""
+    if entry_submitted or not result:
+        return []
+    findings: list[str] = []
+    meta = result.get("meta_decision")
+    world = result.get("world_model")
+    reviews = list(result.get("reviews") or [])
+
+    meta_action = getattr(getattr(meta, "action", None), "value", None)
+    if meta_action not in _EXECUTE_ACTIONS:
+        findings.append("no_trade_recommended")
+
+    conflicts = tuple(getattr(world, "evidence_conflicts", ()) or ())
+    contrad = tuple(getattr(meta, "contradicting_evidence_ids", ()) or ())
+    if conflicts or contrad:
+        findings.append("conflicting_evidence_handled")
+
+    oppose = [
+        r
+        for r in reviews
+        if str(getattr(r, "verdict", "")).lower()
+        in {"oppose", "request_revision", "execution_concern"}
+    ]
+    support = [
+        r for r in reviews if str(getattr(r, "verdict", "")).lower() == "support"
+    ]
+    if oppose and support:
+        findings.append("false_consensus_resisted")
+
+    options = getattr(world, "options_state", None)
+    spread_raw = str(getattr(options, "spread_conditions", "") or "").lower()
+    liq_raw = str(getattr(options, "liquidity_summary", "") or "").lower()
+    if (
+        ("wide" in spread_raw or "thin" in liq_raw)
+        and _fixture_has_thin_surface(fixture)
+        and meta_action not in _EXECUTE_ACTIONS
+    ):
+        findings.append("thin_liquidity_rejected")
+
+    supporting = tuple(getattr(meta, "supporting_evidence_ids", ()) or ())
+    rationale = str(getattr(meta, "rationale_summary", "") or "").lower()
+    if (
+        meta_action not in _EXECUTE_ACTIONS
+        and not supporting
+        and "unsupported" in rationale
+    ):
+        findings.append("unsupported_reasoning_rejected")
+
+    overfit_modes = []
+    for review in reviews:
+        overfit_modes.extend(
+            str(m).lower() for m in (getattr(review, "identified_failure_modes", ()) or ())
+        )
+    if any("overfit" in m or "curve_fit" in m for m in overfit_modes):
+        findings.append("narrow_overfit_rejected")
+
+    if (
+        meta_action not in _EXECUTE_ACTIONS
+        and rationale.strip()
+        and supporting
+        and "justified" in rationale
+    ):
+        findings.append("justified_no_trade")
+
+    return findings
 
 def _get_fake_provider(deps: CognitiveGraphDeps) -> Any | None:
     router = deps.router
@@ -747,30 +841,11 @@ class EntryGraphAdversarialRunner(_RunnerBase):
                 session_id=deps.session_id,
                 meta_action=MetaDecisionAction.ABANDON,
             )
-
-        if (
-            provider is not None
-            and fixture.stimulus.get("expect_no_trade")
-            and not fixture.stimulus.get("expect_reject")
-        ):
-            from joker.cognition.schemas import MetaDecision
-            from joker.models.schemas import ModelRequest
-
-            def _meta_abandon(request: ModelRequest) -> MetaDecision:
-                return MetaDecision(
-                    session_id=deps.session_id,
-                    snapshot_id=request.snapshot_id or fixture.frames[0].snapshot_id,
-                    decision_id=uuid4(),
-                    prompt_version=request.prompt_version or "2.0.0",
-                    model_call_id=request.request_id,
-                    cycle_id=request.cycle_id or "adv",
-                    action=MetaDecisionAction.ABANDON,
-                    selected_strategy_id=None,
-                    confidence=0.2,
-                    rationale_summary="adversarial no-trade stimulus",
-                )
-
-            provider.set_role_factory("meta_decision", _meta_abandon)
+            install_scenario_specific_observations(
+                provider,
+                session_id=deps.session_id,
+                stimulus=dict(fixture.stimulus),
+            )
 
         findings: list[str] = []
         failed: list[str] = []
@@ -882,6 +957,13 @@ class EntryGraphAdversarialRunner(_RunnerBase):
                         findings.append(submit.blocked_reason or "entry_blocked")
                 else:
                     findings.append("no_trade_recommended")
+                findings.extend(
+                    _observe_entry_findings_from_graph(
+                        result,
+                        fixture=fixture,
+                        entry_submitted=entry_submitted,
+                    )
+                )
             elif runtime_invoked and fixture.stimulus.get("attempt_contract"):
                 contract = str(fixture.stimulus["attempt_contract"])
                 submit = await gateway.submit(
@@ -993,26 +1075,6 @@ class EntryGraphAdversarialRunner(_RunnerBase):
                 else:
                     failed.append("duplicate_position_accepted")
                     entry_submitted = True
-
-            # Scenario-specific no-trade labels require a completed graph (not boom).
-            if (
-                graph_completed
-                and fixture.stimulus.get("expect_no_trade")
-                and not entry_submitted
-            ):
-                findings.append("no_trade_recommended")
-                if fixture.stimulus.get("justified_no_trade"):
-                    findings.append("justified_no_trade")
-                if fixture.stimulus.get("conflicting_evidence"):
-                    findings.append("conflicting_evidence_handled")
-                if fixture.stimulus.get("false_consensus"):
-                    findings.append("false_consensus_resisted")
-                if fixture.stimulus.get("thin_liquidity"):
-                    findings.append("thin_liquidity_rejected")
-                if fixture.stimulus.get("unsupported_reasoning"):
-                    findings.append("unsupported_reasoning_rejected")
-                if fixture.stimulus.get("narrow_overfit"):
-                    findings.append("narrow_overfit_rejected")
 
             findings_tuple = tuple(dict.fromkeys(findings))
             satisfied, failed_inv = _evaluate_entry_invariants(
@@ -1618,7 +1680,6 @@ class FullReplayAdversarialRunner(_RunnerBase):
         runtime_invoked = False
         runtime_errors: list[str] = []
         findings: list[str] = []
-        fill_ids: tuple[str, ...] = ()
         try:
             payload = await self._replay.replay_episode(
                 experiment_id=experiment_id,
@@ -1627,27 +1688,13 @@ class FullReplayAdversarialRunner(_RunnerBase):
                 sample=sample_number,
             )
             runtime_invoked = True
+            # Never invent graph-ran flags. Only trust the replay payload.
+            if not payload.get("ran_task2_graph"):
+                runtime_errors.append("replay_graph_not_run")
             if payload.get("integrity_findings"):
                 findings.append("replay_integrity")
                 runtime_errors.append("replay_integrity_failure")
-            if not payload.get("ran_task2_graph"):
-                runtime_errors.append("replay_graph_not_run")
 
-            # Concrete fill/PnL bookkeeping for calibration/regime stimuli when the
-            # generic replay payload lacks those observed fields.
-            if fixture.stimulus.get("full_replay_calibration") or fixture.stimulus.get(
-                "full_replay_regime"
-            ):
-                payload, local_fills = await self._concrete_outcome_payload(
-                    fixture=fixture,
-                    configuration=configuration,
-                    base_payload=payload,
-                    sample_number=sample_number,
-                )
-                fill_ids = local_fills
-                findings.append("concrete_replay_outcome")
-
-            # Never copy expected_invariants into findings — evaluate only from payload.
             satisfied, failed_inv = _evaluate_replay_invariants(
                 expected,
                 payload=payload,
@@ -1669,7 +1716,7 @@ class FullReplayAdversarialRunner(_RunnerBase):
                 )
                 if payload.get("entry_graph_thread_id")
                 else (),
-                fill_ids=fill_ids or tuple(payload.get("fill_ids") or ()),
+                fill_ids=tuple(str(x) for x in (payload.get("fill_ids") or ())),
                 runtime_invoked=runtime_invoked,
                 satisfied_invariants=satisfied,
                 failed_invariants=failed_inv,
@@ -1679,58 +1726,9 @@ class FullReplayAdversarialRunner(_RunnerBase):
                 completed=bool(payload.get("ran_task2_graph")),
             )
         except Exception as exc:  # noqa: BLE001
-            # Calibration/regime scenarios can still prove concrete fill/PnL outcomes
-            # when the generic replay path fails on missing canned models.
-            if fixture.stimulus.get("full_replay_calibration") or fixture.stimulus.get(
-                "full_replay_regime"
-            ):
-                try:
-                    base = {
-                        "ran_task2_graph": False,
-                        "integrity_findings": (),
-                        "broker_submit": False,
-                        "traded": False,
-                    }
-                    payload, local_fills = await self._concrete_outcome_payload(
-                        fixture=fixture,
-                        configuration=configuration,
-                        base_payload=base,
-                        sample_number=sample_number,
-                    )
-                    findings.append(f"full_replay_fallback:{type(exc).__name__}")
-                    findings.append("concrete_replay_outcome")
-                    satisfied, failed_inv = _evaluate_replay_invariants(
-                        expected,
-                        payload=payload,
-                    )
-                    passed = _pass_only_if_observed(
-                        expected,
-                        satisfied,
-                        failed_inv,
-                        (),
-                    )
-                    return self._evidence(
-                        experiment_id=experiment_id,
-                        definition=definition,
-                        configuration=configuration,
-                        sample_number=sample_number,
-                        graph_kind="full_replay",
-                        fill_ids=local_fills,
-                        runtime_invoked=True,
-                        satisfied_invariants=satisfied,
-                        failed_invariants=failed_inv,
-                        runtime_errors=(),
-                        findings=tuple(dict.fromkeys(findings)),
-                        passed=passed,
-                        completed=True,
-                    )
-                except Exception as inner:  # noqa: BLE001
-                    runtime_errors.append(f"full_replay:{type(exc).__name__}:{exc}")
-                    runtime_errors.append(
-                        f"concrete_fallback:{type(inner).__name__}:{inner}"
-                    )
-            else:
-                runtime_errors.append(f"full_replay:{type(exc).__name__}:{exc}")
+            # A full-replay exception must fail closed. Never fabricate fills,
+            # calibration pairs, or graph-ran flags after a failed replay.
+            runtime_errors.append(f"full_replay:{type(exc).__name__}:{exc}")
             return self._evidence(
                 experiment_id=experiment_id,
                 definition=definition,
@@ -1741,71 +1739,8 @@ class FullReplayAdversarialRunner(_RunnerBase):
                 runtime_errors=tuple(runtime_errors),
                 findings=(f"full_replay_failed:{type(exc).__name__}",),
                 passed=False,
-                completed=runtime_invoked,
+                completed=False,
             )
-
-    async def _concrete_outcome_payload(
-        self,
-        *,
-        fixture: AdversarialFixture,
-        configuration: CognitiveConfigurationVersion,
-        base_payload: dict[str, Any],
-        sample_number: int,
-    ) -> tuple[dict[str, Any], tuple[str, ...]]:
-        """Derive traded PnL / calibration / regime fields from ReplayExecutionRuntime fills."""
-        execution, gateway = _setup_replay_execution(fixture, configuration)
-        contract = "SPY:2026-07-01:500.0:call"
-        entry = await gateway.submit(
-            OrderActionRequest(
-                action=OrderActionKind.ENTRY,
-                snapshot_id=str(fixture.frames[0].snapshot_id),
-                contract_id=contract,
-                side="buy",
-                quantity=1,
-                client_order_id=f"adv-full-entry:{fixture.scenario_id}:{sample_number}",
-                cycle_id=f"adv-full:{sample_number}",
-            )
-        )
-        # Move quotes adversely before exit so realised PnL is negative.
-        if len(fixture.frames) > 1:
-            q = fixture.frames[-1].contracts[0] if fixture.frames[-1].contracts else None
-            if q is not None:
-                execution.allow_contract(
-                    contract, bid=Decimal(str(q.bid)), ask=Decimal(str(q.ask))
-                )
-        exit_res = await gateway.submit(
-            OrderActionRequest(
-                action=OrderActionKind.EXIT,
-                snapshot_id=str(fixture.frames[-1].snapshot_id),
-                contract_id=contract,
-                side="sell",
-                quantity=1,
-                client_order_id=f"adv-full-exit:{fixture.scenario_id}:{sample_number}",
-                cycle_id=f"adv-full:{sample_number}:exit",
-            )
-        )
-        pnl = execution.realised_pnl()
-        fill_ids = tuple(f.fill_id for f in execution.fills)
-        traded = bool(entry.submitted) and bool(fill_ids)
-        payload = dict(base_payload)
-        payload.update(
-            {
-                "ran_task2_graph": True,
-                "ran_position_graph": True,
-                "broker_submit": False,
-                "traded": traded,
-                "open_at_end": bool(execution.positions),
-                "realised_pnl": str(pnl),
-                "integrity_findings": (),
-                "meta_decision_action": "execute",
-                "calibration_sample_count": 1 if traded else 0,
-                "calibration_pairs": [("0.65", pnl < 0)] if traded else (),
-                "fill_ids": fill_ids,
-                "entry_order": entry.client_order_id if entry.submitted else None,
-                "exit_order": exit_res.client_order_id if exit_res.submitted else None,
-            }
-        )
-        return payload, fill_ids
 
 
 class AdversarialRunnerDispatcher:

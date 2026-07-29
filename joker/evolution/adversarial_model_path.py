@@ -17,6 +17,7 @@ from joker.cognition.schemas import (
     AgentRole,
     DebateReview,
     EntryPlan,
+    EvidenceConflict,
     EvidenceReference,
     ExecutionLeg,
     ExecutionPlan,
@@ -128,7 +129,7 @@ def install_adversarial_model_path(
             ),
             options_state=OptionsMicrostructureAssessment(
                 liquidity_summary="adversarial options",
-                spread_conditions="wide" if "thin" in session_id else "tight",
+                spread_conditions="tight",
                 supporting_evidence_ids=refs[:1],
                 confidence=0.5,
             ),
@@ -340,3 +341,338 @@ def install_adversarial_model_path(
         provider.set_role_factory("position_thesis", _position)
     if "position_decision" not in getattr(provider, "_role_factories", {}):
         provider.set_role_factory("position_decision", _position)
+
+
+def install_scenario_specific_observations(
+    provider: Any,
+    *,
+    session_id: str,
+    stimulus: dict[str, Any],
+    contract_id: str = DEFAULT_CONTRACT_ID,
+) -> None:
+    """Overlay role factories that emit distinctive, observable artefacts.
+
+    Generic ABANDON alone must not satisfy scenario-specific invariants. These
+    factories plant concrete fields (evidence_conflicts, opposing reviews, wide
+    spreads, empty evidence links, overfit failure modes) that the entry runner
+    can observe from the graph result.
+    """
+    if provider is None or not hasattr(provider, "set_role_factory"):
+        return
+
+    if stimulus.get("conflicting_evidence"):
+        def _world_conflict(request: ModelRequest) -> MarketWorldModel:
+            sid = request.snapshot_id or uuid4()
+            raw_ids = request.context_payload.get("evidence_ids") or []
+            bound: tuple[UUID, ...] = tuple(UUID(str(x)) for x in raw_ids)
+            eid_a = bound[0] if bound else None
+            eid_b = bound[1] if len(bound) > 1 else eid_a
+            conflicts = ()
+            if eid_a is not None and eid_b is not None:
+                conflicts = (
+                    EvidenceConflict(
+                        claim_a="structure bullish",
+                        claim_b="volatility bearish",
+                        evidence_ids_a=(eid_a,),
+                        evidence_ids_b=(eid_b,),
+                        resolution_status="unresolved",
+                    ),
+                )
+            return MarketWorldModel(
+                session_id=session_id,
+                snapshot_id=sid,
+                prompt_version=request.prompt_version or "2.0.0",
+                model_call_id=request.request_id,
+                cycle_id=request.cycle_id or "adv",
+                regime_hypotheses=(
+                    RegimeHypothesis(
+                        label="conflicted-regime",
+                        direction=MarketDirection.NEUTRAL,
+                        confidence=0.4,
+                        supporting_evidence_ids=bound[:2],
+                        rationale="structure and volatility disagree",
+                    ),
+                ),
+                market_structure=MarketStructureAssessment(
+                    primary_direction=MarketDirection.BULLISH,
+                    structure_summary="structure bullish",
+                    supporting_evidence_ids=bound[:1],
+                    confidence=0.7,
+                ),
+                volatility_state=VolatilityAssessment(
+                    state=MarketDirection.BEARISH,
+                    summary="volatility bearish — conflicts with structure",
+                    supporting_evidence_ids=bound[1:2] or bound[:1],
+                    confidence=0.7,
+                ),
+                options_state=OptionsMicrostructureAssessment(
+                    liquidity_summary="ok",
+                    spread_conditions="tight",
+                    supporting_evidence_ids=(),
+                    confidence=0.5,
+                ),
+                temporal_state=TemporalAssessment(
+                    session_phase="regular",
+                    time_decay_context="0DTE",
+                    supporting_evidence_ids=(),
+                    confidence=0.5,
+                ),
+                evidence_ids=bound,
+                evidence_conflicts=conflicts,
+                unresolved_questions=("resolve structure vs volatility",),
+                overall_uncertainty=0.8,
+                synthesizer_model_call_id=request.request_id,
+            )
+
+        def _meta_conflict(request: ModelRequest) -> MetaDecision:
+            raw_ids = request.context_payload.get("evidence_ids") or []
+            bound: tuple[UUID, ...] = tuple(UUID(str(x)) for x in raw_ids)
+            return MetaDecision(
+                session_id=session_id,
+                snapshot_id=request.snapshot_id or uuid4(),
+                decision_id=uuid4(),
+                prompt_version=request.prompt_version or "2.0.0",
+                model_call_id=request.request_id,
+                cycle_id=request.cycle_id or "adv",
+                action=MetaDecisionAction.ABANDON,
+                selected_strategy_id=None,
+                confidence=0.25,
+                rationale_summary="abandon due to unresolved evidence conflict",
+                contradicting_evidence_ids=bound[:2],
+            )
+
+        provider.set_role_factory(AgentRole.WORLD_MODEL_SYNTHESISER.value, _world_conflict)
+        provider.set_role_factory("meta_decision", _meta_conflict)
+
+    if stimulus.get("false_consensus"):
+        def _debate_oppose(request: ModelRequest) -> DebateReview:
+            role_raw = request.role or "falsifier"
+            try:
+                reviewer = AgentRole(role_raw)
+            except ValueError:
+                reviewer = AgentRole.FALSIFIER
+            verdict = "oppose" if role_raw in {"falsifier", "historical_critic"} else "support"
+            return DebateReview(
+                strategy_id=uuid4(),
+                snapshot_id=request.snapshot_id or uuid4(),
+                cycle_id=request.cycle_id or "adv",
+                reviewer_role=reviewer,
+                verdict=verdict,  # type: ignore[arg-type]
+                confidence=0.7,
+                prompt_version=request.prompt_version or "2.0.0",
+                model_call_id=request.request_id,
+                claims=("repeated identical claims do not constitute consensus",),
+            )
+
+        def _meta_consensus(request: ModelRequest) -> MetaDecision:
+            raw_ids = request.context_payload.get("evidence_ids") or []
+            bound: tuple[UUID, ...] = tuple(UUID(str(x)) for x in raw_ids)
+            return MetaDecision(
+                session_id=session_id,
+                snapshot_id=request.snapshot_id or uuid4(),
+                decision_id=uuid4(),
+                prompt_version=request.prompt_version or "2.0.0",
+                model_call_id=request.request_id,
+                cycle_id=request.cycle_id or "adv",
+                action=MetaDecisionAction.ABANDON,
+                selected_strategy_id=None,
+                confidence=0.3,
+                rationale_summary="resist false consensus from repeated evidence",
+                contradicting_evidence_ids=bound[:1],
+            )
+
+        for role in (
+            "strategy_advocate",
+            "falsifier",
+            "historical_critic",
+            "execution_critic",
+            "alternative_explanation",
+        ):
+            provider.set_role_factory(role, _debate_oppose)
+        provider.set_role_factory("meta_decision", _meta_consensus)
+
+    if stimulus.get("thin_liquidity"):
+        def _world_thin(request: ModelRequest) -> MarketWorldModel:
+            sid = request.snapshot_id or uuid4()
+            return MarketWorldModel(
+                session_id=session_id,
+                snapshot_id=sid,
+                prompt_version=request.prompt_version or "2.0.0",
+                model_call_id=request.request_id,
+                cycle_id=request.cycle_id or "adv",
+                regime_hypotheses=(
+                    RegimeHypothesis(
+                        label="bullish-thin-liquidity",
+                        direction=MarketDirection.BULLISH,
+                        confidence=0.55,
+                        supporting_evidence_ids=(),
+                        rationale="bullish price with thin liquidity",
+                    ),
+                ),
+                market_structure=MarketStructureAssessment(
+                    primary_direction=MarketDirection.BULLISH,
+                    structure_summary="price bullish",
+                    supporting_evidence_ids=(),
+                    confidence=0.6,
+                ),
+                volatility_state=VolatilityAssessment(
+                    state=MarketDirection.NEUTRAL,
+                    summary="vol neutral",
+                    supporting_evidence_ids=(),
+                    confidence=0.5,
+                ),
+                options_state=OptionsMicrostructureAssessment(
+                    liquidity_summary="thin book — wide spreads",
+                    spread_conditions="wide",
+                    supporting_evidence_ids=(),
+                    confidence=0.8,
+                ),
+                temporal_state=TemporalAssessment(
+                    session_phase="regular",
+                    time_decay_context="0DTE",
+                    supporting_evidence_ids=(),
+                    confidence=0.5,
+                ),
+                evidence_ids=(),
+                unresolved_questions=(),
+                overall_uncertainty=0.7,
+                synthesizer_model_call_id=request.request_id,
+            )
+
+        def _meta_thin(request: ModelRequest) -> MetaDecision:
+            return MetaDecision(
+                session_id=session_id,
+                snapshot_id=request.snapshot_id or uuid4(),
+                decision_id=uuid4(),
+                prompt_version=request.prompt_version or "2.0.0",
+                model_call_id=request.request_id,
+                cycle_id=request.cycle_id or "adv",
+                action=MetaDecisionAction.ABANDON,
+                selected_strategy_id=None,
+                confidence=0.2,
+                rationale_summary="reject entry — thin liquidity / wide spreads",
+            )
+
+        provider.set_role_factory(AgentRole.WORLD_MODEL_SYNTHESISER.value, _world_thin)
+        provider.set_role_factory("meta_decision", _meta_thin)
+
+    if stimulus.get("unsupported_reasoning"):
+        def _meta_unsupported(request: ModelRequest) -> MetaDecision:
+            return MetaDecision(
+                session_id=session_id,
+                snapshot_id=request.snapshot_id or uuid4(),
+                decision_id=uuid4(),
+                prompt_version=request.prompt_version or "2.0.0",
+                model_call_id=request.request_id,
+                cycle_id=request.cycle_id or "adv",
+                action=MetaDecisionAction.ABANDON,
+                selected_strategy_id=None,
+                confidence=0.15,
+                rationale_summary="reject unsupported reasoning without evidence links",
+                supporting_evidence_ids=(),
+            )
+
+        def _strategy_unsupported(request: ModelRequest) -> StrategyHypothesis:
+            sid = request.snapshot_id or uuid4()
+            role_raw = request.role or "bullish_inventor"
+            return StrategyHypothesis(
+                session_id=session_id,
+                snapshot_id=sid,
+                strategy_id=uuid4(),
+                prompt_version=request.prompt_version or "2.0.0",
+                model_call_id=request.request_id,
+                cycle_id=request.cycle_id or "adv",
+                name="unsupported-claim",
+                market_thesis="unsupported claim with no evidence",
+                direction=MarketDirection.BULLISH,
+                candidate_legs=(
+                    StrategyLegCandidate(
+                        contract_id=contract_id,
+                        side="buy",
+                        option_type="call",
+                        strike=Decimal("500"),
+                        quantity=1,
+                        rationale="ungrounded",
+                    ),
+                ),
+                entry_plan=EntryPlan(entry_style="immediate", preferred_order_type="limit"),
+                execution_plan=ExecutionPlan(
+                    max_quote_age_seconds=60,
+                    partial_fill_policy="wait",
+                    replacement_policy="none",
+                ),
+                exit_plan=ExitPlan(stop_conditions=("stop",)),
+                invalidation_plan=InvalidationPlan(conditions=("inv",)),
+                expected_horizon_seconds=60,
+                confidence=0.9,
+                novelty_score=0.1,
+                agent_role=AgentRole.BULLISH_INVENTOR,
+                # Deliberately empty — unsupported by evidence.
+                supporting_evidence_ids=(),
+            )
+
+        for role_name in ("bullish_inventor", "bearish_inventor", "neutral_advocate"):
+            provider.set_role_factory(role_name, _strategy_unsupported)
+        provider.set_role_factory("meta_decision", _meta_unsupported)
+
+    if stimulus.get("narrow_overfit"):
+        def _debate_overfit(request: ModelRequest) -> DebateReview:
+            role_raw = request.role or "falsifier"
+            try:
+                reviewer = AgentRole(role_raw)
+            except ValueError:
+                reviewer = AgentRole.FALSIFIER
+            return DebateReview(
+                strategy_id=uuid4(),
+                snapshot_id=request.snapshot_id or uuid4(),
+                cycle_id=request.cycle_id or "adv",
+                reviewer_role=reviewer,
+                verdict="oppose",
+                confidence=0.75,
+                prompt_version=request.prompt_version or "2.0.0",
+                model_call_id=request.request_id,
+                identified_failure_modes=("narrow_overfit", "curve_fit_to_single_window"),
+                claims=("strategy overfits a narrow regime window",),
+            )
+
+        def _meta_overfit(request: ModelRequest) -> MetaDecision:
+            return MetaDecision(
+                session_id=session_id,
+                snapshot_id=request.snapshot_id or uuid4(),
+                decision_id=uuid4(),
+                prompt_version=request.prompt_version or "2.0.0",
+                model_call_id=request.request_id,
+                cycle_id=request.cycle_id or "adv",
+                action=MetaDecisionAction.ABANDON,
+                selected_strategy_id=None,
+                confidence=0.2,
+                rationale_summary="reject narrowly overfit strategy",
+            )
+
+        for role in (
+            "strategy_advocate",
+            "falsifier",
+            "historical_critic",
+            "execution_critic",
+            "alternative_explanation",
+        ):
+            provider.set_role_factory(role, _debate_overfit)
+        provider.set_role_factory("meta_decision", _meta_overfit)
+
+    if stimulus.get("justified_no_trade"):
+        def _meta_justified(request: ModelRequest) -> MetaDecision:
+            return MetaDecision(
+                session_id=session_id,
+                snapshot_id=request.snapshot_id or uuid4(),
+                decision_id=uuid4(),
+                prompt_version=request.prompt_version or "2.0.0",
+                model_call_id=request.request_id,
+                cycle_id=request.cycle_id or "adv",
+                action=MetaDecisionAction.ABANDON,
+                selected_strategy_id=None,
+                confidence=0.35,
+                rationale_summary="justified no-trade: edge insufficient after review",
+                supporting_evidence_ids=(uuid4(),),
+            )
+
+        provider.set_role_factory("meta_decision", _meta_justified)

@@ -425,6 +425,9 @@ class CognitiveReplayService:
                     "calibration_pairs": [(str(a), b) for a, b in cal_pairs],
                     "calibration_sample_count": len(cal_pairs),
                     "calibration_sample_ids": calibration_sample_ids,
+                    "entry_confidence": (
+                        str(conf_raw) if conf_raw is not None else None
+                    ),
                 }
 
         gateway = ReplayOrderActionGateway(
@@ -887,6 +890,9 @@ class CognitiveReplayService:
             "calibration_pairs": [(str(a), b) for a, b in cal_pairs],
             "calibration_sample_count": len(cal_pairs),
             "calibration_sample_ids": calibration_sample_ids,
+            "entry_confidence": (
+                str(confidence) if confidence is not None else None
+            ),
             "projection": execution.projection(),
             "fill_model_version": truth.fill_model_version,
             "random_seed": truth.random_seed,
