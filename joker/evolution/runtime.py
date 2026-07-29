@@ -117,6 +117,7 @@ class EvolutionRuntime:
     _episode_queue: asyncio.Queue[dict[str, Any]] | None = None
     _eval_queue: asyncio.Queue[UUID] | None = None
     _workers: list[asyncio.Task[None]] = field(default_factory=list)
+    _index_tasks: set[asyncio.Task[Any]] = field(default_factory=set)
     _prepared: bool = False
     _workers_started: bool = False
     _subscribed: bool = False
@@ -325,7 +326,15 @@ class EvolutionRuntime:
         self._subscribed = True
 
     async def _index_domain_event(self, event: DomainEvent) -> None:
-        """Persist domain events into session_event_index (fail-soft)."""
+        """Enqueue session_event_index persistence (fail-soft, non-blocking on bus)."""
+        if self.session_event_index is None:
+            return
+        self._spawn_background(
+            self._persist_session_event_index(event),
+            name=f"evolution-index-{event.event_id}",
+        )
+
+    async def _persist_session_event_index(self, event: DomainEvent) -> None:
         if self.session_event_index is None:
             return
         payload = dict(event.payload or {})
@@ -406,6 +415,16 @@ class EvolutionRuntime:
     async def shutdown(self) -> None:
         if self.orchestrator is not None:
             self.orchestrator.pause()
+        # Drain pending index writes before cancelling workers / closing DBs.
+        pending_index = list(self._index_tasks)
+        if pending_index:
+            await asyncio.wait(pending_index, timeout=5.0)
+            still = [t for t in pending_index if not t.done()]
+            for task in still:
+                task.cancel()
+            if still:
+                await asyncio.gather(*still, return_exceptions=True)
+        self._index_tasks.clear()
         for worker in self._workers:
             worker.cancel()
         for worker in self._workers:
@@ -529,10 +548,22 @@ class EvolutionRuntime:
         if cycle_id and event.exchange_timestamp is not None:
             self._cycle_exchange_timestamp[cycle_id] = event.exchange_timestamp
         # New cycles pin champion unless already pinned (recovery path).
+        # Offload DB work — bus handlers must stay under handler_timeout.
         if cycle_id and cycle_id not in self._applied_by_cycle:
-            await self.pin_and_apply_for_cycle(cycle_id)
+            self._spawn_background(
+                self.pin_and_apply_for_cycle(cycle_id),
+                name=f"evolution-pin-{cycle_id}",
+            )
 
     async def _on_position_opened(self, event: DomainEvent) -> None:
+        # Capture immutable event fields then finish on a background task so the
+        # bus handler cannot block snapshot fan-out under SQLite contention.
+        self._spawn_background(
+            self._handle_position_opened(event),
+            name=f"evolution-position-opened-{event.event_id}",
+        )
+
+    async def _handle_position_opened(self, event: DomainEvent) -> None:
         contract_id = str(event.payload.get("contract_id") or "")
         cycle_id = str(event.payload.get("cycle_id") or "")
         client_order_id = str(event.payload.get("client_order_id") or "")
@@ -596,6 +627,12 @@ class EvolutionRuntime:
         )
 
     async def _on_cognitive_cycle_completed(self, event: DomainEvent) -> None:
+        self._spawn_background(
+            self._handle_cognitive_cycle_completed(event),
+            name=f"evolution-cycle-completed-{event.event_id}",
+        )
+
+    async def _handle_cognitive_cycle_completed(self, event: DomainEvent) -> None:
         outcome = str(event.payload.get("outcome") or "")
         if outcome in {"no_trade", "hold", "reject", "rejected", ""}:
             await self.enqueue_episode_job(
@@ -619,6 +656,12 @@ class EvolutionRuntime:
                     event_sequence=getattr(event, "sequence", None),
                 )
                 self.wake_orchestrator(reason="shadow_snapshot_enqueued")
+
+    def _spawn_background(self, coro: Awaitable[Any], *, name: str) -> None:
+        """Schedule durable evolution work outside the event-bus timeout window."""
+        task = asyncio.create_task(coro, name=name)
+        self._index_tasks.add(task)
+        task.add_done_callback(self._index_tasks.discard)
 
     def _trading_date_from_job(self, job: dict[str, Any]) -> date | None:
         ts = job.get("exchange_timestamp")

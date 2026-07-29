@@ -1,0 +1,182 @@
+mode: PAPER
+live_trading_enabled: false
+
+# Live paper sessions require real Webull market data (no mock/replay).
+data:
+  default_provider: webull
+  quote_poll_interval_seconds: 1.0
+
+exchange:
+  calendar: XNYS
+  timezone: America/New_York
+
+market_data:
+  observation_poll_seconds: 1
+  bar_timeframes:
+    - 1m
+    - 5m
+  late_observation_tolerance_seconds: 2
+
+data_quality:
+  underlying_stale_seconds: 5
+  option_stale_seconds: 10
+  maximum_relative_spread: 0.25
+
+runtime:
+  event_handler_timeout_seconds: 10
+  reconciliation_interval_seconds: 5
+
+persistence:
+  database_url: sqlite:///data/joker.db
+  checkpoint_database_url: sqlite:///data/joker_checkpoints.db
+
+# Auto-selects Webull paper account when WEBULL_PAPER_TRADING_ENABLED=true
+# and WEBULL_PAPER_ACCOUNT_ID is set; otherwise local PaperBroker.
+broker:
+  provider: paper
+  require_explicit_confirmation: true
+  webull_paper_trading_enabled: false
+
+risk:
+  allow_delayed_quotes: true
+  feed_max_silence_seconds: 60
+  delayed_quote_max_age_seconds: 900
+  # Agent-approved entries execute; soft caps are advisory only.
+  policy: agent_led
+  # Raise soft caps so advisory context is not tiny (still not vetoes).
+  max_trades_per_day: 5
+  max_premium_usd: 500.0
+  max_daily_loss_usd: 500.0
+
+agents:
+  runtime: cognitive_graph
+  mock_agents: false
+  execution_mode: agent_led
+  intraday_enabled: true
+  # Legacy council interval (unused as primary path in agent_led)
+  intraday_interval_seconds: 300.0
+  # Primary realtime AI decision cadence
+  decision_interval_seconds: 45.0
+  max_decision_calls_per_session: 40
+  max_proposals_per_session: 20
+  min_proposal_confidence: 0.45
+  require_propose_before_enter: true
+  confirm_ttl_seconds: 120.0
+  max_confirm_spy_drift_pct: 0.20
+  max_confirm_option_mid_worsen_pct: 15.0
+  use_edge_prefilter: true
+  fast_confirm_min_seconds: 8.0
+  postmarket_learner_enabled: true
+  memory_lookback_days: 5
+
+cognitive_graph:
+  enabled: true
+  max_parallel_agents: 5
+  max_cycle_seconds: 90
+  max_debate_rounds: 2
+  max_strategy_candidates: 3
+  max_hypotheses_per_cycle: 5
+  max_strategy_switches: 1
+  max_agent_data_requests: 1
+  market_snapshot_coalescing: true
+  legacy_fallback_enabled: false
+  position:
+    enabled: true
+    minimum_reassessment_interval_seconds: 5
+    prioritise_over_new_entries: true
+  context:
+    max_1m_bars: 60
+    max_5m_bars: 36
+    maximum_option_rows_per_request: 80
+    maximum_context_characters: 60000
+
+models:
+  # Local-paper cognitive path: Ollama is mandatory unless mock_agents /
+  # JOKER_COGNITIVE_USE_FAKE_MODELS explicitly remaps profiles to fake.
+  ollama:
+    enabled: true
+    base_url: http://127.0.0.1:11434
+    request_timeout_seconds: 45.0
+    max_concurrent_requests: 1
+  # OpenAI escalation remains optional; availability is reported at startup.
+  openai:
+    enabled: false
+  max_schema_repair_attempts: 1
+  max_provider_escalations: 1
+  max_parallel_model_calls: 5
+
+# Task 3 cognitive evolution — paper-only, default disabled for Task 1/2 safety.
+evolution:
+  enabled: true
+  episode_compiler:
+    enabled: true
+    no_trade_windows_minutes: [5, 15, 30]
+    finalise_at_session_end: true
+  evaluation:
+    enabled: true
+    max_parallel_episodes: 4
+    evaluator_profile: reasoning_local
+    counterfactual_max_per_episode: 3
+  datasets:
+    minimum_episode_count: 50
+    minimum_holdout_count: 20
+    minimum_regime_count: 3
+  experiments:
+    enabled: true
+    max_parallel_replays: 4
+    maximum_model_calls: 5000
+    maximum_cost_gbp: 25.00
+    repeated_samples: 3
+  orchestrator:
+    enabled: true
+    minimum_new_completed_episodes: 50
+    minimum_new_evaluations: 50
+    minimum_holdout_episodes: 20
+    maximum_active_challengers: 1
+    automatic_cycle_interval_minutes: 60
+    pause_under_load: true
+  shadow:
+    enabled: true
+    maximum_challengers: 1
+    queue_size: 128
+    snapshot_coalescing: true
+    minimum_completed_cycles: 20
+    minimum_traded_cycles: 5
+    minimum_regime_coverage: 2
+    minimum_observation_minutes: 60
+    allow_promotion_before_shadow: false
+    maximum_integrity_findings: 0
+  promotion:
+    auto_promote_paper_only: true
+    require_agent_recommendation: true
+    require_deterministic_eligibility: true
+    maximum_tail_loss_regression_pct: 5
+    maximum_calibration_regression_pct: 3
+    maximum_latency_regression_pct: 25
+    maximum_cost_regression_pct: 50
+    minimum_completed_episodes: 20
+    minimum_holdout_episodes: 10
+    require_known_cost: true
+    minimum_calibration_samples: 20
+    require_brier_score: true
+    require_expected_calibration_error: true
+  drift:
+    enabled: true
+    rolling_episode_window: 50
+    safety_rollback_immediate: true
+    strategic_rollback_requires_agent: true
+
+# Daily authorized capital + profit goal (confirmed at session start)
+capital:
+  authorized_usd: 500.0
+  target_profit_pct: 20.0
+  max_concurrent_positions: 1
+  max_contracts_per_trade: 20
+  min_contracts_per_trade: 1
+  require_session_confirm: true
+  pause_entries_when_goal_met: true
+  aggression_mode: goal_adaptive
+  max_kelly_fraction: 0.35
+  min_win_probability: 0.45
+  behind_goal_boost: 0.15
+  ahead_goal_dampen: 0.15

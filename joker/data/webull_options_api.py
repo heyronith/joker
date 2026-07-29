@@ -89,6 +89,15 @@ class HttpWebullOptionsMarketApi:
         self._http = http_client or WebullHttpClient(env, client=client)
         self._stock_api = stock_api
 
+    def close(self) -> None:
+        """Close the owned Webull HTTP client."""
+        close = getattr(self._http, "close", None)
+        if callable(close):
+            close()
+        stock_close = getattr(self._stock_api, "close", None)
+        if callable(stock_close):
+            stock_close()
+
     @property
     def CONTRACT_DISCOVERY_VERIFIED(self) -> bool:
         return get_endpoint("option_chain").verified

@@ -198,6 +198,12 @@ class HttpWebullTradeApi(WebullTradeApi):
         if token:
             self._http.set_access_token(token)
 
+    def close(self) -> None:
+        """Close the owned Webull HTTP trade client."""
+        close = getattr(self._http, "close", None)
+        if callable(close):
+            close()
+
     def list_accounts(self) -> list[dict[str, Any]]:
         payload = self._http.request_json("broker_account_list")
         if isinstance(payload, list):

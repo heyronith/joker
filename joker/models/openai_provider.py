@@ -39,6 +39,7 @@ class OpenAIModelProvider:
         self._config = config or OpenAIProviderConfig()
         self._api_key = api_key
         self._client = client
+        self._owns_client = client is None
 
     @property
     def provider_name(self) -> str:
@@ -69,7 +70,23 @@ class OpenAIModelProvider:
             return self._client
         from openai import AsyncOpenAI
 
-        return AsyncOpenAI(api_key=self._resolve_api_key())
+        self._client = AsyncOpenAI(api_key=self._resolve_api_key())
+        self._owns_client = True
+        return self._client
+
+    async def aclose(self) -> None:
+        """Close the owned AsyncOpenAI client when present; allow later recreate."""
+        client = self._client
+        if client is None or not getattr(self, "_owns_client", False):
+            return
+        close = getattr(client, "close", None)
+        if close is not None:
+            result = close()
+            if hasattr(result, "__await__"):
+                await result
+        self._client = None
+        # Keep ownership so the next _get_client() allocates a fresh client.
+        self._owns_client = True
 
     async def healthcheck(self) -> ProviderHealth:
         """Check OpenAI availability without logging credentials."""

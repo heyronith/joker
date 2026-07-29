@@ -29,8 +29,15 @@ class WebullHttpClient:
         api_env = (env.webull_api_env or "uat").lower()
         self._base_url = base_url or WEBULL_BASE_URLS.get(api_env, WEBULL_BASE_URLS["uat"])
         self._host = host_from_base_url(self._base_url)
+        self._owns_client = client is None
         self._http = client or httpx.Client(timeout=30.0)
         self._access_token: str | None = env.webull_access_token or None
+
+    def close(self) -> None:
+        """Close the owned httpx client."""
+        if self._owns_client:
+            self._http.close()
+            self._owns_client = False
 
     @property
     def access_token(self) -> str | None:

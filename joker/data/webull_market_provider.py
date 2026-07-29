@@ -57,6 +57,12 @@ class WebullMarketDataProvider(MarketDataProvider):
         # "bars" = Webull 1m OHLCV loaded; "quotes" = quote-derived fallback
         self._candle_source: str = "none"
 
+    def close(self) -> None:
+        """Close the underlying Webull market HTTP client when present."""
+        close = getattr(self._api, "close", None)
+        if callable(close):
+            close()
+
     @property
     def feed_health(self) -> str:
         return self._feed_health

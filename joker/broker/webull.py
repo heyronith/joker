@@ -72,6 +72,12 @@ class WebullClient(BrokerClient):
         self._orders: dict[str, BrokerOrder] = {}
         self._intent_by_order: dict[str, OrderIntent] = {}
 
+    def close(self) -> None:
+        """Close the underlying Webull trade HTTP client when present."""
+        close = getattr(self._api, "close", None)
+        if callable(close):
+            close()
+
     def submit_order(self, intent: OrderIntent) -> BrokerOrder:
         self._assert_paper_only()
         client_order_id = new_client_order_id()

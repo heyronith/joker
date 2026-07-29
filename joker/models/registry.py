@@ -101,3 +101,23 @@ class ModelRegistry:
             self._providers["ollama"] = OllamaModelProvider(self._config.ollama)
         if self._config.openai.enabled and "openai" not in self._providers:
             self._providers["openai"] = OpenAIModelProvider(self._config.openai)
+
+    async def aclose(self) -> None:
+        """Close registered providers' HTTP clients without dropping registrations.
+
+        Providers recreate clients lazily on the next request so startup
+        validation on a temporary event loop does not leak transports into the
+        long-lived paper session loop.
+        """
+        for provider in list(self._providers.values()):
+            close = getattr(provider, "aclose", None)
+            if close is not None:
+                result = close()
+                if hasattr(result, "__await__"):
+                    await result
+            else:
+                sync_close = getattr(provider, "close", None)
+                if callable(sync_close):
+                    sync_close()
+        # Re-seed defaults if a provider cleared itself; keep fake/ollama/openai.
+        self._ensure_default_providers()

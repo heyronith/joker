@@ -182,6 +182,12 @@ class HttpWebullMarketApi:
         self._api_env = WebullApiEnv.from_string(env.webull_api_env)
         self._http = http_client or WebullHttpClient(env, client=client)
 
+    def close(self) -> None:
+        """Close the owned Webull HTTP client."""
+        close = getattr(self._http, "close", None)
+        if callable(close):
+            close()
+
     def _ensure_auth(self) -> None:
         if self._http.access_token:
             return

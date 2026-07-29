@@ -375,6 +375,7 @@ class CognitiveAgentRuntime:
         if self._checkpointer_helper is not None:
             await self._checkpointer_helper.close()
             self._deps.checkpointer = None
+        await self._registry.aclose()
         from joker.persistence.aiosqlite_lifecycle import drain_aiosqlite_workers
 
         await drain_aiosqlite_workers()
@@ -406,7 +407,20 @@ class CognitiveAgentRuntime:
             return
 
         if event.event_type == EventType.MARKET_SNAPSHOT_CREATED:
-            await self._enqueue_snapshot_work(event)
+            # Never await ledger projection on the bus handler path — that can
+            # exceed handler_timeout under SQLite contention and cancel routing.
+            self._sequence += 1
+            await self._decision_queue.put(
+                _QueuedWork(
+                    priority=_Priority.NEW_ENTRY_SNAPSHOT,
+                    sequence=self._sequence,
+                    event=event,
+                    kind="snapshot_route",
+                )
+            )
+            self._counters.queued_events = (
+                self._decision_queue.qsize() + self._position_queue.qsize()
+            )
             return
 
         priority = self._event_priority(event)
@@ -582,7 +596,10 @@ class CognitiveAgentRuntime:
                     await self._run_coalesced_new_entry()
                 continue
             try:
-                await self._run_decision_work(work.event)
+                if work.kind == "snapshot_route":
+                    await self._enqueue_snapshot_work(work.event)
+                else:
+                    await self._run_decision_work(work.event)
             except Exception as exc:
                 logger.exception("cognitive decision worker error", exc_info=exc)
                 self._counters.last_error = CognitiveError(

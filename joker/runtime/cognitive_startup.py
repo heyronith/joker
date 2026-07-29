@@ -94,7 +94,12 @@ async def validate_cognitive_providers(
     fake_forced = bool(mock_agents) or _env_truthy(FAKE_OVERRIDE_ENV)
     allow_unhealthy = _env_truthy(ALLOW_UNHEALTHY_ENV)
 
-    cfg = models_config
+    # Defensive: production load_app_settings() already yields ModelsConfig;
+    # retain coercion for direct external callers that still pass a mapping.
+    if isinstance(models_config, ModelsConfig):
+        cfg = models_config
+    else:
+        cfg = ModelsConfig.model_validate(models_config)
     if not cfg.profiles:
         cfg = cfg.model_copy(update={"profiles": default_model_profiles()})
 
@@ -223,6 +228,9 @@ async def validate_cognitive_providers(
             "notes": notes,
         },
     )
+    # Healthchecks may have opened AsyncClients on a temporary asyncio.run loop.
+    # Close them here so the long-lived paper session recreates clients on its loop.
+    await reg.aclose()
     return CognitiveStartupResult(
         registry=reg,
         availability=availability,

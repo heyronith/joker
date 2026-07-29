@@ -211,6 +211,21 @@ class AppSettings(BaseModel):
     models: Any = Field(default_factory=_default_models_config)
     evolution: Any = Field(default_factory=_default_evolution_settings)
 
+    @field_validator("models", mode="before")
+    @classmethod
+    def _parse_models(cls, value: Any) -> Any:
+        from joker.models.schemas import ModelsConfig
+
+        if value is None:
+            return ModelsConfig()
+        if isinstance(value, ModelsConfig):
+            return value
+        if isinstance(value, dict):
+            return ModelsConfig.model_validate(value)
+        raise TypeError(
+            f"models must be ModelsConfig or mapping, got {type(value).__name__}"
+        )
+
     @field_validator("evolution", mode="before")
     @classmethod
     def _parse_evolution(cls, value: Any) -> Any:

@@ -406,6 +406,7 @@ class LivePaperRunner:
             bridge=task1_bridge,
             broker_account_id=selection.kind,
         )
+        _http_clients: list[Any] = [broker]
 
         def shutdown_task1() -> None:
             evolution = getattr(self, "_evolution_runtime", None)
@@ -421,6 +422,15 @@ class LivePaperRunner:
                 except Exception:
                     pass
                 self._task1_bridge = None
+            for client in list(_http_clients):
+                closer = getattr(client, "close", None)
+                if not callable(closer):
+                    continue
+                try:
+                    closer()
+                except Exception:
+                    pass
+            _http_clients.clear()
 
         def log(event_type: str, payload: dict) -> None:
             self._log(run_id, event_type, payload, on_event=on_event)
@@ -483,6 +493,7 @@ class LivePaperRunner:
             allow_delayed_quotes=self.app_settings.risk.allow_delayed_quotes,
             poll_interval_seconds=self.app_settings.data.quote_poll_interval_seconds,
         )
+        _http_clients.append(provider)
 
         try:
             ok = provider.authenticate()
@@ -518,6 +529,7 @@ class LivePaperRunner:
                 api=config.webull_options_api,
                 app_settings=self.app_settings,
             )
+            _http_clients.append(options_provider)
             options_provider.authenticate()
             if capability_usable_for_shadow():
                 options_provider.verified = True
@@ -716,6 +728,12 @@ class LivePaperRunner:
             except (AgentError, LLMClientError) as exc:
                 failures.append(f"openai_council_failed: {exc}")
                 log("live_paper.failure", {"error": failures[-1]})
+            finally:
+                if config.llm_client is None:
+                    council_llm = getattr(council, "llm", None)
+                    closer = getattr(council_llm, "close", None)
+                    if callable(closer):
+                        closer()
 
         reactive = ReactiveEngine(
             RiskGovernor(risk_config, mode, live_enabled=False),
@@ -1594,13 +1612,17 @@ class LivePaperRunner:
                         max_retries=agent_cfg.max_retries,
                         default_timeout_seconds=float(agent_cfg.council_timeout_seconds),
                     )
-                    lesson = run_postmarket_learner(
-                        llm,
-                        agent_cfg,
-                        trading_day=trading_day,
-                        session_stats=session_stats,
-                        memory=day_memory,
-                    )
+                    try:
+                        lesson = run_postmarket_learner(
+                            llm,
+                            agent_cfg,
+                            trading_day=trading_day,
+                            session_stats=session_stats,
+                            memory=day_memory,
+                        )
+                    finally:
+                        if config.llm_client is None:
+                            llm.close()
                 save_session_lesson(self.app_settings.data_dir, lesson)
                 log("memory.lesson_saved",
                     {

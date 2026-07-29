@@ -250,6 +250,7 @@ class OpenAILLMClient(LLMClient):
         self._max_retries = max_retries
         self._default_timeout = default_timeout_seconds
         self._client = client
+        self._owns_client = client is None
         self._log: list[LLMRequestLogEntry] = []
 
     @property
@@ -261,7 +262,20 @@ class OpenAILLMClient(LLMClient):
             return self._client
         from openai import OpenAI
 
-        return OpenAI(api_key=self._api_key)
+        self._client = OpenAI(api_key=self._api_key)
+        self._owns_client = True
+        return self._client
+
+    def close(self) -> None:
+        """Close the owned OpenAI HTTP client when present; allow later recreate."""
+        client = self._client
+        if client is None or not getattr(self, "_owns_client", False):
+            return
+        close = getattr(client, "close", None)
+        if callable(close):
+            close()
+        self._client = None
+        self._owns_client = True
 
     def complete_structured(
         self,

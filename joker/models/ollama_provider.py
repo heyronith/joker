@@ -122,6 +122,9 @@ class OllamaModelProvider:
             "model": profile_model,
             "messages": messages,
             "stream": False,
+            # Thinking models (e.g. qwen3.5) otherwise fill message.thinking and
+            # leave message.content empty, which fails structured validation.
+            "think": False,
             "options": {
                 "num_predict": request.max_output_tokens,
             },

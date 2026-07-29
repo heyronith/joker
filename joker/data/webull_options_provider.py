@@ -164,6 +164,12 @@ class WebullOptionsDataProvider:
         result = self.api.authenticate()
         return result.success
 
+    def close(self) -> None:
+        """Close the underlying Webull options HTTP client when present."""
+        close = getattr(self.api, "close", None)
+        if callable(close):
+            close()
+
     def discover_contracts(
         self,
         symbol: str,

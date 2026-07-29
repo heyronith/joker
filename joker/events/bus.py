@@ -88,10 +88,18 @@ class InProcessAsyncEventBus:
                 if self._handler_timeout is None:
                     await handler(event)
                 else:
+                    # Shield is intentionally NOT used: timeouts must cancel the
+                    # handler so shutdown can drain. Handlers must therefore be
+                    # fast (enqueue) and leave durable work to workers.
                     await asyncio.wait_for(handler(event), timeout=self._handler_timeout)
             except asyncio.TimeoutError:
                 logger.error(
-                    "event_handler_timeout",
+                    "event_handler_timeout handler=%s event_type=%s "
+                    "timeout_seconds=%s handler_cancelled=True "
+                    "work_may_be_incomplete=True",
+                    name,
+                    event.event_type.value,
+                    self._handler_timeout,
                     extra={
                         "handler": name,
                         "timeout_seconds": self._handler_timeout,
@@ -99,6 +107,8 @@ class InProcessAsyncEventBus:
                         "event_type": event.event_type.value,
                         "session_id": event.session_id,
                         "correlation_id": str(event.correlation_id),
+                        "handler_cancelled": True,
+                        "work_may_be_incomplete": True,
                     },
                 )
             except Exception:
