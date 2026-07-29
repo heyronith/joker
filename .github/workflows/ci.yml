@@ -43,6 +43,7 @@ jobs:
             --timeout=300 \
             -r fE \
             -W error::pytest.PytestUnhandledThreadExceptionWarning \
+            -W error::ResourceWarning \
             --tb=short | tee pytest-output.txt
       - name: Upload pytest output
         if: always()

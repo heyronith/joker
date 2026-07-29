@@ -246,6 +246,17 @@ class LivePaperRunner:
         broker = selection.client
         result.broker_kind = selection.kind
         result.broker_label = selection.label
+        if (self.app_settings.broker.provider or "").strip().lower() in {
+            "webull_paper",
+            "webull",
+        }:
+            from joker.broker.interface import PaperBroker
+
+            if selection.kind != "webull_paper" or isinstance(broker, PaperBroker):
+                raise LivePaperError(
+                    "broker.provider=webull_paper resolved to a non-Webull broker; "
+                    "refusing PaperBroker fallback"
+                )
 
         # Task 1 cutover: SessionSupervisor owns market/execution truth.
         task1_db = Path(self.app_settings.db_path).parent / "joker_task1.db"

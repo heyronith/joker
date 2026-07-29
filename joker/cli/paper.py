@@ -236,6 +236,19 @@ def paper_run(
         )
         raise typer.Exit(code=1)
 
+    # Fail closed for profiles that pin broker.provider=webull_paper — never fall
+    # through to local PaperBroker even when --require-webull-paper is omitted.
+    yaml_provider = (result.app_settings.broker.provider or "paper").strip().lower()
+    if yaml_provider in {"webull_paper", "webull"} and not webull_paper_env_ready(
+        result.env_settings
+    ):
+        console.print(
+            "[red]Config broker.provider=webull_paper requires "
+            "WEBULL_PAPER_TRADING_ENABLED=true, WEBULL_PAPER_ACCOUNT_ID, and "
+            "WEBULL_LIVE_TRADING_ENABLED=false. Refusing PaperBroker fallback.[/red]"
+        )
+        raise typer.Exit(code=1)
+
     if result.app_settings.mode.value != "PAPER":
         console.print("[yellow]Forcing PAPER mode for this session.[/yellow]")
         result.app_settings = result.app_settings.model_copy(
@@ -380,3 +393,62 @@ def paper_run(
 
     if run_result.failures or run_result.errors:
         raise typer.Exit(code=1)
+
+
+@paper_app.command("execution-smoke")
+def paper_execution_smoke(
+    config: Optional[str] = typer.Option(
+        "config/paper-all-tasks.yaml", "--config", "-c", envvar="JOKER_CONFIG"
+    ),
+    require_sandbox: bool = typer.Option(
+        False,
+        "--require-sandbox",
+        help="Required. Refuse unless trade API env is exactly sandbox.",
+    ),
+    confirm_place: bool = typer.Option(
+        False,
+        "--confirm-place",
+        help="Required. Explicitly confirm placing one sandbox order.",
+    ),
+    skip_model_check: bool = typer.Option(False, "--skip-model-check"),
+) -> None:
+    """Place+cancel exactly one SPY 0DTE limit via Task 1 ExecutionRuntime (sandbox only)."""
+    from joker.config.validation import validate_startup
+    from joker.runtime.execution_smoke import ExecutionSmokeError, ExecutionSmokeRunner
+
+    if not require_sandbox or not confirm_place:
+        console.print(
+            "[red]execution-smoke requires both --require-sandbox and --confirm-place.[/red]"
+        )
+        raise typer.Exit(code=1)
+
+    result = validate_startup(config_path=config, skip_model_check=skip_model_check)
+    if result.app_settings.mode.value != "PAPER":
+        console.print("[red]mode must be PAPER[/red]")
+        raise typer.Exit(code=1)
+    if result.app_settings.live_trading_enabled:
+        console.print("[red]live_trading_enabled must be false[/red]")
+        raise typer.Exit(code=1)
+
+    console.print(
+        "[yellow]Sandbox execution-smoke: one $0.01 buy via ExecutionRuntime, "
+        "then immediate cancel. Real money remains prohibited.[/yellow]"
+    )
+    runner = ExecutionSmokeRunner(
+        result.app_settings,
+        result.env_settings,
+        require_sandbox=require_sandbox,
+        confirm_place=confirm_place,
+    )
+    smoke = runner.run()
+    summary = smoke.redacted_summary()
+    console.print(summary)
+    if not smoke.passed:
+        for err in smoke.errors:
+            console.print(f"[red]FAIL[/red] {err}")
+        raise typer.Exit(code=1)
+    console.print(
+        "[green]PASS[/green] sandbox place+cancel via ExecutionRuntime; "
+        f"orders {smoke.initial_open_orders}→{smoke.final_open_orders}, "
+        f"positions {smoke.initial_positions}→{smoke.final_positions}"
+    )

@@ -73,12 +73,30 @@ class WebullHttpClient:
             issue = "rate limit"
         elif malformed:
             issue = "malformed response"
+        detail = ""
+        api_error_code = issue.replace(" ", "_").upper()
+        try:
+            import json
+
+            payload = json.loads(body) if body else None
+            if isinstance(payload, dict):
+                msg = str(payload.get("message") or "").strip()
+                code = str(payload.get("error_code") or "").strip()
+                if code:
+                    api_error_code = code
+                if msg:
+                    detail = f": {msg}"
+                elif code:
+                    detail = f": {code}"
+        except Exception:
+            if body:
+                detail = f": {body[:200]}"
         return WebullApiError(
-            f"Webull {endpoint.name} HTTP {status} ({issue})",
+            f"Webull {endpoint.name} HTTP {status} ({issue}){detail}",
             status_code=status,
             subscription_related=subscription,
             rate_limited=rate_limited,
-            error_code=issue.replace(" ", "_").upper(),
+            error_code=api_error_code,
         )
 
     def request_json(

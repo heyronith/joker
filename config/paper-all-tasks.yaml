@@ -30,12 +30,11 @@ persistence:
   database_url: sqlite:///data/joker.db
   checkpoint_database_url: sqlite:///data/joker_checkpoints.db
 
-# Auto-selects Webull paper account when WEBULL_PAPER_TRADING_ENABLED=true
-# and WEBULL_PAPER_ACCOUNT_ID is set; otherwise local PaperBroker.
+# Fail-closed: Webull paper/sandbox only — never falls back to local PaperBroker.
 broker:
-  provider: paper
+  provider: webull_paper
   require_explicit_confirmation: true
-  webull_paper_trading_enabled: false
+  webull_paper_trading_enabled: true
 
 risk:
   allow_delayed_quotes: true

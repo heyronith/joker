@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from joker.broker.interface import BrokerError, PaperBroker
@@ -78,5 +80,5 @@ def test_paper_broker_has_no_webull_import() -> None:
 
     source_file = mod.__file__
     assert source_file
-    content = open(source_file).read()
+    content = Path(source_file).read_text(encoding="utf-8")
     assert "webull" not in content.lower()
