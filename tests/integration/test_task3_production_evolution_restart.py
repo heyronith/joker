@@ -104,6 +104,18 @@ async def test_production_orchestrator_restart_after_node(
             assert getattr(crashed_state, attr) is not None, (
                 f"crash after {node_name} must leave durable {attr}"
             )
+        if node_name == "apply_promotion_decision":
+            crashed_state = _cycle_from_record(record)
+            # Apply must not advance audit stage to finalise before finalise runs,
+            # or resume would re-ainvoke the full graph instead of activation pause.
+            assert crashed_state.stage == "applying_decision"
+            assert crashed_state.promotion_decision_id is not None
+            pre_resume = await runtime._repos["activations"].get_by_decision_id(
+                crashed_state.promotion_decision_id
+            )
+            assert pre_resume is not None, (
+                "apply_promotion_decision must persist activation before crash"
+            )
     finally:
         await runtime.shutdown()
         await drain_aiosqlite_workers(timeout=0.5)

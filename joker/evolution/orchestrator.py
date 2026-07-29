@@ -430,7 +430,13 @@ class EvolutionOrchestrator:
         # replay experiment + adversarial on every tick — hang CI under load.
         if state.stage == "collect_shadow_evidence" and state.status == "running":
             return await self._advance_from_shadow_pause(state)
-        if state.stage == "applying_decision" and state.status == "running":
+        # Crash-after-apply audits stage as applying_decision (preferred) or
+        # finalise_cycle (legacy). Never re-ainvoke from START — that replays
+        # experiment/adversarial and can drop activation under checkpoint races.
+        if state.status == "running" and state.stage in {
+            "applying_decision",
+            "finalise_cycle",
+        }:
             return await self._advance_from_activation_pause(state)
         graph_state = self._cycle_to_graph_state(state)
         graph_state["pending_evidence"] = False
@@ -876,7 +882,9 @@ class EvolutionOrchestrator:
                 + list(activation.failure_codes)
                 + ["activation_incomplete"],
             }
-        return {"stage": "finalise_cycle"}
+        # Keep applying_decision until finalise runs so crash-after-apply resumes
+        # via _advance_from_activation_pause instead of full-graph replay.
+        return {"stage": "applying_decision"}
 
     async def _node_finalise(self, state: EvolutionOrchestratorState) -> dict[str, Any]:
         if self._claims is not None and state.get("status") != "failed":
