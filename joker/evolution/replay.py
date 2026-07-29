@@ -86,6 +86,31 @@ class CognitiveReplayError(RuntimeError):
     pass
 
 
+def execution_flags_from_workflow(
+    workflow: Mapping[str, Any],
+) -> tuple[bool, bool, bool]:
+    """Reconstruct ran_* flags from persisted workflow — never invent True.
+
+    * ``ran_task2_graph`` ← ``entry_graph_completed``
+    * ``ran_position_graph`` ← any frame with ``position_graph_completed``
+    * ``ran_order_management`` ← entry OM ran flag or frame OM thread/ran records
+    """
+    ran_task2 = bool(workflow.get("entry_graph_completed"))
+    ran_position = False
+    ran_om = bool(workflow.get("entry_order_management_ran"))
+    frames = workflow.get("frames") or {}
+    if isinstance(frames, dict):
+        for frame_state in frames.values():
+            if not isinstance(frame_state, dict):
+                continue
+            if frame_state.get("position_graph_completed"):
+                ran_position = True
+            threads = frame_state.get("order_management_thread_ids") or []
+            if frame_state.get("order_management_ran") or threads:
+                ran_om = True
+    return ran_task2, ran_position, ran_om
+
+
 class CognitiveReplayService:
     """Replay champion/challenger configs through Task 2 graphs without live broker."""
 
@@ -394,6 +419,7 @@ class CognitiveReplayService:
                     f":{sample}:{idx}"
                     for idx, _ in enumerate(cal_pairs)
                 )
+                ran_task2, ran_position, ran_om = execution_flags_from_workflow(payload)
                 return {
                     "realised_pnl": pnl,
                     "model_calls": telemetry["model_calls"],
@@ -411,9 +437,10 @@ class CognitiveReplayService:
                         Decimal(str(p.quantity)) > 0
                         for p in execution.positions.values()
                     ),
-                    "ran_task2_graph": True,
-                    "ran_position_graph": True,
-                    "ran_order_management": True,
+                    "ran_task2_graph": ran_task2,
+                    "ran_position_graph": ran_position,
+                    "ran_order_management": ran_om,
+                    "meta_decision_action": payload.get("entry_action_value"),
                     "integrity_findings": (),
                     "historical_pnl_attributed": False,
                     "sample": sample,
@@ -571,6 +598,7 @@ class CognitiveReplayService:
                                 gateway=gateway,
                             )
                             ran_order_management = True
+                            workflow["entry_order_management_ran"] = True
                             self.order_management_runs += 1
                         except RuntimeError as exc:
                             integrity.append(str(exc))
@@ -655,6 +683,7 @@ class CognitiveReplayService:
                                 ran_order_management = True
                                 self.order_management_runs += 1
                                 om_threads.append(om_thread)
+                                frame_ck["order_management_ran"] = True
                             except RuntimeError as exc:
                                 integrity.append(str(exc))
                     frame_ck["order_management_completed"] = True
