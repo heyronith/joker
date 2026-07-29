@@ -55,6 +55,19 @@ class ReplayOrderActionGateway:
                     raise ReplayExecutionError(
                         f"contract_not_on_frozen_surface:{request.contract_id}"
                     )
+                existing = self.execution.positions.get(request.contract_id)
+                if existing is not None and existing.quantity > 0:
+                    return OrderActionResult(
+                        submitted=False,
+                        client_order_id=request.client_order_id,
+                        blocked_reason="duplicate_position_prevented",
+                    )
+                if request.client_order_id in self.execution.orders:
+                    return OrderActionResult(
+                        submitted=False,
+                        client_order_id=request.client_order_id,
+                        blocked_reason="duplicate_order_prevented",
+                    )
 
             if request.action == OrderActionKind.REPLACE:
                 order = self.execution.replace_order(

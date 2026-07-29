@@ -57,7 +57,7 @@ async def _config(tmp_path) -> CognitiveConfigurationVersion:
     return champ
 
 
-def _deps(router) -> CognitiveGraphDeps:
+def _deps(router, db_path=None) -> CognitiveGraphDeps:
     return CognitiveGraphDeps(
         router=router,
         config=CognitiveGraphSettings(),
@@ -80,7 +80,7 @@ def _deps(router) -> CognitiveGraphDeps:
         submit_callback=None,
         event_bus=None,
         clock=None,
-        db_path=None,
+        db_path=db_path,
         checkpointer=None,
         data_quality_loader=None,
         projection_loader=None,
@@ -343,18 +343,22 @@ async def test_full_replay_fixture_invokes_cognitive_replay_service(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_provider_timeout_is_observed_by_real_graph_path(tmp_path, monkeypatch):
+async def test_provider_timeout_is_observed_by_dispatcher_entry_path(tmp_path):
     router, fake = _router()
     cfg = await _config(tmp_path)
     definition = next(d for d in ADVERSARIAL_DEFINITIONS if d.scenario_id == "adv_10")
+    assert definition.execution_mode == "entry_graph"
     fixture = await AdversarialFixtureRepository().load(
         definition.frozen_truth_fixture_id, expected_version=definition.version
     )
     assert fixture.provider_behaviour == "timeout"
     store = PolicyVersionStore(tmp_path / "c.db")
-    runner = EntryGraphAdversarialRunner(
+    from joker.evolution.adversarial_runners import AdversarialRunnerDispatcher
+
+    dispatcher = AdversarialRunnerDispatcher(
         template_deps=_deps(router), policy_store=store
     )
+    runner = dispatcher.for_mode(definition.execution_mode)
     evidence = await runner.execute(
         experiment_id=uuid4(),
         definition=definition,
@@ -364,6 +368,7 @@ async def test_provider_timeout_is_observed_by_real_graph_path(tmp_path, monkeyp
     )
     assert evidence.completed
     assert evidence.graph_thread_ids
+    assert evidence.execution_mode == "entry_graph"
     assert suite_executed(evidence)
 
 

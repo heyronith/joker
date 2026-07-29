@@ -98,17 +98,35 @@ def _contract(
     )
 
 
+# Every required scenario must map to a runner that can observe its invariant.
+# Do not default unmapped scenarios to full_replay — that previously allowed
+# label-only "passes" from a clean generic replay.
 _MODE_MAP: dict[str, ExecutionMode] = {
     "adv_01": "entry_graph",
+    "adv_02": "entry_graph",
     "adv_03": "entry_graph",
+    "adv_04": "entry_graph",
+    "adv_05": "entry_graph",
+    "adv_06": "position_graph",
     "adv_07": "order_management",
     "adv_08": "position_graph",
     "adv_09": "order_management",
+    "adv_10": "entry_graph",
+    "adv_11": "entry_graph",
+    "adv_12": "entry_graph",
+    "adv_13": "entry_graph",
+    "adv_14": "entry_graph",
     "adv_15": "execution_recovery",
     "adv_16": "execution_recovery",
     "adv_17": "entry_graph",
     "adv_18": "entry_graph",
     "adv_19": "entry_graph",
+    "adv_20": "entry_graph",
+    "adv_21": "entry_graph",
+    "adv_22": "full_replay",
+    "adv_23": "full_replay",
+    "adv_24": "position_graph",
+    "adv_25": "entry_graph",
 }
 
 _INVARIANTS: dict[str, tuple[str, ...]] = {
@@ -142,6 +160,9 @@ _INVARIANTS: dict[str, tuple[str, ...]] = {
 
 def build_scenario_definitions() -> tuple[AdversarialScenarioDefinition, ...]:
     out: list[AdversarialScenarioDefinition] = []
+    missing = [s.scenario_id for s in ADVERSARIAL_CORPUS if s.scenario_id not in _MODE_MAP]
+    if missing:
+        raise RuntimeError(f"adversarial_scenarios_missing_execution_mode:{missing}")
     for s in ADVERSARIAL_CORPUS:
         out.append(
             AdversarialScenarioDefinition(
@@ -151,7 +172,7 @@ def build_scenario_definitions() -> tuple[AdversarialScenarioDefinition, ...]:
                 required=s.required,
                 frozen_truth_fixture_id=_fid(s.scenario_id),
                 expected_invariants=_INVARIANTS.get(s.scenario_id, ()),
-                execution_mode=_MODE_MAP.get(s.scenario_id, "full_replay"),
+                execution_mode=_MODE_MAP[s.scenario_id],
             )
         )
     return tuple(out)
@@ -161,8 +182,11 @@ ADVERSARIAL_DEFINITIONS = build_scenario_definitions()
 
 
 def _build_fixture(scenario_id: str) -> AdversarialFixture:
+    if scenario_id not in _MODE_MAP:
+        raise RuntimeError(f"adversarial_fixture_missing_execution_mode:{scenario_id}")
     valid = _contract("SPY:2026-07-01:500.0:call")
     invented = _contract("SPY:2099-01-01:999.0:call", expiry="2099-01-01", is_0dte=False)
+    thin = _contract("SPY:2026-07-01:500.0:call", bid="0.05", ask="2.50")
     frames: list[ReplayMarketFrame]
     stimulus: dict[str, Any] = {"scenario_id": scenario_id}
     if scenario_id == "adv_03":
@@ -174,6 +198,24 @@ def _build_fixture(scenario_id: str) -> AdversarialFixture:
         frames = [_frame(scenario_id=scenario_id, index=0, contracts=(stale,))]
         stimulus["stale_quote"] = True
         stimulus["expect_reject"] = True
+    elif scenario_id == "adv_02":
+        frames = [_frame(scenario_id=scenario_id, index=0, contracts=(valid,))]
+        stimulus["conflicting_evidence"] = True
+        stimulus["expect_no_trade"] = True
+    elif scenario_id == "adv_04":
+        frames = [_frame(scenario_id=scenario_id, index=0, contracts=(valid,))]
+        stimulus["false_consensus"] = True
+        stimulus["expect_no_trade"] = True
+    elif scenario_id == "adv_05":
+        frames = [_frame(scenario_id=scenario_id, index=0, contracts=(thin,))]
+        stimulus["thin_liquidity"] = True
+        stimulus["expect_no_trade"] = True
+    elif scenario_id == "adv_06":
+        frames = [
+            _frame(scenario_id=scenario_id, index=0, contracts=(valid,)),
+            _frame(scenario_id=scenario_id, index=1, contracts=(valid,)),
+        ]
+        stimulus["thesis_invalidation_exit"] = True
     elif scenario_id == "adv_17":
         frames = [_frame(scenario_id=scenario_id, index=0, contracts=(valid,))]
         stimulus["missing_data_quality"] = True
@@ -210,6 +252,37 @@ def _build_fixture(scenario_id: str) -> AdversarialFixture:
             _frame(scenario_id=scenario_id, index=2, contracts=(valid,)),
         ]
         stimulus["reduce_then_exit"] = True
+    elif scenario_id == "adv_13":
+        frames = [_frame(scenario_id=scenario_id, index=0, contracts=(valid,))]
+        stimulus["duplicate_order"] = True
+    elif scenario_id == "adv_14":
+        frames = [_frame(scenario_id=scenario_id, index=0, contracts=(valid,))]
+        stimulus["duplicate_position"] = True
+    elif scenario_id == "adv_20":
+        frames = [_frame(scenario_id=scenario_id, index=0, contracts=(valid,))]
+        stimulus["expect_no_trade"] = True
+        stimulus["justified_no_trade"] = True
+    elif scenario_id == "adv_21":
+        frames = [_frame(scenario_id=scenario_id, index=0, contracts=(valid,))]
+        stimulus["unsupported_reasoning"] = True
+        stimulus["expect_no_trade"] = True
+    elif scenario_id == "adv_24":
+        frames = [
+            _frame(scenario_id=scenario_id, index=0, contracts=(valid,)),
+            _frame(scenario_id=scenario_id, index=1, contracts=(valid,)),
+        ]
+        stimulus["urgent_exit"] = True
+    elif scenario_id == "adv_25":
+        frames = [_frame(scenario_id=scenario_id, index=0, contracts=(valid,))]
+        stimulus["narrow_overfit"] = True
+        stimulus["expect_no_trade"] = True
+    elif scenario_id in {"adv_22", "adv_23"}:
+        frames = [
+            _frame(scenario_id=scenario_id, index=0, contracts=(valid,), bid="500.00", ask="500.10"),
+            _frame(scenario_id=scenario_id, index=1, contracts=(valid,), bid="498.00", ask="498.20"),
+        ]
+        key = "full_replay_regime" if scenario_id == "adv_23" else "full_replay_calibration"
+        stimulus[key] = True
     else:
         frames = [
             _frame(scenario_id=scenario_id, index=0, contracts=(valid,)),
@@ -223,7 +296,7 @@ def _build_fixture(scenario_id: str) -> AdversarialFixture:
         version="3.1.0",
         frames=tuple(frames),
         expected_invariants=_INVARIANTS.get(scenario_id, ()),
-        execution_mode=_MODE_MAP.get(scenario_id, "full_replay"),
+        execution_mode=_MODE_MAP[scenario_id],
         stimulus=stimulus,
         crash_injection_point=(
             "after_accept" if scenario_id == "adv_16" else (
