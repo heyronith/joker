@@ -1650,13 +1650,35 @@ class FullReplayAdversarialRunner(_RunnerBase):
         await _seed_fixture_into_task1_repos(self._template, fixture)
         provider = _get_fake_provider(self._template)
         if provider is not None:
-            from joker.cognition.schemas import MetaDecisionAction
+            from joker.cognition.schemas import MetaDecisionAction, PositionAction
 
+            wants_exit = bool(
+                fixture.stimulus.get("full_replay_calibration")
+                or fixture.stimulus.get("full_replay_regime")
+                or fixture.stimulus.get("full_replay_exit")
+            )
             install_adversarial_model_path(
                 provider,
                 session_id=getattr(self._template, "session_id", "adv-replay"),
                 meta_action=MetaDecisionAction.EXECUTE,
+                position_action=PositionAction.EXIT if wants_exit else PositionAction.HOLD,
             )
+            if wants_exit:
+                # Production harness may already own position factories via paper-path
+                # state — flip that control so EXIT is actually observed.
+                paper_ctl = getattr(provider, "_paper_path_state", None)
+                if paper_ctl is not None:
+                    paper_ctl.position_action = PositionAction.EXIT
+                else:
+                    factories = getattr(provider, "_role_factories", {})
+                    factories.pop("position_thesis", None)
+                    factories.pop("position_decision", None)
+                    install_adversarial_model_path(
+                        provider,
+                        session_id=getattr(self._template, "session_id", "adv-replay"),
+                        meta_action=MetaDecisionAction.EXECUTE,
+                        position_action=PositionAction.EXIT,
+                    )
 
         episode = TradingEpisode(
             session_id=f"adv-replay:{experiment_id}",

@@ -277,12 +277,21 @@ def _build_fixture(scenario_id: str) -> AdversarialFixture:
         stimulus["narrow_overfit"] = True
         stimulus["expect_no_trade"] = True
     elif scenario_id in {"adv_22", "adv_23"}:
+        # Entry on frame 0 at ~1.20 ask; adverse frame 1 exits near 0.40 bid → loss.
+        adverse = _contract("SPY:2026-07-01:500.0:call", bid="0.40", ask="0.60")
         frames = [
             _frame(scenario_id=scenario_id, index=0, contracts=(valid,), bid="500.00", ask="500.10"),
-            _frame(scenario_id=scenario_id, index=1, contracts=(valid,), bid="498.00", ask="498.20"),
+            _frame(
+                scenario_id=scenario_id,
+                index=1,
+                contracts=(adverse,),
+                bid="498.00",
+                ask="498.20",
+            ),
         ]
         key = "full_replay_regime" if scenario_id == "adv_23" else "full_replay_calibration"
         stimulus[key] = True
+        stimulus["full_replay_exit"] = True
     else:
         frames = [
             _frame(scenario_id=scenario_id, index=0, contracts=(valid,)),
