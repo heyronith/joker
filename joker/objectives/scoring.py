@@ -95,9 +95,11 @@ class ObjectiveStrategyScorer:
             codes.append("resolution_after_deadline")
         if self.require_positive_ev and ev is not None and ev <= 0:
             codes.append("non_positive_expected_value")
+        if self.require_positive_ev and ev is None and not candidate.is_no_trade:
+            codes.append("expected_value_unavailable")
         if win_p is not None and float(win_p) < self.min_win_p:
             codes.append("win_probability_below_minimum")
-        if ev is None and win_p is None and not self.allow_ordinal:
+        if ev is None and win_p is None and not self.allow_ordinal and not candidate.is_no_trade:
             codes.append("probability_unavailable")
 
         p_after: Decimal | None = None
@@ -123,6 +125,7 @@ class ObjectiveStrategyScorer:
             in {
                 "capital_required_exceeds_available",
                 "non_positive_expected_value",
+                "expected_value_unavailable",
                 "resolution_after_deadline",
                 "win_probability_below_minimum",
             }

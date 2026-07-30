@@ -433,6 +433,7 @@ class LivePaperRunner:
             if objective_service is not None:
                 from joker.runtime.objective_recovery import recover_session_objective
 
+                task1_bridge.supervisor.bind_objective_service(objective_service)
                 task1_bridge.run_coro(
                     recover_session_objective(
                         objective_service,

@@ -86,7 +86,7 @@ async def test_task3_production_evolution_acceptance(tmp_path) -> None:
             final_state.experiment_id
         )
         assert definition is not None
-        assert len(definition.adversarial_scenario_ids) == 25
+        assert len(definition.adversarial_scenario_ids) == len(required_scenario_ids())
 
         adv_results = await evolution.adversarial_suite._store.list_for_experiment(
             final_state.experiment_id

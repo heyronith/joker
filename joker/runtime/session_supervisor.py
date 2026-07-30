@@ -93,6 +93,8 @@ class SessionSupervisor:
         }
         self._last_reconciliation: ReconciliationReport | None = None
         self._unresolved: UnresolvedReconciliation | None = None
+        self._objective_service: Any | None = None
+        self._objective_projector: Any | None = None
 
     @property
     def session_id(self) -> str:
@@ -145,6 +147,27 @@ class SessionSupervisor:
     @property
     def unresolved_reconciliation(self) -> UnresolvedReconciliation | None:
         return self._unresolved
+
+    def bind_objective_service(self, service: Any) -> None:
+        """Attach Task-1 objective service + capital projector (post-start)."""
+        from joker.objectives.projector import (
+            ObjectiveCapitalProjector,
+            subscribe_objective_projector,
+        )
+
+        self._objective_service = service
+        if service is None:
+            self._objective_projector = None
+            return
+        projector = ObjectiveCapitalProjector(service)
+        self._objective_projector = projector
+        subscribe_objective_projector(self._bus, projector)
+        if self._unresolved is not None:
+            service.mark_reconciliation_unresolved(True)
+
+    @property
+    def objective_service(self) -> Any | None:
+        return self._objective_service
 
     @property
     def claims_recovery(self) -> bool:

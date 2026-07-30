@@ -82,6 +82,7 @@ class OrderActionRequest:
     proposal_id: str | None = None
     decision_id: str | None = None
     strategy_id: str | None = None
+    estimate_id: str | None = None
     cycle_id: str | None = None
     replace_of_client_order_id: str | None = None
     position_lifecycle_id: str | None = None
@@ -353,6 +354,8 @@ class OrderActionGateway:
                     or obj_state.entries_paused
                     or obj_state.feasibility_classification == "infeasible"
                     or obj_state.time_remaining_seconds <= 0
+                    or getattr(obj_state, "truth_degraded", False)
+                    or obj_state.status == "truth_degraded"
                 ):
                     return OrderActionResult(
                         submitted=False,
@@ -364,13 +367,69 @@ class OrderActionGateway:
                         ),
                         working_orders=working,
                     )
-                premium = Decimal(str(command.intent.limit_price or 0)) * Decimal("100") * Decimal(
-                    int(command.intent.quantity)
+                # Reload persisted estimate and revalidate EV against current quote.
+                estimate = None
+                repo = getattr(self._deps.objective_service, "_repo", None)
+                if repo is not None and request.estimate_id:
+                    estimate = repo.get_strategy_estimate(request.estimate_id)
+                elif repo is not None and request.strategy_id:
+                    estimate = repo.get_latest_estimate_for_strategy(
+                        strategy_id=request.strategy_id,
+                        objective_id=obj_state.objective_id,
+                    )
+                if estimate is None or not estimate.valid:
+                    return OrderActionResult(
+                        submitted=False,
+                        client_order_id=request.client_order_id,
+                        blocked_reason="objective_estimate_missing_or_invalid",
+                        working_orders=working,
+                    )
+                if str(estimate.objective_id) != str(obj_state.objective_id):
+                    return OrderActionResult(
+                        submitted=False,
+                        client_order_id=request.client_order_id,
+                        blocked_reason="objective_estimate_wrong_objective",
+                        working_orders=working,
+                    )
+                if request.strategy_id and str(estimate.strategy_id) != str(
+                    request.strategy_id
+                ):
+                    return OrderActionResult(
+                        submitted=False,
+                        client_order_id=request.client_order_id,
+                        blocked_reason="objective_estimate_wrong_strategy",
+                        working_orders=working,
+                    )
+                if str(estimate.snapshot_id) != str(request.snapshot_id):
+                    # Still allow if EV remains positive after current quote repricing.
+                    pass
+                premium_per = Decimal(str(command.intent.limit_price or 0))
+                qty = int(command.intent.quantity)
+                # Reprice EV: without calibrated samples EV stays as stored; reject if None/<=0.
+                require_ev = bool(
+                    getattr(
+                        self._deps.objective_service,
+                        "require_positive_expected_value",
+                        True,
+                    )
                 )
+                ev = estimate.expected_value_usd
+                if require_ev and (ev is None or ev <= 0):
+                    return OrderActionResult(
+                        submitted=False,
+                        client_order_id=request.client_order_id,
+                        blocked_reason="objective_ev_not_positive",
+                        working_orders=working,
+                    )
+                premium = premium_per * Decimal("100") * Decimal(qty)
                 await self._deps.objective_service.reserve_for_order(
                     client_order_id=command.client_order_id,
+                    premium_per_contract_usd=premium_per,
+                    quantity=qty,
                     estimated_premium_usd=premium,
                     objective_state_version=obj_state.version,
+                    contract_id=request.contract_id,
+                    position_lifecycle_id=request.position_lifecycle_id,
                 )
                 reserved = True
             except Exception as exc:

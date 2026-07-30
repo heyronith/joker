@@ -28,6 +28,7 @@ class FeasibilityInputs:
     slippage_usd_estimate: Decimal | None = None
     open_positions: int = 0
     working_orders: int = 0
+    valid_contract_count: int | None = None
     evidence_ids: tuple[UUID, ...] = ()
 
 
@@ -90,6 +91,9 @@ class GoalFeasibilityEngine:
         ):
             constraints.append("premium_exceeds_available_capital")
 
+        if inputs.valid_contract_count is not None and inputs.valid_contract_count <= 0:
+            constraints.append("no_affordable_contract")
+
         if inputs.quote_age_seconds is not None and inputs.quote_age_seconds > self.max_quote_age_seconds:
             constraints.append("stale_quotes")
             uncertainty.append("quote_age_elevated")
@@ -108,8 +112,13 @@ class GoalFeasibilityEngine:
         if required_pct >= Decimal("100") and minutes_left < 60:
             constraints.append("extreme_target_vs_time")
 
-        if "premium_exceeds_available_capital" in constraints and state.open_position_count == 0:
+        if (
+            "premium_exceeds_available_capital" in constraints
+            or "no_affordable_contract" in constraints
+        ) and state.open_position_count == 0:
             classification: str = "infeasible"
+        elif "session_not_regular" in constraints:
+            classification = "infeasible"
         elif "extreme_target_vs_time" in constraints or "high_target_insufficient_time" in constraints:
             classification = "low" if required_pct < Decimal("100") else "infeasible"
         elif "wide_spreads" in constraints or "stale_quotes" in constraints:
@@ -134,6 +143,29 @@ class GoalFeasibilityEngine:
         if classification == "infeasible":
             est_p = None  # never invent a numeric p for forced entries
 
+        calc_inputs = {
+            "session_phase": inputs.session_phase,
+            "median_premium_usd": (
+                str(inputs.median_premium_usd)
+                if inputs.median_premium_usd is not None
+                else None
+            ),
+            "typical_spread_pct": inputs.typical_spread_pct,
+            "quote_age_seconds": inputs.quote_age_seconds,
+            "realised_vol": inputs.realised_vol,
+            "implied_vol": inputs.implied_vol,
+            "valid_contract_count": inputs.valid_contract_count,
+            "open_positions": inputs.open_positions,
+            "working_orders": inputs.working_orders,
+            "comparable_outcome_samples": inputs.comparable_outcome_samples,
+            "estimated_opportunities_remaining": inputs.estimated_opportunities_remaining,
+            "slippage_usd_estimate": (
+                str(inputs.slippage_usd_estimate)
+                if inputs.slippage_usd_estimate is not None
+                else None
+            ),
+        }
+
         return GoalFeasibilityAssessment(
             assessment_id=uuid4(),
             objective_id=state.objective_id,
@@ -151,6 +183,7 @@ class GoalFeasibilityEngine:
             assumptions=tuple(assumptions),
             uncertainty_reasons=tuple(uncertainty),
             evidence_ids=inputs.evidence_ids,
+            calculation_inputs=calc_inputs,
             created_at=datetime.now(timezone.utc),
         )
 

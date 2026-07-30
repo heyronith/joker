@@ -89,6 +89,7 @@ ObjectiveStatus = Literal[
     "temporarily_infeasible",
     "paused",
     "stopped_by_user",
+    "truth_degraded",
 ]
 
 FeasibilityClassification = Literal[
@@ -122,6 +123,10 @@ class SessionObjectiveState(BaseModel):
     target_profit_usd: Decimal
     target_ending_equity_usd: Decimal
 
+    # Explicit exposure split (both encumber authorised capital)
+    working_order_reservation_usd: Decimal = Decimal("0.00")
+    filled_position_exposure_usd: Decimal = Decimal("0.00")
+    # Alias: total encumbered = working + filled
     reserved_capital_usd: Decimal = Decimal("0.00")
     available_capital_usd: Decimal
     realised_pnl_usd: Decimal = Decimal("0.00")
@@ -143,11 +148,14 @@ class SessionObjectiveState(BaseModel):
     open_position_count: int = 0
     max_concurrent_positions: int = 1
     deadline_exchange_time: datetime | None = None
+    truth_degraded: bool = False
 
     @field_validator(
         "authorised_capital_usd",
         "target_profit_usd",
         "target_ending_equity_usd",
+        "working_order_reservation_usd",
+        "filled_position_exposure_usd",
         "reserved_capital_usd",
         "available_capital_usd",
         "realised_pnl_usd",
@@ -169,31 +177,108 @@ class SessionObjectiveState(BaseModel):
             raise ValueError("timestamps must be timezone-aware")
         return value
 
+    @property
+    def total_encumbered_usd(self) -> Decimal:
+        return (
+            self.working_order_reservation_usd + self.filled_position_exposure_usd
+        ).quantize(Decimal("0.01"))
 
-ReservationStatus = Literal["open", "released", "converted", "partial"]
+
+ExposureStatus = Literal[
+    "working_order_reservation",
+    "filled_position_exposure",
+    "partial",
+    "released",
+    "closed",
+]
+
+# Backward-compatible alias used by older call sites / tests.
+ReservationStatus = ExposureStatus
 
 
-class CapitalReservation(BaseModel):
-    """Idempotent capital reservation keyed by client_order_id."""
+class CapitalExposure(BaseModel):
+    """Working-order reservation and/or filled-position cost-basis exposure.
+
+    Idempotent by ``client_order_id``. Available capital invariant:
+
+        available = authorised - filled_position_exposure - working_order_reservation
+    """
 
     model_config = ConfigDict(extra="forbid")
 
-    reservation_id: UUID = Field(default_factory=uuid4)
+    exposure_id: UUID = Field(default_factory=uuid4)
     objective_id: UUID
     session_id: str
     client_order_id: str
     broker_order_id: str | None = None
-    estimated_premium_usd: Decimal
-    reserved_usd: Decimal
-    status: ReservationStatus = "open"
+    contract_id: str | None = None
+    position_lifecycle_id: str | None = None
+
+    estimated_premium_per_contract_usd: Decimal
+    requested_quantity: int = 1
+    working_quantity: int = 0
+    filled_quantity: int = 0
+    average_fill_price: Decimal | None = None  # option premium per share
+
+    working_order_reservation_usd: Decimal = Decimal("0.00")
+    filled_exposure_usd: Decimal = Decimal("0.00")
+
+    status: ExposureStatus = "working_order_reservation"
     objective_state_version: int
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
-    @field_validator("estimated_premium_usd", "reserved_usd", mode="before")
+    @field_validator(
+        "estimated_premium_per_contract_usd",
+        "working_order_reservation_usd",
+        "filled_exposure_usd",
+        "average_fill_price",
+        mode="before",
+    )
     @classmethod
-    def _dec(cls, value: object) -> Decimal:
+    def _dec(cls, value: object) -> Decimal | None:
+        if value is None:
+            return None
         return _money(value)  # type: ignore[arg-type]
+
+    @property
+    def total_encumbered_usd(self) -> Decimal:
+        return (
+            self.working_order_reservation_usd + self.filled_exposure_usd
+        ).quantize(Decimal("0.01"))
+
+    @property
+    def reserved_usd(self) -> Decimal:
+        """Backward-compatible total encumbrance for this row."""
+        return self.total_encumbered_usd
+
+    @property
+    def estimated_premium_usd(self) -> Decimal:
+        return (
+            self.estimated_premium_per_contract_usd
+            * Decimal("100")
+            * Decimal(max(1, self.requested_quantity))
+        ).quantize(Decimal("0.01"))
+
+    def derive_status(self) -> ExposureStatus:
+        if self.status in {"released", "closed"}:
+            return self.status
+        if self.filled_exposure_usd > 0 and self.working_order_reservation_usd > 0:
+            return "partial"
+        if self.filled_exposure_usd > 0:
+            return "filled_position_exposure"
+        if self.working_order_reservation_usd > 0:
+            return "working_order_reservation"
+        return "released"
+
+    @property
+    def reservation_id(self) -> UUID:
+        """Backward-compatible alias for exposure_id."""
+        return self.exposure_id
+
+
+# Alias retained for imports / gradual migration.
+CapitalReservation = CapitalExposure
 
 
 class ObjectiveContext(BaseModel):
@@ -204,6 +289,8 @@ class ObjectiveContext(BaseModel):
     authorised_capital_usd: Decimal
     available_capital_usd: Decimal
     reserved_capital_usd: Decimal
+    working_order_reservation_usd: Decimal = Decimal("0.00")
+    filled_position_exposure_usd: Decimal = Decimal("0.00")
     realised_pnl_usd: Decimal
     target_profit_usd: Decimal
     required_profit_remaining_usd: Decimal
@@ -246,7 +333,49 @@ class GoalFeasibilityAssessment(BaseModel):
     assumptions: tuple[str, ...] = ()
     uncertainty_reasons: tuple[str, ...] = ()
     evidence_ids: tuple[UUID, ...] = ()
+    calculation_inputs: dict[str, Any] = Field(default_factory=dict)
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+class StrategyObjectiveEstimate(BaseModel):
+    """Typed EV/capital estimate for a strategy — never model prose alone."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    estimate_id: UUID = Field(default_factory=uuid4)
+    strategy_id: UUID
+    objective_id: UUID
+    snapshot_id: UUID
+
+    expected_value_usd: Decimal | None = None
+    estimated_win_probability: Decimal | None = None
+    estimated_payoff_ratio: Decimal | None = None
+    estimated_resolution_seconds: int | None = None
+
+    capital_required_usd: Decimal
+    maximum_loss_usd: Decimal
+
+    calculation_method: str
+    assumptions: tuple[str, ...] = ()
+    evidence_ids: tuple[UUID, ...] = ()
+    uncertainty_reasons: tuple[str, ...] = ()
+    quote_inputs: dict[str, Any] = Field(default_factory=dict)
+    valid: bool = True
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+    @field_validator(
+        "expected_value_usd",
+        "estimated_win_probability",
+        "estimated_payoff_ratio",
+        "capital_required_usd",
+        "maximum_loss_usd",
+        mode="before",
+    )
+    @classmethod
+    def _dec(cls, value: object) -> Decimal | None:
+        if value is None:
+            return None
+        return _money(value)  # type: ignore[arg-type]
 
 
 class ObjectiveStrategyScore(BaseModel):
@@ -258,6 +387,7 @@ class ObjectiveStrategyScore(BaseModel):
     objective_id: UUID
     strategy_id: UUID | None
     snapshot_id: UUID
+    estimate_id: UUID | None = None
 
     expected_value_usd: Decimal | None = None
     expected_return_on_authorised_capital_pct: Decimal | None = None
@@ -277,6 +407,7 @@ class ObjectiveStrategyScore(BaseModel):
     calculation_inputs: dict[str, Any] = Field(default_factory=dict)
     assumptions: tuple[str, ...] = ()
     evidence_ids: tuple[UUID, ...] = ()
+    uncertainty_reasons: tuple[str, ...] = ()
     valid: bool = True
     invalidation_codes: tuple[str, ...] = ()
     is_no_trade: bool = False
@@ -290,6 +421,7 @@ class ObjectiveSizingDecision(BaseModel):
     sizing_id: UUID = Field(default_factory=uuid4)
     objective_id: UUID
     strategy_id: UUID | None = None
+    estimate_id: UUID | None = None
     requested_quantity: int | None = None
     approved_quantity: int
 
@@ -338,10 +470,13 @@ def build_definition(
 
 
 def state_to_context(state: SessionObjectiveState) -> ObjectiveContext:
+    encumbered = state.total_encumbered_usd
     return ObjectiveContext(
         authorised_capital_usd=state.authorised_capital_usd,
         available_capital_usd=state.available_capital_usd,
-        reserved_capital_usd=state.reserved_capital_usd,
+        reserved_capital_usd=encumbered,
+        working_order_reservation_usd=state.working_order_reservation_usd,
+        filled_position_exposure_usd=state.filled_position_exposure_usd,
         realised_pnl_usd=state.realised_pnl_usd,
         target_profit_usd=state.target_profit_usd,
         required_profit_remaining_usd=state.required_profit_remaining_usd,
@@ -356,6 +491,14 @@ def state_to_context(state: SessionObjectiveState) -> ObjectiveContext:
         objective_version=state.version,
         status=state.status,
     )
+
+
+def premium_notional_usd(
+    premium_per_contract: Decimal | float, quantity: int
+) -> Decimal:
+    return (
+        Decimal(str(premium_per_contract)) * Decimal("100") * Decimal(int(quantity))
+    ).quantize(Decimal("0.01"))
 
 
 # Roles that must NOT receive ObjectiveContext (perception-neutral).

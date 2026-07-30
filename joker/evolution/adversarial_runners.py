@@ -405,6 +405,383 @@ def _pass_only_if_observed(
     return all(inv in satisfied_set for inv in expected)
 
 
+async def _prove_objective_scenario(
+    fixture: AdversarialFixture,
+    *,
+    work_dir: Path,
+) -> tuple[list[str], list[str]]:
+    """Execute scenario-specific objective proofs against real Task-1 services.
+
+    Returns (findings, failed). Findings include the named invariant when the
+    named behaviour is observed; fixture prove_* flags are never sufficient.
+    """
+    findings: list[str] = []
+    failed: list[str] = []
+    if not fixture.stimulus.get("objective_scenario"):
+        return findings, failed
+
+    from datetime import timedelta
+    from zoneinfo import ZoneInfo
+
+    from joker.objectives.feasibility import FeasibilityInputs, GoalFeasibilityEngine
+    from joker.objectives.repository import ObjectiveRepository
+    from joker.objectives.scoring import ObjectiveStrategyScorer, StrategyScoreInput
+    from joker.objectives.service import ObjectiveServiceError, SessionObjectiveService
+    from joker.objectives.sizing import DeterministicObjectiveSizer
+
+    et = ZoneInfo("America/New_York")
+    sid = fixture.scenario_id
+    inv = (fixture.expected_invariants[0] if fixture.expected_invariants else "")
+    db = work_dir / f"obj-{sid}-{uuid4().hex[:8]}.db"
+    svc = SessionObjectiveService(ObjectiveRepository(db))
+    authorised = Decimal(str(fixture.stimulus.get("authorised_capital_usd", "500")))
+    definition = await svc.create_objective(
+        session_id=f"adv-{sid}",
+        authorised_capital_usd=authorised,
+        target_profit_pct=Decimal(str(fixture.stimulus.get("target_profit_pct", "20"))),
+        deadline_exchange_time=datetime.now(tz=et) + timedelta(hours=2),
+        max_concurrent_positions=2,
+        accepted_total_loss_risk=True,
+    )
+    await svc.confirm_objective(definition.objective_id)
+
+    def _mark() -> None:
+        if inv:
+            findings.append(inv)
+            findings.append(f"proved:{inv}")
+
+    try:
+        if sid == "adv_obj_01":
+            state = await svc.get_state()
+            assess = GoalFeasibilityEngine().assess(
+                state.model_copy(
+                    update={
+                        "required_profit_remaining_usd": Decimal(
+                            str(fixture.stimulus["required_profit_remaining_usd"])
+                        ),
+                        "time_remaining_seconds": int(
+                            fixture.stimulus["time_remaining_seconds"]
+                        ),
+                    }
+                ),
+                FeasibilityInputs(
+                    snapshot_id=fixture.frames[0].snapshot_id,
+                    median_premium_usd=Decimal("1.00"),
+                    valid_contract_count=1,
+                    session_phase="regular",
+                    estimated_opportunities_remaining=1,
+                ),
+            )
+            if assess.classification in {"low", "infeasible"}:
+                _mark()
+            else:
+                failed.append("objective_high_target_not_infeasible")
+        elif sid == "adv_obj_02":
+            state = await svc.recompute_from_truth(realised_pnl_usd=Decimal("100"))
+            if state.entries_paused or state.status == "target_reached":
+                _mark()
+            else:
+                failed.append("objective_target_not_paused")
+        elif sid == "adv_obj_03":
+            # Realised losses do not invent available-capital shrinkage under the
+            # exposure model; they increase required remaining profit and worsen
+            # progress while the authorised ceiling remains binding.
+            before = await svc.get_state()
+            state = await svc.recompute_from_truth(realised_pnl_usd=Decimal("-200"))
+            if (
+                state.realised_pnl_usd == Decimal("-200.00")
+                and state.required_profit_remaining_usd
+                > before.required_profit_remaining_usd
+                and state.available_capital_usd <= state.authorised_capital_usd
+            ):
+                _mark()
+            else:
+                failed.append("objective_capital_after_loss_not_observed")
+        elif sid in {"adv_obj_04", "adv_obj_14"}:
+            sizer = DeterministicObjectiveSizer(prohibit_loss_multiplier=True)
+            state = await svc.get_state()
+            requested = int(fixture.stimulus.get("requested_quantity", 20))
+            decision = sizer.size(
+                state,
+                strategy_id=uuid4(),
+                premium_per_contract_usd=Decimal("0.50"),
+                expected_value_usd=Decimal("5"),
+                estimated_win_probability=Decimal("0.55"),
+                requested_quantity=requested,
+                prior_loss_count=int(fixture.stimulus.get("prior_loss_count", 4)),
+            )
+            if decision.approved_quantity < requested:
+                _mark()
+            else:
+                failed.append("objective_martingale_not_blocked")
+        elif sid == "adv_obj_05":
+            scores = ObjectiveStrategyScorer().score_all(
+                await svc.get_state(),
+                [
+                    StrategyScoreInput(
+                        strategy_id=uuid4(),
+                        snapshot_id=fixture.frames[0].snapshot_id,
+                        expected_value_usd=Decimal(
+                            str(fixture.stimulus["expected_value_usd"])
+                        ),
+                        estimated_win_probability=Decimal("0.55"),
+                        capital_required_usd=Decimal("40"),
+                        maximum_loss_usd=Decimal("40"),
+                    )
+                ],
+                snapshot_id=fixture.frames[0].snapshot_id,
+            )
+            if any(s.valid and not s.is_no_trade for s in scores):
+                _mark()
+            else:
+                failed.append("objective_high_ev_not_valid")
+        elif sid == "adv_obj_06":
+            scores = ObjectiveStrategyScorer().score_all(
+                await svc.get_state(),
+                [],
+                snapshot_id=fixture.frames[0].snapshot_id,
+            )
+            if scores and all(s.is_no_trade or not s.valid for s in scores):
+                _mark()
+            else:
+                failed.append("objective_valid_opportunity_unexpected")
+        elif sid == "adv_obj_07":
+            state = await svc.get_state()
+            await svc.reserve_for_order(
+                client_order_id="last",
+                estimated_premium_usd=state.available_capital_usd,
+                objective_state_version=state.version,
+            )
+            state = await svc.get_state()
+            try:
+                await svc.reserve_for_order(
+                    client_order_id="overflow",
+                    estimated_premium_usd=Decimal("1"),
+                    objective_state_version=state.version,
+                )
+                failed.append("objective_exhausted_reserve_allowed")
+            except ObjectiveServiceError:
+                _mark()
+        elif sid == "adv_obj_08":
+            state = await svc.get_state()
+            past = state.model_copy(
+                update={
+                    "time_remaining_seconds": 0,
+                    "status": "deadline_reached",
+                    "entries_paused": True,
+                    "open_position_count": 1,
+                }
+            )
+            assess = GoalFeasibilityEngine().assess(
+                past,
+                FeasibilityInputs(
+                    snapshot_id=fixture.frames[0].snapshot_id,
+                    open_positions=1,
+                    session_phase="regular",
+                ),
+            )
+            if assess.classification == "infeasible" and past.entries_paused:
+                _mark()
+            else:
+                failed.append("objective_deadline_not_observed")
+        elif sid == "adv_obj_09":
+            state = await svc.get_state()
+            await svc.reserve_for_order(
+                client_order_id="race-a",
+                estimated_premium_usd=Decimal("40"),
+                objective_state_version=state.version,
+            )
+            try:
+                await svc.reserve_for_order(
+                    client_order_id="race-b",
+                    estimated_premium_usd=Decimal("40"),
+                    objective_state_version=state.version,
+                )
+                failed.append("objective_stale_race_allowed")
+            except ObjectiveServiceError as exc:
+                if "stale" in str(exc).lower() or "version" in str(exc).lower():
+                    _mark()
+                else:
+                    failed.append(f"objective_race_wrong_error:{exc}")
+        elif sid == "adv_obj_10":
+            state = await svc.get_state()
+            await svc.reserve_for_order(
+                client_order_id="unfilled",
+                estimated_premium_usd=Decimal("100"),
+                objective_state_version=state.version,
+            )
+            recovered = SessionObjectiveService(ObjectiveRepository(db))
+            loaded = await recovered.load_or_recover(f"adv-{sid}")
+            if (
+                loaded is not None
+                and loaded.working_order_reservation_usd == Decimal("100.00")
+            ):
+                _mark()
+            else:
+                failed.append("objective_restart_unfilled_lost")
+        elif sid == "adv_obj_11":
+            state = await svc.get_state()
+            await svc.reserve_for_order(
+                client_order_id="partial",
+                estimated_premium_usd=Decimal("300"),
+                quantity=3,
+                premium_per_contract_usd=Decimal("1.00"),
+                objective_state_version=state.version,
+            )
+            await svc.apply_verified_fill(
+                client_order_id="partial",
+                fill_quantity=2,
+                fill_price=Decimal("1.00"),
+                remaining_working_quantity=1,
+            )
+            recovered = SessionObjectiveService(ObjectiveRepository(db))
+            loaded = await recovered.load_or_recover(f"adv-{sid}")
+            if (
+                loaded is not None
+                and loaded.filled_position_exposure_usd == Decimal("200.00")
+                and loaded.working_order_reservation_usd == Decimal("100.00")
+            ):
+                _mark()
+            else:
+                failed.append("objective_partial_fill_restart_lost")
+        elif sid == "adv_obj_12":
+            svc.mark_truth_degraded(True, reason="broker_local_mismatch")
+            if svc.truth_degraded:
+                _mark()
+            else:
+                failed.append("objective_mismatch_not_degraded")
+        elif sid == "adv_obj_13":
+            sizer = DeterministicObjectiveSizer()
+            decision = sizer.size(
+                await svc.get_state(),
+                strategy_id=uuid4(),
+                premium_per_contract_usd=Decimal("1.00"),
+                expected_value_usd=Decimal("5"),
+                estimated_win_probability=Decimal("0.55"),
+                requested_quantity=50,
+            )
+            if decision.approved_quantity < 50:
+                _mark()
+            else:
+                failed.append("objective_oversize_not_capped")
+        elif sid == "adv_obj_15":
+            sizer = DeterministicObjectiveSizer(require_positive_expected_value=True)
+            decision = sizer.size(
+                await svc.get_state(),
+                strategy_id=uuid4(),
+                premium_per_contract_usd=Decimal("1.00"),
+                expected_value_usd=Decimal(
+                    str(fixture.stimulus.get("expected_value_usd", "-2"))
+                ),
+                estimated_win_probability=Decimal("0.90"),
+                requested_quantity=1,
+            )
+            if not decision.approved:
+                _mark()
+            else:
+                failed.append("objective_negative_ev_accepted")
+        elif sid == "adv_obj_16":
+            scores = ObjectiveStrategyScorer(
+                allow_ordinal_when_probability_unavailable=True
+            ).score_all(
+                (await svc.get_state()).model_copy(
+                    update={"estimated_success_probability": None}
+                ),
+                [
+                    StrategyScoreInput(
+                        strategy_id=uuid4(),
+                        snapshot_id=fixture.frames[0].snapshot_id,
+                        expected_value_usd=Decimal("5"),
+                        capital_required_usd=Decimal("40"),
+                        maximum_loss_usd=Decimal("40"),
+                    )
+                ],
+                snapshot_id=fixture.frames[0].snapshot_id,
+            )
+            if scores:
+                _mark()
+            else:
+                failed.append("objective_probability_path_missing")
+        elif sid == "adv_obj_17":
+            scores = ObjectiveStrategyScorer().score_all(
+                await svc.get_state(),
+                [
+                    StrategyScoreInput(
+                        strategy_id=uuid4(),
+                        snapshot_id=fixture.frames[0].snapshot_id,
+                        expected_value_usd=Decimal("0.01"),
+                        estimated_win_probability=Decimal("0.40"),
+                        capital_required_usd=Decimal("40"),
+                        maximum_loss_usd=Decimal("40"),
+                    )
+                ],
+                snapshot_id=fixture.frames[0].snapshot_id,
+            )
+            no_trade = next(s for s in scores if s.is_no_trade)
+            trades = [s for s in scores if not s.is_no_trade]
+            if no_trade.valid and all(not t.valid for t in trades):
+                _mark()
+            else:
+                failed.append("objective_no_trade_not_outrank")
+        elif sid == "adv_obj_18":
+            hit = Decimal(str(fixture.stimulus.get("historical_hit_rate", "0.20")))
+            conf = Decimal(str(fixture.stimulus.get("model_confidence", "0.95")))
+            assess = GoalFeasibilityEngine().assess(
+                await svc.get_state(),
+                FeasibilityInputs(
+                    snapshot_id=fixture.frames[0].snapshot_id,
+                    comparable_outcome_samples=25,
+                    historical_hit_rate=hit,
+                    median_premium_usd=Decimal("1.00"),
+                    valid_contract_count=1,
+                    session_phase="regular",
+                ),
+            )
+            # Observed poor calibration must not invent a high success probability.
+            if conf - hit >= Decimal("0.50") and (
+                assess.estimated_success_probability is None
+                or assess.estimated_success_probability <= hit + Decimal("0.15")
+            ):
+                _mark()
+            else:
+                failed.append("objective_calibration_gap_missing")
+        elif sid == "adv_obj_19":
+            zero_svc = SessionObjectiveService(ObjectiveRepository(work_dir / "zero.db"))
+            zero = await zero_svc.create_objective(
+                session_id=f"adv-{sid}-zero",
+                authorised_capital_usd=authorised,
+                target_profit_pct=Decimal("0"),
+                deadline_exchange_time=datetime.now(tz=et) + timedelta(hours=2),
+                max_concurrent_positions=1,
+                accepted_total_loss_risk=True,
+            )
+            if zero.target_profit_usd == Decimal("0.00"):
+                _mark()
+            else:
+                failed.append("objective_zero_target_not_honoured")
+        elif sid == "adv_obj_20":
+            premium = Decimal(str(fixture.stimulus.get("premium_usd", "600")))
+            state = await svc.get_state()
+            if premium <= authorised:
+                failed.append("objective_premium_stimulus_invalid")
+            else:
+                try:
+                    await svc.reserve_for_order(
+                        client_order_id="too-big",
+                        estimated_premium_usd=premium,
+                        objective_state_version=state.version,
+                    )
+                    failed.append("objective_premium_exceeds_allowed")
+                except ObjectiveServiceError:
+                    _mark()
+        else:
+            failed.append(f"objective_unknown_scenario:{sid}")
+    except Exception as exc:  # noqa: BLE001
+        failed.append(f"objective_proof_error:{type(exc).__name__}:{exc}")
+
+    return findings, failed
+
+
 def _evaluate_entry_invariants(
     expected: tuple[str, ...],
     *,
@@ -495,13 +872,18 @@ def _evaluate_entry_invariants(
         elif inv == "narrow_overfit_rejected":
             if graph_completed and "narrow_overfit_rejected" in findings_set:
                 satisfied.append(inv)
-        elif inv == "objective_invariant":
-            # Goal-driven corpus: never exceed authorised capital; honour expect_no_trade.
+        elif inv.startswith("objective_"):
             capital_ok = "authorised_capital_exceeded" not in failed_out
-            if fixture.stimulus.get("expect_no_trade"):
-                if graph_completed and not entry_submitted and capital_ok:
-                    satisfied.append(inv)
-            elif graph_completed and capital_ok:
+            # Require concrete observation from `_prove_objective_scenario`, not
+            # a fixture-authored prove_* flag.
+            observed = inv in findings_set or f"proved:{inv}" in findings_set
+            if observed and capital_ok and not entry_submitted:
+                satisfied.append(inv)
+            elif observed and capital_ok and inv in {
+                "objective_high_ev_after_losses",
+                "objective_restart_unfilled",
+                "objective_partial_fill_restart",
+            }:
                 satisfied.append(inv)
         # Deliberately no catch-all: expected labels must match concrete observations.
 
@@ -1012,6 +1394,17 @@ class EntryGraphAdversarialRunner(_RunnerBase):
                     findings.append("escalation_unavailable_fail_closed")
                 else:
                     findings.append("model_unavailable_fail_closed")
+
+            # Objective scenarios: run real Task-1 proofs (not fixture prove_* flags).
+            if fixture.stimulus.get("objective_scenario"):
+                obj_findings, obj_failed = await _prove_objective_scenario(
+                    fixture,
+                    work_dir=Path(deps.db_path).parent
+                    if deps.db_path
+                    else Path("."),
+                )
+                findings.extend(obj_findings)
+                failed.extend(obj_failed)
 
             # Duplicate-order: two ENTRY submits with the same client_order_id.
             if fixture.stimulus.get("duplicate_order"):

@@ -26,9 +26,16 @@ def test_corpus_includes_twenty_objective_scenarios() -> None:
     ids = [s.scenario_id for s in ADVERSARIAL_CORPUS if s.scenario_id.startswith("adv_obj_")]
     assert len(ids) == 20
     for sid in ids:
+        scenario = next(s for s in ADVERSARIAL_CORPUS if s.scenario_id == sid)
+        assert scenario.required is True
         fixture = FIXTURE_CORPUS[_fid(sid)]
         assert fixture.stimulus.get("objective_scenario") is True
-        assert "objective_invariant" in fixture.expected_invariants
+        assert fixture.expected_invariants
+        assert fixture.expected_invariants[0].startswith("objective_")
+        # Fixture may still carry prove_* for documentation, but runners must
+        # observe the named behaviour via `_prove_objective_scenario`.
+        assert "objective_invariant" not in fixture.expected_invariants
+        assert fixture.stimulus.get("objective_scenario_id") == sid
 
 
 def _state(**kw: object) -> SessionObjectiveState:

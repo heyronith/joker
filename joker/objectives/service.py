@@ -1,4 +1,4 @@
-"""Task-1 SessionObjectiveService — durable capital truth and reservations."""
+"""Task-1 SessionObjectiveService — durable capital truth and exposures."""
 
 from __future__ import annotations
 
@@ -16,10 +16,11 @@ from joker.objectives.events import (
 )
 from joker.objectives.repository import ObjectiveRepository
 from joker.objectives.schemas import (
-    CapitalReservation,
+    CapitalExposure,
     SessionObjectiveDefinition,
     SessionObjectiveState,
     build_definition,
+    premium_notional_usd,
     state_to_context,
 )
 
@@ -31,7 +32,7 @@ class ObjectiveServiceError(RuntimeError):
 
 
 class SessionObjectiveService:
-    """Owns session objective lifecycle, reservations, and recomputation."""
+    """Owns session objective lifecycle, exposures, and recomputation."""
 
     def __init__(
         self,
@@ -54,10 +55,15 @@ class SessionObjectiveService:
         self._objective_id: UUID | None = None
         self._broker_submission_seen = False
         self._reconciliation_unresolved = False
+        self._truth_degraded = False
 
     @property
     def operator_events(self) -> BoundedOperatorEventProjection:
         return self._events
+
+    @property
+    def truth_degraded(self) -> bool:
+        return self._truth_degraded or self._reconciliation_unresolved
 
     def _emit(
         self,
@@ -69,7 +75,8 @@ class SessionObjectiveService:
         before: dict[str, Any] | None = None,
         after: dict[str, Any] | None = None,
         linked_ids: dict[str, str] | None = None,
-    ) -> None:
+        persist_audit: bool = True,
+    ) -> dict[str, Any]:
         event = make_objective_event(
             event_type,
             objective_id=objective_id,
@@ -80,14 +87,31 @@ class SessionObjectiveService:
             linked_ids=linked_ids,
         )
         self._events.publish(event)
-        self._repo.append_audit(
-            audit_id=str(uuid4()),
-            objective_id=objective_id,
-            session_id=session_id,
-            event_type=event_type.value,
-            payload=event.sanitised_payload(),
-            created_at=event.timestamp,
-        )
+        payload = event.sanitised_payload()
+        if persist_audit:
+            self._repo.append_audit(
+                audit_id=str(uuid4()),
+                objective_id=objective_id,
+                session_id=session_id,
+                event_type=event_type.value,
+                payload=payload,
+                created_at=event.timestamp,
+            )
+        return {
+            "audit_id": str(uuid4()),
+            "session_id": session_id,
+            "event_type": event_type.value,
+            "payload": payload,
+            "created_at": event.timestamp,
+        }
+
+    def mark_truth_degraded(self, degraded: bool, *, reason: str = "") -> None:
+        self._truth_degraded = bool(degraded)
+        if degraded:
+            logger.error(
+                "objective_truth_degraded",
+                extra={"reason": reason, "objective_id": str(self._objective_id)},
+            )
 
     async def create_objective(
         self,
@@ -117,9 +141,6 @@ class SessionObjectiveService:
                 else pause_entries_when_goal_met
             ),
         )
-        # Store unarmed until confirm
-        pending = definition.model_copy(update={"armed": False})
-        # frozen model — rebuild
         pending = SessionObjectiveDefinition(
             objective_id=definition.objective_id,
             session_id=definition.session_id,
@@ -147,6 +168,8 @@ class SessionObjectiveService:
             authorised_capital_usd=pending.authorised_capital_usd,
             target_profit_usd=pending.target_profit_usd,
             target_ending_equity_usd=pending.target_ending_equity_usd,
+            working_order_reservation_usd=Decimal("0.00"),
+            filled_position_exposure_usd=Decimal("0.00"),
             reserved_capital_usd=Decimal("0.00"),
             available_capital_usd=pending.authorised_capital_usd,
             required_profit_remaining_usd=pending.target_profit_usd,
@@ -217,6 +240,8 @@ class SessionObjectiveService:
 
     def mark_reconciliation_unresolved(self, unresolved: bool) -> None:
         self._reconciliation_unresolved = unresolved
+        if unresolved:
+            self.mark_truth_degraded(True, reason="reconciliation_unresolved")
 
     async def load_or_recover(self, session_id: str) -> SessionObjectiveState | None:
         definition = self._repo.latest_definition_for_session(session_id)
@@ -226,24 +251,44 @@ class SessionObjectiveService:
         self._broker_submission_seen = definition.first_broker_submission_at is not None
         return await self.recompute_from_truth()
 
-    async def recompute_from_truth(
+    def _sum_exposures(
+        self, objective_id: UUID
+    ) -> tuple[Decimal, Decimal, int]:
+        working = Decimal("0.00")
+        filled = Decimal("0.00")
+        open_positions = 0
+        for exp in self._repo.list_encumbering_exposures(objective_id):
+            working += Decimal(str(exp.working_order_reservation_usd))
+            filled += Decimal(str(exp.filled_exposure_usd))
+            if exp.filled_quantity > 0 and exp.status in {
+                "filled_position_exposure",
+                "partial",
+            }:
+                open_positions += 1
+        return (
+            working.quantize(Decimal("0.01")),
+            filled.quantize(Decimal("0.01")),
+            open_positions,
+        )
+
+    def _build_state_from_exposures(
         self,
+        definition: SessionObjectiveDefinition,
+        prev: SessionObjectiveState | None,
         *,
-        realised_pnl_usd: Decimal | float | None = None,
-        unrealised_pnl_usd: Decimal | float | None = None,
+        realised_pnl_usd: Decimal | None = None,
+        unrealised_pnl_usd: Decimal | None = None,
         open_position_count: int | None = None,
         force_status: str | None = None,
         now: datetime | None = None,
+        truth_degraded: bool | None = None,
     ) -> SessionObjectiveState:
-        if self._objective_id is None:
-            raise ObjectiveServiceError("objective state is missing")
-        definition = self._repo.get_definition(self._objective_id)
-        if definition is None:
-            raise ObjectiveServiceError("objective definition missing")
-        prev = self._repo.latest_state(self._objective_id)
-        reserved = Decimal("0.00")
-        for res in self._repo.list_open_reservations(self._objective_id):
-            reserved += Decimal(str(res.reserved_usd))
+        working, filled, derived_positions = self._sum_exposures(definition.objective_id)
+        encumbered = (working + filled).quantize(Decimal("0.01"))
+        available = max(
+            Decimal("0.00"),
+            (definition.authorised_capital_usd - encumbered).quantize(Decimal("0.01")),
+        )
         realised = (
             Decimal(str(realised_pnl_usd))
             if realised_pnl_usd is not None
@@ -257,11 +302,11 @@ class SessionObjectiveService:
         positions = (
             open_position_count
             if open_position_count is not None
-            else (prev.open_position_count if prev else 0)
-        )
-        available = max(
-            Decimal("0.00"),
-            (definition.authorised_capital_usd - reserved).quantize(Decimal("0.01")),
+            else (
+                derived_positions
+                if prev is None
+                else max(prev.open_position_count, derived_positions)
+            )
         )
         remaining_profit = max(
             Decimal("0.00"),
@@ -286,41 +331,46 @@ class SessionObjectiveService:
         stance = prev.current_stance if prev else "observe"
         feasibility = prev.feasibility_classification if prev else "unknown"
         est_p = prev.estimated_success_probability if prev else None
+        degraded = (
+            self.truth_degraded
+            if truth_degraded is None
+            else bool(truth_degraded)
+        )
 
         if not definition.armed and status != "pending_confirmation":
             status = "pending_confirmation"
-
         if definition.armed and status == "pending_confirmation" and force_status is None:
             status = "active"
-
         if remaining_s <= 0 and self.stop_new_entries_at_deadline:
             status = "deadline_reached"
             stance = "deadline"
             entries_paused = True
-
         if realised >= definition.target_profit_usd and definition.pause_entries_when_goal_met:
             status = "target_reached"
             stance = "defend"
             entries_paused = True
-
-        if available <= 0 and positions == 0 and reserved <= 0:
+        if available <= 0 and positions == 0 and encumbered <= 0:
             if realised < definition.target_profit_usd and remaining_s > 0:
                 status = "capital_exhausted"
                 stance = "infeasible"
                 entries_paused = True
-
+        if degraded:
+            status = "truth_degraded"
+            entries_paused = True
         if force_status:
             status = force_status
 
         version = (prev.version + 1) if prev else 1
-        state = SessionObjectiveState(
+        return SessionObjectiveState(
             objective_id=definition.objective_id,
             session_id=definition.session_id,
             status=status,  # type: ignore[arg-type]
             authorised_capital_usd=definition.authorised_capital_usd,
             target_profit_usd=definition.target_profit_usd,
             target_ending_equity_usd=definition.target_ending_equity_usd,
-            reserved_capital_usd=reserved.quantize(Decimal("0.01")),
+            working_order_reservation_usd=working,
+            filled_position_exposure_usd=filled,
+            reserved_capital_usd=encumbered,
             available_capital_usd=available,
             realised_pnl_usd=realised.quantize(Decimal("0.01")),
             unrealised_pnl_usd=unrealised.quantize(Decimal("0.01")),
@@ -336,6 +386,36 @@ class SessionObjectiveService:
             open_position_count=positions,
             max_concurrent_positions=definition.max_concurrent_positions,
             deadline_exchange_time=definition.deadline_exchange_time,
+            truth_degraded=degraded,
+        )
+
+    async def recompute_from_truth(
+        self,
+        *,
+        realised_pnl_usd: Decimal | float | None = None,
+        unrealised_pnl_usd: Decimal | float | None = None,
+        open_position_count: int | None = None,
+        force_status: str | None = None,
+        now: datetime | None = None,
+    ) -> SessionObjectiveState:
+        if self._objective_id is None:
+            raise ObjectiveServiceError("objective state is missing")
+        definition = self._repo.get_definition(self._objective_id)
+        if definition is None:
+            raise ObjectiveServiceError("objective definition missing")
+        prev = self._repo.latest_state(self._objective_id)
+        state = self._build_state_from_exposures(
+            definition,
+            prev,
+            realised_pnl_usd=(
+                Decimal(str(realised_pnl_usd)) if realised_pnl_usd is not None else None
+            ),
+            unrealised_pnl_usd=(
+                Decimal(str(unrealised_pnl_usd)) if unrealised_pnl_usd is not None else None
+            ),
+            open_position_count=open_position_count,
+            force_status=force_status,
+            now=now,
         )
         self._repo.append_state(state)
         self._emit(
@@ -345,8 +425,9 @@ class SessionObjectiveService:
             after={
                 "status": state.status,
                 "available": str(state.available_capital_usd),
+                "working": str(state.working_order_reservation_usd),
+                "filled_exposure": str(state.filled_position_exposure_usd),
                 "reserved": str(state.reserved_capital_usd),
-                "progress": str(state.progress_to_goal_pct),
                 "version": state.version,
             },
         )
@@ -370,6 +451,8 @@ class SessionObjectiveService:
             raise ObjectiveServiceError("objective is unconfirmed")
         if state.status == "pending_confirmation":
             raise ObjectiveServiceError("objective is unconfirmed")
+        if self.truth_degraded or state.truth_degraded or state.status == "truth_degraded":
+            raise ObjectiveServiceError("objective truth is degraded")
         if self._reconciliation_unresolved:
             raise ObjectiveServiceError("reconciliation is unresolved")
         if state.status == "deadline_reached" or (
@@ -389,106 +472,494 @@ class SessionObjectiveService:
         self,
         *,
         client_order_id: str,
-        estimated_premium_usd: Decimal | float,
+        estimated_premium_usd: Decimal | float | None = None,
+        premium_per_contract_usd: Decimal | float | None = None,
+        quantity: int = 1,
         objective_state_version: int,
-    ) -> CapitalReservation:
+        contract_id: str | None = None,
+        position_lifecycle_id: str | None = None,
+    ) -> CapitalExposure:
         state = await self.get_state()
         if state.version != objective_state_version:
             raise ObjectiveServiceError("objective version is stale")
         self._assert_entry_allowed(state)
-        premium = Decimal(str(estimated_premium_usd)).quantize(Decimal("0.01"))
-        if premium <= 0:
-            raise ObjectiveServiceError("estimated premium must be > 0")
-        existing = self._repo.get_reservation_by_client_order(client_order_id)
-        if existing is not None and existing.status in {"open", "partial", "converted"}:
-            # Idempotent: return existing open reservation
+        existing = self._repo.get_exposure_by_client_order(client_order_id)
+        if existing is not None and existing.status in {
+            "working_order_reservation",
+            "partial",
+            "filled_position_exposure",
+        }:
             return existing
-        if premium > state.available_capital_usd:
+
+        if premium_per_contract_usd is not None:
+            per = Decimal(str(premium_per_contract_usd))
+            qty = max(1, int(quantity))
+            working = premium_notional_usd(per, qty)
+        elif estimated_premium_usd is not None:
+            working = Decimal(str(estimated_premium_usd)).quantize(Decimal("0.01"))
+            qty = max(1, int(quantity))
+            per = (working / (Decimal("100") * Decimal(qty))).quantize(Decimal("0.01"))
+        else:
+            raise ObjectiveServiceError("premium required for reservation")
+        if working <= 0:
+            raise ObjectiveServiceError("estimated premium must be > 0")
+        if working > state.available_capital_usd:
             raise ObjectiveServiceError(
-                f"available capital insufficient: need {premium}, have {state.available_capital_usd}"
+                f"available capital insufficient: need {working}, have {state.available_capital_usd}"
             )
-        reservation = CapitalReservation(
+
+        exposure = CapitalExposure(
             objective_id=state.objective_id,
             session_id=state.session_id,
             client_order_id=client_order_id,
-            estimated_premium_usd=premium,
-            reserved_usd=premium,
-            status="open",
+            contract_id=contract_id,
+            position_lifecycle_id=position_lifecycle_id,
+            estimated_premium_per_contract_usd=per,
+            requested_quantity=qty,
+            working_quantity=qty,
+            filled_quantity=0,
+            working_order_reservation_usd=working,
+            filled_exposure_usd=Decimal("0.00"),
+            status="working_order_reservation",
             objective_state_version=state.version,
         )
-        # Optimistic bump
-        new_reserved = (state.reserved_capital_usd + premium).quantize(Decimal("0.01"))
-        new_available = (state.authorised_capital_usd - new_reserved).quantize(
-            Decimal("0.01")
+        definition = self._repo.get_definition(state.objective_id)
+        assert definition is not None
+        # Temporary upsert so sum includes this exposure for new state construction.
+        # Atomic path writes both; we build new_state from projected sums.
+        projected_working = state.working_order_reservation_usd + working
+        projected_filled = state.filled_position_exposure_usd
+        encumbered = (projected_working + projected_filled).quantize(Decimal("0.01"))
+        available = max(
+            Decimal("0.00"),
+            (definition.authorised_capital_usd - encumbered).quantize(Decimal("0.01")),
         )
         new_state = state.model_copy(
             update={
-                "reserved_capital_usd": new_reserved,
-                "available_capital_usd": max(Decimal("0.00"), new_available),
+                "working_order_reservation_usd": projected_working.quantize(Decimal("0.01")),
+                "filled_position_exposure_usd": projected_filled,
+                "reserved_capital_usd": encumbered,
+                "available_capital_usd": available,
                 "version": state.version + 1,
                 "last_recomputed_at": datetime.now(timezone.utc),
             }
         )
-        ok = self._repo.compare_and_swap_state_version(
-            objective_id=state.objective_id,
-            expected_version=state.version,
-            new_state=new_state,
-        )
-        if not ok:
-            raise ObjectiveServiceError("objective version is stale")
-        self._repo.upsert_reservation(reservation)
-        self._emit(
+        audit = self._emit(
             ObjectiveOperatorEventType.CAPITAL_RESERVED,
             objective_id=state.objective_id,
             session_id=state.session_id,
-            after={"reserved_usd": str(premium), "client_order_id": client_order_id},
+            after={
+                "working_usd": str(working),
+                "client_order_id": client_order_id,
+            },
             linked_ids={"client_order_id": client_order_id},
+            persist_audit=False,
         )
-        return reservation
+        ok = self._repo.atomic_mutate_exposure(
+            objective_id=state.objective_id,
+            expected_version=state.version,
+            exposure=exposure,
+            new_state=new_state,
+            audit=audit,
+            dedupe_key=f"reserve:{client_order_id}",
+        )
+        if not ok:
+            raise ObjectiveServiceError("objective version is stale")
+        return exposure
 
     async def release_for_order(
         self,
         *,
         client_order_id: str,
         reason: str = "released",
+        dedupe_key: str | None = None,
     ) -> SessionObjectiveState:
-        existing = self._repo.get_reservation_by_client_order(client_order_id)
+        """Release remaining working-order reservation only (not filled exposure)."""
+        existing = self._repo.get_exposure_by_client_order(client_order_id)
         if existing is None:
             return await self.get_state()
-        if existing.status == "released":
+        if existing.status in {"released", "closed"} and existing.working_order_reservation_usd <= 0:
             return await self.get_state()
+        state = await self.get_state()
+        key = dedupe_key or f"release_working:{client_order_id}:{reason}"
+        if self._repo.has_projection_dedupe(key):
+            return state
+
         updated = existing.model_copy(
             update={
-                "status": "released",
-                "reserved_usd": Decimal("0.00"),
+                "working_order_reservation_usd": Decimal("0.00"),
+                "working_quantity": 0,
+                "status": (
+                    "filled_position_exposure"
+                    if existing.filled_exposure_usd > 0
+                    else "released"
+                ),
                 "updated_at": datetime.now(timezone.utc),
+                "objective_state_version": state.version,
             }
         )
-        self._repo.upsert_reservation(updated)
-        self._emit(
+        # Apply temporarily for sum — atomic write uses updated exposure.
+        definition = self._repo.get_definition(state.objective_id)
+        assert definition is not None
+        # Compute new totals excluding released working portion.
+        working = Decimal("0.00")
+        filled = Decimal("0.00")
+        for exp in self._repo.list_encumbering_exposures(state.objective_id):
+            if exp.client_order_id == client_order_id:
+                working += updated.working_order_reservation_usd
+                filled += updated.filled_exposure_usd
+            else:
+                working += exp.working_order_reservation_usd
+                filled += exp.filled_exposure_usd
+        encumbered = (working + filled).quantize(Decimal("0.01"))
+        available = max(
+            Decimal("0.00"),
+            (definition.authorised_capital_usd - encumbered).quantize(Decimal("0.01")),
+        )
+        new_state = state.model_copy(
+            update={
+                "working_order_reservation_usd": working.quantize(Decimal("0.01")),
+                "filled_position_exposure_usd": filled.quantize(Decimal("0.01")),
+                "reserved_capital_usd": encumbered,
+                "available_capital_usd": available,
+                "version": state.version + 1,
+                "last_recomputed_at": datetime.now(timezone.utc),
+            }
+        )
+        audit = self._emit(
             ObjectiveOperatorEventType.CAPITAL_RELEASED,
             objective_id=existing.objective_id,
             session_id=existing.session_id,
             reason_codes=(reason,),
             linked_ids={"client_order_id": client_order_id},
+            persist_audit=False,
         )
-        return await self.recompute_from_truth()
+        ok = self._repo.atomic_mutate_exposure(
+            objective_id=state.objective_id,
+            expected_version=state.version,
+            exposure=updated,
+            new_state=new_state,
+            audit=audit,
+            dedupe_key=key,
+        )
+        if not ok:
+            raise ObjectiveServiceError("objective version is stale")
+        return new_state
+
+    async def apply_verified_fill(
+        self,
+        *,
+        client_order_id: str,
+        fill_quantity: int,
+        fill_price: Decimal | float,
+        remaining_working_quantity: int | None = None,
+        dedupe_key: str | None = None,
+        contract_id: str | None = None,
+        open_position_count: int | None = None,
+    ) -> SessionObjectiveState:
+        """Convert filled qty to cost-basis exposure; retain working for unfilled."""
+        existing = self._repo.get_exposure_by_client_order(client_order_id)
+        if existing is None:
+            raise ObjectiveServiceError(
+                f"no exposure for client_order_id={client_order_id}"
+            )
+        state = await self.get_state()
+        key = dedupe_key or (
+            f"fill:{client_order_id}:{fill_quantity}:{fill_price}:"
+            f"{remaining_working_quantity}"
+        )
+        if self._repo.has_projection_dedupe(key):
+            return state
+
+        fill_qty = max(0, int(fill_quantity))
+        price = Decimal(str(fill_price))
+        fill_notional = premium_notional_usd(price, fill_qty)
+        prior_filled_qty = int(existing.filled_quantity)
+        new_filled_qty = prior_filled_qty + fill_qty
+        # Weighted average fill price
+        if prior_filled_qty > 0 and existing.average_fill_price is not None:
+            prior_notional = premium_notional_usd(
+                existing.average_fill_price, prior_filled_qty
+            )
+            avg = (
+                (prior_notional + fill_notional)
+                / (Decimal("100") * Decimal(new_filled_qty))
+            ).quantize(Decimal("0.0001"))
+        else:
+            avg = price
+        filled_exposure = premium_notional_usd(avg, new_filled_qty)
+
+        if remaining_working_quantity is not None:
+            rem_qty = max(0, int(remaining_working_quantity))
+        else:
+            rem_qty = max(0, int(existing.working_quantity) - fill_qty)
+        working_usd = (
+            premium_notional_usd(existing.estimated_premium_per_contract_usd, rem_qty)
+            if rem_qty > 0
+            else Decimal("0.00")
+        )
+        if rem_qty > 0 and filled_exposure > 0:
+            status = "partial"
+        elif filled_exposure > 0:
+            status = "filled_position_exposure"
+        elif working_usd > 0:
+            status = "working_order_reservation"
+        else:
+            status = "released"
+
+        updated = existing.model_copy(
+            update={
+                "filled_quantity": new_filled_qty,
+                "working_quantity": rem_qty,
+                "average_fill_price": avg,
+                "filled_exposure_usd": filled_exposure,
+                "working_order_reservation_usd": working_usd,
+                "status": status,
+                "contract_id": contract_id or existing.contract_id,
+                "updated_at": datetime.now(timezone.utc),
+                "objective_state_version": state.version,
+            }
+        )
+        definition = self._repo.get_definition(state.objective_id)
+        assert definition is not None
+        working = Decimal("0.00")
+        filled = Decimal("0.00")
+        for exp in self._repo.list_encumbering_exposures(state.objective_id):
+            if exp.client_order_id == client_order_id:
+                working += updated.working_order_reservation_usd
+                filled += updated.filled_exposure_usd
+            else:
+                working += exp.working_order_reservation_usd
+                filled += exp.filled_exposure_usd
+        # Include updated even if status list would exclude mid-flight.
+        if updated.status not in {
+            "working_order_reservation",
+            "filled_position_exposure",
+            "partial",
+            "open",
+            "converted",
+        }:
+            pass
+        encumbered = (working + filled).quantize(Decimal("0.01"))
+        available = max(
+            Decimal("0.00"),
+            (definition.authorised_capital_usd - encumbered).quantize(Decimal("0.01")),
+        )
+        positions = (
+            open_position_count
+            if open_position_count is not None
+            else max(state.open_position_count, 1 if new_filled_qty > 0 else 0)
+        )
+        new_state = state.model_copy(
+            update={
+                "working_order_reservation_usd": working.quantize(Decimal("0.01")),
+                "filled_position_exposure_usd": filled.quantize(Decimal("0.01")),
+                "reserved_capital_usd": encumbered,
+                "available_capital_usd": available,
+                "open_position_count": positions,
+                "version": state.version + 1,
+                "last_recomputed_at": datetime.now(timezone.utc),
+            }
+        )
+        audit = self._emit(
+            ObjectiveOperatorEventType.CAPITAL_RESERVED,
+            objective_id=state.objective_id,
+            session_id=state.session_id,
+            reason_codes=("verified_fill",),
+            after={
+                "filled_exposure_usd": str(filled_exposure),
+                "working_order_reservation_usd": str(working_usd),
+                "client_order_id": client_order_id,
+            },
+            linked_ids={"client_order_id": client_order_id},
+            persist_audit=False,
+        )
+        ok = self._repo.atomic_mutate_exposure(
+            objective_id=state.objective_id,
+            expected_version=state.version,
+            exposure=updated,
+            new_state=new_state,
+            audit=audit,
+            dedupe_key=key,
+        )
+        if not ok:
+            raise ObjectiveServiceError("objective version is stale")
+        return new_state
+
+    async def reduce_position_exposure(
+        self,
+        *,
+        client_order_id: str | None = None,
+        contract_id: str | None = None,
+        closed_quantity: int,
+        realised_pnl_delta_usd: Decimal | float = 0,
+        dedupe_key: str | None = None,
+        open_position_count: int | None = None,
+        final_close: bool = False,
+    ) -> SessionObjectiveState:
+        """Release proportional filled cost-basis exposure on reduce/close."""
+        state = await self.get_state()
+        key = dedupe_key or (
+            f"reduce:{client_order_id or contract_id}:{closed_quantity}:"
+            f"{realised_pnl_delta_usd}:{final_close}"
+        )
+        if self._repo.has_projection_dedupe(key):
+            return state
+
+        existing: CapitalExposure | None = None
+        if client_order_id:
+            existing = self._repo.get_exposure_by_client_order(client_order_id)
+        if existing is None and contract_id:
+            for exp in self._repo.list_encumbering_exposures(state.objective_id):
+                if exp.contract_id == contract_id and exp.filled_exposure_usd > 0:
+                    existing = exp
+                    break
+        if existing is None:
+            # Still record PnL even without exposure row.
+            return await self.recompute_from_truth(
+                realised_pnl_usd=(
+                    state.realised_pnl_usd + Decimal(str(realised_pnl_delta_usd))
+                ).quantize(Decimal("0.01")),
+                open_position_count=open_position_count,
+            )
+
+        closed_qty = max(0, int(closed_quantity))
+        if existing.filled_quantity <= 0 or existing.average_fill_price is None:
+            release = (
+                existing.filled_exposure_usd
+                if final_close
+                else Decimal("0.00")
+            )
+            remaining_qty = 0 if final_close else existing.filled_quantity
+        else:
+            release = premium_notional_usd(existing.average_fill_price, closed_qty)
+            release = min(release, existing.filled_exposure_usd)
+            remaining_qty = max(0, existing.filled_quantity - closed_qty)
+            if final_close:
+                release = existing.filled_exposure_usd
+                remaining_qty = 0
+        remaining_filled = (
+            Decimal("0.00")
+            if remaining_qty <= 0
+            else premium_notional_usd(existing.average_fill_price or 0, remaining_qty)
+        )
+        status = (
+            "closed"
+            if remaining_qty <= 0 and existing.working_order_reservation_usd <= 0
+            else (
+                "partial"
+                if remaining_qty > 0 and existing.working_order_reservation_usd > 0
+                else (
+                    "filled_position_exposure"
+                    if remaining_qty > 0
+                    else (
+                        "working_order_reservation"
+                        if existing.working_order_reservation_usd > 0
+                        else "closed"
+                    )
+                )
+            )
+        )
+        updated = existing.model_copy(
+            update={
+                "filled_quantity": remaining_qty,
+                "filled_exposure_usd": remaining_filled,
+                "status": status,
+                "updated_at": datetime.now(timezone.utc),
+                "objective_state_version": state.version,
+            }
+        )
+        definition = self._repo.get_definition(state.objective_id)
+        assert definition is not None
+        working = Decimal("0.00")
+        filled = Decimal("0.00")
+        for exp in self._repo.list_encumbering_exposures(state.objective_id):
+            if exp.client_order_id == existing.client_order_id:
+                working += updated.working_order_reservation_usd
+                filled += updated.filled_exposure_usd
+            else:
+                working += exp.working_order_reservation_usd
+                filled += exp.filled_exposure_usd
+        encumbered = (working + filled).quantize(Decimal("0.01"))
+        available = max(
+            Decimal("0.00"),
+            (definition.authorised_capital_usd - encumbered).quantize(Decimal("0.01")),
+        )
+        new_realised = (
+            state.realised_pnl_usd + Decimal(str(realised_pnl_delta_usd))
+        ).quantize(Decimal("0.01"))
+        positions = (
+            0
+            if final_close or remaining_qty <= 0
+            else (
+                open_position_count
+                if open_position_count is not None
+                else state.open_position_count
+            )
+        )
+        new_state = self._build_state_from_exposures(
+            definition,
+            state.model_copy(
+                update={
+                    "working_order_reservation_usd": working,
+                    "filled_position_exposure_usd": filled,
+                    "reserved_capital_usd": encumbered,
+                    "available_capital_usd": available,
+                    "realised_pnl_usd": new_realised,
+                    "open_position_count": positions,
+                }
+            ),
+            realised_pnl_usd=new_realised,
+            open_position_count=positions,
+        )
+        # Force version bump relative to current state
+        new_state = new_state.model_copy(
+            update={
+                "working_order_reservation_usd": working.quantize(Decimal("0.01")),
+                "filled_position_exposure_usd": filled.quantize(Decimal("0.01")),
+                "reserved_capital_usd": encumbered,
+                "available_capital_usd": available,
+                "version": state.version + 1,
+                "last_recomputed_at": datetime.now(timezone.utc),
+            }
+        )
+        audit = self._emit(
+            ObjectiveOperatorEventType.CAPITAL_RELEASED,
+            objective_id=state.objective_id,
+            session_id=state.session_id,
+            reason_codes=("position_reduce" if not final_close else "position_close",),
+            after={
+                "released_usd": str(release),
+                "remaining_filled_usd": str(remaining_filled),
+            },
+            linked_ids={
+                "client_order_id": existing.client_order_id,
+                **({"contract_id": contract_id} if contract_id else {}),
+            },
+            persist_audit=False,
+        )
+        ok = self._repo.atomic_mutate_exposure(
+            objective_id=state.objective_id,
+            expected_version=state.version,
+            exposure=updated,
+            new_state=new_state,
+            audit=audit,
+            dedupe_key=key,
+        )
+        if not ok:
+            raise ObjectiveServiceError("objective version is stale")
+        return new_state
 
     async def associate_broker_order(
         self, *, client_order_id: str, broker_order_id: str
     ) -> None:
-        existing = self._repo.get_reservation_by_client_order(client_order_id)
-        if existing is None:
-            return
-        self._repo.upsert_reservation(
-            existing.model_copy(
-                update={
-                    "broker_order_id": broker_order_id,
-                    "updated_at": datetime.now(timezone.utc),
-                }
-            )
+        updated = self._repo.atomic_associate_broker_order(
+            client_order_id=client_order_id,
+            broker_order_id=broker_order_id,
         )
-        definition = self._repo.get_definition(existing.objective_id)
+        if updated is None:
+            return
+        definition = self._repo.get_definition(updated.objective_id)
         if definition is not None and definition.first_broker_submission_at is None:
             armed = SessionObjectiveDefinition(
                 objective_id=definition.objective_id,
@@ -517,40 +988,78 @@ class SessionObjectiveService:
         convert_reservation: bool = False,
         partial_reserved_usd: Decimal | float | None = None,
         open_position_count: int | None = None,
+        fill_quantity: int | None = None,
+        fill_price: Decimal | float | None = None,
+        remaining_working_quantity: int | None = None,
+        dedupe_key: str | None = None,
+        closed_quantity: int | None = None,
+        final_close: bool = False,
+        contract_id: str | None = None,
     ) -> SessionObjectiveState:
-        if client_order_id:
-            existing = self._repo.get_reservation_by_client_order(client_order_id)
-            if existing is not None:
-                if convert_reservation:
-                    reserved = (
-                        Decimal(str(partial_reserved_usd))
-                        if partial_reserved_usd is not None
-                        else existing.reserved_usd
-                    )
-                    status = "partial" if partial_reserved_usd is not None else "converted"
-                    self._repo.upsert_reservation(
-                        existing.model_copy(
-                            update={
-                                "status": status,
-                                "reserved_usd": Decimal(str(reserved)).quantize(
-                                    Decimal("0.01")
-                                ),
-                                "updated_at": datetime.now(timezone.utc),
-                            }
-                        )
-                    )
-                elif partial_reserved_usd is not None:
-                    self._repo.upsert_reservation(
-                        existing.model_copy(
-                            update={
-                                "status": "partial",
-                                "reserved_usd": Decimal(str(partial_reserved_usd)).quantize(
-                                    Decimal("0.01")
-                                ),
-                                "updated_at": datetime.now(timezone.utc),
-                            }
-                        )
-                    )
+        """Compatibility facade over fill/reduce/close exposure transitions."""
+        if convert_reservation and client_order_id and fill_quantity and fill_price is not None:
+            return await self.apply_verified_fill(
+                client_order_id=client_order_id,
+                fill_quantity=fill_quantity,
+                fill_price=fill_price,
+                remaining_working_quantity=remaining_working_quantity,
+                dedupe_key=dedupe_key,
+                contract_id=contract_id,
+                open_position_count=open_position_count,
+            )
+        if convert_reservation and client_order_id and partial_reserved_usd is not None:
+            # Legacy partial path: interpret partial_reserved as remaining working.
+            existing = self._repo.get_exposure_by_client_order(client_order_id)
+            if existing is None:
+                return await self.get_state()
+            rem = Decimal(str(partial_reserved_usd))
+            filled = max(
+                Decimal("0.00"),
+                existing.total_encumbered_usd - rem,
+            )
+            per = existing.estimated_premium_per_contract_usd
+            filled_qty = (
+                int((filled / (per * Decimal("100"))).to_integral_value())
+                if per > 0
+                else 0
+            )
+            return await self.apply_verified_fill(
+                client_order_id=client_order_id,
+                fill_quantity=max(1, filled_qty),
+                fill_price=per,
+                remaining_working_quantity=max(
+                    0,
+                    int((rem / (per * Decimal("100"))).to_integral_value())
+                    if per > 0
+                    else 0,
+                ),
+                dedupe_key=dedupe_key,
+                open_position_count=open_position_count,
+            )
+        if convert_reservation and client_order_id and fill_price is None:
+            # Full convert without explicit fill details — use reserved premium.
+            existing = self._repo.get_exposure_by_client_order(client_order_id)
+            if existing is None:
+                return await self.get_state()
+            qty = max(1, existing.working_quantity or existing.requested_quantity)
+            return await self.apply_verified_fill(
+                client_order_id=client_order_id,
+                fill_quantity=qty,
+                fill_price=existing.estimated_premium_per_contract_usd,
+                remaining_working_quantity=0,
+                dedupe_key=dedupe_key,
+                open_position_count=open_position_count,
+            )
+        if closed_quantity is not None or final_close:
+            return await self.reduce_position_exposure(
+                client_order_id=client_order_id,
+                contract_id=contract_id,
+                closed_quantity=int(closed_quantity or 0),
+                realised_pnl_delta_usd=realised_pnl_delta_usd,
+                dedupe_key=dedupe_key,
+                open_position_count=open_position_count,
+                final_close=final_close,
+            )
         state = await self.get_state()
         new_realised = (
             state.realised_pnl_usd + Decimal(str(realised_pnl_delta_usd))
@@ -581,7 +1090,12 @@ class SessionObjectiveService:
 
     async def resume_entries(self, *, reason: str = "resumed") -> SessionObjectiveState:
         state = await self.get_state()
-        if state.status in {"deadline_reached", "target_reached", "capital_exhausted"}:
+        if state.status in {
+            "deadline_reached",
+            "target_reached",
+            "capital_exhausted",
+            "truth_degraded",
+        }:
             raise ObjectiveServiceError(f"cannot resume from terminal status {state.status}")
         resumed = state.model_copy(
             update={

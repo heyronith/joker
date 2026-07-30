@@ -156,10 +156,26 @@ _INVARIANTS: dict[str, tuple[str, ...]] = {
     "adv_23": ("regime_shift_handled",),
     "adv_24": ("urgent_exit_priority",),
     "adv_25": ("narrow_overfit_rejected",),
-    **{
-        f"adv_obj_{i:02d}": ("objective_invariant",)
-        for i in range(1, 21)
-    },
+    "adv_obj_01": ("objective_high_target_infeasible",),
+    "adv_obj_02": ("objective_target_pause",),
+    "adv_obj_03": ("objective_capital_after_loss",),
+    "adv_obj_04": ("objective_no_martingale",),
+    "adv_obj_05": ("objective_high_ev_after_losses",),
+    "adv_obj_06": ("objective_no_valid_opportunity",),
+    "adv_obj_07": ("objective_capital_exhausted",),
+    "adv_obj_08": ("objective_deadline_with_position",),
+    "adv_obj_09": ("objective_reservation_race",),
+    "adv_obj_10": ("objective_restart_unfilled",),
+    "adv_obj_11": ("objective_partial_fill_restart",),
+    "adv_obj_12": ("objective_broker_mismatch",),
+    "adv_obj_13": ("objective_oversize_capped",),
+    "adv_obj_14": ("objective_martingale_blocked",),
+    "adv_obj_15": ("objective_negative_ev_rejected",),
+    "adv_obj_16": ("objective_probability_unavailable",),
+    "adv_obj_17": ("objective_no_trade_outranks",),
+    "adv_obj_18": ("objective_poor_calibration",),
+    "adv_obj_19": ("objective_zero_profit_target",),
+    "adv_obj_20": ("objective_premium_exceeds_capital",),
 }
 
 
@@ -298,29 +314,72 @@ def _build_fixture(scenario_id: str) -> AdversarialFixture:
         stimulus[key] = True
         stimulus["full_replay_exit"] = True
     elif scenario_id.startswith("adv_obj_"):
+        expensive = _contract(
+            "SPY:2026-07-01:500.0:call",
+            bid="6.00",
+            ask="6.50",
+        )
         frames = [
-            _frame(scenario_id=scenario_id, index=0, contracts=(valid,)),
+            _frame(
+                scenario_id=scenario_id,
+                index=0,
+                contracts=(expensive if scenario_id == "adv_obj_20" else valid,),
+            ),
             _frame(scenario_id=scenario_id, index=1, contracts=(valid,)),
         ]
         stimulus["objective_scenario"] = True
         stimulus["objective_scenario_id"] = scenario_id
-        # Most objective adversarial cases must not submit oversized/unsafe entries.
-        no_trade_ids = {
-            "adv_obj_01",
-            "adv_obj_02",
-            "adv_obj_06",
-            "adv_obj_07",
-            "adv_obj_08",
-            "adv_obj_13",
-            "adv_obj_14",
-            "adv_obj_15",
-            "adv_obj_17",
-            "adv_obj_19",
-            "adv_obj_20",
-        }
-        if scenario_id in no_trade_ids:
-            stimulus["expect_no_trade"] = True
         stimulus["expect_capital_respected"] = True
+        stimulus["expect_no_trade"] = True
+        # Scenario-specific observable stimuli
+        stimulus.update(
+            {
+                "adv_obj_01": {"required_profit_remaining_usd": "450", "time_remaining_seconds": 600},
+                "adv_obj_02": {"target_reached": True, "entries_paused": True},
+                "adv_obj_03": {"realised_pnl_usd": "-200", "available_reduced": True},
+                "adv_obj_04": {"prior_loss_count": 4, "prohibit_martingale": True},
+                "adv_obj_05": {"prior_loss_count": 3, "expected_value_usd": "12"},
+                "adv_obj_06": {"no_valid_strategy": True},
+                "adv_obj_07": {"available_capital_usd": "5"},
+                "adv_obj_08": {"deadline_reached": True, "open_position": True},
+                "adv_obj_09": {"reservation_race": True, "stale_version_must_fail": True},
+                "adv_obj_10": {"restart_unfilled": True, "working_reservation_usd": "100"},
+                "adv_obj_11": {
+                    "partial_fill_restart": True,
+                    "filled_exposure_usd": "200",
+                    "working_order_reservation_usd": "100",
+                },
+                "adv_obj_12": {"broker_local_mismatch": True},
+                "adv_obj_13": {"requested_quantity": 50, "must_cap": True},
+                "adv_obj_14": {
+                    "requested_quantity": 20,
+                    "prior_loss_count": 5,
+                    "martingale_blocked": True,
+                },
+                "adv_obj_15": {
+                    "expected_value_usd": "-2",
+                    "high_upside": True,
+                    "must_reject": True,
+                },
+                "adv_obj_16": {"probability_unavailable": True},
+                "adv_obj_17": {"no_trade_outranks": True},
+                "adv_obj_18": {
+                    "model_confidence": 0.95,
+                    "historical_hit_rate": "0.20",
+                    "poor_calibration": True,
+                },
+                "adv_obj_19": {"target_profit_pct": "0"},
+                "adv_obj_20": {
+                    "authorised_capital_usd": "50",
+                    "premium_usd": "600",
+                    "premium_exceeds_capital": True,
+                },
+            }.get(scenario_id, {})
+        )
+        # Named prove flags for invariant evaluation
+        inv = _INVARIANTS.get(scenario_id, ("",))[0]
+        if inv:
+            stimulus[f"prove_{inv}"] = True
     else:
         frames = [
             _frame(scenario_id=scenario_id, index=0, contracts=(valid,)),

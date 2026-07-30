@@ -836,71 +836,16 @@ class CognitiveAgentRuntime:
     async def _sync_objective_reservation(
         self, event: DomainEvent, *, client_order_id: str
     ) -> None:
-        """Convert/release capital reservations from verified order lifecycle events."""
-        svc = self._deps.objective_service
-        if svc is None or not client_order_id:
-            return
-        try:
-            if event.event_type == EventType.ORDER_REJECTED:
-                await svc.release_for_order(
-                    client_order_id=client_order_id, reason="rejected"
-                )
-            elif event.event_type == EventType.ORDER_CANCELLED:
-                await svc.release_for_order(
-                    client_order_id=client_order_id, reason="cancelled"
-                )
-            elif event.event_type == EventType.ORDER_PARTIALLY_FILLED:
-                payload = dict(event.payload)
-                remaining = payload.get("remaining_premium_usd")
-                await svc.record_verified_outcome(
-                    client_order_id=client_order_id,
-                    convert_reservation=True,
-                    partial_reserved_usd=remaining,
-                )
-            elif event.event_type == EventType.ORDER_FILLED:
-                await svc.record_verified_outcome(
-                    client_order_id=client_order_id,
-                    convert_reservation=True,
-                )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "objective_reservation_sync_failed",
-                extra={
-                    "client_order_id": client_order_id,
-                    "event_type": event.event_type.value,
-                    "error": str(exc),
-                },
-            )
+        """Task 2 observes order events only — financial mutations are Task 1 owned.
+
+        Objective capital projection runs via SessionSupervisor's
+        ObjectiveCapitalProjector subscribed to the Task 1 event bus.
+        """
+        return
 
     async def _sync_objective_on_position_closed(self, event: DomainEvent) -> None:
-        """Update realised PnL / open count when a position fully closes."""
-        svc = self._deps.objective_service
-        if svc is None:
-            return
-        payload = dict(event.payload)
-        client_order_id = str(payload.get("client_order_id") or "") or None
-        pnl_delta = payload.get("realized_pnl") or payload.get("realised_pnl_usd") or 0
-        open_count = None
-        if self._deps.projection_loader is not None:
-            try:
-                projection = await self._deps.projection_loader()
-                if projection is not None:
-                    open_ids = await self._open_position_contract_ids()
-                    open_count = len(open_ids)
-            except Exception:
-                open_count = None
-        try:
-            await svc.record_verified_outcome(
-                client_order_id=client_order_id,
-                realised_pnl_delta_usd=pnl_delta,
-                convert_reservation=bool(client_order_id),
-                open_position_count=open_count,
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "objective_position_close_sync_failed",
-                extra={"error": str(exc)},
-            )
+        """Task 2 observes closes only — realised PnL / exposure release is Task 1."""
+        return
 
     async def _run_position_work(self, event: DomainEvent) -> None:
         if not self._config.position.enabled:

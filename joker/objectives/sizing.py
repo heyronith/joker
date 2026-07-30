@@ -114,7 +114,21 @@ class DeterministicObjectiveSizer:
                 expected_r=expected_r,
             )
 
-        if self.require_positive_ev and expected_value_usd is not None:
+        if self.require_positive_ev:
+            if expected_value_usd is None:
+                reasons.append("ev_unavailable")
+                return self._reject(
+                    state,
+                    strategy_id,
+                    premium,
+                    available,
+                    reasons,
+                    inputs,
+                    is_probe=is_probe,
+                    ev=expected_value_usd,
+                    win_p=estimated_win_probability,
+                    expected_r=expected_r,
+                )
             if Decimal(str(expected_value_usd)) <= 0:
                 reasons.append("ev_non_positive")
                 return self._reject(

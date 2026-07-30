@@ -66,7 +66,7 @@ async def test_recover_marks_unresolved_reconciliation_blocks_reserve(
         unresolved_reconciliation=True,
     )
     state = await armed_service.get_state()
-    with pytest.raises(ObjectiveServiceError, match="reconciliation"):
+    with pytest.raises(ObjectiveServiceError, match="degraded|reconciliation"):
         await armed_service.reserve_for_order(
             client_order_id="blocked",
             estimated_premium_usd=10,
@@ -92,7 +92,7 @@ async def test_fill_converts_reservation_and_close_updates_pnl(
     assert after_fill.open_position_count == 1
     res = armed_service._repo.get_reservation_by_client_order("fill-1")  # noqa: SLF001
     assert res is not None
-    assert res.status == "converted"
+    assert res.status == "filled_position_exposure"
     after_close = await armed_service.record_verified_outcome(
         client_order_id="fill-1",
         realised_pnl_delta_usd=25,

@@ -75,7 +75,9 @@ class CognitiveGraphState(TypedDict, total=False):
     _data_quality: DataQualityReport | None
     _option_surface_id: str | None
     _feasibility_assessment: dict | None
+    _feasibility_inputs: dict | None
     _strategy_scores: list | None
+    _strategy_estimates: list | None
     _no_valid_strategy: bool
     _sizing_decision: dict | None
     _objective_context: dict | None

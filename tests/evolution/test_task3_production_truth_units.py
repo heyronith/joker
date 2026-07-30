@@ -226,7 +226,9 @@ async def test_orchestrator_runs_required_adversarial_suite(tmp_path) -> None:
         challenger_version_id=chall.configuration_version_id,
     )
     assert passed is True
-    assert len(results) == 50  # 25 scenarios × 2 configs
+    from joker.evolution.adversarial import required_scenario_ids
+
+    assert len(results) == len(required_scenario_ids()) * 2
     assert await runner.adversarial_passed(experiment_id) is True
 
 

@@ -47,7 +47,7 @@ async def test_create_confirm_and_reserve_release(tmp_path: Path) -> None:
         estimated_premium_usd=Decimal("50.00"),
         objective_state_version=state.version,
     )
-    assert res.status == "open"
+    assert res.status == "working_order_reservation"
     # idempotent
     res2 = await svc.reserve_for_order(
         client_order_id="c1",

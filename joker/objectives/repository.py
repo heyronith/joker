@@ -1,22 +1,36 @@
-"""SQLite persistence for session objectives and capital reservations."""
+"""SQLite persistence for session objectives and capital exposures."""
 
 from __future__ import annotations
 
 import json
 import sqlite3
+from collections.abc import Callable
 from datetime import datetime
-from decimal import Decimal
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID
 
 from joker.objectives.schemas import (
-    CapitalReservation,
+    CapitalExposure,
     GoalFeasibilityAssessment,
     ObjectiveStrategyScore,
     SessionObjectiveDefinition,
     SessionObjectiveState,
+    StrategyObjectiveEstimate,
 )
+
+CrashPoint = Literal[
+    "before_transaction",
+    "after_exposure_write",
+    "after_state_append",
+    "after_audit_append",
+    "after_broker_accept_before_association",
+]
+
+
+class CrashInjected(RuntimeError):
+    """Raised by crash-injection hooks during atomic objective mutations."""
+
 
 OBJECTIVE_SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS session_objective_definitions (
@@ -87,6 +101,22 @@ CREATE TABLE IF NOT EXISTS objective_strategy_scores (
 );
 CREATE INDEX IF NOT EXISTS idx_obj_score_objective
     ON objective_strategy_scores (objective_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_obj_score_strategy
+    ON objective_strategy_scores (strategy_id, snapshot_id);
+
+CREATE TABLE IF NOT EXISTS objective_strategy_estimates (
+    estimate_id TEXT PRIMARY KEY NOT NULL,
+    objective_id TEXT NOT NULL,
+    strategy_id TEXT NOT NULL,
+    snapshot_id TEXT NOT NULL,
+    valid INTEGER NOT NULL,
+    payload_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_obj_est_strategy
+    ON objective_strategy_estimates (strategy_id, snapshot_id);
+CREATE INDEX IF NOT EXISTS idx_obj_est_objective
+    ON objective_strategy_estimates (objective_id, created_at);
 
 CREATE TABLE IF NOT EXISTS objective_decision_audit (
     audit_id TEXT PRIMARY KEY NOT NULL,
@@ -100,7 +130,25 @@ CREATE INDEX IF NOT EXISTS idx_obj_audit_session
     ON objective_decision_audit (session_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_obj_audit_objective
     ON objective_decision_audit (objective_id, created_at);
+
+CREATE TABLE IF NOT EXISTS objective_projection_dedupe (
+    dedupe_key TEXT PRIMARY KEY NOT NULL,
+    objective_id TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_obj_dedupe_objective
+    ON objective_projection_dedupe (objective_id, created_at);
 """
+
+_ENCUMBERING_STATUSES = (
+    "working_order_reservation",
+    "filled_position_exposure",
+    "partial",
+    # legacy statuses from earlier schema versions
+    "open",
+    "converted",
+)
 
 
 def apply_objective_migrations(db_path: str | Path) -> Path:
@@ -121,12 +169,70 @@ def _dumps(model: Any) -> str:
     return json.dumps(model, sort_keys=True)
 
 
+def _normalize_exposure_payload(raw: dict[str, Any]) -> dict[str, Any]:
+    """Upgrade legacy reservation payloads to CapitalExposure shape."""
+    data = dict(raw)
+    status = str(data.get("status") or "working_order_reservation")
+    if status == "open":
+        status = "working_order_reservation"
+    elif status == "converted":
+        status = "filled_position_exposure"
+    data["status"] = status
+
+    if "exposure_id" not in data and "reservation_id" in data:
+        data["exposure_id"] = data["reservation_id"]
+    if "estimated_premium_per_contract_usd" not in data:
+        est = data.get("estimated_premium_usd") or "0"
+        qty = int(data.get("requested_quantity") or 1)
+        # Legacy stored total notional; recover per-contract premium.
+        from decimal import Decimal
+
+        total = Decimal(str(est))
+        per = (total / (Decimal("100") * Decimal(max(1, qty)))).quantize(Decimal("0.01"))
+        data["estimated_premium_per_contract_usd"] = str(per)
+    if "working_order_reservation_usd" not in data or "filled_exposure_usd" not in data:
+        reserved = data.get("reserved_usd") or "0"
+        if status in {"working_order_reservation", "open", "partial"}:
+            if status == "partial":
+                data.setdefault("working_order_reservation_usd", reserved)
+                data.setdefault("filled_exposure_usd", "0.00")
+            elif status in {"filled_position_exposure", "converted"}:
+                data.setdefault("working_order_reservation_usd", "0.00")
+                data.setdefault("filled_exposure_usd", reserved)
+            else:
+                data.setdefault("working_order_reservation_usd", reserved)
+                data.setdefault("filled_exposure_usd", "0.00")
+        elif status in {"filled_position_exposure", "converted"}:
+            data.setdefault("working_order_reservation_usd", "0.00")
+            data.setdefault("filled_exposure_usd", reserved)
+        else:
+            data.setdefault("working_order_reservation_usd", "0.00")
+            data.setdefault("filled_exposure_usd", "0.00")
+    data.setdefault("requested_quantity", 1)
+    data.setdefault("working_quantity", data.get("requested_quantity", 1))
+    data.setdefault("filled_quantity", 0)
+    return data
+
+
 class ObjectiveRepository:
     """Task 1 objective persistence on the Task 1 SQLite database."""
 
-    def __init__(self, db_path: str | Path) -> None:
+    def __init__(
+        self,
+        db_path: str | Path,
+        *,
+        crash_hook: Callable[[CrashPoint], None] | None = None,
+    ) -> None:
         self.db_path = Path(db_path)
+        self._crash_hook = crash_hook
         apply_objective_migrations(self.db_path)
+
+    def set_crash_hook(self, hook: Callable[[CrashPoint], None] | None) -> None:
+        self._crash_hook = hook
+
+    def _maybe_crash(self, point: CrashPoint) -> None:
+        if self._crash_hook is not None:
+            self._crash_hook(point)
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path, timeout=30.0)
@@ -185,22 +291,25 @@ class ObjectiveRepository:
 
     def append_state(self, state: SessionObjectiveState) -> None:
         with self._connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO session_objective_state_versions (
-                    objective_id, session_id, version, status, payload_json, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    str(state.objective_id),
-                    state.session_id,
-                    state.version,
-                    state.status,
-                    _dumps(state),
-                    state.last_recomputed_at.isoformat(),
-                ),
-            )
+            self._insert_state(conn, state)
             conn.commit()
+
+    def _insert_state(self, conn: sqlite3.Connection, state: SessionObjectiveState) -> None:
+        conn.execute(
+            """
+            INSERT INTO session_objective_state_versions (
+                objective_id, session_id, version, status, payload_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                str(state.objective_id),
+                state.session_id,
+                state.version,
+                state.status,
+                _dumps(state),
+                state.last_recomputed_at.isoformat(),
+            ),
+        )
 
     def latest_state(self, objective_id: UUID | str) -> SessionObjectiveState | None:
         with self._connect() as conn:
@@ -232,7 +341,10 @@ class ObjectiveRepository:
 
     def get_reservation_by_client_order(
         self, client_order_id: str
-    ) -> CapitalReservation | None:
+    ) -> CapitalExposure | None:
+        return self.get_exposure_by_client_order(client_order_id)
+
+    def get_exposure_by_client_order(self, client_order_id: str) -> CapitalExposure | None:
         with self._connect() as conn:
             row = conn.execute(
                 "SELECT payload_json FROM capital_reservations WHERE client_order_id=?",
@@ -240,51 +352,80 @@ class ObjectiveRepository:
             ).fetchone()
         if row is None:
             return None
-        return CapitalReservation.model_validate_json(row["payload_json"])
+        payload = _normalize_exposure_payload(json.loads(row["payload_json"]))
+        return CapitalExposure.model_validate(payload)
 
-    def upsert_reservation(self, reservation: CapitalReservation) -> None:
+    def upsert_reservation(self, reservation: CapitalExposure) -> None:
+        self.upsert_exposure(reservation)
+
+    def upsert_exposure(self, exposure: CapitalExposure) -> None:
         with self._connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO capital_reservations (
-                    reservation_id, objective_id, session_id, client_order_id,
-                    broker_order_id, estimated_premium_usd, reserved_usd, status,
-                    objective_state_version, payload_json, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(client_order_id) DO UPDATE SET
-                    broker_order_id=excluded.broker_order_id,
-                    reserved_usd=excluded.reserved_usd,
-                    status=excluded.status,
-                    payload_json=excluded.payload_json,
-                    updated_at=excluded.updated_at
-                """,
-                (
-                    str(reservation.reservation_id),
-                    str(reservation.objective_id),
-                    reservation.session_id,
-                    reservation.client_order_id,
-                    reservation.broker_order_id,
-                    str(reservation.estimated_premium_usd),
-                    str(reservation.reserved_usd),
-                    reservation.status,
-                    reservation.objective_state_version,
-                    _dumps(reservation),
-                    reservation.created_at.isoformat(),
-                    reservation.updated_at.isoformat(),
-                ),
-            )
+            self._upsert_exposure(conn, exposure)
             conn.commit()
 
-    def list_open_reservations(self, objective_id: UUID | str) -> list[CapitalReservation]:
+    def _upsert_exposure(self, conn: sqlite3.Connection, exposure: CapitalExposure) -> None:
+        reserved = str(exposure.total_encumbered_usd)
+        conn.execute(
+            """
+            INSERT INTO capital_reservations (
+                reservation_id, objective_id, session_id, client_order_id,
+                broker_order_id, estimated_premium_usd, reserved_usd, status,
+                objective_state_version, payload_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(client_order_id) DO UPDATE SET
+                broker_order_id=excluded.broker_order_id,
+                reserved_usd=excluded.reserved_usd,
+                status=excluded.status,
+                payload_json=excluded.payload_json,
+                updated_at=excluded.updated_at,
+                objective_state_version=excluded.objective_state_version
+            """,
+            (
+                str(exposure.exposure_id),
+                str(exposure.objective_id),
+                exposure.session_id,
+                exposure.client_order_id,
+                exposure.broker_order_id,
+                str(exposure.estimated_premium_usd),
+                reserved,
+                exposure.status,
+                exposure.objective_state_version,
+                _dumps(exposure),
+                exposure.created_at.isoformat(),
+                exposure.updated_at.isoformat(),
+            ),
+        )
+
+    def list_open_reservations(self, objective_id: UUID | str) -> list[CapitalExposure]:
+        return self.list_encumbering_exposures(objective_id)
+
+    def list_encumbering_exposures(self, objective_id: UUID | str) -> list[CapitalExposure]:
+        placeholders = ",".join("?" for _ in _ENCUMBERING_STATUSES)
         with self._connect() as conn:
             rows = conn.execute(
-                """
+                f"""
                 SELECT payload_json FROM capital_reservations
-                WHERE objective_id=? AND status IN ('open', 'partial')
+                WHERE objective_id=? AND status IN ({placeholders})
                 """,
+                (str(objective_id), *_ENCUMBERING_STATUSES),
+            ).fetchall()
+        out: list[CapitalExposure] = []
+        for r in rows:
+            payload = _normalize_exposure_payload(json.loads(r["payload_json"]))
+            out.append(CapitalExposure.model_validate(payload))
+        return out
+
+    def list_all_exposures(self, objective_id: UUID | str) -> list[CapitalExposure]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT payload_json FROM capital_reservations WHERE objective_id=?",
                 (str(objective_id),),
             ).fetchall()
-        return [CapitalReservation.model_validate_json(r["payload_json"]) for r in rows]
+        out: list[CapitalExposure] = []
+        for r in rows:
+            payload = _normalize_exposure_payload(json.loads(r["payload_json"]))
+            out.append(CapitalExposure.model_validate(payload))
+        return out
 
     def save_feasibility(self, assessment: GoalFeasibilityAssessment) -> None:
         with self._connect() as conn:
@@ -327,6 +468,69 @@ class ObjectiveRepository:
             )
             conn.commit()
 
+    def list_strategy_scores_for_snapshot(
+        self, *, objective_id: UUID | str, snapshot_id: UUID | str
+    ) -> list[ObjectiveStrategyScore]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT payload_json FROM objective_strategy_scores
+                WHERE objective_id=? AND snapshot_id=?
+                ORDER BY created_at ASC
+                """,
+                (str(objective_id), str(snapshot_id)),
+            ).fetchall()
+        return [ObjectiveStrategyScore.model_validate_json(r["payload_json"]) for r in rows]
+
+    def save_strategy_estimate(self, estimate: StrategyObjectiveEstimate) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO objective_strategy_estimates (
+                    estimate_id, objective_id, strategy_id, snapshot_id, valid,
+                    payload_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(estimate.estimate_id),
+                    str(estimate.objective_id),
+                    str(estimate.strategy_id),
+                    str(estimate.snapshot_id),
+                    1 if estimate.valid else 0,
+                    _dumps(estimate),
+                    estimate.created_at.isoformat(),
+                ),
+            )
+            conn.commit()
+
+    def get_strategy_estimate(
+        self, estimate_id: UUID | str
+    ) -> StrategyObjectiveEstimate | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT payload_json FROM objective_strategy_estimates WHERE estimate_id=?",
+                (str(estimate_id),),
+            ).fetchone()
+        if row is None:
+            return None
+        return StrategyObjectiveEstimate.model_validate_json(row["payload_json"])
+
+    def get_latest_estimate_for_strategy(
+        self, *, strategy_id: UUID | str, objective_id: UUID | str
+    ) -> StrategyObjectiveEstimate | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT payload_json FROM objective_strategy_estimates
+                WHERE strategy_id=? AND objective_id=?
+                ORDER BY created_at DESC LIMIT 1
+                """,
+                (str(strategy_id), str(objective_id)),
+            ).fetchone()
+        if row is None:
+            return None
+        return StrategyObjectiveEstimate.model_validate_json(row["payload_json"])
+
     def append_audit(
         self,
         *,
@@ -338,22 +542,51 @@ class ObjectiveRepository:
         created_at: datetime,
     ) -> None:
         with self._connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO objective_decision_audit (
-                    audit_id, objective_id, session_id, event_type, payload_json, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    audit_id,
-                    str(objective_id),
-                    session_id,
-                    event_type,
-                    json.dumps(payload, sort_keys=True),
-                    created_at.isoformat(),
-                ),
+            self._append_audit(
+                conn,
+                audit_id=audit_id,
+                objective_id=objective_id,
+                session_id=session_id,
+                event_type=event_type,
+                payload=payload,
+                created_at=created_at,
             )
             conn.commit()
+
+    def _append_audit(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        audit_id: str,
+        objective_id: UUID | str,
+        session_id: str,
+        event_type: str,
+        payload: dict[str, Any],
+        created_at: datetime,
+    ) -> None:
+        conn.execute(
+            """
+            INSERT INTO objective_decision_audit (
+                audit_id, objective_id, session_id, event_type, payload_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                audit_id,
+                str(objective_id),
+                session_id,
+                event_type,
+                json.dumps(payload, sort_keys=True),
+                created_at.isoformat(),
+            ),
+        )
+
+    def has_projection_dedupe(self, dedupe_key: str) -> bool:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM objective_projection_dedupe WHERE dedupe_key=?",
+                (dedupe_key,),
+            ).fetchone()
+        return row is not None
 
     def compare_and_swap_state_version(
         self,
@@ -362,8 +595,9 @@ class ObjectiveRepository:
         expected_version: int,
         new_state: SessionObjectiveState,
     ) -> bool:
-        """Optimistic version guard used by reserve/release."""
+        """Optimistic version guard (legacy non-exposure path)."""
         with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             latest = conn.execute(
                 """
                 SELECT version FROM session_objective_state_versions
@@ -373,21 +607,121 @@ class ObjectiveRepository:
             ).fetchone()
             current = int(latest["version"]) if latest else 0
             if current != expected_version:
+                conn.rollback()
                 return False
-            conn.execute(
-                """
-                INSERT INTO session_objective_state_versions (
-                    objective_id, session_id, version, status, payload_json, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    str(new_state.objective_id),
-                    new_state.session_id,
-                    new_state.version,
-                    new_state.status,
-                    _dumps(new_state),
-                    new_state.last_recomputed_at.isoformat(),
-                ),
-            )
+            self._insert_state(conn, new_state)
             conn.commit()
             return True
+
+    def atomic_mutate_exposure(
+        self,
+        *,
+        objective_id: UUID | str,
+        expected_version: int,
+        exposure: CapitalExposure,
+        new_state: SessionObjectiveState,
+        audit: dict[str, Any] | None = None,
+        dedupe_key: str | None = None,
+    ) -> bool:
+        """Atomically: version check → exposure upsert → state append → audit/dedupe.
+
+        Uses ``BEGIN IMMEDIATE`` so concurrent writers cannot interleave.
+        """
+        self._maybe_crash("before_transaction")
+        with self._connect() as conn:
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                if dedupe_key is not None:
+                    existing = conn.execute(
+                        "SELECT 1 FROM objective_projection_dedupe WHERE dedupe_key=?",
+                        (dedupe_key,),
+                    ).fetchone()
+                    if existing is not None:
+                        conn.rollback()
+                        return True  # already applied — idempotent success
+                latest = conn.execute(
+                    """
+                    SELECT version FROM session_objective_state_versions
+                    WHERE objective_id=? ORDER BY version DESC LIMIT 1
+                    """,
+                    (str(objective_id),),
+                ).fetchone()
+                current = int(latest["version"]) if latest else 0
+                if current != expected_version:
+                    conn.rollback()
+                    return False
+                self._upsert_exposure(conn, exposure)
+                self._maybe_crash("after_exposure_write")
+                self._insert_state(conn, new_state)
+                self._maybe_crash("after_state_append")
+                if audit is not None:
+                    self._append_audit(
+                        conn,
+                        audit_id=str(audit["audit_id"]),
+                        objective_id=objective_id,
+                        session_id=str(audit["session_id"]),
+                        event_type=str(audit["event_type"]),
+                        payload=dict(audit.get("payload") or {}),
+                        created_at=audit["created_at"],
+                    )
+                    self._maybe_crash("after_audit_append")
+                if dedupe_key is not None:
+                    conn.execute(
+                        """
+                        INSERT INTO objective_projection_dedupe (
+                            dedupe_key, objective_id, event_type, created_at
+                        ) VALUES (?, ?, ?, ?)
+                        """,
+                        (
+                            dedupe_key,
+                            str(objective_id),
+                            str((audit or {}).get("event_type") or "exposure_mutation"),
+                            new_state.last_recomputed_at.isoformat(),
+                        ),
+                    )
+                conn.commit()
+                return True
+            except CrashInjected:
+                conn.rollback()
+                raise
+            except Exception:
+                conn.rollback()
+                raise
+
+    def atomic_associate_broker_order(
+        self,
+        *,
+        client_order_id: str,
+        broker_order_id: str,
+        crash_after_accept: bool = False,
+    ) -> CapitalExposure | None:
+        """Associate broker order id; optional crash before commit for tests."""
+        with self._connect() as conn:
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute(
+                    "SELECT payload_json FROM capital_reservations WHERE client_order_id=?",
+                    (client_order_id,),
+                ).fetchone()
+                if row is None:
+                    conn.rollback()
+                    return None
+                payload = _normalize_exposure_payload(json.loads(row["payload_json"]))
+                exposure = CapitalExposure.model_validate(payload)
+                updated = exposure.model_copy(
+                    update={
+                        "broker_order_id": broker_order_id,
+                        "updated_at": datetime.now().astimezone(),
+                    }
+                )
+                self._upsert_exposure(conn, updated)
+                if crash_after_accept:
+                    self._maybe_crash("after_broker_accept_before_association")
+                conn.commit()
+                return updated
+            except CrashInjected:
+                conn.rollback()
+                raise
+            except Exception:
+                conn.rollback()
+                raise

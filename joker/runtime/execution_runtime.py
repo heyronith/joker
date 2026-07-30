@@ -449,6 +449,9 @@ class ExecutionRuntime:
         written: list[LedgerEvent] = []
         if await self._ledger.append(event):
             written.append(event)
+            remaining_qty = Decimal("0") if final else max(
+                Decimal("0"), Decimal(order.quantity) - qty
+            )
             await self._publish_order_event(
                 domain_type,
                 client_order_id,
@@ -457,6 +460,12 @@ class ExecutionRuntime:
                     "broker_order_id": order.order_id,
                     "price": str(fill_price),
                     "qty": str(qty),
+                    "fill_qty": str(qty),
+                    "fill_price": str(fill_price),
+                    "remaining_quantity": str(int(remaining_qty)),
+                    "ledger_event_id": str(event.ledger_event_id),
+                    "idempotency_key": event.idempotency_key,
+                    "contract_id": cid,
                 },
             )
             after = await self.project_session()

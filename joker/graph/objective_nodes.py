@@ -8,9 +8,11 @@ from uuid import UUID
 
 from joker.cognition.schemas import MetaDecisionAction
 from joker.graph.cognitive_state import CognitiveGraphState
+from joker.graph.context_hydrate import load_snapshot_truth
 from joker.graph.graph_deps import CognitiveGraphDeps
 from joker.graph.node_helpers import append_error, append_trace, trace_update
-from joker.objectives.feasibility import FeasibilityInputs
+from joker.objectives.estimate import StrategyEstimateBuilder
+from joker.objectives.feasibility_inputs import build_feasibility_inputs_from_truth
 from joker.objectives.scoring import StrategyScoreInput
 from joker.objectives.schemas import state_to_context
 
@@ -21,6 +23,7 @@ _HARD_BLOCK_CODES = frozenset(
         "deadline_reached",
         "entries_paused",
         "objective_infeasible",
+        "truth_degraded",
     }
 )
 
@@ -56,6 +59,17 @@ async def gate_objective_confirmed(
                 node_name="validate_trigger",
                 error_code="objective_unavailable",
                 message=str(exc),
+                recoverable=False,
+            ),
+        }
+    if getattr(obj_state, "truth_degraded", False) or obj_state.status == "truth_degraded":
+        return {
+            "_block_new_entries": True,
+            **append_error(
+                state,
+                node_name="validate_trigger",
+                error_code="truth_degraded",
+                message="objective truth degraded — no new entries",
                 recoverable=False,
             ),
         }
@@ -115,10 +129,23 @@ async def assess_goal_feasibility_node(
         )
     obj_state = await deps.objective_service.get_state()
     snapshot_id = UUID(str(state.get("snapshot_id")))
-    assessment = deps.feasibility_engine.assess(
-        obj_state,
-        FeasibilityInputs(snapshot_id=snapshot_id),
+    snapshot, data_quality, _surface, surface_slice = await load_snapshot_truth(
+        deps, snapshot_id
     )
+    projection = None
+    if deps.projection_loader is not None:
+        projection = await deps.projection_loader()
+    evidence_ids = tuple(e.evidence_id for e in (state.get("evidence") or []))
+    inputs = build_feasibility_inputs_from_truth(
+        snapshot_id=snapshot_id,
+        snapshot=snapshot,
+        data_quality=data_quality,
+        option_surface_slice=surface_slice,
+        projection=projection,
+        available_capital_usd=obj_state.available_capital_usd,
+        evidence_ids=evidence_ids,
+    )
+    assessment = deps.feasibility_engine.assess(obj_state, inputs)
     if deps.objective_service._repo is not None:  # noqa: SLF001
         deps.objective_service._repo.save_feasibility(assessment)
     await deps.objective_service.update_feasibility(
@@ -128,6 +155,18 @@ async def assess_goal_feasibility_node(
     block = assessment.classification == "infeasible"
     update: dict[str, Any] = {
         "_feasibility_assessment": assessment.model_dump(mode="json"),
+        "_feasibility_inputs": {
+            "session_phase": inputs.session_phase,
+            "median_premium_usd": (
+                str(inputs.median_premium_usd)
+                if inputs.median_premium_usd is not None
+                else None
+            ),
+            "typical_spread_pct": inputs.typical_spread_pct,
+            "quote_age_seconds": inputs.quote_age_seconds,
+            "valid_contract_count": inputs.valid_contract_count,
+            "comparable_outcome_samples": inputs.comparable_outcome_samples,
+        },
         **trace_update(
             append_trace(state, node_name="assess_goal_feasibility", status="completed")
         ),
@@ -158,41 +197,56 @@ async def score_strategies_against_objective_node(
     obj_state = await deps.objective_service.get_state()
     snapshot_id = UUID(str(state.get("snapshot_id")))
     p_before = obj_state.estimated_success_probability
+    _, _, _surface, surface_slice = await load_snapshot_truth(deps, snapshot_id)
+    # Prefer mid of first usable contract as default premium for estimates.
+    default_premium: Decimal | None = None
+    for contract in surface_slice:
+        bid = getattr(contract, "bid", None)
+        ask = getattr(contract, "ask", None)
+        if bid is None or ask is None:
+            continue
+        try:
+            default_premium = (
+                (Decimal(str(bid)) + Decimal(str(ask))) / Decimal("2")
+            ).quantize(Decimal("0.01"))
+            break
+        except Exception:
+            continue
+
+    builder = StrategyEstimateBuilder(
+        require_positive_expected_value=bool(
+            getattr(deps.objective_service, "require_positive_expected_value", True)
+        )
+    )
     candidates: list[StrategyScoreInput] = []
+    estimates: list[dict[str, Any]] = []
     for strategy in state.get("strategies") or []:
-        ev = getattr(strategy, "expected_value_usd", None)
-        win_p = getattr(strategy, "estimated_win_probability", None)
-        extras = getattr(strategy, "model_extra", None) or {}
-        if ev is None and isinstance(extras, dict):
-            ev = extras.get("expected_value_usd")
-        if win_p is None and isinstance(extras, dict):
-            win_p = extras.get("estimated_win_probability")
-        capital = obj_state.available_capital_usd
-        max_loss = obj_state.available_capital_usd
-        # Prefer explicit capital/max-loss when present on the strategy payload.
-        for attr, target in (
-            ("capital_required_usd", "capital"),
-            ("maximum_loss_usd", "max_loss"),
-        ):
-            raw = getattr(strategy, attr, None)
-            if raw is None and isinstance(extras, dict):
-                raw = extras.get(attr)
-            if raw is not None:
-                if target == "capital":
-                    capital = Decimal(str(raw))
-                else:
-                    max_loss = Decimal(str(raw))
+        estimate = builder.build(
+            strategy=strategy,
+            objective_state=obj_state,
+            snapshot_id=snapshot_id,
+            premium_per_contract_usd=default_premium,
+            evidence_ids=tuple(getattr(strategy, "supporting_evidence_ids", ()) or ()),
+        )
+        deps.objective_service._repo.save_strategy_estimate(estimate)  # noqa: SLF001
+        estimates.append(estimate.model_dump(mode="json"))
         candidates.append(
             StrategyScoreInput(
                 strategy_id=strategy.strategy_id,
                 snapshot_id=snapshot_id,
-                expected_value_usd=Decimal(str(ev)) if ev is not None else None,
-                estimated_win_probability=(
-                    Decimal(str(win_p)) if win_p is not None else None
-                ),
-                maximum_loss_usd=max_loss,
-                capital_required_usd=capital,
-                calculation_inputs={"name": getattr(strategy, "name", None)},
+                expected_value_usd=estimate.expected_value_usd,
+                estimated_win_probability=estimate.estimated_win_probability,
+                estimated_payoff_ratio=estimate.estimated_payoff_ratio,
+                estimated_resolution_seconds=estimate.estimated_resolution_seconds,
+                maximum_loss_usd=estimate.maximum_loss_usd,
+                capital_required_usd=estimate.capital_required_usd,
+                evidence_ids=estimate.evidence_ids,
+                assumptions=estimate.assumptions,
+                calculation_inputs={
+                    "estimate_id": str(estimate.estimate_id),
+                    "calculation_method": estimate.calculation_method,
+                    "uncertainty_reasons": list(estimate.uncertainty_reasons),
+                },
             )
         )
     scores = deps.objective_strategy_scorer.score_all(
@@ -201,11 +255,24 @@ async def score_strategies_against_objective_node(
         snapshot_id=snapshot_id,
         target_probability_before=p_before,
     )
-    for score in scores:
+    # Attach estimate_id onto scores via calculation_inputs already present.
+    for score, cand in zip(scores, candidates, strict=False):
+        if score.is_no_trade:
+            continue
+        est_id = (cand.calculation_inputs or {}).get("estimate_id")
+        if est_id:
+            score.estimate_id = UUID(str(est_id))
+            score.uncertainty_reasons = tuple(
+                (cand.calculation_inputs or {}).get("uncertainty_reasons") or ()
+            )
         deps.objective_service._repo.save_strategy_score(score)  # noqa: SLF001
+    for score in scores:
+        if score.is_no_trade:
+            deps.objective_service._repo.save_strategy_score(score)  # noqa: SLF001
     valid_trade = [s for s in scores if s.valid and not s.is_no_trade]
     return {
         "_strategy_scores": [s.model_dump(mode="json") for s in scores],
+        "_strategy_estimates": estimates,
         "_no_valid_strategy": len(valid_trade) == 0,
         **trace_update(
             append_trace(
@@ -215,6 +282,17 @@ async def score_strategies_against_objective_node(
             )
         ),
     }
+
+
+def _estimate_for_strategy(
+    state: CognitiveGraphState, strategy_id: UUID | None
+) -> dict[str, Any] | None:
+    if strategy_id is None:
+        return None
+    for est in state.get("_strategy_estimates") or []:
+        if str(est.get("strategy_id")) == str(strategy_id):
+            return est
+    return None
 
 
 async def deterministic_sizing_node(
@@ -244,19 +322,25 @@ async def deterministic_sizing_node(
         }
     proposal = state.get("execution_proposal")
     obj_state = await deps.objective_service.get_state()
-    if obj_state.feasibility_classification == "infeasible":
+    estimate = _estimate_for_strategy(state, meta.selected_strategy_id)
+    if estimate is None or not estimate.get("valid"):
         return {
-            "_sizing_decision": {"approved": False, "reason_codes": ["infeasible"]},
-            "_block_new_entries": True,
+            "_sizing_decision": {
+                "approved": False,
+                "reason_codes": ["estimate_missing_or_invalid"],
+            },
             **append_error(
                 state,
                 node_name="deterministic_sizing",
-                error_code="infeasible",
-                message="infeasible objective blocks sizing",
+                error_code="estimate_invalid",
+                message="selected strategy lacks a valid objective estimate",
             ),
         }
+    ev = estimate.get("expected_value_usd")
+    win_p = estimate.get("estimated_win_probability")
+    payoff = estimate.get("estimated_payoff_ratio")
     requested = None
-    premium = Decimal("0.10")
+    premium = Decimal(str(estimate.get("quote_inputs", {}).get("premium_per_contract") or "0.10"))
     if proposal is not None and getattr(proposal, "legs", None):
         leg = proposal.legs[0]
         requested = int(getattr(leg, "quantity", 1) or 1)
@@ -269,10 +353,15 @@ async def deterministic_sizing_node(
         strategy_id=meta.selected_strategy_id,
         premium_per_contract_usd=premium,
         requested_quantity=requested,
+        expected_value_usd=ev,
+        estimated_win_probability=win_p,
+        expected_r=payoff,
         is_probe=is_probe,
     )
+    dump = decision.model_dump(mode="json")
+    dump["estimate_id"] = estimate.get("estimate_id")
     update: dict[str, Any] = {
-        "_sizing_decision": decision.model_dump(mode="json"),
+        "_sizing_decision": dump,
         **trace_update(
             append_trace(state, node_name="deterministic_sizing", status="completed")
         ),
@@ -317,6 +406,17 @@ async def apply_objective_sizing_to_proposal(
         }
     meta = state.get("meta_decision")
     obj_state = await deps.objective_service.get_state()
+    strategy_id = getattr(meta, "selected_strategy_id", None) or getattr(
+        proposal, "strategy_id", None
+    )
+    estimate = _estimate_for_strategy(state, strategy_id)
+    if estimate is None or not estimate.get("valid"):
+        return append_error(
+            state,
+            node_name="apply_objective_sizing",
+            error_code="estimate_invalid",
+            message="cannot size without a valid positive-EV estimate",
+        )
     leg = proposal.legs[0]
     premium = Decimal(str(leg.limit_price or "0.10"))
     requested = int(leg.quantity)
@@ -325,10 +425,12 @@ async def apply_objective_sizing_to_proposal(
     ) or getattr(proposal, "action", None) == "probe"
     decision = deps.capital_sizer.size(
         obj_state,
-        strategy_id=getattr(meta, "selected_strategy_id", None)
-        or getattr(proposal, "strategy_id", None),
+        strategy_id=strategy_id,
         premium_per_contract_usd=premium,
         requested_quantity=requested,
+        expected_value_usd=estimate.get("expected_value_usd"),
+        estimated_win_probability=estimate.get("estimated_win_probability"),
+        expected_r=estimate.get("estimated_payoff_ratio"),
         is_probe=is_probe,
     )
     if not decision.approved or decision.approved_quantity <= 0:
@@ -342,13 +444,13 @@ async def apply_objective_sizing_to_proposal(
             ),
         }
     qty = int(decision.approved_quantity)
-    new_legs = tuple(
-        leg.model_copy(update={"quantity": qty}) for leg in proposal.legs
-    )
+    new_legs = tuple(leg.model_copy(update={"quantity": qty}) for leg in proposal.legs)
     sized = proposal.model_copy(update={"legs": new_legs})
+    dump = decision.model_dump(mode="json")
+    dump["estimate_id"] = estimate.get("estimate_id")
     return {
         "execution_proposal": sized,
-        "_sizing_decision": decision.model_dump(mode="json"),
+        "_sizing_decision": dump,
         **trace_update(
             append_trace(state, node_name="apply_objective_sizing", status="completed")
         ),
