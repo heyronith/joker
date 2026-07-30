@@ -763,6 +763,10 @@ async def run_closed_trade_round_trip(
     clock: FrozenExchangeClock = stack["clock"]
     start: datetime = stack["start"]
     session_id = stack["evolution"].session_id
+    # Require a fresh gateway ENTRY — do not treat a leftover open position as success.
+    await wait_ready_for_new_entry(stack, trade_index=trade_index)
+    install_paper_path_factories(fake, session_id=session_id)
+    set_position_action(fake, PositionAction.HOLD)
     entries_before = len(stack["gateway_entry_ids"])
     exits_before = len(stack["gateway_exit_ids"])
 
@@ -778,10 +782,35 @@ async def run_closed_trade_round_trip(
     )
     _refresh_trade_canned(fake, trade_index)
     register_evolution_router_canned(fake)
+    await stack["supervisor"].event_bus.drain(timeout=5.0)
+    for i in range(120):
+        if len(stack["gateway_entry_ids"]) > entries_before:
+            break
+        if i > 0 and i % 15 == 0:
+            projection = await supervisor.execution_runtime.project_session()
+            pos = projection.positions.get(CONTRACT_ID)
+            if pos is not None and pos.quantity != 0:
+                await ensure_flat_position(stack, trade_index=trade_index)
+                set_position_action(fake, PositionAction.HOLD)
+            now = clock.now()
+            tick = await supervisor.market_runtime.tick(now=now + timedelta(seconds=1))
+            clock.set_now(now + timedelta(seconds=1))
+            if tick.snapshot is not None:
+                register_full_path_canned(
+                    fake,
+                    tick.snapshot.snapshot_id,
+                    f"cycle-entry-retry-{trade_index}-{i}",
+                    session=session_id,
+                    position_action=PositionAction.HOLD,
+                )
+                register_evolution_router_canned(fake)
+        await asyncio.sleep(0.15)
+    else:
+        raise AssertionError(
+            "gateway_entry_ids did not progress through OrderActionGateway "
+            f"(before={entries_before}, after={len(stack['gateway_entry_ids'])})"
+        )
     await _wait_for_position(supervisor, want_open=True, attempts=100)
-    await _wait_for_gateway_progress(
-        stack, key="gateway_entry_ids", before=entries_before, attempts=40
-    )
 
     exit_start = entry_start + timedelta(minutes=8)
     clock.set_now(exit_start)

@@ -1397,12 +1397,13 @@ class EntryGraphAdversarialRunner(_RunnerBase):
 
             # Objective scenarios: run real Task-1 proofs (not fixture prove_* flags).
             if fixture.stimulus.get("objective_scenario"):
-                obj_findings, obj_failed = await _prove_objective_scenario(
-                    fixture,
-                    work_dir=Path(deps.db_path).parent
-                    if deps.db_path
-                    else Path("."),
-                )
+                import tempfile
+
+                with tempfile.TemporaryDirectory(prefix="adv-obj-prove-") as tmp:
+                    obj_findings, obj_failed = await _prove_objective_scenario(
+                        fixture,
+                        work_dir=Path(tmp),
+                    )
                 findings.extend(obj_findings)
                 failed.extend(obj_failed)
 

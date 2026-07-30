@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from decimal import Decimal
 from uuid import uuid4
 
@@ -90,16 +91,23 @@ async def test_full_loop_drift_and_rollback(tmp_path) -> None:
         await ensure_flat_position(stack, trade_index=99)
 
         # Real paper entry under promoted champion B (via _on_position_opened pin path).
-        await evolution.pin_and_apply_for_cycle(f"post-promote-entry-{uuid4().hex[:8]}")
+        pinned = await evolution.pin_and_apply_for_cycle(
+            f"post-promote-entry-{uuid4().hex[:8]}"
+        )
+        assert pinned is not None
+        assert pinned.configuration_version_id == champ_b.configuration_version_id
         await run_open_trade_entry_only(stack, trade_index=2, minute_offset=40)
         await stack["supervisor"].event_bus.drain(timeout=10.0)
         projection = await stack["supervisor"].execution_runtime.project_session()
         pos = projection.positions.get(CONTRACT_ID)
         assert pos is not None and pos.quantity != 0
-        assert (
-            evolution.originating_configuration_for_contract(CONTRACT_ID)
-            == champ_b.configuration_version_id
-        )
+        origin = None
+        for _ in range(40):
+            origin = evolution.originating_configuration_for_contract(CONTRACT_ID)
+            if origin == champ_b.configuration_version_id:
+                break
+            await asyncio.sleep(0.1)
+        assert origin == champ_b.configuration_version_id
 
         assert evolution.drift is not None
         await evolution.drift.observe(
