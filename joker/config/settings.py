@@ -186,6 +186,12 @@ def _default_evolution_settings() -> Any:
     return EvolutionSettings()
 
 
+def _default_objective_settings() -> Any:
+    from joker.objectives.config import ObjectiveSettings
+
+    return ObjectiveSettings()
+
+
 class AppSettings(BaseModel):
     """Merged application settings from YAML config and environment."""
 
@@ -210,6 +216,7 @@ class AppSettings(BaseModel):
     cognitive_graph: CognitiveGraphSettings = Field(default_factory=CognitiveGraphSettings)
     models: Any = Field(default_factory=_default_models_config)
     evolution: Any = Field(default_factory=_default_evolution_settings)
+    objective: Any = Field(default_factory=_default_objective_settings)
 
     @field_validator("models", mode="before")
     @classmethod
@@ -237,6 +244,19 @@ class AppSettings(BaseModel):
             return value
         if isinstance(value, dict):
             return EvolutionSettings.model_validate(value)
+        return value
+
+    @field_validator("objective", mode="before")
+    @classmethod
+    def _parse_objective(cls, value: Any) -> Any:
+        from joker.objectives.config import ObjectiveSettings
+
+        if value is None:
+            return ObjectiveSettings()
+        if isinstance(value, ObjectiveSettings):
+            return value
+        if isinstance(value, dict):
+            return ObjectiveSettings.model_validate(value)
         return value
 
     @field_validator("mode", mode="before")

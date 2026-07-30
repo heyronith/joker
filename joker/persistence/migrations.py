@@ -159,7 +159,9 @@ def apply_task1_migrations(db_path: str | Path) -> Path:
         conn.commit()
     finally:
         conn.close()
+    from joker.objectives.repository import apply_objective_migrations
     from joker.evolution.migrations import apply_task3_migrations
 
+    apply_objective_migrations(path)
     apply_task3_migrations(path)
     return path

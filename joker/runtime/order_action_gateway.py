@@ -234,6 +234,11 @@ class OrderActionGateway:
         if request.action == OrderActionKind.CANCEL:
             target = request.replace_of_client_order_id or request.client_order_id
             await self._deps.execution_runtime.cancel_order(client_order_id=target)
+            if self._deps.objective_service is not None:
+                await self._deps.objective_service.release_for_order(
+                    client_order_id=target,
+                    reason="cancelled",
+                )
             return OrderActionResult(
                 submitted=True,
                 client_order_id=target,
@@ -334,7 +339,46 @@ class OrderActionGateway:
                 client_order_id=request.replace_of_client_order_id
             )
 
-        order = await self._deps.execution_runtime.submit_execution_command(command)
+        # Objective capital reservation before ENTRY/PROBE/ADD
+        reserved = False
+        if request.action in {
+            OrderActionKind.ENTRY,
+            OrderActionKind.PROBE,
+            OrderActionKind.ADD,
+        } and self._deps.objective_service is not None:
+            try:
+                obj_state = await self._deps.objective_service.get_state()
+                premium = Decimal(str(command.intent.limit_price or 0)) * Decimal("100") * Decimal(
+                    int(command.intent.quantity)
+                )
+                await self._deps.objective_service.reserve_for_order(
+                    client_order_id=command.client_order_id,
+                    estimated_premium_usd=premium,
+                    objective_state_version=obj_state.version,
+                )
+                reserved = True
+            except Exception as exc:
+                return OrderActionResult(
+                    submitted=False,
+                    client_order_id=request.client_order_id,
+                    blocked_reason=f"objective_reserve_failed: {exc}",
+                    working_orders=working,
+                )
+
+        try:
+            order = await self._deps.execution_runtime.submit_execution_command(command)
+        except Exception as exc:
+            if reserved and self._deps.objective_service is not None:
+                await self._deps.objective_service.release_for_order(
+                    client_order_id=command.client_order_id,
+                    reason="broker_submission_failed",
+                )
+            raise
+        if reserved and self._deps.objective_service is not None and order is not None:
+            await self._deps.objective_service.associate_broker_order(
+                client_order_id=command.client_order_id,
+                broker_order_id=str(order.order_id),
+            )
         if self._deps.provenance_registry is not None:
             from joker.evolution.lifecycle_id import make_position_lifecycle_id
             from joker.persistence.cognitive_execution_provenance import (

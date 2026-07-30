@@ -22,7 +22,7 @@ class EvaluationRuntimeSettings(BaseModel):
     max_parallel_episodes: int = 4
     evaluator_profile: str = "reasoning_local"
     counterfactual_max_per_episode: int = 3
-    evaluator_version: str = "3.0.0"
+    evaluator_version: str = "3.1.0"
 
 
 class DatasetSettings(BaseModel):

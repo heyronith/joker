@@ -42,6 +42,7 @@ DataQualityLoader = Callable[
     Awaitable[DataQualityReport | None],
 ]
 ProjectionLoader = Callable[[], Awaitable[Any]]
+ObjectiveStateLoader = Callable[[], Awaitable[Any]]
 
 
 @dataclass
@@ -78,6 +79,12 @@ class CognitiveGraphDeps:
     cycle_registry: Any | None = None
     order_management_action_repo: Any | None = None
     submitted_proposal_ids: set[str] = field(default_factory=set)
+    # Goal-driven objective dependencies (required when objective.enabled)
+    objective_service: Any | None = None
+    objective_state_loader: ObjectiveStateLoader | None = None
+    feasibility_engine: Any | None = None
+    objective_strategy_scorer: Any | None = None
+    capital_sizer: Any | None = None
 
     def limits_dict(self) -> dict[str, int]:
         return {
@@ -88,3 +95,22 @@ class CognitiveGraphDeps:
             "max_hypotheses_per_cycle": self.config.max_hypotheses_per_cycle,
             "max_cycle_seconds": self.config.max_cycle_seconds,
         }
+
+    def require_objective_dependencies(self) -> None:
+        """Fail closed when a goal-aware production profile lacks objective wiring."""
+        missing: list[str] = []
+        if self.objective_service is None:
+            missing.append("objective_service")
+        if self.objective_state_loader is None:
+            missing.append("objective_state_loader")
+        if self.feasibility_engine is None:
+            missing.append("feasibility_engine")
+        if self.objective_strategy_scorer is None:
+            missing.append("objective_strategy_scorer")
+        if self.capital_sizer is None:
+            missing.append("capital_sizer")
+        if missing:
+            raise RuntimeError(
+                "objective-enabled production path missing CognitiveGraphDeps: "
+                + ", ".join(missing)
+            )

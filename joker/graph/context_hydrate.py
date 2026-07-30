@@ -87,6 +87,7 @@ async def assemble_role_context(
     position_projection: dict[str, Any] | None = None,
     session_artifact_summaries: tuple[dict[str, Any], ...] = (),
     legacy_playbook_context: dict[str, Any] | None = None,
+    objective_context: dict[str, Any] | None = None,
 ) -> ContextPackage:
     """Assemble a role-specific context package using injected assembler/limits."""
     return deps.context_assembler.assemble(
@@ -100,4 +101,5 @@ async def assemble_role_context(
         position_projection=position_projection,
         session_artifact_summaries=session_artifact_summaries,
         legacy_playbook_context=legacy_playbook_context,
+        objective_context=objective_context,
     )

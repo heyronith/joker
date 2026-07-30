@@ -184,18 +184,33 @@ def paper_run(
     authorized_capital: Optional[float] = typer.Option(
         None,
         "--authorized-capital",
-        help="Max premium USD to risk today (skips default; still confirmed unless --yes)",
+        help="Max premium USD to risk today (required with --yes when objective.enabled)",
     ),
     target_profit_pct: Optional[float] = typer.Option(
         None,
         "--target-profit-pct",
-        help="Daily profit goal as %% of authorized capital (default from config, often 20)",
+        help="Profit goal as %% of authorised capital",
+    ),
+    target_deadline: Optional[str] = typer.Option(
+        None,
+        "--target-deadline",
+        help='Deadline as "15:30 ET" or timezone-aware ISO timestamp',
+    ),
+    max_concurrent_positions: Optional[int] = typer.Option(
+        None,
+        "--max-concurrent-positions",
+        help="Maximum concurrent positions for this session",
+    ),
+    acknowledge_total_loss: bool = typer.Option(
+        False,
+        "--acknowledge-total-loss",
+        help="Acknowledge that the full authorised capital may be lost (paper)",
     ),
     yes: bool = typer.Option(
         False,
         "--yes",
         "-y",
-        help="Skip interactive capital/goal confirmation (use flags/config values)",
+        help="Skip prompts only when all required objective values + ack are provided",
     ),
     heartbeat_seconds: float = typer.Option(
         5.0,
@@ -262,15 +277,41 @@ def paper_run(
         else "local PaperBroker (simulated fills)"
     )
 
-    from joker.cli.session_confirm import confirm_session_capital
+    from joker.cli.session_confirm import confirm_session_capital, confirm_session_objective
+    from joker.storage.models import new_run_id
+    import asyncio
 
-    capital_budget = confirm_session_capital(
-        result.app_settings.capital,
-        console=console,
-        authorized_usd=authorized_capital,
-        target_profit_pct=target_profit_pct,
-        yes=yes,
-    )
+    objective_enabled = bool(getattr(result.app_settings.objective, "enabled", False))
+    session_id = f"paper-{new_run_id()}"
+    task1_db = Path(result.app_settings.db_path).resolve().parent / "joker_task1.db"
+
+    objective_service = None
+    if objective_enabled:
+        bundle = asyncio.run(
+            confirm_session_objective(
+                result.app_settings,
+                session_id=session_id,
+                db_path=task1_db,
+                console=console,
+                authorized_usd=authorized_capital,
+                target_profit_pct=target_profit_pct,
+                target_deadline=target_deadline,
+                max_concurrent_positions=max_concurrent_positions,
+                acknowledge_total_loss=acknowledge_total_loss,
+                yes=yes,
+            )
+        )
+        capital_budget = bundle.capital_budget
+        objective_service = bundle.objective_service
+    else:
+        capital_budget = confirm_session_capital(
+            result.app_settings.capital,
+            console=console,
+            authorized_usd=authorized_capital,
+            target_profit_pct=target_profit_pct,
+            max_concurrent_positions=max_concurrent_positions,
+            yes=yes,
+        )
 
     runner = LivePaperRunner(result.app_settings, result.env_settings)
     last_heartbeat = 0.0
@@ -353,6 +394,8 @@ def paper_run(
             mock_agents=not use_openai,
             require_options=True,
             capital_budget=capital_budget,
+            objective_service=objective_service,
+            cognitive_session_id_override=session_id if objective_enabled else None,
         ),
         on_state=on_state,
         on_event=on_event,

@@ -1,24 +1,36 @@
-"""Interactive session capital / goal confirmation for paper runs."""
+"""Interactive session capital / goal / objective confirmation for paper runs."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
+from decimal import Decimal
+from pathlib import Path
+from typing import Any
 
 import typer
 from rich.console import Console
 from rich.table import Table
 
-from joker.config.settings import CapitalSettings
+from joker.config.settings import AppSettings, CapitalSettings
+from joker.objectives.deadline import DeadlineParseError, resolve_deadline, time_remaining_seconds
+from joker.objectives.events import BoundedOperatorEventProjection
+from joker.objectives.feasibility import GoalFeasibilityEngine
+from joker.objectives.repository import ObjectiveRepository
+from joker.objectives.scoring import ObjectiveStrategyScorer
+from joker.objectives.service import SessionObjectiveService
+from joker.objectives.sizing import DeterministicObjectiveSizer
 from joker.risk.capital import CapitalBudget, CapitalPlan
 
 
-@dataclass(frozen=True)
-class SessionCapitalInput:
-    authorized_usd: float
-    target_profit_pct: float
-    max_concurrent_positions: int
-    max_contracts_per_trade: int
-    pause_entries_when_goal_met: bool = True
+@dataclass
+class SessionObjectiveBundle:
+    """Confirmed objective + legacy CapitalBudget mirror for MarketEventHandler."""
+
+    capital_budget: CapitalBudget
+    objective_service: SessionObjectiveService | None = None
+    objective_id: str | None = None
+    deadline_exchange_time: datetime | None = None
 
 
 def plan_from_settings(settings: CapitalSettings) -> CapitalPlan:
@@ -45,11 +57,7 @@ def confirm_session_capital(
     max_concurrent_positions: int | None = None,
     yes: bool = False,
 ) -> CapitalBudget:
-    """
-    Confirm daily authorized capital and profit goal before the session arms.
-
-    Pass --yes / CLI values to skip prompts (automation / tests).
-    """
+    """Legacy capital confirmation (objective-disabled profiles)."""
     out = console or Console()
     auth = float(authorized_usd if authorized_usd is not None else settings.authorized_usd)
     target = float(
@@ -120,3 +128,211 @@ def confirm_session_capital(
             raise typer.Abort()
 
     return budget
+
+
+async def confirm_session_objective(
+    app_settings: AppSettings,
+    *,
+    session_id: str,
+    db_path: Path,
+    console: Console | None = None,
+    authorized_usd: float | None = None,
+    target_profit_pct: float | None = None,
+    target_deadline: str | None = None,
+    max_concurrent_positions: int | None = None,
+    acknowledge_total_loss: bool = False,
+    yes: bool = False,
+    exchange_tz: str | None = None,
+) -> SessionObjectiveBundle:
+    """Confirm and persist a durable Task-1 session objective before Task 2 starts."""
+    out = console or Console()
+    obj_settings = app_settings.objective
+    capital = app_settings.capital
+    tz = exchange_tz or str(app_settings.exchange.timezone)
+
+    if yes:
+        missing: list[str] = []
+        if authorized_usd is None:
+            missing.append("--authorized-capital")
+        if target_profit_pct is None:
+            missing.append("--target-profit-pct")
+        if obj_settings.require_deadline and not target_deadline:
+            missing.append("--target-deadline")
+        if max_concurrent_positions is None:
+            missing.append("--max-concurrent-positions")
+        if obj_settings.require_total_loss_acknowledgement and not acknowledge_total_loss:
+            missing.append("--acknowledge-total-loss")
+        if missing:
+            raise typer.BadParameter(
+                "--yes requires explicit values for: " + ", ".join(missing)
+            )
+
+    auth = authorized_usd
+    target = target_profit_pct
+    concurrent = max_concurrent_positions
+    deadline_raw = target_deadline
+    ack = acknowledge_total_loss
+
+    if not yes:
+        out.print("\n[bold]Session objective confirmation[/bold]")
+        out.print(
+            "[dim]Authorised capital = max premium at risk in paper/sandbox. "
+            "Never inferred from broker buying power.[/dim]"
+        )
+        auth = float(
+            typer.prompt(
+                "Authorised capital (USD)",
+                default=float(auth if auth is not None else capital.authorized_usd),
+                type=float,
+            )
+        )
+        target = float(
+            typer.prompt(
+                "Target profit %",
+                default=float(target if target is not None else capital.target_profit_pct),
+                type=float,
+            )
+        )
+        deadline_raw = str(
+            typer.prompt(
+                "Target deadline (e.g. 15:30 ET or ISO timestamp)",
+                default=deadline_raw or "15:30 ET",
+            )
+        )
+        concurrent = int(
+            typer.prompt(
+                "Max concurrent positions",
+                default=int(
+                    concurrent
+                    if concurrent is not None
+                    else obj_settings.default_max_concurrent_positions
+                ),
+                type=int,
+            )
+        )
+        if obj_settings.require_total_loss_acknowledgement:
+            ack = typer.confirm(
+                f"I acknowledge that the full authorised capital "
+                f"(${auth:,.2f}) may be lost in this paper account",
+                default=False,
+            )
+
+    if auth is None or float(auth) <= 0:
+        raise typer.BadParameter("authorised capital must be > 0")
+    if target is None or float(target) < 0:
+        raise typer.BadParameter("target profit % must be >= 0")
+    if concurrent is None or int(concurrent) < 1:
+        raise typer.BadParameter("max concurrent positions must be >= 1")
+    if obj_settings.require_deadline and not deadline_raw:
+        raise typer.BadParameter("target deadline is required")
+    if obj_settings.require_total_loss_acknowledgement and not ack:
+        raise typer.BadParameter("total-loss acknowledgement is required")
+
+    try:
+        deadline = resolve_deadline(str(deadline_raw), exchange_tz=tz)
+    except DeadlineParseError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+    profit = Decimal(str(auth)) * Decimal(str(target)) / Decimal("100")
+    ending = Decimal(str(auth)) + profit
+    remaining = time_remaining_seconds(deadline, exchange_tz=tz)
+
+    table = Table(title="Resolved session objective")
+    table.add_column("Field")
+    table.add_column("Value")
+    table.add_row("Authorised capital", f"${float(auth):,.2f}")
+    table.add_row("Target profit %", f"{float(target):.1f}%")
+    table.add_row("Target profit $", f"${float(profit):,.2f}")
+    table.add_row("Target ending equity", f"${float(ending):,.2f}")
+    table.add_row("Deadline (exchange)", deadline.isoformat())
+    table.add_row("Time remaining", f"{remaining}s")
+    table.add_row("Max concurrent positions", str(int(concurrent)))
+    table.add_row("Total-loss acknowledged", "yes" if ack else "no")
+    out.print(table)
+
+    if not yes:
+        ok = typer.confirm("Confirm and arm this objective?", default=True)
+        if not ok:
+            raise typer.Abort()
+
+    repo = ObjectiveRepository(db_path)
+    events = BoundedOperatorEventProjection(
+        capacity=int(getattr(obj_settings, "operator_event_capacity", 256))
+    )
+    service = SessionObjectiveService(
+        repo,
+        exchange_tz=tz,
+        operator_events=events,
+        pause_entries_when_goal_met=bool(obj_settings.pause_entries_when_goal_met),
+        stop_new_entries_at_deadline=bool(obj_settings.stop_new_entries_at_deadline),
+        require_positive_expected_value=bool(obj_settings.require_positive_expected_value),
+        minimum_win_probability=float(obj_settings.minimum_win_probability),
+    )
+    definition = await service.create_objective(
+        session_id=session_id,
+        authorised_capital_usd=auth,
+        target_profit_pct=target,
+        deadline_exchange_time=deadline,
+        max_concurrent_positions=int(concurrent),
+        accepted_total_loss_risk=bool(ack),
+        pause_entries_when_goal_met=bool(obj_settings.pause_entries_when_goal_met),
+    )
+    state = await service.confirm_objective(definition.objective_id)
+    out.print(
+        f"[green]Objective confirmed[/green] id={definition.objective_id} "
+        f"status={state.status} version={state.version}"
+    )
+
+    plan = CapitalPlan(
+        authorized_usd=float(auth),
+        target_profit_pct=float(target),
+        max_concurrent_positions=int(concurrent),
+        max_contracts_per_trade=int(
+            getattr(obj_settings, "maximum_authorised_contracts", capital.max_contracts_per_trade)
+        ),
+        min_contracts_per_trade=int(capital.min_contracts_per_trade),
+        aggression_mode=str(capital.aggression_mode),
+        max_kelly_fraction=float(capital.max_kelly_fraction),
+        min_win_probability=float(obj_settings.minimum_win_probability),
+        behind_goal_boost=float(capital.behind_goal_boost),
+        ahead_goal_dampen=float(capital.ahead_goal_dampen),
+    )
+    return SessionObjectiveBundle(
+        capital_budget=CapitalBudget(plan=plan),
+        objective_service=service,
+        objective_id=str(definition.objective_id),
+        deadline_exchange_time=deadline,
+    )
+
+
+def build_objective_engines(app_settings: AppSettings) -> dict[str, Any]:
+    """Construct feasibility/scorer/sizer from settings for graph deps."""
+    obj = app_settings.objective
+    capital = app_settings.capital
+    return {
+        "feasibility_engine": GoalFeasibilityEngine(
+            minimum_samples_for_numeric_probability=int(
+                obj.feasibility.minimum_samples_for_numeric_probability
+            ),
+        ),
+        "objective_strategy_scorer": ObjectiveStrategyScorer(
+            require_positive_expected_value=bool(obj.require_positive_expected_value),
+            minimum_win_probability=float(obj.minimum_win_probability),
+            allow_ordinal_when_probability_unavailable=bool(
+                obj.feasibility.allow_ordinal_scoring_when_probability_unavailable
+            ),
+        ),
+        "capital_sizer": DeterministicObjectiveSizer(
+            max_capital_fraction=float(obj.sizing.max_capital_fraction),
+            max_probe_fraction=float(obj.sizing.max_probe_fraction),
+            prohibit_loss_multiplier=bool(obj.sizing.prohibit_loss_multiplier),
+            minimum_win_probability=float(obj.minimum_win_probability),
+            require_positive_expected_value=bool(obj.require_positive_expected_value),
+            maximum_authorised_contracts=int(obj.maximum_authorised_contracts),
+            min_contracts=int(capital.min_contracts_per_trade),
+            aggression_mode=str(capital.aggression_mode),
+            max_kelly_fraction=float(capital.max_kelly_fraction),
+            behind_goal_boost=float(capital.behind_goal_boost),
+            ahead_goal_dampen=float(capital.ahead_goal_dampen),
+        ),
+    }

@@ -78,6 +78,9 @@ class LivePaperRunConfig:
     trade_api: Any | None = None
     # Session capital budget (required for agent sizing); tests may inject
     capital_budget: CapitalBudget | None = None
+    # Task-1 durable objective service (required when objective.enabled)
+    objective_service: Any | None = None
+    cognitive_session_id_override: str | None = None
 
 
 @dataclass
@@ -299,9 +302,12 @@ class LivePaperRunner:
             # Stable cognitive session survives process restart; run_id remains audit-only.
             from joker.runtime.cognitive_session import live_paper_cognitive_session_id
 
-            cognitive_session_id = live_paper_cognitive_session_id(
-                broker_kind=selection.kind,
-                env=self.env_settings,
+            cognitive_session_id = (
+                config.cognitive_session_id_override
+                or live_paper_cognitive_session_id(
+                    broker_kind=selection.kind,
+                    env=self.env_settings,
+                )
             )
             model_router = ModelRouter(
                 registry,
@@ -310,6 +316,33 @@ class LivePaperRunner:
             )
             repos = build_default_repositories(task1_db)
             model_router.set_model_call_repo(repos["model_call_repo"])
+            objective_service = config.objective_service
+            obj_settings = getattr(self.app_settings, "objective", None)
+            if (
+                obj_settings is not None
+                and bool(getattr(obj_settings, "enabled", False))
+                and objective_service is None
+            ):
+                raise LivePaperError(
+                    "objective.enabled requires a confirmed SessionObjectiveService "
+                    "before starting the cognitive graph"
+                )
+            feasibility_engine = None
+            objective_strategy_scorer = None
+            capital_sizer = None
+            objective_state_loader = None
+            if objective_service is not None:
+                from joker.cli.session_confirm import build_objective_engines
+
+                engines = build_objective_engines(self.app_settings)
+                feasibility_engine = engines["feasibility_engine"]
+                objective_strategy_scorer = engines["objective_strategy_scorer"]
+                capital_sizer = engines["capital_sizer"]
+
+                async def _objective_state_loader():
+                    return await objective_service.get_state()
+
+                objective_state_loader = _objective_state_loader
             cognitive_graph_deps = CognitiveGraphDeps(
                 router=model_router,
                 config=self.app_settings.cognitive_graph,
@@ -322,8 +355,18 @@ class LivePaperRunner:
                 option_surface_repo=OptionSurfaceRepository(task1_db),
                 data_quality_repo=DataQualityRepository(task1_db),
                 db_path=task1_db,
+                objective_service=objective_service,
+                objective_state_loader=objective_state_loader,
+                feasibility_engine=feasibility_engine,
+                objective_strategy_scorer=objective_strategy_scorer,
+                capital_sizer=capital_sizer,
                 **repos,
             )
+            if (
+                obj_settings is not None
+                and bool(getattr(obj_settings, "enabled", False))
+            ):
+                cognitive_graph_deps.require_objective_dependencies()
             injected_agent_runtime = CognitiveAgentRuntime(
                 session_id=cognitive_session_id,
                 run_id=run_id,

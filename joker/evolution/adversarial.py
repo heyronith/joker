@@ -39,6 +39,27 @@ ADVERSARIAL_CORPUS: tuple[AdversarialScenario, ...] = (
     AdversarialScenario("adv_23", "regime_shift", "Regime shift between entry and exit"),
     AdversarialScenario("adv_24", "concurrent_urgent_exit", "Entry cycle concurrent with urgent exit"),
     AdversarialScenario("adv_25", "narrow_period_overfit", "Config overfit to a narrow historical period"),
+    # Objective / goal-driven adversarial corpus (unit-tested; not promotion-hard yet)
+    AdversarialScenario("adv_obj_01", "high_target_insufficient_time", "Very high target with insufficient time", required=False),
+    AdversarialScenario("adv_obj_02", "target_reached_early", "Target reached early pauses entries", required=False),
+    AdversarialScenario("adv_obj_03", "large_initial_loss", "Large initial loss reduces available capital", required=False),
+    AdversarialScenario("adv_obj_04", "consecutive_losses", "Multiple consecutive losses without martingale", required=False),
+    AdversarialScenario("adv_obj_05", "high_ev_after_losses", "One high-EV opportunity after losses", required=False),
+    AdversarialScenario("adv_obj_06", "no_valid_opportunity", "No valid opportunity all session", required=False),
+    AdversarialScenario("adv_obj_07", "capital_almost_exhausted", "Capital almost exhausted", required=False),
+    AdversarialScenario("adv_obj_08", "deadline_open_position", "Deadline passes with an open position", required=False),
+    AdversarialScenario("adv_obj_09", "reservation_race", "Concurrent reservation race", required=False),
+    AdversarialScenario("adv_obj_10", "restart_unfilled", "Restart with accepted but unfilled order", required=False),
+    AdversarialScenario("adv_obj_11", "partial_fill_restart", "Partial fill before restart", required=False),
+    AdversarialScenario("adv_obj_12", "broker_local_mismatch", "Broker position differs from reservation", required=False),
+    AdversarialScenario("adv_obj_13", "model_oversize", "Model recommends more contracts than affordable", required=False),
+    AdversarialScenario("adv_obj_14", "martingale_blocked", "Model recommends martingale-style sizing", required=False),
+    AdversarialScenario("adv_obj_15", "negative_ev_high_upside", "High upside but negative expected value", required=False),
+    AdversarialScenario("adv_obj_16", "probability_unavailable", "Target probability unavailable", required=False),
+    AdversarialScenario("adv_obj_17", "no_trade_better", "No-trade higher objective value than trading", required=False),
+    AdversarialScenario("adv_obj_18", "poor_calibration", "High-confidence model with poor calibration", required=False),
+    AdversarialScenario("adv_obj_19", "zero_profit_target", "Profit target is zero", required=False),
+    AdversarialScenario("adv_obj_20", "capital_below_premium", "Authorised capital smaller than one premium", required=False),
 )
 
 

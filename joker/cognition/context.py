@@ -59,6 +59,7 @@ class ContextPackage(BaseModel):
     position_projection: dict[str, Any] | None = None
     session_artifact_summaries: tuple[dict[str, Any], ...] = ()
     legacy_playbook_context: dict[str, Any] | None = None
+    objective_context: dict[str, Any] | None = None
 
     truncations: tuple[ContextTruncationRecord, ...] = ()
     context_hash: str
@@ -99,6 +100,7 @@ class ContextAssembler:
         position_projection: dict[str, Any] | None = None,
         session_artifact_summaries: tuple[dict[str, Any], ...] = (),
         legacy_playbook_context: dict[str, Any] | None = None,
+        objective_context: dict[str, Any] | None = None,
     ) -> ContextPackage:
         """Assemble a bounded context package for the given role."""
         if snapshot.snapshot_id is None:
@@ -106,6 +108,7 @@ class ContextAssembler:
 
         from joker.cognition.prompt_overrides import get_active_context_policy
         from joker.cognition.memory_policy import select_memories
+        from joker.objectives.schemas import OBJECTIVE_AWARE_ROLES, OBJECTIVE_NEUTRAL_ROLES
 
         policy = get_active_context_policy() or {}
         max_chars = int(
@@ -228,6 +231,17 @@ class ContextAssembler:
         if self.config.include_legacy_playbook and legacy_playbook_context:
             include_legacy = True
 
+        # Perception-neutral roles must never see objective pressure.
+        role_key = agent_role.value
+        include_objective = False
+        objective_payload = None
+        if role_key in OBJECTIVE_NEUTRAL_ROLES:
+            include_objective = False
+            objective_payload = None
+        elif role_key in OBJECTIVE_AWARE_ROLES and objective_context is not None:
+            include_objective = True
+            objective_payload = objective_context
+
         package_body = {
             "agent_role": agent_role.value,
             "session_id": session_id,
@@ -248,6 +262,7 @@ class ContextAssembler:
             if include_artifacts
             else [],
             "legacy_playbook_context": legacy_playbook_context if include_legacy else None,
+            "objective_context": objective_payload if include_objective else None,
             "truncations": [t.model_dump(mode="json") for t in truncations],
         }
 
@@ -297,6 +312,7 @@ class ContextAssembler:
             position_projection=position_projection if include_positions else None,
             session_artifact_summaries=session_artifact_summaries if include_artifacts else (),
             legacy_playbook_context=legacy_playbook_context if include_legacy else None,
+            objective_context=objective_payload if include_objective else None,
             truncations=tuple(truncations),
             context_hash=context_hash,
             serialized_size_chars=size_chars,

@@ -127,6 +127,7 @@ _MODE_MAP: dict[str, ExecutionMode] = {
     "adv_23": "full_replay",
     "adv_24": "position_graph",
     "adv_25": "entry_graph",
+    **{f"adv_obj_{i:02d}": "entry_graph" for i in range(1, 21)},
 }
 
 _INVARIANTS: dict[str, tuple[str, ...]] = {
@@ -155,6 +156,10 @@ _INVARIANTS: dict[str, tuple[str, ...]] = {
     "adv_23": ("regime_shift_handled",),
     "adv_24": ("urgent_exit_priority",),
     "adv_25": ("narrow_overfit_rejected",),
+    **{
+        f"adv_obj_{i:02d}": ("objective_invariant",)
+        for i in range(1, 21)
+    },
 }
 
 

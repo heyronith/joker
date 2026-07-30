@@ -56,6 +56,18 @@ class DeterministicOutcomeMetrics(BaseModel):
     data_quality_exposure: int = 0
     safety_violations: int = 0
     integrity_violations: int = 0
+    # Goal-driven objective metrics (optional; omitted when no objective)
+    objective_id: str | None = None
+    target_reached: bool | None = None
+    deadline_reached: bool | None = None
+    remaining_capital_usd: Decimal | None = None
+    estimated_success_probability_before: Decimal | None = None
+    estimated_success_probability_after: Decimal | None = None
+    expected_value_usd: Decimal | None = None
+    no_trade_selected: bool | None = None
+    objective_regret: Decimal | None = None
+    authorised_capital_respected: bool | None = None
+    negative_ev_lucky_win: bool | None = None
 
 
 class EvidencePackage(BaseModel):

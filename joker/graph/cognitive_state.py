@@ -74,6 +74,11 @@ class CognitiveGraphState(TypedDict, total=False):
     _context_package: ContextPackage | None
     _data_quality: DataQualityReport | None
     _option_surface_id: str | None
+    _feasibility_assessment: dict | None
+    _strategy_scores: list | None
+    _no_valid_strategy: bool
+    _sizing_decision: dict | None
+    _objective_context: dict | None
 
     # Position graph channels
     _position_id: str | None

@@ -27,6 +27,13 @@ from joker.graph.graph_deps import CognitiveGraphDeps
 from joker.graph.node_helpers import append_error, append_trace, trace_update, utc_now
 from joker.graph.perception_graph import build_perception_graph
 from joker.graph.strategy_graph import build_strategy_graph
+from joker.graph.objective_nodes import (
+    assess_goal_feasibility_node,
+    deterministic_sizing_node,
+    gate_objective_confirmed,
+    load_objective_context,
+    score_strategies_against_objective_node,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -58,7 +65,16 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
                 message="missing trigger_event_id or snapshot_id",
                 recoverable=False,
             )
-        return trace_update(append_trace(state, node_name="validate_trigger", status="completed"))
+        gate = await gate_objective_confirmed(deps, state)
+        if gate is not None and gate.get("errors"):
+            # Hard-stop for unconfirmed; soft abandon markers still continue to hydrate
+            codes = {getattr(e, "error_code", None) for e in gate.get("errors") or []}
+            if "objective_unconfirmed" in codes or "objective_unavailable" in codes:
+                return gate
+        return {
+            **(gate or {}),
+            **trace_update(append_trace(state, node_name="validate_trigger", status="completed")),
+        }
 
     async def hydrate_context(state: CognitiveGraphState) -> dict[str, Any]:
         snapshot_id = state.get("snapshot_id")
@@ -90,6 +106,8 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
                 position_projection = {
                     "positions": [str(p) for p in getattr(projection, "positions", ())]
                 }
+        objective_context = await load_objective_context(deps)
+        # Perception-neutral default package (MARKET_STRUCTURE never gets objective).
         context = await assemble_role_context(
             deps,
             agent_role=AgentRole.MARKET_STRUCTURE,
@@ -100,6 +118,7 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
             option_surface_slice=surface_slice,
             order_projection=order_projection,
             position_projection=position_projection,
+            objective_context=None,
         )
         return {
             "cycle_id": cycle_id,
@@ -109,6 +128,7 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
             "_option_surface_id": str(record.option_surface_id)
             if record.option_surface_id
             else None,
+            "_objective_context": objective_context,
             "latest_known_snapshot_id": str(snapshot_id),
             **trace_update(append_trace(state, node_name="hydrate_context", status="completed")),
         }
@@ -191,6 +211,53 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
         context = state.get("_context_package")  # type: ignore[typeddict-item]
         if not isinstance(context, ContextPackage):
             return {}
+        if state.get("_no_valid_strategy"):
+            from uuid import uuid4 as _uuid4
+
+            from joker.cognition.schemas import MetaDecision
+
+            snapshot_raw = state.get("snapshot_id") or state.get("latest_known_snapshot_id")
+            decision = MetaDecision(
+                session_id=state.get("session_id") or deps.session_id,
+                snapshot_id=UUID(str(snapshot_raw)),
+                prompt_version="objective-no-trade-v1",
+                model_call_id=_uuid4(),
+                cycle_id=str(state.get("cycle_id") or _uuid4()),
+                action=MetaDecisionAction.ABANDON,
+                confidence=1.0,
+                rationale_summary="no valid objective strategy scores; retaining no-trade",
+                selected_strategy_id=None,
+            )
+            return {
+                "meta_decision": decision,
+                **trace_update(
+                    append_trace(
+                        state,
+                        node_name="meta_decision",
+                        status="completed",
+                        artifact_ids=(decision.decision_id,),
+                    )
+                ),
+            }
+        # Re-assemble meta context with sanitised objective when available.
+        objective_context = state.get("_objective_context")
+        if objective_context and deps.snapshot_repo is not None and state.get("snapshot_id"):
+            try:
+                record, data_quality, _surface, surface_slice = await load_snapshot_truth(
+                    deps, state["snapshot_id"]
+                )
+                context = await assemble_role_context(
+                    deps,
+                    agent_role=AgentRole.META_DECISION,
+                    session_id=state.get("session_id") or deps.session_id,
+                    cycle_id=state.get("cycle_id") or "",
+                    snapshot=record,
+                    data_quality=data_quality,
+                    option_surface_slice=surface_slice,
+                    objective_context=objective_context,
+                )
+            except Exception:
+                pass
         strategies = state.get("strategies") or []
         decision = await run_meta_decision(
             state=state,
@@ -218,6 +285,8 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
             return "persist_cycle"
         if state.get("stale_decision"):
             return "persist_stale"
+        if state.get("_no_valid_strategy"):
+            return "persist_cycle"
         action = meta.action
         if action in {MetaDecisionAction.EXECUTE, MetaDecisionAction.PROBE}:
             return "entry_tactician"
@@ -449,6 +518,17 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
         await _publish_cycle_completed(deps, state, outcome="stale")
         return trace_update(append_trace(state, node_name="persist_stale", status="completed"))
 
+    async def assess_goal_feasibility(state: CognitiveGraphState) -> dict[str, Any]:
+        return await assess_goal_feasibility_node(deps, state)
+
+    async def score_strategies_against_objective(
+        state: CognitiveGraphState,
+    ) -> dict[str, Any]:
+        return await score_strategies_against_objective_node(deps, state)
+
+    async def deterministic_sizing(state: CognitiveGraphState) -> dict[str, Any]:
+        return await deterministic_sizing_node(deps, state)
+
     graph = StateGraph(CognitiveGraphState)
     graph.add_node("validate_trigger", validate_trigger)
     graph.add_node("hydrate_context", hydrate_context)
@@ -456,10 +536,15 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
     graph.add_node("synthesise_world_model", synthesise_world_model)
     graph.add_node("discovery", discovery)
     graph.add_node("strategy", strategy_graph)
+    graph.add_node("assess_goal_feasibility", assess_goal_feasibility)
+    graph.add_node(
+        "score_strategies_against_objective", score_strategies_against_objective
+    )
     graph.add_node("select_debate_candidates", select_debate_candidates)
     graph.add_node("debate", debate)
     graph.add_node("meta_decision", meta_decision_node)
     graph.add_node("strategy_switch_revision", strategy_switch_revision)
+    graph.add_node("deterministic_sizing", deterministic_sizing)
     graph.add_node("entry_tactician", entry_tactician_node)
     graph.add_node("validate_execution_proposal", validate_execution_proposal)
     graph.add_node("submit_execution_command", submit_execution_command)
@@ -474,14 +559,16 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
     graph.add_edge("perception", "synthesise_world_model")
     graph.add_edge("synthesise_world_model", "discovery")
     graph.add_edge("discovery", "strategy")
-    graph.add_edge("strategy", "select_debate_candidates")
+    graph.add_edge("strategy", "assess_goal_feasibility")
+    graph.add_edge("assess_goal_feasibility", "score_strategies_against_objective")
+    graph.add_edge("score_strategies_against_objective", "select_debate_candidates")
     graph.add_edge("select_debate_candidates", "debate")
     graph.add_edge("debate", "meta_decision")
     graph.add_conditional_edges(
         "meta_decision",
         route_meta_decision,
         {
-            "entry_tactician": "entry_tactician",
+            "entry_tactician": "deterministic_sizing",
             "persist_cycle": "persist_cycle",
             "persist_pending_cycle": "persist_pending_cycle",
             "persist_evidence_request": "persist_evidence_request",
@@ -489,6 +576,7 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
             "strategy_switch_revision": "strategy_switch_revision",
         },
     )
+    graph.add_edge("deterministic_sizing", "entry_tactician")
     graph.add_conditional_edges(
         "strategy_switch_revision",
         after_switch_route,
