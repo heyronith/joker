@@ -79,6 +79,8 @@ class CognitiveGraphState(TypedDict, total=False):
     _no_valid_strategy: bool
     _sizing_decision: dict | None
     _objective_context: dict | None
+    _block_new_entries: bool
+    _meta_decision_override: str | None
 
     # Position graph channels
     _position_id: str | None

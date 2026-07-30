@@ -28,8 +28,10 @@ from joker.graph.node_helpers import append_error, append_trace, trace_update, u
 from joker.graph.perception_graph import build_perception_graph
 from joker.graph.strategy_graph import build_strategy_graph
 from joker.graph.objective_nodes import (
+    apply_objective_sizing_to_proposal,
     assess_goal_feasibility_node,
     deterministic_sizing_node,
+    entry_blocked_by_objective,
     gate_objective_confirmed,
     load_objective_context,
     score_strategies_against_objective_node,
@@ -58,23 +60,31 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
 
     async def validate_trigger(state: CognitiveGraphState) -> dict[str, Any]:
         if not state.get("trigger_event_id") or not state.get("snapshot_id"):
-            return append_error(
-                state,
-                node_name="validate_trigger",
-                error_code="invalid_trigger",
-                message="missing trigger_event_id or snapshot_id",
-                recoverable=False,
-            )
+            return {
+                "_block_new_entries": True,
+                **append_error(
+                    state,
+                    node_name="validate_trigger",
+                    error_code="invalid_trigger",
+                    message="missing trigger_event_id or snapshot_id",
+                    recoverable=False,
+                ),
+            }
         gate = await gate_objective_confirmed(deps, state)
-        if gate is not None and gate.get("errors"):
-            # Hard-stop for unconfirmed; soft abandon markers still continue to hydrate
-            codes = {getattr(e, "error_code", None) for e in gate.get("errors") or []}
-            if "objective_unconfirmed" in codes or "objective_unavailable" in codes:
-                return gate
         return {
             **(gate or {}),
-            **trace_update(append_trace(state, node_name="validate_trigger", status="completed")),
+            **trace_update(
+                append_trace(state, node_name="validate_trigger", status="completed")
+            ),
         }
+
+    def after_validate_trigger(state: CognitiveGraphState) -> str:
+        if entry_blocked_by_objective(state):
+            return "persist_cycle"
+        errors = state.get("errors") or []
+        if any(getattr(e, "error_code", None) == "invalid_trigger" for e in errors):
+            return "persist_cycle"
+        return "hydrate_context"
 
     async def hydrate_context(state: CognitiveGraphState) -> dict[str, Any]:
         snapshot_id = state.get("snapshot_id")
@@ -211,12 +221,21 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
         context = state.get("_context_package")  # type: ignore[typeddict-item]
         if not isinstance(context, ContextPackage):
             return {}
-        if state.get("_no_valid_strategy"):
+        if (
+            state.get("_no_valid_strategy")
+            or state.get("_meta_decision_override") == "abandon"
+            or entry_blocked_by_objective(state)
+        ):
             from uuid import uuid4 as _uuid4
 
             from joker.cognition.schemas import MetaDecision
 
             snapshot_raw = state.get("snapshot_id") or state.get("latest_known_snapshot_id")
+            reason = "no valid objective strategy scores; retaining no-trade"
+            if state.get("_meta_decision_override") == "abandon" or entry_blocked_by_objective(
+                state
+            ):
+                reason = "objective gate blocks new entries; abandoning"
             decision = MetaDecision(
                 session_id=state.get("session_id") or deps.session_id,
                 snapshot_id=UUID(str(snapshot_raw)),
@@ -225,7 +244,7 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
                 cycle_id=str(state.get("cycle_id") or _uuid4()),
                 action=MetaDecisionAction.ABANDON,
                 confidence=1.0,
-                rationale_summary="no valid objective strategy scores; retaining no-trade",
+                rationale_summary=reason,
                 selected_strategy_id=None,
             )
             return {
@@ -285,7 +304,7 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
             return "persist_cycle"
         if state.get("stale_decision"):
             return "persist_stale"
-        if state.get("_no_valid_strategy"):
+        if state.get("_no_valid_strategy") or entry_blocked_by_objective(state):
             return "persist_cycle"
         action = meta.action
         if action in {MetaDecisionAction.EXECUTE, MetaDecisionAction.PROBE}:
@@ -335,6 +354,25 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
                 error_code="missing_inputs",
                 message="meta_decision and strategy required for entry tactician",
             )
+        # Role-specific re-assemble with sanitised ObjectiveContext for goal-aware tactician.
+        objective_context = state.get("_objective_context")
+        if objective_context and deps.snapshot_repo is not None and state.get("snapshot_id"):
+            try:
+                record, data_quality, _surface, surface_slice = await load_snapshot_truth(
+                    deps, state["snapshot_id"]
+                )
+                context = await assemble_role_context(
+                    deps,
+                    agent_role=AgentRole.ENTRY_TACTICIAN,
+                    session_id=state.get("session_id") or deps.session_id,
+                    cycle_id=state.get("cycle_id") or "",
+                    snapshot=record,
+                    data_quality=data_quality,
+                    option_surface_slice=surface_slice,
+                    objective_context=objective_context,
+                )
+            except Exception:
+                pass
         proposal = await run_entry_tactician(
             state=state,
             router=deps.router,
@@ -355,6 +393,9 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
                 )
             ),
         }
+
+    async def apply_objective_sizing(state: CognitiveGraphState) -> dict[str, Any]:
+        return await apply_objective_sizing_to_proposal(deps, state)
 
     async def validate_execution_proposal(state: CognitiveGraphState) -> dict[str, Any]:
         proposal = state.get("execution_proposal")
@@ -546,6 +587,7 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
     graph.add_node("strategy_switch_revision", strategy_switch_revision)
     graph.add_node("deterministic_sizing", deterministic_sizing)
     graph.add_node("entry_tactician", entry_tactician_node)
+    graph.add_node("apply_objective_sizing", apply_objective_sizing)
     graph.add_node("validate_execution_proposal", validate_execution_proposal)
     graph.add_node("submit_execution_command", submit_execution_command)
     graph.add_node("persist_cycle", persist_cycle)
@@ -554,7 +596,14 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
     graph.add_node("persist_stale", persist_stale)
 
     graph.add_edge(START, "validate_trigger")
-    graph.add_edge("validate_trigger", "hydrate_context")
+    graph.add_conditional_edges(
+        "validate_trigger",
+        after_validate_trigger,
+        {
+            "hydrate_context": "hydrate_context",
+            "persist_cycle": "persist_cycle",
+        },
+    )
     graph.add_edge("hydrate_context", "perception")
     graph.add_edge("perception", "synthesise_world_model")
     graph.add_edge("synthesise_world_model", "discovery")
@@ -587,9 +636,27 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
         if state.get("stale_decision"):
             return "persist_stale"
         errors = state.get("errors") or []
-        if any(e.error_code == "validation_failed" for e in errors):
+        if any(
+            e.error_code
+            in {
+                "validation_failed",
+                "sizing_rejected",
+                "entries_blocked",
+                "missing_proposal",
+            }
+            for e in errors
+        ):
             return "persist_cycle"
         return "submit_execution_command"
+
+    def after_apply_sizing(state: CognitiveGraphState) -> str:
+        errors = state.get("errors") or []
+        if any(
+            e.error_code in {"sizing_rejected", "entries_blocked", "missing_proposal"}
+            for e in errors
+        ):
+            return "persist_cycle"
+        return "validate_execution_proposal"
 
     graph.add_conditional_edges(
         "validate_execution_proposal",
@@ -600,7 +667,15 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
             "persist_cycle": "persist_cycle",
         },
     )
-    graph.add_edge("entry_tactician", "validate_execution_proposal")
+    graph.add_edge("entry_tactician", "apply_objective_sizing")
+    graph.add_conditional_edges(
+        "apply_objective_sizing",
+        after_apply_sizing,
+        {
+            "validate_execution_proposal": "validate_execution_proposal",
+            "persist_cycle": "persist_cycle",
+        },
+    )
     graph.add_edge("submit_execution_command", "persist_cycle")
     graph.add_edge("persist_cycle", END)
     graph.add_edge("persist_pending_cycle", END)

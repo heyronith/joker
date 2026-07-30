@@ -430,6 +430,19 @@ class LivePaperRunner:
             )
             assert cognitive_graph_deps.execution_runtime is not None
             assert cognitive_graph_deps.order_action_gateway is not None
+            if objective_service is not None:
+                from joker.runtime.objective_recovery import recover_session_objective
+
+                task1_bridge.run_coro(
+                    recover_session_objective(
+                        objective_service,
+                        session_id=bridge_session_id,
+                        execution_runtime=task1_bridge.execution_runtime,
+                        unresolved_reconciliation=(
+                            task1_bridge.supervisor.unresolved_reconciliation is not None
+                        ),
+                    )
+                )
             if bool(getattr(self.app_settings.evolution, "enabled", False)):
                 from joker.evolution.runtime import EvolutionRuntime
 

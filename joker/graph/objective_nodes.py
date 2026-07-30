@@ -14,6 +14,16 @@ from joker.objectives.feasibility import FeasibilityInputs
 from joker.objectives.scoring import StrategyScoreInput
 from joker.objectives.schemas import state_to_context
 
+_HARD_BLOCK_CODES = frozenset(
+    {
+        "objective_unconfirmed",
+        "objective_unavailable",
+        "deadline_reached",
+        "entries_paused",
+        "objective_infeasible",
+    }
+)
+
 
 async def load_objective_context(deps: CognitiveGraphDeps) -> dict[str, Any] | None:
     if deps.objective_state_loader is None:
@@ -22,31 +32,48 @@ async def load_objective_context(deps: CognitiveGraphDeps) -> dict[str, Any] | N
     return state_to_context(state).model_dump_for_hash()
 
 
-async def gate_objective_confirmed(deps: CognitiveGraphDeps, state: CognitiveGraphState) -> dict[str, Any] | None:
+def entry_blocked_by_objective(state: CognitiveGraphState) -> bool:
+    """True when new ENTRY/PROBE must not proceed."""
+    if state.get("_block_new_entries"):
+        return True
+    errors = state.get("errors") or []
+    return any(getattr(e, "error_code", None) in _HARD_BLOCK_CODES for e in errors)
+
+
+async def gate_objective_confirmed(
+    deps: CognitiveGraphDeps, state: CognitiveGraphState
+) -> dict[str, Any] | None:
     """Return an error update if objective is required but not entry-ready."""
     if deps.objective_service is None:
         return None
     try:
         obj_state = await deps.objective_service.get_state()
     except Exception as exc:
-        return append_error(
-            state,
-            node_name="validate_trigger",
-            error_code="objective_unavailable",
-            message=str(exc),
-            recoverable=False,
-        )
+        return {
+            "_block_new_entries": True,
+            **append_error(
+                state,
+                node_name="validate_trigger",
+                error_code="objective_unavailable",
+                message=str(exc),
+                recoverable=False,
+            ),
+        }
     if obj_state.status == "pending_confirmation":
-        return append_error(
-            state,
-            node_name="validate_trigger",
-            error_code="objective_unconfirmed",
-            message="entry graph requires a confirmed objective",
-            recoverable=False,
-        )
+        return {
+            "_block_new_entries": True,
+            **append_error(
+                state,
+                node_name="validate_trigger",
+                error_code="objective_unconfirmed",
+                message="entry graph requires a confirmed objective",
+                recoverable=False,
+            ),
+        }
     if obj_state.status == "deadline_reached" or obj_state.time_remaining_seconds <= 0:
         return {
-            "meta_decision_override": "abandon",
+            "_block_new_entries": True,
+            "_meta_decision_override": "abandon",
             **append_error(
                 state,
                 node_name="validate_trigger",
@@ -56,7 +83,8 @@ async def gate_objective_confirmed(deps: CognitiveGraphDeps, state: CognitiveGra
         }
     if obj_state.entries_paused or obj_state.status == "target_reached":
         return {
-            "meta_decision_override": "abandon",
+            "_block_new_entries": True,
+            "_meta_decision_override": "abandon",
             **append_error(
                 state,
                 node_name="validate_trigger",
@@ -66,7 +94,8 @@ async def gate_objective_confirmed(deps: CognitiveGraphDeps, state: CognitiveGra
         }
     if obj_state.feasibility_classification == "infeasible":
         return {
-            "meta_decision_override": "abandon",
+            "_block_new_entries": True,
+            "_meta_decision_override": "abandon",
             **append_error(
                 state,
                 node_name="validate_trigger",
@@ -96,12 +125,25 @@ async def assess_goal_feasibility_node(
         classification=assessment.classification,
         estimated_success_probability=assessment.estimated_success_probability,
     )
-    return {
+    block = assessment.classification == "infeasible"
+    update: dict[str, Any] = {
         "_feasibility_assessment": assessment.model_dump(mode="json"),
         **trace_update(
             append_trace(state, node_name="assess_goal_feasibility", status="completed")
         ),
     }
+    if block:
+        update["_block_new_entries"] = True
+        update["_meta_decision_override"] = "abandon"
+        update.update(
+            append_error(
+                state,
+                node_name="assess_goal_feasibility",
+                error_code="objective_infeasible",
+                message="feasibility infeasible — no new entries",
+            )
+        )
+    return update
 
 
 async def score_strategies_against_objective_node(
@@ -118,20 +160,36 @@ async def score_strategies_against_objective_node(
     p_before = obj_state.estimated_success_probability
     candidates: list[StrategyScoreInput] = []
     for strategy in state.get("strategies") or []:
-        ev = None
-        win_p = None
-        # Soft reads from strategy payload if present
+        ev = getattr(strategy, "expected_value_usd", None)
+        win_p = getattr(strategy, "estimated_win_probability", None)
         extras = getattr(strategy, "model_extra", None) or {}
-        if hasattr(strategy, "expected_value_usd"):
-            ev = getattr(strategy, "expected_value_usd")
-        capital = Decimal("0")
-        max_loss = Decimal("0")
+        if ev is None and isinstance(extras, dict):
+            ev = extras.get("expected_value_usd")
+        if win_p is None and isinstance(extras, dict):
+            win_p = extras.get("estimated_win_probability")
+        capital = obj_state.available_capital_usd
+        max_loss = obj_state.available_capital_usd
+        # Prefer explicit capital/max-loss when present on the strategy payload.
+        for attr, target in (
+            ("capital_required_usd", "capital"),
+            ("maximum_loss_usd", "max_loss"),
+        ):
+            raw = getattr(strategy, attr, None)
+            if raw is None and isinstance(extras, dict):
+                raw = extras.get(attr)
+            if raw is not None:
+                if target == "capital":
+                    capital = Decimal(str(raw))
+                else:
+                    max_loss = Decimal(str(raw))
         candidates.append(
             StrategyScoreInput(
                 strategy_id=strategy.strategy_id,
                 snapshot_id=snapshot_id,
-                expected_value_usd=ev,
-                estimated_win_probability=win_p,
+                expected_value_usd=Decimal(str(ev)) if ev is not None else None,
+                estimated_win_probability=(
+                    Decimal(str(win_p)) if win_p is not None else None
+                ),
                 maximum_loss_usd=max_loss,
                 capital_required_usd=capital,
                 calculation_inputs={"name": getattr(strategy, "name", None)},
@@ -174,12 +232,22 @@ async def deterministic_sizing_node(
         return trace_update(
             append_trace(state, node_name="deterministic_sizing", status="skipped")
         )
+    if entry_blocked_by_objective(state):
+        return {
+            "_sizing_decision": {"approved": False, "reason_codes": ["entries_blocked"]},
+            **append_error(
+                state,
+                node_name="deterministic_sizing",
+                error_code="entries_blocked",
+                message="objective gate blocks sizing",
+            ),
+        }
     proposal = state.get("execution_proposal")
-    # Sizing may run before tactician; use meta + strategy hints
     obj_state = await deps.objective_service.get_state()
     if obj_state.feasibility_classification == "infeasible":
         return {
             "_sizing_decision": {"approved": False, "reason_codes": ["infeasible"]},
+            "_block_new_entries": True,
             **append_error(
                 state,
                 node_name="deterministic_sizing",
@@ -203,9 +271,85 @@ async def deterministic_sizing_node(
         requested_quantity=requested,
         is_probe=is_probe,
     )
-    return {
+    update: dict[str, Any] = {
         "_sizing_decision": decision.model_dump(mode="json"),
         **trace_update(
             append_trace(state, node_name="deterministic_sizing", status="completed")
+        ),
+    }
+    if not decision.approved:
+        update.update(
+            append_error(
+                state,
+                node_name="deterministic_sizing",
+                error_code="sizing_rejected",
+                message="deterministic sizer rejected quantity",
+            )
+        )
+    return update
+
+
+async def apply_objective_sizing_to_proposal(
+    deps: CognitiveGraphDeps, state: CognitiveGraphState
+) -> dict[str, Any]:
+    """Re-size with proposal premium and clamp legs; fail closed if rejected."""
+    proposal = state.get("execution_proposal")
+    if proposal is None:
+        return append_error(
+            state,
+            node_name="apply_objective_sizing",
+            error_code="missing_proposal",
+            message="no execution proposal to size",
+        )
+    if deps.capital_sizer is None or deps.objective_service is None:
+        return trace_update(
+            append_trace(state, node_name="apply_objective_sizing", status="skipped")
+        )
+    if entry_blocked_by_objective(state):
+        return {
+            "_block_new_entries": True,
+            **append_error(
+                state,
+                node_name="apply_objective_sizing",
+                error_code="entries_blocked",
+                message="objective gate blocks sized entry",
+            ),
+        }
+    meta = state.get("meta_decision")
+    obj_state = await deps.objective_service.get_state()
+    leg = proposal.legs[0]
+    premium = Decimal(str(leg.limit_price or "0.10"))
+    requested = int(leg.quantity)
+    is_probe = bool(
+        meta is not None and meta.action == MetaDecisionAction.PROBE
+    ) or getattr(proposal, "action", None) == "probe"
+    decision = deps.capital_sizer.size(
+        obj_state,
+        strategy_id=getattr(meta, "selected_strategy_id", None)
+        or getattr(proposal, "strategy_id", None),
+        premium_per_contract_usd=premium,
+        requested_quantity=requested,
+        is_probe=is_probe,
+    )
+    if not decision.approved or decision.approved_quantity <= 0:
+        return {
+            "_sizing_decision": decision.model_dump(mode="json"),
+            **append_error(
+                state,
+                node_name="apply_objective_sizing",
+                error_code="sizing_rejected",
+                message="deterministic sizer rejected proposal quantity",
+            ),
+        }
+    qty = int(decision.approved_quantity)
+    new_legs = tuple(
+        leg.model_copy(update={"quantity": qty}) for leg in proposal.legs
+    )
+    sized = proposal.model_copy(update={"legs": new_legs})
+    return {
+        "execution_proposal": sized,
+        "_sizing_decision": decision.model_dump(mode="json"),
+        **trace_update(
+            append_trace(state, node_name="apply_objective_sizing", status="completed")
         ),
     }

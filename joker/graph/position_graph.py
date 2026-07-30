@@ -71,6 +71,15 @@ def build_position_graph(deps: CognitiveGraphDeps):
         position_projection = _extract_position(projection, str(position_id))
         order_projection = _extract_orders(projection)
         cycle_id = state.get("cycle_id") or str(uuid4())
+        objective_context = None
+        if deps.objective_state_loader is not None:
+            try:
+                from joker.objectives.schemas import state_to_context
+
+                obj_state = await deps.objective_state_loader()
+                objective_context = state_to_context(obj_state).model_dump_for_hash()
+            except Exception:
+                objective_context = None
         context = await assemble_role_context(
             deps,
             agent_role=AgentRole.POSITION_THESIS,
@@ -81,10 +90,12 @@ def build_position_graph(deps: CognitiveGraphDeps):
             option_surface_slice=surface_slice,
             order_projection=order_projection,
             position_projection=position_projection,
+            objective_context=objective_context,
         )
         return {
             "cycle_id": cycle_id,
             "_context_package": context,
+            "_objective_context": objective_context,
             "_position_projection": position_projection,
             "_order_projection": order_projection,
             "_trading_date": snapshot.trading_date.isoformat(),
@@ -265,6 +276,7 @@ def build_position_graph(deps: CognitiveGraphDeps):
             option_surface_slice=surface_slice,
             order_projection=state.get("_order_projection"),  # type: ignore[arg-type]
             position_projection=state.get("_position_projection"),  # type: ignore[arg-type]
+            objective_context=state.get("_objective_context"),
             session_artifact_summaries=(
                 {
                     "critic_notes": state.get("_position_critic_notes"),

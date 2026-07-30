@@ -495,6 +495,14 @@ def _evaluate_entry_invariants(
         elif inv == "narrow_overfit_rejected":
             if graph_completed and "narrow_overfit_rejected" in findings_set:
                 satisfied.append(inv)
+        elif inv == "objective_invariant":
+            # Goal-driven corpus: never exceed authorised capital; honour expect_no_trade.
+            capital_ok = "authorised_capital_exceeded" not in failed_out
+            if fixture.stimulus.get("expect_no_trade"):
+                if graph_completed and not entry_submitted and capital_ok:
+                    satisfied.append(inv)
+            elif graph_completed and capital_ok:
+                satisfied.append(inv)
         # Deliberately no catch-all: expected labels must match concrete observations.
 
     return tuple(dict.fromkeys(satisfied)), tuple(dict.fromkeys(failed_out))

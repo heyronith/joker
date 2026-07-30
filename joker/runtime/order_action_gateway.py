@@ -348,6 +348,22 @@ class OrderActionGateway:
         } and self._deps.objective_service is not None:
             try:
                 obj_state = await self._deps.objective_service.get_state()
+                if (
+                    obj_state.status == "deadline_reached"
+                    or obj_state.entries_paused
+                    or obj_state.feasibility_classification == "infeasible"
+                    or obj_state.time_remaining_seconds <= 0
+                ):
+                    return OrderActionResult(
+                        submitted=False,
+                        client_order_id=request.client_order_id,
+                        blocked_reason=(
+                            f"objective_gate:{obj_state.status}:"
+                            f"paused={obj_state.entries_paused}:"
+                            f"feasibility={obj_state.feasibility_classification}"
+                        ),
+                        working_orders=working,
+                    )
                 premium = Decimal(str(command.intent.limit_price or 0)) * Decimal("100") * Decimal(
                     int(command.intent.quantity)
                 )

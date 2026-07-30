@@ -297,6 +297,30 @@ def _build_fixture(scenario_id: str) -> AdversarialFixture:
         key = "full_replay_regime" if scenario_id == "adv_23" else "full_replay_calibration"
         stimulus[key] = True
         stimulus["full_replay_exit"] = True
+    elif scenario_id.startswith("adv_obj_"):
+        frames = [
+            _frame(scenario_id=scenario_id, index=0, contracts=(valid,)),
+            _frame(scenario_id=scenario_id, index=1, contracts=(valid,)),
+        ]
+        stimulus["objective_scenario"] = True
+        stimulus["objective_scenario_id"] = scenario_id
+        # Most objective adversarial cases must not submit oversized/unsafe entries.
+        no_trade_ids = {
+            "adv_obj_01",
+            "adv_obj_02",
+            "adv_obj_06",
+            "adv_obj_07",
+            "adv_obj_08",
+            "adv_obj_13",
+            "adv_obj_14",
+            "adv_obj_15",
+            "adv_obj_17",
+            "adv_obj_19",
+            "adv_obj_20",
+        }
+        if scenario_id in no_trade_ids:
+            stimulus["expect_no_trade"] = True
+        stimulus["expect_capital_respected"] = True
     else:
         frames = [
             _frame(scenario_id=scenario_id, index=0, contracts=(valid,)),

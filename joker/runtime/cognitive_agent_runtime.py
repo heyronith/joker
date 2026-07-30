@@ -833,11 +833,81 @@ class CognitiveAgentRuntime:
                 logger.warning("latest_snapshot_lookup_failed", extra={"error": str(exc)})
         return payload
 
+    async def _sync_objective_reservation(
+        self, event: DomainEvent, *, client_order_id: str
+    ) -> None:
+        """Convert/release capital reservations from verified order lifecycle events."""
+        svc = self._deps.objective_service
+        if svc is None or not client_order_id:
+            return
+        try:
+            if event.event_type == EventType.ORDER_REJECTED:
+                await svc.release_for_order(
+                    client_order_id=client_order_id, reason="rejected"
+                )
+            elif event.event_type == EventType.ORDER_CANCELLED:
+                await svc.release_for_order(
+                    client_order_id=client_order_id, reason="cancelled"
+                )
+            elif event.event_type == EventType.ORDER_PARTIALLY_FILLED:
+                payload = dict(event.payload)
+                remaining = payload.get("remaining_premium_usd")
+                await svc.record_verified_outcome(
+                    client_order_id=client_order_id,
+                    convert_reservation=True,
+                    partial_reserved_usd=remaining,
+                )
+            elif event.event_type == EventType.ORDER_FILLED:
+                await svc.record_verified_outcome(
+                    client_order_id=client_order_id,
+                    convert_reservation=True,
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "objective_reservation_sync_failed",
+                extra={
+                    "client_order_id": client_order_id,
+                    "event_type": event.event_type.value,
+                    "error": str(exc),
+                },
+            )
+
+    async def _sync_objective_on_position_closed(self, event: DomainEvent) -> None:
+        """Update realised PnL / open count when a position fully closes."""
+        svc = self._deps.objective_service
+        if svc is None:
+            return
+        payload = dict(event.payload)
+        client_order_id = str(payload.get("client_order_id") or "") or None
+        pnl_delta = payload.get("realized_pnl") or payload.get("realised_pnl_usd") or 0
+        open_count = None
+        if self._deps.projection_loader is not None:
+            try:
+                projection = await self._deps.projection_loader()
+                if projection is not None:
+                    open_ids = await self._open_position_contract_ids()
+                    open_count = len(open_ids)
+            except Exception:
+                open_count = None
+        try:
+            await svc.record_verified_outcome(
+                client_order_id=client_order_id,
+                realised_pnl_delta_usd=pnl_delta,
+                convert_reservation=bool(client_order_id),
+                open_position_count=open_count,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "objective_position_close_sync_failed",
+                extra={"error": str(exc)},
+            )
+
     async def _run_position_work(self, event: DomainEvent) -> None:
         if not self._config.position.enabled:
             return
         assert self._position_graph is not None
         if event.event_type == EventType.POSITION_CLOSED:
+            await self._sync_objective_on_position_closed(event)
             return
         resolved = await self._resolve_provenance(event)
         position_id = str(
@@ -994,6 +1064,7 @@ class CognitiveAgentRuntime:
         client_order_id = str(resolved.get("client_order_id") or "")
         if not client_order_id:
             return
+        await self._sync_objective_reservation(event, client_order_id=client_order_id)
         snapshot_id = str(
             resolved.get("snapshot_id")
             or resolved.get("market_snapshot_id")
@@ -1039,6 +1110,15 @@ class CognitiveAgentRuntime:
                 snapshot, data_quality, _surface, surface_slice = await load_snapshot_truth(
                     self._deps, snapshot_id
                 )
+                objective_context = None
+                if self._deps.objective_state_loader is not None:
+                    try:
+                        from joker.objectives.schemas import state_to_context
+
+                        obj_state = await self._deps.objective_state_loader()
+                        objective_context = state_to_context(obj_state).model_dump_for_hash()
+                    except Exception:
+                        objective_context = None
                 context = await assemble_role_context(
                     self._deps,
                     agent_role=AgentRole.ORDER_MANAGER,
@@ -1052,6 +1132,7 @@ class CognitiveAgentRuntime:
                         for k, v in order_projection.items()
                         if not str(k).startswith("_")
                     },
+                    objective_context=objective_context,
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.warning("order_context_failed", extra={"error": str(exc)})
