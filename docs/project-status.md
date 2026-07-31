@@ -9,7 +9,7 @@
 | Current phase | historical EV integration and execution repricing (local green; tip CI pending) |
 | Current branch | `task3-agent-evolution` |
 | Baseline commit (pre-phase) | `a27b2ae826afc4fa09ba79e30d08b1adb89aad65` |
-| Tip commit (this phase) | *(set after commit)* |
+| Tip commit (this phase) | `d7de93a89d33f77eabad9a1185ecd0f9e08e1ea8` |
 | Latest verified CI run (baseline) | `30575743238` |
 | Latest verified CI run (tip) | *(set after CI)* |
 | Local Python 3.12 | 781 passed ×3 (`ResourceWarning` as error) |
