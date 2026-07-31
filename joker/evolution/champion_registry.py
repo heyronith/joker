@@ -38,6 +38,8 @@ class ChampionRegistry:
         return self._configs
 
     async def initialize(self) -> None:
+        if self._initialized:
+            return
         apply_task3_migrations(self._db_path)
         await self._configs.initialize()
         await self._policies.initialize()

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from decimal import Decimal, InvalidOperation
 from typing import Any, Sequence
 from uuid import UUID
 
@@ -120,6 +121,20 @@ def validate_meta_decision(
                 raise CognitiveValidationError(
                     "no valid trade objective scores; must abandon/no-trade"
                 )
+            # No-trade outranks when it has strictly better supported objective value.
+            sel_ev = selected.get("expected_value_usd")
+            nt_ev = no_trade.get("expected_value_usd")
+            try:
+                if (
+                    sel_ev is not None
+                    and nt_ev is not None
+                    and Decimal(str(nt_ev)) > Decimal(str(sel_ev))
+                ):
+                    raise CognitiveValidationError(
+                        "no-trade has strictly better supported objective value"
+                    )
+            except (InvalidOperation, TypeError, ValueError):
+                pass
 
 
 async def run_meta_decision(

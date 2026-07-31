@@ -44,6 +44,54 @@ class ObjectiveSizingSettings(BaseModel):
         return value
 
 
+class HistoricalOutcomeSettings(BaseModel):
+    """Factual Task-3 historical analogue / EV eligibility thresholds."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    minimum_samples_for_ev: int = 20
+    maximum_samples: int = 200
+    minimum_similarity: float = 0.65
+    minimum_effective_sample_size: float = 15.0
+    maximum_episode_age_days: int = 90
+    confidence_level: float = 0.95
+    require_lower_confidence_bound_positive: bool = True
+    require_same_strategy_family: bool = True
+    use_similarity_weighting: bool = True
+    estimate_ttl_seconds: int = 300
+    max_premium_change_pct_for_repricing: float = 25.0
+
+    @field_validator(
+        "minimum_samples_for_ev", "maximum_samples", "maximum_episode_age_days"
+    )
+    @classmethod
+    def _pos_int(cls, value: int) -> int:
+        if value < 1:
+            raise ValueError("must be >= 1")
+        return value
+
+    @field_validator("minimum_similarity", "confidence_level")
+    @classmethod
+    def _unit(cls, value: float) -> float:
+        if not 0 < value <= 1:
+            raise ValueError("must be in (0, 1]")
+        return value
+
+
+class ExplorationModeSettings(BaseModel):
+    """Operator-approved research exploration — disabled by default."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    operator_confirmation_required: bool = True
+    paper_only: bool = True
+    maximum_capital_usd: float = 25.0
+    maximum_concurrent_positions: int = 1
+    maximum_trades_per_session: int = 1
+    require_complete_truth: bool = True
+
+
 class ObjectiveSettings(BaseModel):
     """Session objective gates — no default capital/target/deadline that silently arms."""
 
@@ -66,6 +114,12 @@ class ObjectiveSettings(BaseModel):
         default_factory=ObjectiveFeasibilitySettings
     )
     sizing: ObjectiveSizingSettings = Field(default_factory=ObjectiveSizingSettings)
+    historical_outcomes: HistoricalOutcomeSettings = Field(
+        default_factory=HistoricalOutcomeSettings
+    )
+    exploration: ExplorationModeSettings = Field(
+        default_factory=ExplorationModeSettings
+    )
     operator_event_capacity: int = 256
 
     @field_validator("minimum_win_probability")

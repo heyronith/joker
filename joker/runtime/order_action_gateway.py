@@ -334,6 +334,21 @@ class OrderActionGateway:
                 working_orders=working,
             )
 
+        # Kill switch is stronger than objective approval — block new risk only.
+        # Checked before REPLACE cancel so we never tear down a working order first.
+        if request.action in {
+            OrderActionKind.ENTRY,
+            OrderActionKind.PROBE,
+            OrderActionKind.ADD,
+            OrderActionKind.REPLACE,
+        } and bool(getattr(self._deps, "kill_switch", False)):
+            return OrderActionResult(
+                submitted=False,
+                client_order_id=request.client_order_id,
+                blocked_reason="KILL_SWITCH",
+                working_orders=working,
+            )
+
         if request.action == OrderActionKind.REPLACE:
             assert request.replace_of_client_order_id
             await self._deps.execution_runtime.cancel_order(
@@ -350,12 +365,17 @@ class OrderActionGateway:
             try:
                 obj_state = await self._deps.objective_service.get_state()
                 if (
-                    obj_state.status == "deadline_reached"
+                    obj_state.status
+                    in {
+                        "deadline_reached",
+                        "truth_degraded",
+                        "insufficient_historical_evidence",
+                        "pending_confirmation",
+                    }
                     or obj_state.entries_paused
                     or obj_state.feasibility_classification == "infeasible"
                     or obj_state.time_remaining_seconds <= 0
                     or getattr(obj_state, "truth_degraded", False)
-                    or obj_state.status == "truth_degraded"
                 ):
                     return OrderActionResult(
                         submitted=False,
@@ -367,13 +387,13 @@ class OrderActionGateway:
                         ),
                         working_orders=working,
                     )
-                # Reload persisted estimate and revalidate EV against current quote.
+                # Reload persisted estimate / historical summary; reprice vs current quote.
+                svc = self._deps.objective_service
                 estimate = None
-                repo = getattr(self._deps.objective_service, "_repo", None)
-                if repo is not None and request.estimate_id:
-                    estimate = repo.get_strategy_estimate(request.estimate_id)
-                elif repo is not None and request.strategy_id:
-                    estimate = repo.get_latest_estimate_for_strategy(
+                if request.estimate_id:
+                    estimate = svc.get_strategy_estimate(request.estimate_id)
+                elif request.strategy_id:
+                    estimate = svc.get_latest_estimate_for_strategy(
                         strategy_id=request.strategy_id,
                         objective_id=obj_state.objective_id,
                     )
@@ -400,29 +420,68 @@ class OrderActionGateway:
                         blocked_reason="objective_estimate_wrong_strategy",
                         working_orders=working,
                     )
-                if str(estimate.snapshot_id) != str(request.snapshot_id):
-                    # Still allow if EV remains positive after current quote repricing.
-                    pass
+                if estimate.historical_summary_id is not None:
+                    summary = svc.get_historical_summary(estimate.historical_summary_id)
+                    if summary is None or not summary.valid_for_ev:
+                        return OrderActionResult(
+                            submitted=False,
+                            client_order_id=request.client_order_id,
+                            blocked_reason="objective_historical_summary_invalid",
+                            working_orders=working,
+                        )
                 premium_per = Decimal(str(command.intent.limit_price or 0))
                 qty = int(command.intent.quantity)
-                # Reprice EV: without calibrated samples EV stays as stored; reject if None/<=0.
                 require_ev = bool(
-                    getattr(
-                        self._deps.objective_service,
-                        "require_positive_expected_value",
-                        True,
-                    )
+                    getattr(svc, "require_positive_expected_value", True)
                 )
-                ev = estimate.expected_value_usd
-                if require_ev and (ev is None or ev <= 0):
+                hist_settings = getattr(
+                    self._deps, "historical_outcome_settings", None
+                )
+                max_change = Decimal("25")
+                if hist_settings is not None:
+                    max_change = Decimal(
+                        str(hist_settings.max_premium_change_pct_for_repricing)
+                    )
+                from joker.objectives.repricing import reprice_long_option_estimate
+
+                # Snapshot mismatch forces explicit repricing (never a silent pass).
+                if str(estimate.snapshot_id) != str(request.snapshot_id):
+                    if estimate.expected_value_usd is None:
+                        return OrderActionResult(
+                            submitted=False,
+                            client_order_id=request.client_order_id,
+                            blocked_reason="objective_estimate_snapshot_mismatch",
+                            working_orders=working,
+                        )
+                repriced = reprice_long_option_estimate(
+                    estimate,
+                    current_premium_per_contract_usd=premium_per,
+                    quantity=qty,
+                    request_snapshot_id=request.snapshot_id,
+                    max_premium_change_pct=max_change,
+                )
+                ev = repriced.repriced_expected_value_usd
+                if require_ev and (ev is None or ev <= 0 or not repriced.valid):
                     return OrderActionResult(
                         submitted=False,
                         client_order_id=request.client_order_id,
-                        blocked_reason="objective_ev_not_positive",
+                        blocked_reason=(
+                            "objective_repriced_ev_not_positive:"
+                            + ",".join(repriced.invalidation_reasons)
+                        ),
                         working_orders=working,
                     )
+                # ADD must use incremental capital only (quantity on the command).
+                if request.action == OrderActionKind.ADD and require_ev:
+                    if ev is None or ev <= 0:
+                        return OrderActionResult(
+                            submitted=False,
+                            client_order_id=request.client_order_id,
+                            blocked_reason="objective_incremental_add_ev_not_positive",
+                            working_orders=working,
+                        )
                 premium = premium_per * Decimal("100") * Decimal(qty)
-                await self._deps.objective_service.reserve_for_order(
+                await svc.reserve_for_order(
                     client_order_id=command.client_order_id,
                     premium_per_contract_usd=premium_per,
                     quantity=qty,
@@ -782,6 +841,7 @@ def provenanced_to_action_request(
         proposal_id=provenanced.proposal_id,
         decision_id=provenanced.decision_id,
         strategy_id=provenanced.strategy_id,
+        estimate_id=getattr(provenanced, "estimate_id", None),
         cycle_id=provenanced.cycle_id,
         evidence_ids=provenanced.evidence_ids,
         broker_account_id=cmd.broker_account_id,

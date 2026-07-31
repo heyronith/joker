@@ -90,6 +90,7 @@ ObjectiveStatus = Literal[
     "paused",
     "stopped_by_user",
     "truth_degraded",
+    "insufficient_historical_evidence",
 ]
 
 FeasibilityClassification = Literal[
@@ -363,12 +364,28 @@ class StrategyObjectiveEstimate(BaseModel):
     valid: bool = True
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
+    # Historical-EV provenance (reproducible from persisted inputs)
+    historical_query_id: UUID | None = None
+    historical_summary_id: UUID | None = None
+    comparable_episode_ids: tuple[UUID, ...] = ()
+    evaluation_ids: tuple[UUID, ...] = ()
+    similarity_policy_version: str | None = None
+    sample_count: int = 0
+    effective_sample_size: Decimal | None = None
+    average_similarity: Decimal | None = None
+    lower_confidence_bound_ev_usd: Decimal | None = None
+    estimate_version: str = "1.0.0"
+    valid_until: datetime | None = None
+
     @field_validator(
         "expected_value_usd",
         "estimated_win_probability",
         "estimated_payoff_ratio",
         "capital_required_usd",
         "maximum_loss_usd",
+        "effective_sample_size",
+        "average_similarity",
+        "lower_confidence_bound_ev_usd",
         mode="before",
     )
     @classmethod
@@ -376,6 +393,15 @@ class StrategyObjectiveEstimate(BaseModel):
         if value is None:
             return None
         return _money(value)  # type: ignore[arg-type]
+
+    @field_validator("created_at", "valid_until")
+    @classmethod
+    def _aware_est(cls, value: datetime | None) -> datetime | None:
+        if value is None:
+            return None
+        if value.tzinfo is None:
+            raise ValueError("timestamps must be timezone-aware")
+        return value
 
 
 class ObjectiveStrategyScore(BaseModel):

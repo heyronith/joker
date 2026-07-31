@@ -37,6 +37,7 @@ class ProvenancedExecutionCommand:
     cycle_id: str
     evidence_ids: tuple[str, ...]
     max_quote_age_seconds: int | None = 3600
+    estimate_id: str | None = None
 
 
 @dataclass(frozen=True)

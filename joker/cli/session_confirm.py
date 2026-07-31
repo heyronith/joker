@@ -309,6 +309,37 @@ def build_objective_engines(app_settings: AppSettings) -> dict[str, Any]:
     """Construct feasibility/scorer/sizer from settings for graph deps."""
     obj = app_settings.objective
     capital = app_settings.capital
+    from joker.objectives.historical_outcomes import HistoricalOutcomeService
+
+    hist_settings = obj.historical_outcomes
+    # Production wiring attaches Task-3 episode repos when evolution DB is available.
+    # Until then the service fails closed (zero samples → EV unavailable).
+    historical_service = HistoricalOutcomeService(
+        settings=hist_settings,
+        repository=None,
+    )
+    evolution_db = getattr(app_settings, "evolution_db_path", None) or getattr(
+        getattr(app_settings, "evolution", None), "db_path", None
+    )
+    if evolution_db is not None:
+        try:
+            from pathlib import Path
+
+            from joker.evolution.repositories import build_evolution_repositories
+            from joker.objectives.historical_outcomes import (
+                build_historical_outcome_service_from_evolution_repos,
+            )
+
+            repos = build_evolution_repositories(Path(evolution_db))
+            historical_service = build_historical_outcome_service_from_evolution_repos(
+                episode_repo=repos["episodes"],
+                evaluation_repo=repos["evaluations"],
+                settings=hist_settings,
+            )
+        except Exception:
+            # Fail closed: keep empty loader rather than inventing samples.
+            historical_service = HistoricalOutcomeService(settings=hist_settings)
+
     return {
         "feasibility_engine": GoalFeasibilityEngine(
             minimum_samples_for_numeric_probability=int(
@@ -335,4 +366,6 @@ def build_objective_engines(app_settings: AppSettings) -> dict[str, Any]:
             behind_goal_boost=float(capital.behind_goal_boost),
             ahead_goal_dampen=float(capital.ahead_goal_dampen),
         ),
+        "historical_outcome_service": historical_service,
+        "historical_outcome_settings": hist_settings,
     }

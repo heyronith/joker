@@ -22,6 +22,7 @@ from joker.evolution.schemas import CognitiveConfigurationVersion, TradingEpisod
 from joker.evolution.telemetry import (
     aggregate_model_call_telemetry,
     extract_confidence_outcome_pairs,
+    resolve_calibration_outcome,
 )
 from joker.graph.cognitive_graph import build_cognitive_graph, initial_cycle_state
 from joker.graph.graph_deps import CognitiveGraphDeps
@@ -29,6 +30,40 @@ from joker.graph.langgraph_checkpointer import ainvoke_config
 from joker.graph.position_graph import build_position_graph
 from joker.models.router import ModelRouter
 from joker.runtime.order_action_gateway import OrderActionKind, OrderActionRequest
+
+
+def _calibration_pairs_for_replay(
+    *,
+    episode: TradingEpisode,
+    meta_confidence: Decimal | None,
+    traded: bool,
+    realised_pnl: Decimal | None,
+) -> list[tuple[Decimal, int]]:
+    """Build calibration pairs without inventing losses for non-outcomes."""
+    pairs = extract_confidence_outcome_pairs(
+        meta_confidence=meta_confidence,
+        traded=traded,
+        realised_pnl=realised_pnl,
+    )
+    if pairs:
+        return pairs
+    # Authoritative paper episode outcome when this sample could not re-trade.
+    if (
+        meta_confidence is not None
+        and episode.completed
+        and episode.action_class == "closed_trade"
+        and episode.realised_pnl is not None
+    ):
+        resolution = resolve_calibration_outcome(
+            episode_id=episode.episode_id,
+            meta_confidence=meta_confidence,
+            traded=True,
+            realised_pnl=Decimal(str(episode.realised_pnl)),
+            complete=True,
+        )
+        if resolution.included and resolution.outcome is not None:
+            return [(meta_confidence, int(resolution.outcome))]
+    return []
 
 
 def _proposal_contract_id(proposal: Any) -> str | None:
@@ -409,10 +444,11 @@ class CognitiveReplayService:
                         conf_dec = None
                 traded = bool(prior.get("entry_order_id"))
                 pnl = prior.get("realised_pnl") or execution.realised_pnl()
-                cal_pairs = extract_confidence_outcome_pairs(
+                cal_pairs = _calibration_pairs_for_replay(
+                    episode=episode,
                     meta_confidence=conf_dec,
                     traded=traded,
-                    realised_pnl=Decimal(str(pnl)),
+                    realised_pnl=Decimal(str(pnl)) if pnl is not None else None,
                 )
                 calibration_sample_ids = tuple(
                     f"{experiment_id}:{episode.episode_id}:{configuration_version_id}"
@@ -880,7 +916,8 @@ class CognitiveReplayService:
                 conf_dec = Decimal(str(confidence))
             except Exception:
                 conf_dec = None
-        cal_pairs = extract_confidence_outcome_pairs(
+        cal_pairs = _calibration_pairs_for_replay(
+            episode=episode,
             meta_confidence=conf_dec,
             traded=traded,
             realised_pnl=pnl,

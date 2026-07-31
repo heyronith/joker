@@ -85,6 +85,10 @@ class CognitiveGraphDeps:
     feasibility_engine: Any | None = None
     objective_strategy_scorer: Any | None = None
     capital_sizer: Any | None = None
+    historical_outcome_service: Any | None = None
+    historical_outcome_settings: Any | None = None
+    # Risk kill switch — stronger than objective approval for ENTRY/PROBE/ADD.
+    kill_switch: bool = False
 
     def limits_dict(self) -> dict[str, int]:
         return {
@@ -109,6 +113,8 @@ class CognitiveGraphDeps:
             missing.append("objective_strategy_scorer")
         if self.capital_sizer is None:
             missing.append("capital_sizer")
+        if self.historical_outcome_service is None:
+            missing.append("historical_outcome_service")
         if missing:
             raise RuntimeError(
                 "objective-enabled production path missing CognitiveGraphDeps: "

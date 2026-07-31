@@ -94,3 +94,22 @@ def test_observed_confidence_yields_real_pair() -> None:
         realised_pnl=Decimal("10"),
     )
     assert pairs == [(Decimal("0.7"), 1)]
+
+
+def test_missing_outcome_creates_no_calibration_sample() -> None:
+    assert (
+        extract_confidence_outcome_pairs(
+            meta_confidence=Decimal("0.8"),
+            traded=False,
+            realised_pnl=None,
+        )
+        == []
+    )
+    assert (
+        extract_confidence_outcome_pairs(
+            meta_confidence=Decimal("0.8"),
+            traded=True,
+            realised_pnl=None,
+        )
+        == []
+    )

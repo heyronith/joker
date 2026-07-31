@@ -69,6 +69,9 @@ class DeterministicObjectiveSizer:
             "deadline_reached",
             "capital_exhausted",
             "stopped_by_user",
+            "insufficient_historical_evidence",
+            "truth_degraded",
+            "pending_confirmation",
         }:
             reasons.append(f"status_blocks_sizing:{state.status}")
             return self._reject(

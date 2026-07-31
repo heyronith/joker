@@ -202,3 +202,20 @@ objective:
     max_capital_fraction: 0.85
     max_probe_fraction: 0.15
     prohibit_loss_multiplier: true
+  historical_outcomes:
+    minimum_samples_for_ev: 20
+    maximum_samples: 200
+    minimum_similarity: 0.65
+    minimum_effective_sample_size: 15
+    maximum_episode_age_days: 90
+    confidence_level: 0.95
+    require_lower_confidence_bound_positive: true
+    require_same_strategy_family: true
+  exploration:
+    enabled: false
+    operator_confirmation_required: true
+    paper_only: true
+    maximum_capital_usd: 25
+    maximum_concurrent_positions: 1
+    maximum_trades_per_session: 1
+    require_complete_truth: true

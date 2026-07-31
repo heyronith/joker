@@ -331,6 +331,8 @@ class LivePaperRunner:
             objective_strategy_scorer = None
             capital_sizer = None
             objective_state_loader = None
+            historical_outcome_service = None
+            historical_outcome_settings = None
             if objective_service is not None:
                 from joker.cli.session_confirm import build_objective_engines
 
@@ -338,6 +340,12 @@ class LivePaperRunner:
                 feasibility_engine = engines["feasibility_engine"]
                 objective_strategy_scorer = engines["objective_strategy_scorer"]
                 capital_sizer = engines["capital_sizer"]
+                historical_outcome_service = engines["historical_outcome_service"]
+                historical_outcome_settings = engines["historical_outcome_settings"]
+                # Persist historical queries/summaries beside objective capital truth.
+                hist_repo = getattr(objective_service, "_repo", None)
+                if hist_repo is not None and historical_outcome_service is not None:
+                    historical_outcome_service._repo = hist_repo  # noqa: SLF001
 
                 async def _objective_state_loader():
                     return await objective_service.get_state()
@@ -360,6 +368,9 @@ class LivePaperRunner:
                 feasibility_engine=feasibility_engine,
                 objective_strategy_scorer=objective_strategy_scorer,
                 capital_sizer=capital_sizer,
+                historical_outcome_service=historical_outcome_service,
+                historical_outcome_settings=historical_outcome_settings,
+                kill_switch=bool(self.app_settings.risk.kill_switch),
                 **repos,
             )
             if (

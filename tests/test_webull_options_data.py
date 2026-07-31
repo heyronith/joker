@@ -315,7 +315,10 @@ def test_diagnostics_summarize_unavailable_fields() -> None:
 
 
 def test_options_snapshot_capture_writes_safe_jsonl(tmp_path: Path) -> None:
-    exp = date.today()
+    # Align seeded expiry with provider.market_today() (America/New_York).
+    from joker.data.webull_options_provider import MARKET_TZ
+
+    exp = datetime.now(MARKET_TZ).date()
     call_c = _contract(550, "call", "c550", exp)
     put_c = _contract(550, "put", "p550", exp)
     api = _mock_options_api([call_c, put_c], {"c550": _snapshot(call_c), "p550": _snapshot(put_c)})

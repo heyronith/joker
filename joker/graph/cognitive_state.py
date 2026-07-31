@@ -78,6 +78,9 @@ class CognitiveGraphState(TypedDict, total=False):
     _feasibility_inputs: dict | None
     _strategy_scores: list | None
     _strategy_estimates: list | None
+    _historical_summaries: list | None
+    _historical_sample_count: int | None
+    _historical_minimum_required: int | None
     _no_valid_strategy: bool
     _sizing_decision: dict | None
     _objective_context: dict | None

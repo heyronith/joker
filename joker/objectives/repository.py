@@ -10,6 +10,11 @@ from pathlib import Path
 from typing import Any, Literal
 from uuid import UUID
 
+from joker.objectives.historical_schemas import (
+    HistoricalLeakageReport,
+    HistoricalOutcomeQuery,
+    HistoricalOutcomeSummary,
+)
 from joker.objectives.schemas import (
     CapitalExposure,
     GoalFeasibilityAssessment,
@@ -139,6 +144,38 @@ CREATE TABLE IF NOT EXISTS objective_projection_dedupe (
 );
 CREATE INDEX IF NOT EXISTS idx_obj_dedupe_objective
     ON objective_projection_dedupe (objective_id, created_at);
+
+CREATE TABLE IF NOT EXISTS objective_historical_queries (
+    query_id TEXT PRIMARY KEY NOT NULL,
+    objective_id TEXT NOT NULL,
+    strategy_id TEXT NOT NULL,
+    snapshot_id TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_obj_hist_query_strategy
+    ON objective_historical_queries (strategy_id, snapshot_id);
+
+CREATE TABLE IF NOT EXISTS objective_historical_summaries (
+    summary_id TEXT PRIMARY KEY NOT NULL,
+    query_id TEXT NOT NULL,
+    strategy_id TEXT NOT NULL,
+    snapshot_id TEXT NOT NULL,
+    valid_for_ev INTEGER NOT NULL,
+    payload_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_obj_hist_summary_query
+    ON objective_historical_summaries (query_id);
+CREATE INDEX IF NOT EXISTS idx_obj_hist_summary_strategy
+    ON objective_historical_summaries (strategy_id, snapshot_id);
+
+CREATE TABLE IF NOT EXISTS objective_historical_leakage_reports (
+    query_id TEXT PRIMARY KEY NOT NULL,
+    safe INTEGER NOT NULL,
+    payload_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
 """
 
 _ENCUMBERING_STATUSES = (
@@ -530,6 +567,104 @@ class ObjectiveRepository:
         if row is None:
             return None
         return StrategyObjectiveEstimate.model_validate_json(row["payload_json"])
+
+    def save_historical_query(self, query: HistoricalOutcomeQuery) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO objective_historical_queries (
+                    query_id, objective_id, strategy_id, snapshot_id,
+                    payload_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(query.query_id),
+                    str(query.objective_id),
+                    str(query.strategy_id),
+                    str(query.snapshot_id),
+                    _dumps(query),
+                    query.created_at.isoformat(),
+                ),
+            )
+            conn.commit()
+
+    def get_historical_query(
+        self, query_id: UUID | str
+    ) -> HistoricalOutcomeQuery | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT payload_json FROM objective_historical_queries WHERE query_id=?",
+                (str(query_id),),
+            ).fetchone()
+        if row is None:
+            return None
+        return HistoricalOutcomeQuery.model_validate_json(row["payload_json"])
+
+    def save_historical_summary(self, summary: HistoricalOutcomeSummary) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO objective_historical_summaries (
+                    summary_id, query_id, strategy_id, snapshot_id, valid_for_ev,
+                    payload_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(summary.summary_id),
+                    str(summary.query_id),
+                    str(summary.strategy_id),
+                    str(summary.snapshot_id),
+                    1 if summary.valid_for_ev else 0,
+                    _dumps(summary),
+                    summary.created_at.isoformat(),
+                ),
+            )
+            conn.commit()
+
+    def get_historical_summary(
+        self, summary_id: UUID | str
+    ) -> HistoricalOutcomeSummary | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT payload_json FROM objective_historical_summaries WHERE summary_id=?",
+                (str(summary_id),),
+            ).fetchone()
+        if row is None:
+            return None
+        return HistoricalOutcomeSummary.model_validate_json(row["payload_json"])
+
+    def get_latest_historical_summary_for_strategy(
+        self, *, strategy_id: UUID | str, snapshot_id: UUID | str
+    ) -> HistoricalOutcomeSummary | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT payload_json FROM objective_historical_summaries
+                WHERE strategy_id=? AND snapshot_id=?
+                ORDER BY created_at DESC LIMIT 1
+                """,
+                (str(strategy_id), str(snapshot_id)),
+            ).fetchone()
+        if row is None:
+            return None
+        return HistoricalOutcomeSummary.model_validate_json(row["payload_json"])
+
+    def save_leakage_report(self, report: HistoricalLeakageReport) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO objective_historical_leakage_reports (
+                    query_id, safe, payload_json, created_at
+                ) VALUES (?, ?, ?, ?)
+                """,
+                (
+                    str(report.query_id),
+                    1 if report.safe else 0,
+                    _dumps(report),
+                    datetime.now().astimezone().isoformat(),
+                ),
+            )
+            conn.commit()
 
     def append_audit(
         self,

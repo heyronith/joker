@@ -1154,3 +1154,70 @@ class SessionObjectiveService:
             },
         )
         return updated
+
+    # ------------------------------------------------------------------
+    # Public persistence API (graph nodes must not touch _repo)
+    # ------------------------------------------------------------------
+
+    def save_feasibility(self, assessment: Any) -> None:
+        self._repo.save_feasibility(assessment)
+
+    def save_strategy_estimate(self, estimate: Any) -> None:
+        self._repo.save_strategy_estimate(estimate)
+
+    def save_strategy_score(self, score: Any) -> None:
+        self._repo.save_strategy_score(score)
+
+    def get_strategy_estimate(self, estimate_id: UUID | str) -> Any | None:
+        return self._repo.get_strategy_estimate(estimate_id)
+
+    def get_latest_estimate_for_strategy(
+        self, *, strategy_id: UUID | str, objective_id: UUID | str
+    ) -> Any | None:
+        return self._repo.get_latest_estimate_for_strategy(
+            strategy_id=strategy_id, objective_id=objective_id
+        )
+
+    def get_historical_summary(self, summary_id: UUID | str) -> Any | None:
+        return self._repo.get_historical_summary(summary_id)
+
+    def get_latest_historical_summary_for_strategy(
+        self, *, strategy_id: UUID | str, snapshot_id: UUID | str
+    ) -> Any | None:
+        return self._repo.get_latest_historical_summary_for_strategy(
+            strategy_id=strategy_id, snapshot_id=snapshot_id
+        )
+
+    async def mark_insufficient_historical_evidence(
+        self, *, sample_count: int, minimum_required: int
+    ) -> SessionObjectiveState:
+        """Cold-start: keep observing; block ENTRY/PROBE/ADD until evidence exists."""
+        state = await self.get_state()
+        if state.status in {
+            "pending_confirmation",
+            "deadline_reached",
+            "stopped_by_user",
+            "truth_degraded",
+            "target_reached",
+            "capital_exhausted",
+        }:
+            return state
+        updated = state.model_copy(
+            update={
+                "status": "insufficient_historical_evidence",
+                "version": state.version + 1,
+                "last_recomputed_at": datetime.now(timezone.utc),
+            }
+        )
+        self._repo.append_state(updated)
+        self._emit(
+            ObjectiveOperatorEventType.FEASIBILITY_ASSESSED,
+            objective_id=updated.objective_id,
+            session_id=updated.session_id,
+            reason_codes=("insufficient_historical_evidence",),
+            after={
+                "sample_count": sample_count,
+                "minimum_required": minimum_required,
+            },
+        )
+        return updated

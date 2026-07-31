@@ -65,6 +65,9 @@ class ReplayEpisodeTruth(BaseModel):
     # Deprecated — production path uses frames; kept for legacy unit tests only.
     contract_quotes: dict[str, dict[str, Any]] = Field(default_factory=dict)
     frames: tuple[Any, ...] = ()
+    # When False, entry+terminal diagnostic frames were used — not EV/promotion eligible.
+    authoritative_horizon_complete: bool = True
+    horizon_integrity_findings: tuple[str, ...] = ()
 
     def frame_quotes(self, index: int = 0) -> dict[str, dict[str, str]]:
         if self.frames:

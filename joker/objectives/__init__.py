@@ -2,6 +2,11 @@
 
 from joker.objectives.deadline import DeadlineParseError, resolve_deadline, time_remaining_seconds
 from joker.objectives.estimate import StrategyEstimateBuilder
+from joker.objectives.historical_outcomes import (
+    HistoricalOutcomeService,
+    build_historical_outcome_service_from_evolution_repos,
+)
+from joker.objectives.repricing import reprice_long_option_estimate
 from joker.objectives.events import (
     BoundedOperatorEventProjection,
     ObjectiveOperatorEvent,
@@ -48,6 +53,7 @@ __all__ = [
     "FeasibilityInputs",
     "GoalFeasibilityAssessment",
     "GoalFeasibilityEngine",
+    "HistoricalOutcomeService",
     "ObjectiveCapitalProjector",
     "ObjectiveContext",
     "ObjectiveOperatorEvent",
@@ -66,8 +72,10 @@ __all__ = [
     "apply_objective_migrations",
     "build_definition",
     "build_feasibility_inputs_from_truth",
+    "build_historical_outcome_service_from_evolution_repos",
     "make_objective_event",
     "premium_notional_usd",
+    "reprice_long_option_estimate",
     "resolve_deadline",
     "state_to_context",
     "subscribe_objective_projector",

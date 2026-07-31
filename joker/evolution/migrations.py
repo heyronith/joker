@@ -425,8 +425,10 @@ def apply_task3_migrations(db_path: str | Path) -> Path:
     """Apply Task 3 DDL to ``db_path`` (create-if-not-exists, idempotent)."""
     path = Path(db_path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(path)
+    # Allow brief contention with aiosqlite workers during parallel Task-3 startup.
+    conn = sqlite3.connect(path, timeout=30.0)
     try:
+        conn.execute("PRAGMA busy_timeout = 30000")
         conn.executescript(_TASK3_SCHEMA_SQL)
         conn.commit()
     finally:

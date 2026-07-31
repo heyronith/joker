@@ -473,6 +473,8 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
                 error_code="submit_validation_failed",
                 message=str(exc),
             )
+        from dataclasses import replace
+
         from joker.runtime.order_action_gateway import (
             OrderActionKind,
             ensure_order_action_gateway,
@@ -486,9 +488,12 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
                 if getattr(proposal, "action", None) == "probe"
                 else OrderActionKind.ENTRY
             )
-            gateway_result = await gateway.submit(
-                provenanced_to_action_request(provenanced, action=action)
-            )
+            action_request = provenanced_to_action_request(provenanced, action=action)
+            sizing = state.get("_sizing_decision") or {}
+            estimate_id = sizing.get("estimate_id")
+            if estimate_id:
+                action_request = replace(action_request, estimate_id=str(estimate_id))
+            gateway_result = await gateway.submit(action_request)
             if not gateway_result.submitted:
                 return append_error(
                     state,

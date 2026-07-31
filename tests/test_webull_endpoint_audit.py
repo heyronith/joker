@@ -188,7 +188,10 @@ def test_empty_option_snapshot_response_fails() -> None:
 
 
 def test_diagnostics_distinguish_unverified_vs_subscription() -> None:
-    exp = date.today()
+    # Align seeded expiry with diagnostics' America/New_York market day.
+    from joker.data.webull_options_provider import MARKET_TZ
+
+    exp = datetime.now(MARKET_TZ).date()
     call_id = build_osi_symbol("SPY", exp, 550, "call")
     put_id = build_osi_symbol("SPY", exp, 550, "put")
     call_c = _contract(550, "call", call_id, exp)

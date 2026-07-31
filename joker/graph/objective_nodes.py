@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any
 from uuid import UUID
@@ -24,6 +25,7 @@ _HARD_BLOCK_CODES = frozenset(
         "entries_paused",
         "objective_infeasible",
         "truth_degraded",
+        "insufficient_historical_evidence",
     }
 )
 
@@ -117,6 +119,17 @@ async def gate_objective_confirmed(
                 message="feasibility infeasible — no new entries",
             ),
         }
+    if obj_state.status == "insufficient_historical_evidence":
+        return {
+            "_block_new_entries": True,
+            "_meta_decision_override": "abandon",
+            **append_error(
+                state,
+                node_name="validate_trigger",
+                error_code="insufficient_historical_evidence",
+                message="cold-start: insufficient factual historical EV samples",
+            ),
+        }
     return None
 
 
@@ -146,8 +159,7 @@ async def assess_goal_feasibility_node(
         evidence_ids=evidence_ids,
     )
     assessment = deps.feasibility_engine.assess(obj_state, inputs)
-    if deps.objective_service._repo is not None:  # noqa: SLF001
-        deps.objective_service._repo.save_feasibility(assessment)
+    deps.objective_service.save_feasibility(assessment)
     await deps.objective_service.update_feasibility(
         classification=assessment.classification,
         estimated_success_probability=assessment.estimated_success_probability,
@@ -197,9 +209,10 @@ async def score_strategies_against_objective_node(
     obj_state = await deps.objective_service.get_state()
     snapshot_id = UUID(str(state.get("snapshot_id")))
     p_before = obj_state.estimated_success_probability
-    _, _, _surface, surface_slice = await load_snapshot_truth(deps, snapshot_id)
+    snapshot, _dq, _surface, surface_slice = await load_snapshot_truth(deps, snapshot_id)
     # Prefer mid of first usable contract as default premium for estimates.
     default_premium: Decimal | None = None
+    option_type: str | None = None
     for contract in surface_slice:
         bid = getattr(contract, "bid", None)
         ask = getattr(contract, "ask", None)
@@ -209,26 +222,68 @@ async def score_strategies_against_objective_node(
             default_premium = (
                 (Decimal(str(bid)) + Decimal(str(ask))) / Decimal("2")
             ).quantize(Decimal("0.01"))
+            option_type = getattr(contract, "option_type", None)
             break
         except Exception:
             continue
 
+    hist_settings = getattr(deps, "historical_outcome_settings", None)
+    min_samples = 20
+    require_lcb = True
+    ttl = 300
+    if hist_settings is not None:
+        min_samples = int(hist_settings.minimum_samples_for_ev)
+        require_lcb = bool(hist_settings.require_lower_confidence_bound_positive)
+        ttl = int(hist_settings.estimate_ttl_seconds)
+
     builder = StrategyEstimateBuilder(
+        minimum_samples_for_calibrated_ev=min_samples,
         require_positive_expected_value=bool(
             getattr(deps.objective_service, "require_positive_expected_value", True)
-        )
+        ),
+        require_lower_confidence_bound_positive=require_lcb,
+        estimate_ttl_seconds=ttl,
     )
+    as_of = datetime.now(timezone.utc)
+    if snapshot is not None:
+        as_of = getattr(snapshot, "exchange_time", None) or getattr(
+            snapshot, "exchange_timestamp", None
+        ) or as_of
+
     candidates: list[StrategyScoreInput] = []
     estimates: list[dict[str, Any]] = []
+    historical_summaries: list[dict[str, Any]] = []
+    max_sample_seen = 0
     for strategy in state.get("strategies") or []:
+        summary = None
+        if deps.historical_outcome_service is not None:
+            direction = str(getattr(strategy.direction, "value", strategy.direction))
+            summary = await deps.historical_outcome_service.summarize_for_strategy(
+                objective_id=obj_state.objective_id,
+                strategy_id=strategy.strategy_id,
+                snapshot_id=snapshot_id,
+                as_of_timestamp=as_of,
+                direction=direction,
+                strategy_family=direction,
+                pattern_ids=tuple(
+                    getattr(strategy, "source_hypothesis_ids", ()) or ()
+                ),
+                option_type=option_type,
+                premium_per_contract_usd=default_premium,
+                expected_horizon_seconds=int(strategy.expected_horizon_seconds),
+                current_episode_id=None,
+            )
+            historical_summaries.append(summary.model_dump(mode="json"))
+            max_sample_seen = max(max_sample_seen, int(summary.sample_count))
         estimate = builder.build(
             strategy=strategy,
             objective_state=obj_state,
             snapshot_id=snapshot_id,
             premium_per_contract_usd=default_premium,
+            historical_summary=summary,
             evidence_ids=tuple(getattr(strategy, "supporting_evidence_ids", ()) or ()),
         )
-        deps.objective_service._repo.save_strategy_estimate(estimate)  # noqa: SLF001
+        deps.objective_service.save_strategy_estimate(estimate)
         estimates.append(estimate.model_dump(mode="json"))
         candidates.append(
             StrategyScoreInput(
@@ -246,6 +301,17 @@ async def score_strategies_against_objective_node(
                     "estimate_id": str(estimate.estimate_id),
                     "calculation_method": estimate.calculation_method,
                     "uncertainty_reasons": list(estimate.uncertainty_reasons),
+                    "historical_summary_id": (
+                        str(estimate.historical_summary_id)
+                        if estimate.historical_summary_id
+                        else None
+                    ),
+                    "sample_count": estimate.sample_count,
+                    "lower_confidence_bound_ev_usd": (
+                        str(estimate.lower_confidence_bound_ev_usd)
+                        if estimate.lower_confidence_bound_ev_usd is not None
+                        else None
+                    ),
                 },
             )
         )
@@ -265,15 +331,27 @@ async def score_strategies_against_objective_node(
             score.uncertainty_reasons = tuple(
                 (cand.calculation_inputs or {}).get("uncertainty_reasons") or ()
             )
-        deps.objective_service._repo.save_strategy_score(score)  # noqa: SLF001
+        deps.objective_service.save_strategy_score(score)
     for score in scores:
         if score.is_no_trade:
-            deps.objective_service._repo.save_strategy_score(score)  # noqa: SLF001
+            deps.objective_service.save_strategy_score(score)
     valid_trade = [s for s in scores if s.valid and not s.is_no_trade]
+    if (
+        not valid_trade
+        and deps.historical_outcome_service is not None
+        and max_sample_seen < min_samples
+    ):
+        await deps.objective_service.mark_insufficient_historical_evidence(
+            sample_count=max_sample_seen,
+            minimum_required=min_samples,
+        )
     return {
         "_strategy_scores": [s.model_dump(mode="json") for s in scores],
         "_strategy_estimates": estimates,
+        "_historical_summaries": historical_summaries,
         "_no_valid_strategy": len(valid_trade) == 0,
+        "_historical_sample_count": max_sample_seen,
+        "_historical_minimum_required": min_samples,
         **trace_update(
             append_trace(
                 state,

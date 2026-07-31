@@ -106,9 +106,83 @@ def extract_confidence_outcome_pairs(
     traded: bool,
     realised_pnl: Decimal | None,
 ) -> list[tuple[Decimal, int]]:
-    """Simple entry-confidence vs profitable-outcome calibration pairs."""
-    if meta_confidence is None:
+    """Entry-confidence vs observed outcome — incomplete episodes yield no sample."""
+    from uuid import uuid4
+
+    from joker.objectives.historical_schemas import CalibrationOutcomeResolution
+
+    resolution = resolve_calibration_outcome(
+        episode_id=uuid4(),
+        meta_confidence=meta_confidence,
+        traded=traded,
+        realised_pnl=realised_pnl,
+        complete=bool(traded and realised_pnl is not None),
+    )
+    if not resolution.included or resolution.outcome is None or meta_confidence is None:
         return []
-    if not traded or realised_pnl is None:
-        return [(meta_confidence, 0)]
-    return [(meta_confidence, 1 if realised_pnl > 0 else 0)]
+    return [(meta_confidence, int(resolution.outcome))]
+
+
+def resolve_calibration_outcome(
+    *,
+    episode_id,
+    meta_confidence: Decimal | None,
+    traded: bool,
+    realised_pnl: Decimal | None,
+    complete: bool = True,
+    truth_degraded: bool = False,
+    evidence_ids: tuple = (),
+):
+    """Incomplete / missing outcomes must not become negative calibration samples."""
+    from uuid import UUID
+
+    from joker.objectives.historical_schemas import CalibrationOutcomeResolution
+
+    eid = episode_id if isinstance(episode_id, UUID) else UUID(str(episode_id))
+    if meta_confidence is None:
+        return CalibrationOutcomeResolution(
+            episode_id=eid,
+            outcome=None,
+            included=False,
+            exclusion_reason="missing_confidence",
+            evidence_ids=tuple(evidence_ids),
+        )
+    if truth_degraded:
+        return CalibrationOutcomeResolution(
+            episode_id=eid,
+            outcome=None,
+            included=False,
+            exclusion_reason="truth_degraded",
+            evidence_ids=tuple(evidence_ids),
+        )
+    if not complete:
+        return CalibrationOutcomeResolution(
+            episode_id=eid,
+            outcome=None,
+            included=False,
+            exclusion_reason="episode_incomplete",
+            evidence_ids=tuple(evidence_ids),
+        )
+    if not traded:
+        return CalibrationOutcomeResolution(
+            episode_id=eid,
+            outcome=None,
+            included=False,
+            exclusion_reason="no_trade_occurred",
+            evidence_ids=tuple(evidence_ids),
+        )
+    if realised_pnl is None:
+        return CalibrationOutcomeResolution(
+            episode_id=eid,
+            outcome=None,
+            included=False,
+            exclusion_reason="realised_pnl_missing",
+            evidence_ids=tuple(evidence_ids),
+        )
+    return CalibrationOutcomeResolution(
+        episode_id=eid,
+        outcome=1 if realised_pnl > 0 else 0,
+        included=True,
+        exclusion_reason=None,
+        evidence_ids=tuple(evidence_ids),
+    )

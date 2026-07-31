@@ -110,8 +110,21 @@ class ReplayTruthLoader:
             snapshot_ids.append(episode.terminal_snapshot_id)
 
         listed = await self._list_horizon_snapshots(episode, initial, terminal)
+        horizon_complete = True
+        horizon_findings: list[str] = []
         if listed:
             snapshot_ids = listed
+        else:
+            # Diagnostic entry+terminal frames only — never treat as complete horizon.
+            horizon_complete = False
+            horizon_findings.extend(
+                (
+                    "authoritative_horizon_incomplete",
+                    "historical_ev_eligible=false",
+                    "promotion_eligible=false",
+                    "truth_degraded=true",
+                )
+            )
 
         for sid in snapshot_ids:
             snap = await self._snapshots.get_by_id(sid)
@@ -175,6 +188,8 @@ class ReplayTruthLoader:
             random_seed=self._random_seed,
             contract_quotes={},
             frames=tuple(frames),
+            authoritative_horizon_complete=horizon_complete,
+            horizon_integrity_findings=tuple(horizon_findings),
         )
 
     async def _load_starting_ledger(
@@ -412,18 +427,9 @@ class ReplayTruthLoader:
             out.append(UUID(str(sid)))
 
         if not out:
-            fallback: list[UUID] = []
-            if episode.initial_snapshot_id is not None:
-                fallback.append(episode.initial_snapshot_id)
-            if (
-                episode.terminal_snapshot_id is not None
-                and episode.terminal_snapshot_id != episode.initial_snapshot_id
-                and episode.terminal_snapshot_id not in fallback
-            ):
-                fallback.append(episode.terminal_snapshot_id)
-            if fallback:
-                return fallback
-            raise ReplayTruthLoadError("empty_horizon_snapshot_sequence")
+            # Empty authoritative window — caller must treat entry+terminal
+            # diagnostic frames as incomplete (not promotion/EV eligible).
+            return []
 
         self._validate_horizon_snapshots(tuple(out), start, end, terminal)
         return out

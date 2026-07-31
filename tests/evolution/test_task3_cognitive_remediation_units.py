@@ -253,13 +253,16 @@ async def test_replay_terminal_time_uses_position_closed_event(tmp_path):
         async def list_between(self, *a, **k):
             return []
 
+        async def list_by_session(self, session_id):
+            return list(self._items.values())
+
     repo = SnapRepo()
     sid0 = uuid4()
     sid1 = uuid4()
     snap_ts = datetime(2026, 7, 1, 15, 0, tzinfo=timezone.utc)
     event_ts = datetime(2026, 7, 1, 15, 30, tzinfo=timezone.utc)
-    repo._items[sid0] = Snap(sid0, snap_ts)
-    repo._items[sid1] = Snap(sid1, snap_ts)
+    repo._items[sid0] = Snap(sid0, datetime(2026, 7, 1, 14, 0, tzinfo=timezone.utc))
+    repo._items[sid1] = Snap(sid1, event_ts)
     loader = ReplayTruthLoader(
         snapshot_repo=repo, allow_synthetic_starting_cash=True, session_starting_cash=Decimal("1000")
     )
@@ -287,8 +290,8 @@ async def test_replay_terminal_time_uses_position_closed_event(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_replay_truth_falls_back_to_frame_timestamps_for_event_ids() -> None:
-    """Episodes may record event ids before durable timestamps are indexed."""
+async def test_replay_truth_empty_horizon_fails_closed() -> None:
+    """Empty authoritative windows may use diagnostic frames only when marked incomplete."""
     from datetime import datetime, timezone
 
     from joker.evolution.replay_truth import ReplayTruthLoader
@@ -341,8 +344,12 @@ async def test_replay_truth_falls_back_to_frame_timestamps_for_event_ids() -> No
         completed=True,
         idempotency_key=f"t-{uuid4()}",
         entry_decision_event_id=uuid4(),
+        entry_decision_timestamp=start_ts,
         terminal_event_id=uuid4(),
+        terminal_event_timestamp=end_ts,
     )
     truth = await loader.load_for_episode(ep)
-    assert truth.entry_decision_timestamp == start_ts
-    assert truth.terminal_event_timestamp == end_ts
+    assert truth.authoritative_horizon_complete is False
+    assert "historical_ev_eligible=false" in truth.horizon_integrity_findings
+    assert "promotion_eligible=false" in truth.horizon_integrity_findings
+    assert "truth_degraded=true" in truth.horizon_integrity_findings
