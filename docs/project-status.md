@@ -12,7 +12,7 @@
 | Primary implementation commit (pre-correction) | `e5cd91cba5ef0b21e16841674124fdda28280def` |
 | Tip commit (this correction) | `27bf157489415ad01bdcb4fcfd2af8224a69508e` |
 | Latest verified CI run (comparison base) | `30629186951` (781 on Python 3.11 + 3.12; Ruff passed) |
-| Latest verified CI run (tip) | *(set after exact-tip CI)* |
+| Latest verified CI run (tip) | `30707444746` (exact tip `569a223`; Ruff + Pytest success on 3.11/3.12; artefacts `pytest-output-3.11`, `pytest-output-3.12`) |
 | Local Python 3.12 | 803 passed ×3 (`ResourceWarning` as error) |
 | Local Python 3.11 | 803 passed ×3 (`ResourceWarning` as error) |
 | Focused historical-EV / gateway / graph | 44 passed ×5 |
