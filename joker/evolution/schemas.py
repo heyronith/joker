@@ -197,6 +197,12 @@ class TradingEpisode(_Frozen):
     exit_slippage: Decimal | None = None
     total_fees: Decimal | None = None
     market_regime_tags: tuple[str, ...] = ()
+    strategy_family: str | None = None
+    pattern_ids: tuple[UUID, ...] = ()
+    option_type: str | None = None
+    session_phase: str | None = None
+    volatility_bucket: str | None = None
+    liquidity_bucket: str | None = None
     data_quality_ids: tuple[UUID, ...] = ()
     option_surface_ids: tuple[UUID, ...] = ()
     source_event_ids: tuple[UUID, ...] = ()

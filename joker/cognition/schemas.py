@@ -503,6 +503,7 @@ class StrategyHypothesis(CycleArtifactBase):
     name: str
     market_thesis: str
     direction: MarketDirection
+    strategy_family: str | None = None
     candidate_legs: tuple[StrategyLegCandidate, ...] = ()
     entry_plan: EntryPlan
     execution_plan: ExecutionPlan

@@ -357,6 +357,29 @@ class DatasetRepository(EvolutionRepository):
         )
         return EvaluationDataset.model_validate_json(row["payload_json"]) if row else None
 
+    async def list_all(self, *, limit: int = 500) -> list[EvaluationDataset]:
+        rows = await self._fetchall(
+            """
+            SELECT payload_json FROM evaluation_datasets
+            ORDER BY created_at DESC LIMIT ?
+            """,
+            (limit,),
+        )
+        return [EvaluationDataset.model_validate_json(r["payload_json"]) for r in rows]
+
+    async def membership_for_episode(
+        self, episode_id: UUID | str
+    ) -> list[tuple[str, str]]:
+        """Return (dataset_id, partition_name) rows for an episode."""
+        rows = await self._fetchall(
+            """
+            SELECT dataset_id, partition_name FROM dataset_episode_membership
+            WHERE episode_id = ?
+            """,
+            (str(episode_id),),
+        )
+        return [(str(r["dataset_id"]), str(r["partition_name"])) for r in rows]
+
 
 class ImprovementProposalRepository(EvolutionRepository):
     async def append(self, proposal: ImprovementProposal) -> bool:

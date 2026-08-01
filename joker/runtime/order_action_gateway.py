@@ -429,7 +429,41 @@ class OrderActionGateway:
                             blocked_reason="objective_historical_summary_invalid",
                             working_orders=working,
                         )
-                premium_per = Decimal(str(command.intent.limit_price or 0))
+                # Authoritative Task-1 quote — never treat proposed limit as quote truth.
+                quote_loader = getattr(
+                    self._deps, "current_option_quote_loader", None
+                )
+                if quote_loader is None:
+                    return OrderActionResult(
+                        submitted=False,
+                        client_order_id=request.client_order_id,
+                        blocked_reason="current_option_quote_loader_missing",
+                        working_orders=working,
+                    )
+                current_quote = await quote_loader(str(request.contract_id))
+                if current_quote is None:
+                    return OrderActionResult(
+                        submitted=False,
+                        client_order_id=request.client_order_id,
+                        blocked_reason="current_quote_missing",
+                        working_orders=working,
+                    )
+                if not current_quote.usable_for_execution:
+                    return OrderActionResult(
+                        submitted=False,
+                        client_order_id=request.client_order_id,
+                        blocked_reason=(
+                            "current_quote_unusable:"
+                            + ",".join(current_quote.invalidation_reasons)
+                        ),
+                        working_orders=working,
+                    )
+                from joker.objectives.execution_quote import (
+                    execution_premium_from_quote,
+                )
+                from joker.objectives.repricing import reprice_long_option_estimate
+
+                premium_per = execution_premium_from_quote(current_quote)
                 qty = int(command.intent.quantity)
                 require_ev = bool(
                     getattr(svc, "require_positive_expected_value", True)
@@ -442,9 +476,11 @@ class OrderActionGateway:
                     max_change = Decimal(
                         str(hist_settings.max_premium_change_pct_for_repricing)
                     )
-                from joker.objectives.repricing import reprice_long_option_estimate
-
-                # Snapshot mismatch forces explicit repricing (never a silent pass).
+                max_age = int(getattr(self._deps, "max_quote_age_seconds", 30) or 30)
+                max_spread = float(
+                    getattr(self._deps, "max_relative_spread", 0.25) or 0.25
+                )
+                # Snapshot mismatch forces explicit revalidation (never a silent pass).
                 if str(estimate.snapshot_id) != str(request.snapshot_id):
                     if estimate.expected_value_usd is None:
                         return OrderActionResult(
@@ -457,8 +493,13 @@ class OrderActionGateway:
                     estimate,
                     current_premium_per_contract_usd=premium_per,
                     quantity=qty,
-                    request_snapshot_id=request.snapshot_id,
+                    request_snapshot_id=current_quote.snapshot_id,
+                    quote_timestamp=current_quote.quote_timestamp,
                     max_premium_change_pct=max_change,
+                    max_quote_age_seconds=max_age,
+                    quote_age_seconds=current_quote.quote_age_seconds,
+                    max_spread_pct=max_spread * 100.0,
+                    current_spread_pct=float(current_quote.relative_spread) * 100.0,
                 )
                 ev = repriced.repriced_expected_value_usd
                 if require_ev and (ev is None or ev <= 0 or not repriced.valid):

@@ -89,6 +89,11 @@ class CognitiveGraphDeps:
     historical_outcome_settings: Any | None = None
     # Risk kill switch — stronger than objective approval for ENTRY/PROBE/ADD.
     kill_switch: bool = False
+    # Authoritative Task-1 quote / quality loaders for execution-time EV.
+    current_option_quote_loader: Any | None = None
+    current_data_quality_loader: Any | None = None
+    max_quote_age_seconds: int = 30
+    max_relative_spread: float = 0.25
 
     def limits_dict(self) -> dict[str, int]:
         return {

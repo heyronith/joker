@@ -49,6 +49,8 @@ class HistoricalOutcomeQuery(BaseModel):
     as_of_timestamp: datetime
     current_episode_id: UUID | None = None
     allow_synthetic_replay: bool = False
+    # Datasets that trained / contaminated the decision under evaluation.
+    blocked_training_dataset_ids: tuple[UUID, ...] = ()
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
     @field_validator("minimum_similarity", mode="before")

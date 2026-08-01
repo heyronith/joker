@@ -62,6 +62,11 @@ class SessionObjectiveService:
         return self._events
 
     @property
+    def repository(self) -> ObjectiveRepository:
+        """Public access to the objective persistence repository."""
+        return self._repo
+
+    @property
     def truth_degraded(self) -> bool:
         return self._truth_degraded or self._reconciliation_unresolved
 

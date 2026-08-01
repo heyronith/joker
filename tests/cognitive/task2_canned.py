@@ -237,11 +237,33 @@ def register_full_path_canned(
     # against a different inventor response mid-graph.
     def _meta_decision_from_request(request: ModelRequest) -> MetaDecision:
         candidates = request.context_payload.get("candidate_strategies") or []
+        scores = request.context_payload.get("objective_strategy_scores") or []
+        valid_ids = {
+            str(s.get("strategy_id"))
+            for s in scores
+            if isinstance(s, dict)
+            and s.get("strategy_id") is not None
+            and s.get("valid")
+            and not s.get("is_no_trade")
+        }
         selected: UUID | None = None
-        for raw in candidates:
-            if isinstance(raw, dict) and raw.get("strategy_id"):
-                selected = UUID(str(raw["strategy_id"]))
-                break
+        # Prefer a strategy with a valid objective score when scores are present.
+        if valid_ids:
+            for raw in candidates:
+                if not isinstance(raw, dict) or not raw.get("strategy_id"):
+                    continue
+                sid_cand = str(raw["strategy_id"])
+                if sid_cand in valid_ids:
+                    selected = UUID(sid_cand)
+                    break
+        if selected is None:
+            for raw in candidates:
+                if isinstance(raw, dict) and raw.get("strategy_id"):
+                    selected = UUID(str(raw["strategy_id"]))
+                    break
+        # When objective scores exist but none are valid trade scores, abandon.
+        if scores and not valid_ids:
+            selected = None
         action = (
             MetaDecisionAction.EXECUTE
             if selected is not None

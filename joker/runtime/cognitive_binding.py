@@ -83,6 +83,23 @@ def bind_cognitive_graph_to_task1(
         deps.option_surface_repo = bridge.supervisor.option_surface_repository
     if bridge.supervisor.snapshot_repository is not None:
         deps.snapshot_repo = bridge.supervisor.snapshot_repository
+    deps.clock = bridge.supervisor.clock
+
+    from joker.objectives.execution_quote import build_current_option_quote_loader
     from joker.runtime.order_action_gateway import OrderActionGateway
 
+    max_age = int(getattr(deps, "max_quote_age_seconds", 30) or 30)
+    max_spread = float(getattr(deps, "max_relative_spread", 0.25) or 0.25)
+    deps.current_option_quote_loader = build_current_option_quote_loader(
+        deps,
+        max_quote_age_seconds=max_age,
+        max_relative_spread=max_spread,
+    )
+
+    async def _current_dq_loader(report_id):
+        if dq_repo is None:
+            return None
+        return await dq_repo.get_by_id(report_id)
+
+    deps.current_data_quality_loader = _current_dq_loader
     deps.order_action_gateway = OrderActionGateway(deps)

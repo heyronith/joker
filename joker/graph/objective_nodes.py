@@ -254,24 +254,74 @@ async def score_strategies_against_objective_node(
     estimates: list[dict[str, Any]] = []
     historical_summaries: list[dict[str, Any]] = []
     max_sample_seen = 0
+    # Regime / liquidity context from world-model assessments when present.
+    regime_labels: list[str] = []
+    volatility_bucket: str | None = None
+    liquidity_bucket: str | None = None
+    session_phase = "unknown"
+    wm = state.get("world_model")
+    if wm is not None:
+        ms = getattr(wm, "market_structure", None)
+        if ms is not None:
+            regime_labels.append(str(getattr(ms, "primary_direction", "")))
+            if getattr(ms, "range_bound", False):
+                regime_labels.append("range_bound")
+            else:
+                regime_labels.append("trend")
+        vol = getattr(wm, "volatility_state", None)
+        if vol is not None:
+            volatility_bucket = str(getattr(vol, "state", None) or "") or None
+        opt = getattr(wm, "options_state", None)
+        if opt is not None:
+            spread = str(getattr(opt, "spread_conditions", "") or "").lower()
+            if "tight" in spread:
+                liquidity_bucket = "tight"
+            elif "wide" in spread:
+                liquidity_bucket = "wide"
+            else:
+                liquidity_bucket = "normal"
+        temporal = getattr(wm, "temporal_state", None)
+        if temporal is not None:
+            session_phase = str(getattr(temporal, "session_phase", "unknown") or "unknown")
+    if session_phase in {"", "unknown"} and deps.clock is not None:
+        from joker.objectives.historical_outcomes import session_phase_from_exchange_ts
+
+        session_phase = session_phase_from_exchange_ts(deps.clock.now())
+
+    current_episode_id = state.get("current_episode_id")
+    if current_episode_id is not None:
+        current_episode_id = UUID(str(current_episode_id))
+
     for strategy in state.get("strategies") or []:
         summary = None
         if deps.historical_outcome_service is not None:
             direction = str(getattr(strategy.direction, "value", strategy.direction))
+            family = getattr(strategy, "strategy_family", None)
+            if not family:
+                role = str(getattr(strategy.agent_role, "value", strategy.agent_role))
+                family = {
+                    "bullish_inventor": "breakout_continuation",
+                    "bearish_inventor": "failed_breakout_reversal",
+                    "neutral_advocate": "mean_reversion",
+                }.get(role, "liquidity_probe")
             summary = await deps.historical_outcome_service.summarize_for_strategy(
                 objective_id=obj_state.objective_id,
                 strategy_id=strategy.strategy_id,
                 snapshot_id=snapshot_id,
                 as_of_timestamp=as_of,
                 direction=direction,
-                strategy_family=direction,
+                strategy_family=str(family),
                 pattern_ids=tuple(
                     getattr(strategy, "source_hypothesis_ids", ()) or ()
                 ),
+                regime_labels=tuple(r for r in regime_labels if r),
+                session_phase=session_phase,
                 option_type=option_type,
+                volatility_bucket=volatility_bucket,
+                liquidity_bucket=liquidity_bucket,
                 premium_per_contract_usd=default_premium,
                 expected_horizon_seconds=int(strategy.expected_horizon_seconds),
-                current_episode_id=None,
+                current_episode_id=current_episode_id,
             )
             historical_summaries.append(summary.model_dump(mode="json"))
             max_sample_seen = max(max_sample_seen, int(summary.sample_count))

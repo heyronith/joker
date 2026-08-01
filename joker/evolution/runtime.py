@@ -133,6 +133,11 @@ class EvolutionRuntime:
     _unsubscribe: list[Callable[[], None]] = field(default_factory=list)
     _orchestrator_wake: asyncio.Event | None = None
 
+    @property
+    def repositories(self) -> dict[str, Any]:
+        """Public access to initialized Task-3 repositories (empty before prepare)."""
+        return dict(self._repos)
+
     async def prepare(self) -> None:
         """Open stores, champion registry, and durable Task 3 checkpointers."""
         if not self.settings.enabled or self._prepared:

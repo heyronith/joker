@@ -305,55 +305,82 @@ async def confirm_session_objective(
     )
 
 
-def build_objective_engines(app_settings: AppSettings) -> dict[str, Any]:
-    """Construct feasibility/scorer/sizer from settings for graph deps."""
+def build_objective_engines(
+    app_settings: AppSettings,
+    *,
+    episode_repository: Any | None = None,
+    evaluation_repository: Any | None = None,
+    dataset_repository: Any | None = None,
+    objective_repository: ObjectiveRepository | None = None,
+):
+    """Construct objective engines with explicit Task-3 repository injection.
+
+    Do not guess evolution DB paths from settings. Callers that already own
+    initialized Task-3 repositories must pass those same instances.
+
+    Returns:
+        ObjectiveEngineBundle
+    """
+    from joker.objectives.engine_bundle import (
+        HistoricalSourceDiagnostic,
+        ObjectiveEngineBundle,
+    )
+    from joker.objectives.historical_outcomes import (
+        HistoricalOutcomeService,
+        build_historical_outcome_service_from_evolution_repos,
+    )
+
     obj = app_settings.objective
     capital = app_settings.capital
-    from joker.objectives.historical_outcomes import HistoricalOutcomeService
-
     hist_settings = obj.historical_outcomes
-    # Production wiring attaches Task-3 episode repos when evolution DB is available.
-    # Until then the service fails closed (zero samples → EV unavailable).
-    historical_service = HistoricalOutcomeService(
-        settings=hist_settings,
-        repository=None,
+
+    diagnostic_reason: str | None = None
+    if episode_repository is not None and evaluation_repository is not None:
+        historical_service = build_historical_outcome_service_from_evolution_repos(
+            episode_repo=episode_repository,
+            evaluation_repo=evaluation_repository,
+            dataset_repo=dataset_repository,
+            settings=hist_settings,
+            repository=objective_repository,
+        )
+    else:
+        diagnostic_reason = (
+            "task3_repositories_unavailable:"
+            f"episodes={episode_repository is not None},"
+            f"evaluations={evaluation_repository is not None}"
+        )
+        historical_service = HistoricalOutcomeService(
+            settings=hist_settings,
+            repository=objective_repository,
+            source_diagnostic_reason=diagnostic_reason,
+        )
+
+    if objective_repository is not None:
+        historical_service.attach_objective_repository(objective_repository)
+
+    diagnostic = HistoricalSourceDiagnostic(
+        episode_loader_configured=historical_service.uses_repository_loaders,
+        evaluation_loader_configured=historical_service.uses_repository_loaders,
+        dataset_loader_configured=historical_service.uses_dataset_loader,
+        objective_repository_attached=historical_service.objective_repository_attached,
+        reason=diagnostic_reason or historical_service.source_diagnostic_reason,
+        cold_start=not historical_service.uses_repository_loaders,
     )
-    evolution_db = getattr(app_settings, "evolution_db_path", None) or getattr(
-        getattr(app_settings, "evolution", None), "db_path", None
-    )
-    if evolution_db is not None:
-        try:
-            from pathlib import Path
 
-            from joker.evolution.repositories import build_evolution_repositories
-            from joker.objectives.historical_outcomes import (
-                build_historical_outcome_service_from_evolution_repos,
-            )
-
-            repos = build_evolution_repositories(Path(evolution_db))
-            historical_service = build_historical_outcome_service_from_evolution_repos(
-                episode_repo=repos["episodes"],
-                evaluation_repo=repos["evaluations"],
-                settings=hist_settings,
-            )
-        except Exception:
-            # Fail closed: keep empty loader rather than inventing samples.
-            historical_service = HistoricalOutcomeService(settings=hist_settings)
-
-    return {
-        "feasibility_engine": GoalFeasibilityEngine(
+    return ObjectiveEngineBundle(
+        feasibility_engine=GoalFeasibilityEngine(
             minimum_samples_for_numeric_probability=int(
                 obj.feasibility.minimum_samples_for_numeric_probability
             ),
         ),
-        "objective_strategy_scorer": ObjectiveStrategyScorer(
+        objective_strategy_scorer=ObjectiveStrategyScorer(
             require_positive_expected_value=bool(obj.require_positive_expected_value),
             minimum_win_probability=float(obj.minimum_win_probability),
             allow_ordinal_when_probability_unavailable=bool(
                 obj.feasibility.allow_ordinal_scoring_when_probability_unavailable
             ),
         ),
-        "capital_sizer": DeterministicObjectiveSizer(
+        capital_sizer=DeterministicObjectiveSizer(
             max_capital_fraction=float(obj.sizing.max_capital_fraction),
             max_probe_fraction=float(obj.sizing.max_probe_fraction),
             prohibit_loss_multiplier=bool(obj.sizing.prohibit_loss_multiplier),
@@ -366,6 +393,7 @@ def build_objective_engines(app_settings: AppSettings) -> dict[str, Any]:
             behind_goal_boost=float(capital.behind_goal_boost),
             ahead_goal_dampen=float(capital.ahead_goal_dampen),
         ),
-        "historical_outcome_service": historical_service,
-        "historical_outcome_settings": hist_settings,
-    }
+        historical_outcome_service=historical_service,
+        historical_outcome_settings=hist_settings,
+        source_diagnostic=diagnostic,
+    )

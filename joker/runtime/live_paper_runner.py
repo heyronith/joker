@@ -335,22 +335,46 @@ class LivePaperRunner:
             historical_outcome_settings = None
             if objective_service is not None:
                 from joker.cli.session_confirm import build_objective_engines
+                from joker.evolution.repositories import build_evolution_repositories
 
-                engines = build_objective_engines(self.app_settings)
-                feasibility_engine = engines["feasibility_engine"]
-                objective_strategy_scorer = engines["objective_strategy_scorer"]
-                capital_sizer = engines["capital_sizer"]
-                historical_outcome_service = engines["historical_outcome_service"]
-                historical_outcome_settings = engines["historical_outcome_settings"]
-                # Persist historical queries/summaries beside objective capital truth.
-                hist_repo = getattr(objective_service, "_repo", None)
-                if hist_repo is not None and historical_outcome_service is not None:
-                    historical_outcome_service._repo = hist_repo  # noqa: SLF001
+                # When evolution is enabled, Task-3 repos live beside Task-1 DB.
+                # Pass those repositories explicitly — never guess settings paths.
+                episode_repo = None
+                evaluation_repo = None
+                dataset_repo = None
+                if bool(getattr(self.app_settings.evolution, "enabled", False)):
+                    evo_repos = build_evolution_repositories(task1_db)
+                    episode_repo = evo_repos["episodes"]
+                    evaluation_repo = evo_repos["evaluations"]
+                    dataset_repo = evo_repos["datasets"]
+                obj_repo = getattr(objective_service, "repository", None)
+                if obj_repo is None:
+                    obj_repo = getattr(objective_service, "_repo", None)
+                engines = build_objective_engines(
+                    self.app_settings,
+                    episode_repository=episode_repo,
+                    evaluation_repository=evaluation_repo,
+                    dataset_repository=dataset_repo,
+                    objective_repository=obj_repo,
+                )
+                feasibility_engine = engines.feasibility_engine
+                objective_strategy_scorer = engines.objective_strategy_scorer
+                capital_sizer = engines.capital_sizer
+                historical_outcome_service = engines.historical_outcome_service
+                historical_outcome_settings = engines.historical_outcome_settings
 
                 async def _objective_state_loader():
                     return await objective_service.get_state()
 
                 objective_state_loader = _objective_state_loader
+            max_quote_age = int(
+                getattr(self.app_settings.data_quality, "option_stale_seconds", 30)
+                or 30
+            )
+            max_spread = float(
+                getattr(self.app_settings.data_quality, "maximum_relative_spread", 0.25)
+                or 0.25
+            )
             cognitive_graph_deps = CognitiveGraphDeps(
                 router=model_router,
                 config=self.app_settings.cognitive_graph,
@@ -371,6 +395,8 @@ class LivePaperRunner:
                 historical_outcome_service=historical_outcome_service,
                 historical_outcome_settings=historical_outcome_settings,
                 kill_switch=bool(self.app_settings.risk.kill_switch),
+                max_quote_age_seconds=max_quote_age,
+                max_relative_spread=max_spread,
                 **repos,
             )
             if (
@@ -471,6 +497,35 @@ class LivePaperRunner:
                 # Prepare Task 3 before Task 2 recovery so champion/config/applicator
                 # and event subscriptions exist before unfinished cycles resume.
                 task1_bridge.run_coro(evolution_runtime.prepare())
+                # Prefer the exact repositories owned by EvolutionRuntime.
+                if (
+                    cognitive_graph_deps.historical_outcome_service is not None
+                    and objective_service is not None
+                ):
+                    from joker.cli.session_confirm import build_objective_engines
+
+                    evo_repos = evolution_runtime.repositories
+                    obj_repo = getattr(objective_service, "repository", None)
+                    if obj_repo is None:
+                        obj_repo = getattr(objective_service, "_repo", None)
+                    engines = build_objective_engines(
+                        self.app_settings,
+                        episode_repository=evo_repos.get("episodes"),
+                        evaluation_repository=evo_repos.get("evaluations"),
+                        dataset_repository=evo_repos.get("datasets"),
+                        objective_repository=obj_repo,
+                    )
+                    cognitive_graph_deps.historical_outcome_service = (
+                        engines.historical_outcome_service
+                    )
+                    cognitive_graph_deps.historical_outcome_settings = (
+                        engines.historical_outcome_settings
+                    )
+                    cognitive_graph_deps.feasibility_engine = engines.feasibility_engine
+                    cognitive_graph_deps.objective_strategy_scorer = (
+                        engines.objective_strategy_scorer
+                    )
+                    cognitive_graph_deps.capital_sizer = engines.capital_sizer
                 evolution_runtime.subscribe_events()
                 injected_agent_runtime.bind_evolution_runtime(evolution_runtime)
                 task1_bridge.start_agent()

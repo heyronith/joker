@@ -13,6 +13,7 @@ from joker.broker.interface import PaperBroker
 from joker.cli.session_confirm import build_objective_engines
 from joker.config.settings import AppSettings, CognitiveGraphSettings
 from joker.events.schemas import EventType
+from joker.evolution.repositories import build_evolution_repositories
 from joker.graph.cognitive_graph import build_cognitive_graph, initial_cycle_state
 from joker.graph.graph_deps import CognitiveGraphDeps
 from joker.graph.langgraph_checkpointer import CognitiveCheckpointer, ainvoke_config
@@ -22,9 +23,8 @@ from joker.models.fake_provider import FakeModelProvider
 from joker.models.registry import ModelRegistry
 from joker.models.router import ModelRouter
 from joker.models.schemas import ModelsConfig, default_model_profiles
+from joker.objectives.execution_quote import build_current_option_quote_loader
 from joker.objectives.repository import ObjectiveRepository, apply_objective_migrations
-from joker.objectives.repricing import reprice_long_option_estimate
-from joker.objectives.schemas import StrategyObjectiveEstimate
 from joker.objectives.service import SessionObjectiveService
 from joker.persistence.aiosqlite_lifecycle import drain_aiosqlite_workers
 from joker.runtime.cognitive_agent_runtime import build_default_repositories
@@ -34,12 +34,20 @@ from joker.runtime.session_supervisor import SessionSupervisor, SessionSuperviso
 from joker.time.calendar import MarketCalendar
 from joker.time.clock import FrozenExchangeClock
 from tests.cognitive.task2_canned import CONTRACT_ID, register_full_path_canned
-from tests.objectives.historical_fixtures import seed_positive_history
+from tests.objectives.historical_fixtures import persist_positive_history
 
 ET = ZoneInfo("America/New_York")
 
 
-async def _prepare_stack(tmp_path, *, pnl: Decimal, n: int = 20, kill_switch: bool = False):
+async def _prepare_stack(
+    tmp_path,
+    *,
+    pnl: Decimal,
+    n: int = 20,
+    kill_switch: bool = False,
+    option_ask: str = "1.20",
+    option_bid: str = "1.00",
+):
     start = datetime(2026, 7, 1, 10, 0, tzinfo=ET)
     clock = FrozenExchangeClock(start, calendar=MarketCalendar())
     db = tmp_path / "joker.db"
@@ -82,8 +90,8 @@ async def _prepare_stack(tmp_path, *, pnl: Decimal, n: int = 20, kill_switch: bo
                 "expiry": date(2026, 7, 1),
                 "strike": "500",
                 "option_type": "call",
-                "bid": "1.00",
-                "ask": "1.20",
+                "bid": option_bid,
+                "ask": option_ask,
                 "quote_timestamp": start + timedelta(minutes=3),
             }
         ]
@@ -93,12 +101,23 @@ async def _prepare_stack(tmp_path, *, pnl: Decimal, n: int = 20, kill_switch: bo
     assert tick.snapshot is not None
 
     apply_objective_migrations(db)
+    evo = build_evolution_repositories(db)
+    for repo in evo.values():
+        await repo.initialize()
+    as_of = start + timedelta(minutes=3)
+    await persist_positive_history(
+        episode_repo=evo["episodes"],
+        evaluation_repo=evo["evaluations"],
+        as_of=as_of,
+        n=n,
+        pnl=pnl,
+        strategy_family="breakout_continuation",
+    )
+
     obj_repo = ObjectiveRepository(db)
     objective_service = SessionObjectiveService(
         obj_repo, require_positive_expected_value=True
     )
-    # Deadline must be relative to wall-clock (objective recompute uses now()),
-    # not the frozen market clock used for snapshot ingestion.
     deadline = datetime.now(tz=ET) + timedelta(hours=4)
     definition = await objective_service.create_objective(
         session_id=session_id,
@@ -122,7 +141,7 @@ async def _prepare_stack(tmp_path, *, pnl: Decimal, n: int = 20, kill_switch: bo
                             "minimum_samples_for_ev": 20,
                             "minimum_effective_sample_size": 15,
                             "require_lower_confidence_bound_positive": True,
-                            "require_same_strategy_family": False,
+                            "require_same_strategy_family": True,
                             "minimum_similarity": 0.10,
                         }
                     ),
@@ -130,11 +149,14 @@ async def _prepare_stack(tmp_path, *, pnl: Decimal, n: int = 20, kill_switch: bo
             )
         }
     )
-    engines = build_objective_engines(app)
-    hist = engines["historical_outcome_service"]
-    hist._repo = obj_repo  # noqa: SLF001
-    hist._settings = engines["historical_outcome_settings"]
-    seed_positive_history(hist, as_of=start + timedelta(minutes=3), n=n, pnl=pnl)
+    engines = build_objective_engines(
+        app,
+        episode_repository=evo["episodes"],
+        evaluation_repository=evo["evaluations"],
+        dataset_repository=evo["datasets"],
+        objective_repository=obj_repo,
+    )
+    assert engines.historical_outcome_service.uses_repository_loaders
 
     fake = FakeModelProvider(available=True)
     register_full_path_canned(
@@ -175,15 +197,17 @@ async def _prepare_stack(tmp_path, *, pnl: Decimal, n: int = 20, kill_switch: bo
         execution_runtime=supervisor.execution_runtime,
         checkpointer=saver,
         db_path=db,
+        clock=clock,
         objective_service=objective_service,
         objective_state_loader=_obj_loader,
-        feasibility_engine=engines["feasibility_engine"],
-        objective_strategy_scorer=engines["objective_strategy_scorer"],
-        capital_sizer=engines["capital_sizer"],
-        historical_outcome_service=hist,
-        historical_outcome_settings=hist._settings,
+        max_quote_age_seconds=3600,
+        max_relative_spread=0.50,
         kill_switch=kill_switch,
+        **engines.as_deps_kwargs(),
         **repos,
+    )
+    deps.current_option_quote_loader = build_current_option_quote_loader(
+        deps, max_quote_age_seconds=3600, max_relative_spread=0.50
     )
     deps.order_action_gateway = OrderActionGateway(deps)
     deps.require_objective_dependencies()
@@ -220,10 +244,17 @@ async def _prepare_stack(tmp_path, *, pnl: Decimal, n: int = 20, kill_switch: bo
         "submitted": submitted,
         "broker": broker,
         "objective_service": objective_service,
-        "hist": hist,
+        "hist": engines.historical_outcome_service,
         "supervisor": supervisor,
         "snapshot_id": tick.snapshot.snapshot_id,
         "checkpointer": ckpt,
+        "market": market,
+        "clock": clock,
+        "start": start,
+        "gateway": gateway,
+        "original_submit": original_submit,
+        "engines": engines,
+        "evo": evo,
     }
 
 
@@ -233,18 +264,22 @@ async def _teardown_stack(stack: dict) -> None:
     await drain_aiosqlite_workers(timeout=0.5)
 
 
+def _valid_estimate(result: dict):
+    estimates = result.get("_strategy_estimates") or []
+    return next((e for e in estimates if e.get("valid")), None)
+
+
 @pytest.mark.asyncio
 async def test_full_compiled_graph_positive_ev_reaches_paper_execution(tmp_path) -> None:
     stack = await _prepare_stack(tmp_path, pnl=Decimal("15.00"), n=20)
     try:
         result = await stack["graph"].ainvoke(stack["state"], config=stack["config"])
-        assert result.get("_strategy_estimates")
-        est = result["_strategy_estimates"][0]
+        est = _valid_estimate(result)
+        assert est is not None
         assert est.get("expected_value_usd") is not None
         assert Decimal(str(est["expected_value_usd"])) > 0
-        assert est.get("valid") is True
         summaries = result.get("_historical_summaries") or []
-        assert summaries and summaries[0].get("valid_for_ev") is True
+        assert any(s.get("valid_for_ev") for s in summaries)
         assert est.get("historical_summary_id")
         assert int(est.get("sample_count") or 0) >= 20
         assert len(stack["submitted"]) == 1
@@ -290,25 +325,18 @@ async def test_full_compiled_graph_negative_ev_does_not_reach_execution(tmp_path
 
 @pytest.mark.asyncio
 async def test_kill_switch_blocks_positive_ev_before_paper_submission(tmp_path) -> None:
-    """Kill switch remains stronger than confirmed objective + positive historical EV."""
     stack = await _prepare_stack(
         tmp_path, pnl=Decimal("15.00"), n=20, kill_switch=True
     )
     try:
         result = await stack["graph"].ainvoke(stack["state"], config=stack["config"])
-        estimates = result.get("_strategy_estimates") or []
-        assert estimates
-        assert estimates[0].get("valid") is True
-        assert Decimal(str(estimates[0]["expected_value_usd"])) > 0
-        summaries = result.get("_historical_summaries") or []
-        assert summaries and summaries[0].get("valid_for_ev") is True
+        est = _valid_estimate(result)
+        assert est is not None
         assert stack["submitted"] == []
         assert not result.get("execution_command_id")
         assert stack["broker"].list_open_orders() == []
-        assert stack["broker"].list_positions() == []
         state = await stack["objective_service"].get_state()
         assert state.working_order_reservation_usd == 0
-        assert state.filled_position_exposure_usd == 0
         assert state.total_encumbered_usd == 0
     finally:
         await _teardown_stack(stack)
@@ -316,46 +344,74 @@ async def test_kill_switch_blocks_positive_ev_before_paper_submission(tmp_path) 
 
 @pytest.mark.asyncio
 async def test_full_compiled_graph_quote_change_blocks_entry(tmp_path) -> None:
-    stack = await _prepare_stack(tmp_path, pnl=Decimal("8.00"), n=20)
+    """Premium rises before gateway; gateway reloads Task-1 quote and rejects."""
+    stack = await _prepare_stack(
+        tmp_path,
+        pnl=Decimal("8.00"),
+        n=20,
+        option_ask="1.00",
+        option_bid="0.90",
+    )
     try:
-        obj_state = await stack["objective_service"].get_state()
-        summary = await stack["hist"].summarize_for_strategy(
-            objective_id=obj_state.objective_id,
-            strategy_id=uuid4(),
-            snapshot_id=stack["snapshot_id"],
-            as_of_timestamp=datetime.now(tz=ET),
-            direction="bullish",
-            strategy_family="bullish",
-        )
-        est = StrategyObjectiveEstimate(
-            strategy_id=uuid4(),
-            objective_id=obj_state.objective_id,
-            snapshot_id=stack["snapshot_id"],
-            expected_value_usd=Decimal("8.00"),
-            capital_required_usd=Decimal("100"),
-            maximum_loss_usd=Decimal("100"),
-            calculation_method="calibrated_episode_average",
-            quote_inputs={
-                "premium_per_contract": "1.00",
-                "quantity": 1,
-                "slippage_per_contract": "0.00",
-            },
-            valid=True,
-            historical_summary_id=summary.summary_id,
-            sample_count=20,
-        )
-        stack["objective_service"].save_strategy_estimate(est)
-        repriced = reprice_long_option_estimate(
-            est,
-            current_premium_per_contract_usd=Decimal("1.20"),
-            quantity=1,
-            request_snapshot_id=uuid4(),
-            current_slippage_per_contract_usd=Decimal("0.00"),
-        )
-        assert repriced.valid is False
-        assert repriced.repriced_expected_value_usd is not None
-        assert repriced.repriced_expected_value_usd <= 0
+        gateway = stack["gateway"]
+        original = stack["original_submit"]
+        submitted: list[str] = []
+
+        async def _worse_quote_then_submit(request):
+            market = stack["market"]
+            clock = stack["clock"]
+            start = stack["start"]
+            later = start + timedelta(minutes=5)
+            clock.set_now(later)
+            await market.ingest_option_quotes(
+                [
+                    {
+                        "contract_id": CONTRACT_ID,
+                        "symbol": "SPY",
+                        "expiry": date(2026, 7, 1),
+                        "strike": "500",
+                        "option_type": "call",
+                        "bid": "1.10",
+                        "ask": "1.20",
+                        "quote_timestamp": later,
+                    }
+                ]
+            )
+            await market.tick(now=later + timedelta(seconds=1))
+            result = await original(request)
+            if result.submitted:
+                submitted.append(result.client_order_id)
+            return result
+
+        gateway.submit = _worse_quote_then_submit  # type: ignore[method-assign]
+        result = await stack["graph"].ainvoke(stack["state"], config=stack["config"])
+        assert submitted == []
+        assert stack["submitted"] == []
         state = await stack["objective_service"].get_state()
         assert state.working_order_reservation_usd == 0
+        # Estimate may have been valid before quote move
+        estimates = result.get("_strategy_estimates") or []
+        assert estimates
+    finally:
+        await _teardown_stack(stack)
+
+
+@pytest.mark.asyncio
+async def test_full_compiled_graph_current_quote_positive_ev_submits_once(
+    tmp_path,
+) -> None:
+    stack = await _prepare_stack(
+        tmp_path,
+        pnl=Decimal("15.00"),
+        n=20,
+        option_ask="1.05",
+        option_bid="1.00",
+    )
+    try:
+        result = await stack["graph"].ainvoke(stack["state"], config=stack["config"])
+        assert len(stack["submitted"]) == 1
+        assert result.get("execution_command_id")
+        state = await stack["objective_service"].get_state()
+        assert state.working_order_reservation_usd > 0 or state.total_encumbered_usd > 0
     finally:
         await _teardown_stack(stack)

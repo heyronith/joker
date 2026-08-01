@@ -7,12 +7,11 @@ from __future__ import annotations
 
 import math
 from collections.abc import Awaitable, Callable, Sequence
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, time, timezone
 from decimal import Decimal
 from statistics import median
 from typing import Any
 from uuid import UUID, uuid4
-
 from joker.objectives.config import HistoricalOutcomeSettings
 from joker.objectives.historical_schemas import (
     ComparableOutcome,
@@ -22,14 +21,23 @@ from joker.objectives.historical_schemas import (
     SimilarityPolicy,
 )
 from joker.objectives.similarity import SIMILARITY_POLICY_VERSION, score_similarity
+from joker.time.calendar import EXCHANGE_TZ, MarketCalendar
+from joker.time.clock import SessionPhase, _session_phase_for
 
 EpisodeLoader = Callable[[], Awaitable[Sequence[Any]]]
 EvaluationLoader = Callable[[UUID], Awaitable[Sequence[Any]]]
+DatasetLoader = Callable[[], Awaitable[Sequence[Any]]]
+EpisodeMembershipLoader = Callable[[UUID], Awaitable[Sequence[tuple[str, str]]]]
+
+_MARKET_CALENDAR = MarketCalendar()
 
 
 def independence_key(episode: Any) -> str:
-    """One authoritative episode contributes at most one live-EV observation."""
-    eid = str(getattr(episode, "episode_id", ""))
+    """One authoritative market truth contributes at most one live-EV observation.
+
+    Keyed by entry + terminal lifecycle (not unique episode row id) so replay
+    clones of the same fills do not inflate sample size.
+    """
     entry = str(
         getattr(episode, "entry_decision_event_id", None)
         or getattr(episode, "position_lifecycle_id", None)
@@ -39,7 +47,7 @@ def independence_key(episode: Any) -> str:
         getattr(episode, "terminal_event_id", None)
         or getattr(episode, "terminal_snapshot_id", "")
     )
-    return f"{eid}|{entry}|{terminal}"
+    return f"{entry}|{terminal}"
 
 
 def _z_for_confidence(level: float) -> Decimal:
@@ -80,19 +88,31 @@ def _horizon_bucket(seconds: int | None) -> str | None:
     return "gte_60m"
 
 
-def _session_phase_from_ts(ts: datetime | None) -> str:
+def session_phase_from_exchange_ts(ts: datetime | None) -> str:
+    """Classify session phase in America/New_York (EST/EDT-correct).
+
+    Regular session is further bucketed into open / midday / close for similarity.
+    """
     if ts is None:
         return "unknown"
-    local = ts.astimezone(timezone.utc)
-    # Rough ET-proxy buckets using UTC offset-naive hour is avoided; use hour ET approx.
-    hour = (local.hour - 4) % 24  # EDT approximation for bucketing only
-    if 9 <= hour < 11:
+    if ts.tzinfo is None:
+        return "unknown"
+    phase = _session_phase_for(ts, _MARKET_CALENDAR)
+    if phase != SessionPhase.REGULAR:
+        return str(phase.value)
+    local = ts.astimezone(EXCHANGE_TZ)
+    t = local.time()
+    if time(9, 30) <= t < time(11, 0):
         return "open"
-    if 11 <= hour < 14:
+    if time(11, 0) <= t < time(14, 0):
         return "midday"
-    if 14 <= hour < 16:
+    if time(14, 0) <= t < time(16, 0):
         return "close"
-    return "other"
+    return str(SessionPhase.REGULAR.value)
+
+
+# Backward-compatible alias used by older call sites/tests.
+_session_phase_from_ts = session_phase_from_exchange_ts
 
 
 class HistoricalOutcomeService:
@@ -103,13 +123,18 @@ class HistoricalOutcomeService:
         *,
         episode_loader: EpisodeLoader | None = None,
         evaluation_loader: EvaluationLoader | None = None,
+        dataset_loader: DatasetLoader | None = None,
+        membership_loader: EpisodeMembershipLoader | None = None,
         settings: HistoricalOutcomeSettings | None = None,
         similarity_policy: SimilarityPolicy | None = None,
         approved_evaluator_versions: frozenset[str] | None = None,
         repository: Any | None = None,
+        source_diagnostic_reason: str | None = None,
     ) -> None:
         self._episode_loader = episode_loader
         self._evaluation_loader = evaluation_loader
+        self._dataset_loader = dataset_loader
+        self._membership_loader = membership_loader
         self._settings = settings or HistoricalOutcomeSettings()
         self._policy = similarity_policy or SimilarityPolicy(
             policy_version=SIMILARITY_POLICY_VERSION
@@ -118,10 +143,31 @@ class HistoricalOutcomeService:
             {"3.0.0", "3.1.0", "3.2.0"}
         )
         self._repo = repository
+        self._source_diagnostic_reason = source_diagnostic_reason
         self._seeded: list[Any] = []
 
+    def attach_objective_repository(self, repository: Any) -> None:
+        """Public attach point for objective query/summary persistence."""
+        self._repo = repository
+
+    @property
+    def uses_repository_loaders(self) -> bool:
+        return self._episode_loader is not None and self._evaluation_loader is not None
+
+    @property
+    def uses_dataset_loader(self) -> bool:
+        return self._dataset_loader is not None
+
+    @property
+    def objective_repository_attached(self) -> bool:
+        return self._repo is not None
+
+    @property
+    def source_diagnostic_reason(self) -> str | None:
+        return self._source_diagnostic_reason
+
     def seed_episodes_for_tests(self, episodes: Sequence[Any]) -> None:
-        """Test helper — production uses episode_loader repositories."""
+        """Unit-test helper only — production tests must persist via repositories."""
         self._seeded = list(episodes)
 
     async def query_comparable_outcomes(
@@ -140,12 +186,34 @@ class HistoricalOutcomeService:
         incomplete: list[UUID] = []
         degraded: list[UUID] = []
         dataset_overlap: list[UUID] = []
+        unsafe_notes: list[str] = []
+
+        as_of = query.as_of_timestamp
+        if as_of is None or getattr(as_of, "tzinfo", None) is None:
+            report = HistoricalLeakageReport(
+                query_id=query.query_id,
+                safe=False,
+                notes=("missing_or_naive_as_of_timestamp",),
+            )
+            summary = self._aggregate(query, (), {"as_of_invalid": 1}, report)
+            if self._repo is not None:
+                self._repo.save_historical_query(query)
+                self._repo.save_historical_summary(summary)
+                self._repo.save_leakage_report(report)
+            return summary, report, ()
+
+        datasets = await self._load_datasets()
+        dataset_by_id = {
+            str(getattr(d, "dataset_id", "")): d for d in datasets
+        }
+        # Unresolved overlap: blocked dataset IDs were supplied but loader missing.
+        if query.blocked_training_dataset_ids and self._dataset_loader is None:
+            unsafe_notes.append("unresolved_dataset_overlap_no_loader")
 
         episodes = await self._load_episodes()
         seen_keys: set[str] = set()
         candidates: list[ComparableOutcome] = []
         max_age = timedelta(days=int(settings.maximum_episode_age_days))
-        as_of = query.as_of_timestamp
 
         for episode in episodes:
             eid = UUID(str(episode.episode_id))
@@ -177,12 +245,39 @@ class HistoricalOutcomeService:
                     exclusion.get("not_factual_closed", 0) + 1
                 )
                 continue
+            if "missing_as_of_fields" in reasons:
+                exclusion["missing_as_of_fields"] = (
+                    exclusion.get("missing_as_of_fields", 0) + 1
+                )
+                unsafe_notes.append(f"missing_timestamp:{eid}")
+                continue
             if reasons:
                 for r in reasons:
                     exclusion[r] = exclusion.get(r, 0) + 1
                 continue
 
+            overlap_reason = await self._dataset_overlap_reason(
+                eid, query, as_of, dataset_by_id
+            )
+            if overlap_reason == "unresolved":
+                unsafe_notes.append(f"unresolved_dataset_overlap:{eid}")
+                dataset_overlap.append(eid)
+                exclusion["dataset_overlap_unresolved"] = (
+                    exclusion.get("dataset_overlap_unresolved", 0) + 1
+                )
+                continue
+            if overlap_reason is not None:
+                dataset_overlap.append(eid)
+                exclusion[overlap_reason] = exclusion.get(overlap_reason, 0) + 1
+                continue
+
             key = independence_key(episode)
+            if "|" not in key or key.startswith("|") or key.endswith("|"):
+                unsafe_notes.append(f"ambiguous_independence_key:{eid}")
+                exclusion["ambiguous_independence_key"] = (
+                    exclusion.get("ambiguous_independence_key", 0) + 1
+                )
+                continue
             if key in seen_keys:
                 duplicates.append(eid)
                 exclusion["duplicate_truth"] = exclusion.get("duplicate_truth", 0) + 1
@@ -222,8 +317,8 @@ class HistoricalOutcomeService:
 
         candidates.sort(key=lambda c: c.similarity_score, reverse=True)
         selected = candidates[: int(query.maximum_samples)]
-        leakage_safe = not (future or current or dataset_overlap)
-        # Duplicate exclusions are handled; they do not make leakage unsafe.
+        # Safe exclusion of future/current/overlap rows does not invalidate remainder.
+        leakage_safe = not unsafe_notes
         report = HistoricalLeakageReport(
             query_id=query.query_id,
             excluded_future_episodes=tuple(future),
@@ -233,9 +328,7 @@ class HistoricalOutcomeService:
             excluded_incomplete=tuple(incomplete),
             excluded_truth_degraded=tuple(degraded),
             safe=leakage_safe,
-            notes=()
-            if leakage_safe
-            else ("leakage_exclusions_present_summary_invalid_if_unresolved",),
+            notes=tuple(dict.fromkeys(unsafe_notes)),
         )
         summary = self._aggregate(query, selected, exclusion, report)
         if self._repo is not None:
@@ -257,10 +350,13 @@ class HistoricalOutcomeService:
         regime_labels: Sequence[str] = (),
         session_phase: str = "unknown",
         option_type: str | None = None,
+        volatility_bucket: str | None = None,
+        liquidity_bucket: str | None = None,
         premium_per_contract_usd: Decimal | None = None,
         expected_horizon_seconds: int | None = None,
         configuration_version_id: UUID | None = None,
         current_episode_id: UUID | None = None,
+        blocked_training_dataset_ids: Sequence[UUID] = (),
     ) -> HistoricalOutcomeSummary:
         query = HistoricalOutcomeQuery(
             objective_id=objective_id,
@@ -268,17 +364,22 @@ class HistoricalOutcomeService:
             snapshot_id=snapshot_id,
             configuration_version_id=configuration_version_id,
             pattern_ids=tuple(pattern_ids),
-            strategy_family=strategy_family or direction,
+            strategy_family=strategy_family,
             direction=direction,
             option_type=option_type,
             regime_labels=tuple(regime_labels),
-            session_phase=session_phase,
+            session_phase=session_phase_from_exchange_ts(as_of_timestamp)
+            if session_phase in {"", "unknown"}
+            else session_phase,
+            volatility_bucket=volatility_bucket,
+            liquidity_bucket=liquidity_bucket,
             premium_bucket=_premium_bucket(premium_per_contract_usd),
             horizon_bucket=_horizon_bucket(expected_horizon_seconds),
             maximum_samples=self._settings.maximum_samples,
             minimum_similarity=Decimal(str(self._settings.minimum_similarity)),
             as_of_timestamp=as_of_timestamp,
             current_episode_id=current_episode_id,
+            blocked_training_dataset_ids=tuple(blocked_training_dataset_ids),
             allow_synthetic_replay=False,
         )
         summary, _report, _outcomes = await self.query_comparable_outcomes(query)
@@ -310,6 +411,53 @@ class HistoricalOutcomeService:
         if self._evaluation_loader is None:
             return ()
         return await self._evaluation_loader(episode_id)
+
+    async def _load_datasets(self) -> Sequence[Any]:
+        if self._dataset_loader is None:
+            return ()
+        return await self._dataset_loader()
+
+    async def _dataset_overlap_reason(
+        self,
+        episode_id: UUID,
+        query: HistoricalOutcomeQuery,
+        as_of: datetime,
+        dataset_by_id: dict[str, Any],
+    ) -> str | None:
+        """Return exclusion reason, 'unresolved', or None if clean."""
+        memberships: list[tuple[str, str]] = []
+        if self._membership_loader is not None:
+            memberships = list(await self._membership_loader(episode_id))
+        else:
+            for ds in dataset_by_id.values():
+                ids = set(getattr(ds, "episode_ids", ()) or ())
+                for part, part_ids in (getattr(ds, "partition_map", {}) or {}).items():
+                    if episode_id in set(part_ids) or episode_id in ids:
+                        memberships.append((str(ds.dataset_id), str(part)))
+                if episode_id in ids and not memberships:
+                    memberships.append((str(ds.dataset_id), "unspecified"))
+
+        blocked = {str(x) for x in query.blocked_training_dataset_ids}
+        for ds_id, partition in memberships:
+            ds = dataset_by_id.get(ds_id)
+            if ds is None and blocked and ds_id in blocked:
+                return "unresolved"
+            if ds is None:
+                continue
+            cutoff = getattr(ds, "time_end", None)
+            if cutoff is not None and cutoff > as_of:
+                return "dataset_cutoff_after_as_of"
+            part = str(partition).lower()
+            if part in {"train", "training", "fit"}:
+                return "training_dataset_overlap"
+            if ds_id in blocked:
+                return "blocked_training_dataset"
+            # Challenger partition containing the same authoritative episode.
+            if part in {"challenger", "challenger_train"}:
+                return "challenger_dataset_overlap"
+        if blocked and self._dataset_loader is None:
+            return "unresolved"
+        return None
 
     def _select_evaluation(self, evaluations: Sequence[Any]) -> Any | None:
         valid = [
@@ -350,9 +498,15 @@ class HistoricalOutcomeService:
         if pnl is None:
             reasons.append("missing_pnl")
         terminal_ts = getattr(episode, "terminal_event_timestamp", None)
+        entry_ts = getattr(episode, "entry_decision_timestamp", None)
+        if terminal_ts is None or entry_ts is None:
+            reasons.append("missing_as_of_fields")
+        if terminal_ts is not None and getattr(terminal_ts, "tzinfo", None) is None:
+            reasons.append("missing_as_of_fields")
+        if entry_ts is not None and getattr(entry_ts, "tzinfo", None) is None:
+            reasons.append("missing_as_of_fields")
         if terminal_ts is not None and terminal_ts > as_of:
             reasons.append("future_terminal")
-        entry_ts = getattr(episode, "entry_decision_timestamp", None)
         if entry_ts is not None and entry_ts > as_of:
             reasons.append("future_entry")
         if terminal_ts is not None and (as_of - terminal_ts) > max_age:
@@ -361,7 +515,6 @@ class HistoricalOutcomeService:
             sample = getattr(episode, "sample", None)
             if sample is not None and int(sample) > 0:
                 reasons.append("synthetic_replay")
-            # Replay-derived markers in findings
             if any("replay" in str(f).lower() for f in findings):
                 reasons.append("synthetic_replay")
         if getattr(episode, "terminal_event_id", None) is None:
@@ -380,6 +533,11 @@ class HistoricalOutcomeService:
         assert entry_ts is not None and terminal_ts is not None
         direction = str(getattr(episode, "direction", None) or "none")
         premium = getattr(episode, "entry_price", None)
+        ep_family = getattr(episode, "strategy_family", None)
+        ep_patterns = tuple(getattr(episode, "pattern_ids", ()) or ())
+        ep_session = getattr(episode, "session_phase", None) or session_phase_from_exchange_ts(
+            entry_ts
+        )
         sim, components = score_similarity(
             query_strategy_family=query.strategy_family,
             query_direction=query.direction,
@@ -390,10 +548,13 @@ class HistoricalOutcomeService:
             query_liquidity_bucket=query.liquidity_bucket,
             query_premium_bucket=query.premium_bucket,
             query_horizon_bucket=query.horizon_bucket,
-            episode_strategy_family=direction,
+            episode_strategy_family=str(ep_family) if ep_family else None,
             episode_direction=direction,
+            episode_pattern_ids=ep_patterns,
             episode_regime_labels=tuple(getattr(episode, "market_regime_tags", ()) or ()),
-            episode_session_phase=_session_phase_from_ts(entry_ts),
+            episode_session_phase=str(ep_session),
+            episode_volatility_bucket=getattr(episode, "volatility_bucket", None),
+            episode_liquidity_bucket=getattr(episode, "liquidity_bucket", None),
             episode_premium_bucket=_premium_bucket(
                 Decimal(str(premium)) if premium is not None else None
             ),
@@ -426,8 +587,8 @@ class HistoricalOutcomeService:
             entry_timestamp=entry_ts,
             terminal_timestamp=terminal_ts,
             regime_labels=tuple(getattr(episode, "market_regime_tags", ()) or ()),
-            session_phase=_session_phase_from_ts(entry_ts),
-            option_type=None,
+            session_phase=str(ep_session),
+            option_type=getattr(episode, "option_type", None),
             entry_premium_usd=(
                 Decimal(str(premium)).quantize(Decimal("0.01"))
                 if premium is not None
@@ -584,6 +745,7 @@ def build_historical_outcome_service_from_evolution_repos(
     *,
     episode_repo: Any,
     evaluation_repo: Any,
+    dataset_repo: Any | None = None,
     settings: HistoricalOutcomeSettings | None = None,
     repository: Any | None = None,
 ) -> HistoricalOutcomeService:
@@ -595,9 +757,25 @@ def build_historical_outcome_service_from_evolution_repos(
     async def _evals(episode_id: UUID) -> Sequence[Any]:
         return await evaluation_repo.list_by_episode(episode_id)
 
+    dataset_loader = None
+    membership_loader = None
+    if dataset_repo is not None:
+
+        async def _datasets() -> Sequence[Any]:
+            return await dataset_repo.list_all(limit=500)
+
+        async def _membership(episode_id: UUID) -> Sequence[tuple[str, str]]:
+            return await dataset_repo.membership_for_episode(episode_id)
+
+        dataset_loader = _datasets
+        membership_loader = _membership
+
     return HistoricalOutcomeService(
         episode_loader=_episodes,
         evaluation_loader=_evals,
+        dataset_loader=dataset_loader,
+        membership_loader=membership_loader,
         settings=settings,
         repository=repository,
+        source_diagnostic_reason=None,
     )

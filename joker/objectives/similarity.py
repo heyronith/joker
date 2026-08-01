@@ -18,7 +18,10 @@ def _as_set(values: Sequence[Any] | None) -> set[str]:
 
 
 def _bucket_match(a: str | None, b: str | None) -> Decimal:
-    if a is None or b is None:
+    # Unspecified query dimension does not constrain eligibility.
+    if a is None or str(a) in {"", "unknown"}:
+        return Decimal("1")
+    if b is None or str(b) in {"", "unknown"}:
         return Decimal("0.5")
     return Decimal("1") if str(a) == str(b) else Decimal("0")
 
@@ -26,8 +29,10 @@ def _bucket_match(a: str | None, b: str | None) -> Decimal:
 def _jaccard(a: set[str], b: set[str]) -> Decimal:
     if not a and not b:
         return Decimal("1")
-    # Unspecified query dimension is neutral, not a hard miss.
-    if not a or not b:
+    # Unspecified query dimension does not constrain eligibility.
+    if not a:
+        return Decimal("1")
+    if not b:
         return Decimal("0.5")
     inter = len(a & b)
     union = len(a | b)
@@ -60,21 +65,34 @@ def score_similarity(
 ) -> tuple[Decimal, dict[str, Decimal]]:
     """Return (final_score, components) in [0, 1]."""
     pol = policy or SimilarityPolicy(policy_version=SIMILARITY_POLICY_VERSION)
-    family_q = (query_strategy_family or query_direction or "").lower()
-    family_e = (episode_strategy_family or episode_direction or "").lower()
-    strategy_family_match = (
-        Decimal("1")
-        if family_q and family_e and family_q == family_e
-        else Decimal("0")
-    )
+    # Strategy family is distinct from direction — never substitute one for the other.
+    family_q = (query_strategy_family or "").lower()
+    family_e = (episode_strategy_family or "").lower()
+    if not family_q:
+        strategy_family_match = Decimal("1")
+    elif not family_e:
+        strategy_family_match = Decimal("0.5")
+    elif family_q == family_e:
+        strategy_family_match = Decimal("1")
+    else:
+        strategy_family_match = Decimal("0")
+    direction_q = (query_direction or "").lower()
+    direction_e = (episode_direction or "").lower()
+    if not direction_q:
+        direction_match = Decimal("1")
+    elif not direction_e:
+        direction_match = Decimal("0.5")
+    elif direction_q == direction_e:
+        direction_match = Decimal("1")
+    else:
+        direction_match = Decimal("0")
     pattern_overlap = _jaccard(_as_set(query_pattern_ids), _as_set(episode_pattern_ids))
     regime_similarity = _jaccard(
         _as_set(query_regime_labels), _as_set(episode_regime_labels)
     )
-    if str(query_session_phase) in {"", "unknown"} or str(episode_session_phase) in {
-        "",
-        "unknown",
-    }:
+    if str(query_session_phase) in {"", "unknown"}:
+        session_phase_match = Decimal("1")
+    elif str(episode_session_phase) in {"", "unknown"}:
         session_phase_match = Decimal("0.5")
     elif str(query_session_phase) == str(episode_session_phase):
         session_phase_match = Decimal("1")
@@ -82,6 +100,7 @@ def score_similarity(
         session_phase_match = Decimal("0")
     components = {
         "strategy_family_match": strategy_family_match,
+        "direction_match": direction_match,
         "pattern_overlap": pattern_overlap,
         "regime_similarity": regime_similarity,
         "session_phase_match": session_phase_match,
@@ -99,8 +118,30 @@ def score_similarity(
         ),
     }
     weights = pol.weight_map()
+    # Direction is scored but folded into family weight budget when absent from policy.
+    scored_keys = [k for k in weights if k in components]
+    weight_sum = sum((weights[k] for k in scored_keys), start=Decimal("0"))
+    if weight_sum <= 0:
+        return Decimal("0"), components
+    # If policy has no direction weight, blend a small share from strategy_family.
+    if "direction_match" not in weights:
+        fam_w = weights.get("strategy_family_match", Decimal("0"))
+        if fam_w > 0:
+            weights = dict(weights)
+            weights["strategy_family_match"] = (fam_w * Decimal("0.75")).quantize(
+                Decimal("0.0001")
+            )
+            weights["direction_match"] = (fam_w * Decimal("0.25")).quantize(
+                Decimal("0.0001")
+            )
+            scored_keys = [k for k in weights if k in components]
+            weight_sum = sum((weights[k] for k in scored_keys), start=Decimal("0"))
     total = sum(
-        (components[k] * weights[k] for k in weights),
+        (components[k] * weights[k] for k in scored_keys),
         start=Decimal("0"),
-    ).quantize(Decimal("0.0001"))
+    )
+    if weight_sum != Decimal("1"):
+        total = (total / weight_sum).quantize(Decimal("0.0001"))
+    else:
+        total = total.quantize(Decimal("0.0001"))
     return total, components
