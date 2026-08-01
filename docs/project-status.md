@@ -10,7 +10,7 @@
 | Current branch | `task3-agent-evolution` |
 | Comparison base (pre-correction) | `e5cd91cba5ef0b21e16841674124fdda28280def` |
 | Primary implementation commit (pre-correction) | `e5cd91cba5ef0b21e16841674124fdda28280def` |
-| Tip commit (this correction) | `dfb632b3ec407320a501b4009ee1abe815f396fa` |
+| Tip commit (this correction) | `27bf157489415ad01bdcb4fcfd2af8224a69508e` |
 | Latest verified CI run (comparison base) | `30629186951` (781 on Python 3.11 + 3.12; Ruff passed) |
 | Latest verified CI run (tip) | *(set after exact-tip CI)* |
 | Local Python 3.12 | 803 passed ×3 (`ResourceWarning` as error) |
