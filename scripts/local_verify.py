@@ -227,6 +227,13 @@ def _parse_pytest_summary(log_path: Path) -> dict:
 
 
 def main() -> int:
+    # Line-buffer progress when stdout is redirected to an evidence log.
+    if hasattr(sys.stdout, "reconfigure"):
+        try:
+            sys.stdout.reconfigure(line_buffering=True)
+        except Exception:
+            pass
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--python",

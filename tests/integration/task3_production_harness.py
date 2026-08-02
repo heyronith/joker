@@ -668,7 +668,10 @@ async def ensure_flat_position(stack: dict, *, trade_index: int = 99) -> None:
 
 
 def _evolution_queues_idle(evolution: EvolutionRuntime) -> bool:
-    """True when episode/eval work queues are empty (workers may still be idle)."""
+    """True when episode/eval queues are empty and no compile/eval is in-flight."""
+    idle = getattr(evolution, "workers_idle", None)
+    if callable(idle):
+        return bool(idle())
     ep_q = getattr(evolution, "_episode_queue", None)
     ev_q = getattr(evolution, "_eval_queue", None)
     ep_idle = ep_q is None or ep_q.empty()
@@ -678,18 +681,20 @@ def _evolution_queues_idle(evolution: EvolutionRuntime) -> bool:
 
 
 async def settle_after_closed_trade(
-    stack: dict, *, min_closed_episodes: int, timeout: float = 45.0
+    stack: dict, *, min_closed_episodes: int, timeout: float = 60.0
 ) -> None:
     """Wait for compile/eval of closed trades before starting another entry.
 
-    CI hosts are slower than local macOS; without this barrier the next paper
-    entry races evolution workers for the FakeModelProvider / SQLite file and
-    never reaches OrderActionGateway.
+    Without this barrier the next paper entry may pause/cancel evolution workers
+    mid-evaluation (queue.empty() is not sufficient while a job is in-flight).
     """
     evolution: EvolutionRuntime = stack["evolution"]
     session_id = evolution.session_id
     await stack["supervisor"].event_bus.drain(timeout=5.0)
-    await wait_for_closed_episodes(evolution, session_id, min_closed_episodes)
+    closed = await wait_for_closed_episodes(
+        evolution, session_id, min_closed_episodes
+    )
+    await wait_for_evaluations(evolution, closed)
     deadline = asyncio.get_event_loop().time() + timeout
     while asyncio.get_event_loop().time() < deadline:
         if _evolution_queues_idle(evolution):
@@ -808,8 +813,18 @@ async def run_closed_trade_round_trip(
     await wait_ready_for_new_entry(stack, trade_index=trade_index)
     # Pause evolution workers during entry so cognitive cycles own the fake
     # provider / SQLite file; keep ingestion so POSITION_CLOSED can enqueue.
+    # Never pause while compile/eval is in-flight — cancel drops dequeued jobs.
     workers_were_running = bool(getattr(evolution, "_workers_started", False))
     if workers_were_running:
+        deadline = asyncio.get_event_loop().time() + 45.0
+        while asyncio.get_event_loop().time() < deadline:
+            if _evolution_queues_idle(evolution):
+                break
+            await asyncio.sleep(0.05)
+        else:
+            raise AssertionError(
+                "evolution workers not idle before pause; refusing to cancel in-flight jobs"
+            )
         await evolution.pause_workers()
     install_paper_path_factories(fake, session_id=session_id)
     set_position_action(fake, PositionAction.HOLD)
@@ -957,7 +972,7 @@ async def wait_for_closed_episodes(evolution: EvolutionRuntime, session_id: str,
 async def wait_for_evaluations(evolution: EvolutionRuntime, episodes) -> list:
     out = []
     for episode in episodes:
-        for _ in range(60):
+        for _ in range(300):
             evaluations = await evolution._repos["evaluations"].list_by_episode(
                 episode.episode_id
             )

@@ -116,6 +116,8 @@ class EvolutionRuntime:
     event_horizon_loader: Task1EventHorizonLoader | None = None
     _episode_queue: asyncio.Queue[dict[str, Any]] | None = None
     _eval_queue: asyncio.Queue[UUID] | None = None
+    _episode_in_flight: int = 0
+    _eval_in_flight: int = 0
     _workers: list[asyncio.Task[None]] = field(default_factory=list)
     _index_tasks: set[asyncio.Task[Any]] = field(default_factory=set)
     _prepared: bool = False
@@ -429,19 +431,35 @@ class EvolutionRuntime:
         await self.start_workers()
         await self.resume()
 
-    async def _cancel_worker_tasks(self) -> None:
-        pending_index = list(self._index_tasks)
-        if pending_index:
-            await asyncio.wait(pending_index, timeout=5.0)
-            still = [t for t in pending_index if not t.done()]
-            for task in still:
-                task.cancel()
-            if still:
-                await asyncio.gather(*still, return_exceptions=True)
-        self._index_tasks.clear()
-        for worker in self._workers:
+    async def _cancel_worker_tasks(
+        self, *, names: frozenset[str] | None = None
+    ) -> None:
+        """Cancel worker tasks.
+
+        When ``names`` is set, only tasks whose asyncio name is in that set are
+        cancelled (and removed from ``_workers``). Index tasks are always
+        drained when cancelling the full worker set (``names is None``).
+        """
+        if names is None:
+            pending_index = list(self._index_tasks)
+            if pending_index:
+                await asyncio.wait(pending_index, timeout=5.0)
+                still = [t for t in pending_index if not t.done()]
+                for task in still:
+                    task.cancel()
+                if still:
+                    await asyncio.gather(*still, return_exceptions=True)
+            self._index_tasks.clear()
+            targets = list(self._workers)
+        else:
+            targets = [
+                w
+                for w in self._workers
+                if (w.get_name() if hasattr(w, "get_name") else "") in names
+            ]
+        for worker in targets:
             worker.cancel()
-        for worker in self._workers:
+        for worker in targets:
             try:
                 await asyncio.wait_for(worker, timeout=5.0)
             except asyncio.CancelledError:
@@ -458,23 +476,63 @@ class EvolutionRuntime:
                     extra={"worker": repr(worker)},
                 )
                 raise
-        self._workers.clear()
-        self._workers_started = False
+        if names is None:
+            self._workers.clear()
+            self._workers_started = False
+        else:
+            surviving = [w for w in self._workers if w not in targets]
+            self._workers = surviving
+            # Keep _workers_started True if any worker remains (e.g. orchestrator).
+            self._workers_started = bool(surviving)
+
+    def workers_idle(self) -> bool:
+        """True when episode/eval queues are empty and no job is in-flight."""
+        ep_q = self._episode_queue
+        ev_q = self._eval_queue
+        ep_idle = ep_q is None or ep_q.empty()
+        ev_idle = ev_q is None or ev_q.empty()
+        index_idle = not self._index_tasks
+        return (
+            ep_idle
+            and ev_idle
+            and index_idle
+            and self._episode_in_flight == 0
+            and self._eval_in_flight == 0
+        )
 
     async def pause_workers(self) -> None:
-        """Temporarily stop workers without quiescing event ingestion.
+        """Temporarily stop episode/eval workers without quiescing ingestion.
 
         Used by paper harnesses so cognitive entry is not raced by episode/eval
         workers; POSITION_CLOSED jobs can still enqueue for later drain.
+
+        Does not pause the orchestrator or start/stop its worker — crash-recovery
+        seeds that disable the orchestrator worker must remain disabled.
+
+        Callers must wait until :meth:`workers_idle` before pausing; cancelling
+        mid-job drops the dequeued item and loses evaluation/compile work.
         """
-        if self.orchestrator is not None:
-            self.orchestrator.pause()
-        await self._cancel_worker_tasks()
+        await self._cancel_worker_tasks(
+            names=frozenset({"evolution-episode", "evolution-eval"})
+        )
 
     async def resume_workers(self) -> None:
-        """Restart workers after :meth:`pause_workers` (clears quiesce flag)."""
+        """Restart episode/eval workers after :meth:`pause_workers`."""
         self._quiesced = False
-        await self.start_workers()
+        if not self.settings.enabled or not self._prepared:
+            return
+        existing = {
+            (w.get_name() if hasattr(w, "get_name") else "") for w in self._workers
+        }
+        if "evolution-episode" not in existing:
+            self._workers.append(
+                asyncio.create_task(self._episode_worker(), name="evolution-episode")
+            )
+        if "evolution-eval" not in existing:
+            self._workers.append(
+                asyncio.create_task(self._evaluation_worker(), name="evolution-eval")
+            )
+        self._workers_started = bool(self._workers)
 
     async def stop_workers(self) -> None:
         """Stop episode/eval/orchestrator workers and drain index tasks.
@@ -721,6 +779,7 @@ class EvolutionRuntime:
         assert self._eval_queue is not None
         while True:
             job = await self._episode_queue.get()
+            self._episode_in_flight += 1
             try:
                 episode = await self._compile_job(job)
                 if episode is not None:
@@ -730,6 +789,7 @@ class EvolutionRuntime:
                 self.last_error = str(exc)
                 logger.exception("evolution_episode_worker_failed")
             finally:
+                self._episode_in_flight = max(0, self._episode_in_flight - 1)
                 self._episode_queue.task_done()
 
     async def _flush_session_event_index(self, *, timeout: float = 5.0) -> None:
@@ -848,6 +908,7 @@ class EvolutionRuntime:
         assert self.evaluation_runner is not None
         while True:
             episode_id = await self._eval_queue.get()
+            self._eval_in_flight += 1
             try:
                 episode = await self._repos["episodes"].get_by_id(episode_id)
                 if episode is not None:
@@ -857,6 +918,7 @@ class EvolutionRuntime:
                 self.last_error = str(exc)
                 logger.exception("evolution_evaluation_worker_failed")
             finally:
+                self._eval_in_flight = max(0, self._eval_in_flight - 1)
                 self._eval_queue.task_done()
 
     def wake_orchestrator(self, *, reason: str = "progress") -> None:
