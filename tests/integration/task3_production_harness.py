@@ -660,8 +660,39 @@ async def ensure_flat_position(stack: dict, *, trade_index: int = 99) -> None:
     )
 
 
+def _evolution_queues_idle(evolution: EvolutionRuntime) -> bool:
+    """True when episode/eval work queues are empty (workers may still be idle)."""
+    ep_q = getattr(evolution, "_episode_queue", None)
+    ev_q = getattr(evolution, "_eval_queue", None)
+    ep_idle = ep_q is None or ep_q.empty()
+    ev_idle = ev_q is None or ev_q.empty()
+    index_idle = not bool(getattr(evolution, "_index_tasks", None))
+    return ep_idle and ev_idle and index_idle
+
+
+async def settle_after_closed_trade(
+    stack: dict, *, min_closed_episodes: int, timeout: float = 45.0
+) -> None:
+    """Wait for compile/eval of closed trades before starting another entry.
+
+    CI hosts are slower than local macOS; without this barrier the next paper
+    entry races evolution workers for the FakeModelProvider / SQLite file and
+    never reaches OrderActionGateway.
+    """
+    evolution: EvolutionRuntime = stack["evolution"]
+    session_id = evolution.session_id
+    await stack["supervisor"].event_bus.drain(timeout=5.0)
+    await wait_for_closed_episodes(evolution, session_id, min_closed_episodes)
+    deadline = asyncio.get_event_loop().time() + timeout
+    while asyncio.get_event_loop().time() < deadline:
+        if _evolution_queues_idle(evolution):
+            break
+        await asyncio.sleep(0.1)
+    await wait_ready_for_new_entry(stack, trade_index=min_closed_episodes + 90)
+
+
 async def wait_ready_for_new_entry(
-    stack: dict, *, trade_index: int = 98, timeout: float = 30.0
+    stack: dict, *, trade_index: int = 98, timeout: float = 45.0
 ) -> None:
     """Ensure flat book, no working entry, and agent idle enough for a new entry."""
     from joker.runtime.order_action_gateway import (
@@ -672,6 +703,7 @@ async def wait_ready_for_new_entry(
     await ensure_flat_position(stack, trade_index=trade_index)
     agent: CognitiveAgentRuntime = stack["agent"]
     supervisor = stack["supervisor"]
+    evolution: EvolutionRuntime = stack["evolution"]
     deadline = asyncio.get_event_loop().time() + timeout
     while asyncio.get_event_loop().time() < deadline:
         await supervisor.event_bus.drain(timeout=2.0)
@@ -680,7 +712,8 @@ async def wait_ready_for_new_entry(
         open_pos = pos is not None and pos.quantity != 0
         working = has_working_entry_order(working_orders_from_projection(projection))
         in_flight = bool(getattr(agent, "_new_entry_in_flight", False))
-        if not open_pos and not working and not in_flight:
+        evo_idle = _evolution_queues_idle(evolution)
+        if not open_pos and not working and not in_flight and evo_idle:
             return
         if open_pos:
             await ensure_flat_position(stack, trade_index=trade_index)
@@ -783,7 +816,7 @@ async def run_closed_trade_round_trip(
     _refresh_trade_canned(fake, trade_index)
     register_evolution_router_canned(fake)
     await stack["supervisor"].event_bus.drain(timeout=5.0)
-    for i in range(120):
+    for i in range(200):
         if len(stack["gateway_entry_ids"]) > entries_before:
             break
         if i > 0 and i % 15 == 0:
@@ -870,10 +903,14 @@ async def run_closed_trade_round_trip(
     await _wait_for_closed_exit(
         stack, exits_before=exits_before, trade_index=trade_index, attempts=120
     )
+    # Barrier so the next round-trip does not race episode compile / evaluation.
+    await settle_after_closed_trade(
+        stack, min_closed_episodes=trade_index + 1, timeout=60.0
+    )
 
 
 async def wait_for_closed_episodes(evolution: EvolutionRuntime, session_id: str, count: int):
-    for _ in range(80):
+    for _ in range(160):
         episodes = await evolution._repos["episodes"].list_by_session(session_id)
         closed = [e for e in episodes if e.action_class == "closed_trade" and e.completed]
         if len(closed) >= count:
