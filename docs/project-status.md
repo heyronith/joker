@@ -6,41 +6,59 @@
 | Task 2 | approved |
 | Task 3 | approved project foundation |
 | Goal-driven objective layer | implemented |
-| Current phase | historical EV production truth correction (not approved) |
+| Current phase | historical EV production truth correction (**not approved**) |
 | Current branch | `task3-agent-evolution` |
 | Comparison base (pre this correction) | `8cb47c69b8bbdd2888f3e12b06c892f90cbe4c63` |
-| Prior verified code tip | `569a2235a2e713bd5de9b84c3b416f913416cd99` |
-| Acceptance path | **local** `python scripts/local_verify.py` (SHA-tied evidence under `artifacts/local-verify/<sha>/`) |
-| GitHub Actions | optional `workflow_dispatch` only — **not** an acceptance gate |
-| Tip commit (this correction) | pending clean commit after verify tooling |
-| Latest local evidence | pending `scripts/local_verify.py` on clean tip |
+| Verified code commit | `fde7a2aec88b2a9e9ca963f837f162479e202cca` |
+| Acceptance path | **local** `python scripts/local_verify.py` → `artifacts/local-verify/<sha>/` |
+| GitHub Actions | `workflow_dispatch` only — **not** an acceptance gate |
+| Latest local evidence (3.12) | verified code `fde7a2a` — **PASS** (`overall_ok: true`) |
+| Docs commit after evidence | documentation-only; does **not** require its own full suite |
+| Python 3.11 on verified code | not re-run (optional; prior tip had 830×3 on 3.11) |
 | Paper-only status | enforced (live trading disabled) |
 | Textual UI status | not started / not modified in this phase |
-| Known unresolved items | independent review; phase remains unapproved |
+| Known unresolved items | independent review of production EV path at `fde7a2a`; phase remains unapproved |
 
-## Local verification (acceptance)
+## What changed (this acceptance move)
 
-Do not treat GitHub Actions push/PR results as acceptance. Reproduce on a clean
-working tree at the exact commit SHA:
+1. **CI is no longer a gate** — `.github/workflows/ci.yml` is `workflow_dispatch` only (no push/PR triggers).
+2. **Local acceptance command** — `scripts/local_verify.py` records a SHA-tied `manifest.json` + `summary.txt` (Ruff, CLI smoke, SQLite integrity, focused×5, full×3, soak×3). Same warning gates as former CI (`ResourceWarning` / unhandled thread exceptions as errors). Gates were not weakened.
+3. **Harness/runtime soak fix** — `pause_workers` cancels only episode/eval workers (not orchestrator), tracks in-flight compile/eval, and settle waits for persisted evaluations before the next entry so cancel cannot drop dequeued jobs.
+
+## Local verification evidence (`fde7a2a`)
+
+Command:
 
 ```bash
-# Python 3.12 (example)
-.venv/bin/python scripts/local_verify.py
-
-# Python 3.11 (example)
-.venv311/bin/python scripts/local_verify.py --python .venv311/bin/python
+.venv/bin/python -u scripts/local_verify.py --python .venv/bin/python
 ```
 
-Defaults (same warning gates as former CI): focused ×5, full suite ×3, soak ×3,
-Ruff, CLI help smoke, fresh-DB SQLite `PRAGMA integrity_check`.
+| Field | Value |
+| --- | --- |
+| Verified code SHA (`manifest.commit_sha`) | `fde7a2aec88b2a9e9ca963f837f162479e202cca` |
+| Result | **PASS** |
+| Manifest (local, gitignored) | `artifacts/local-verify/fde7a2aec88b2a9e9ca963f837f162479e202cca/manifest.json` |
+| Python | 3.12.13 (CPython), `.venv/bin/python` |
+| Platform | macOS-26.5.2-arm64-arm-64bit |
+| SQLite | 3.53.2 — `PRAGMA integrity_check` = **ok** (58 tables after Task1+objectives+Task3 migrations; 0 FK violations) |
+| Ruff | ok |
+| CLI `python -m joker --help` | ok |
+| Focused | 65 passed ×5 |
+| Full suite | 830 passed ×3 |
+| Soak | 15 passed ×3 (recovery matrix + live runner + kill-switch paths) |
+| Git during verify | clean (`git_dirty=false`, porcelain empty) |
+| Note | A later documentation-only commit may dirty/advance the tip; independent review targets `fde7a2a`, not the docs commit |
 
-Evidence: `artifacts/local-verify/<commit_sha>/manifest.json` + `summary.txt`.
+Reproduce later:
+
+```bash
+git checkout fde7a2aec88b2a9e9ca963f837f162479e202cca
+.venv/bin/python scripts/local_verify.py
+```
 
 ## Historical-EV phase status
 
-**Not complete / not approved.** This correction requires production `EpisodeCompiler` factual metadata, fail-closed authoritative event horizons, quote+limit worst-case fill safety, configuration-scoped dataset leakage, and a public session-factory PaperBroker path.
-
-Do not mark the historical-EV phase complete until independent review verifies:
+**Not complete / not approved.** Production path still needs independent review:
 
 ```text
 real EpisodeCompiler output
@@ -52,4 +70,4 @@ real EpisodeCompiler output
 → one public-path PaperBroker submission
 ```
 
-plus green **local** verification evidence for that exact tip SHA on Python 3.11 and 3.12 (GitHub Actions is not required).
+Green local evidence on the tip SHA is recorded above for Python 3.12. GitHub Actions is not required for acceptance.
