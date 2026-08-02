@@ -206,6 +206,8 @@ async def _gateway_stack(tmp_path, *, quote: CurrentExecutionQuote, pnl: Decimal
         session_id="gw",
     )
     runtime = _FakeRuntime()
+    from joker.objectives.config import ObjectiveExecutionSettings
+
     deps = CognitiveGraphDeps(
         router=router,
         config=CognitiveGraphSettings(),
@@ -215,6 +217,9 @@ async def _gateway_stack(tmp_path, *, quote: CurrentExecutionQuote, pnl: Decimal
         objective_service=svc,
         historical_outcome_service=hist,
         historical_outcome_settings=hist._settings,
+        objective_execution_settings=ObjectiveExecutionSettings(
+            maximum_buy_limit_above_ask_pct=5.0
+        ),
         current_option_quote_loader=_loader,
         max_quote_age_seconds=30,
         max_relative_spread=0.25,
@@ -303,13 +308,15 @@ async def test_gateway_loads_current_task1_quote(tmp_path, monkeypatch) -> None:
         }
     )
     svc.save_strategy_estimate(est2)
-    result = await gateway.submit(_entry_request(est2, strategy, limit=9.99))
+    result = await gateway.submit(_entry_request(est2, strategy, limit=1.10))
     assert calls == [CONTRACT_ID]
     assert result.submitted is True
 
 
 @pytest.mark.asyncio
-async def test_gateway_does_not_use_limit_price_as_quote_truth(tmp_path, monkeypatch) -> None:
+async def test_gateway_rejects_extreme_buy_limit_above_ask(
+    tmp_path, monkeypatch
+) -> None:
     quote = _quote(ask="1.10", bid="1.00")
     gateway, svc, est, strategy, runtime, calls, _ = await _gateway_stack(
         tmp_path, quote=quote, pnl=Decimal("25")
@@ -329,10 +336,38 @@ async def test_gateway_does_not_use_limit_price_as_quote_truth(tmp_path, monkeyp
     svc.save_strategy_estimate(est2)
     result = await gateway.submit(_entry_request(est2, strategy, limit=99.0))
     assert calls == [CONTRACT_ID]
-    assert result.submitted is True
+    assert result.submitted is False
+    assert "buy_limit_exceeds_max_displacement_above_ask" in (result.blocked_reason or "")
+    assert runtime.submissions == []
     state = await svc.get_state()
-    # Reservation uses ask $1.10, not limit $99
-    assert state.working_order_reservation_usd == Decimal("110.00")
+    assert state.working_order_reservation_usd == 0
+
+
+@pytest.mark.asyncio
+async def test_gateway_cannot_submit_9900_notional_with_110_reservation(
+    tmp_path, monkeypatch
+) -> None:
+    """Extreme limit must not reach the broker with an under-sized reservation."""
+    quote = _quote(ask="1.10", bid="1.00")
+    gateway, svc, est, strategy, runtime, _, _ = await _gateway_stack(
+        tmp_path, quote=quote, pnl=Decimal("25")
+    )
+    _patch_validate(monkeypatch)
+    est2 = est.model_copy(
+        update={
+            "valid": True,
+            "expected_value_usd": Decimal("25.00"),
+            "quote_inputs": {
+                "premium_per_contract": "1.00",
+                "quantity": 1,
+                "slippage_per_contract": "0.00",
+            },
+        }
+    )
+    svc.save_strategy_estimate(est2)
+    result = await gateway.submit(_entry_request(est2, strategy, limit=99.0))
+    assert result.submitted is False
+    assert runtime.submissions == []
 
 
 @pytest.mark.asyncio
@@ -391,7 +426,7 @@ async def test_gateway_rejects_non_positive_current_quote_ev(tmp_path, monkeypat
         }
     )
     svc.save_strategy_estimate(est2)
-    result = await gateway.submit(_entry_request(est2, strategy))
+    result = await gateway.submit(_entry_request(est2, strategy, limit=1.50))
     assert result.submitted is False
     assert "objective_repriced_ev_not_positive" in (result.blocked_reason or "")
     assert runtime.submissions == []
@@ -420,11 +455,118 @@ async def test_gateway_reserves_once_after_positive_current_quote_ev(
         }
     )
     svc.save_strategy_estimate(est2)
-    result = await gateway.submit(_entry_request(est2, strategy))
+    result = await gateway.submit(_entry_request(est2, strategy, limit=1.05))
     assert result.submitted is True
     assert len(runtime.submissions) == 1
     state = await svc.get_state()
     assert state.working_order_reservation_usd > 0
+
+
+@pytest.mark.asyncio
+async def test_gateway_reservation_covers_submitted_limit(tmp_path, monkeypatch) -> None:
+    quote = _quote(ask="1.00", bid="0.95", spread="0.05")
+    gateway, svc, est, strategy, runtime, _, _ = await _gateway_stack(
+        tmp_path, quote=quote, pnl=Decimal("30")
+    )
+    _patch_validate(monkeypatch, limit_price=1.04)
+    est2 = est.model_copy(
+        update={
+            "valid": True,
+            "expected_value_usd": Decimal("30.00"),
+            "quote_inputs": {
+                "premium_per_contract": "1.00",
+                "quantity": 1,
+                "slippage_per_contract": "0.00",
+            },
+        }
+    )
+    svc.save_strategy_estimate(est2)
+    result = await gateway.submit(_entry_request(est2, strategy, limit=1.04))
+    assert result.submitted is True
+    state = await svc.get_state()
+    submitted_limit = Decimal(str(runtime.submissions[0].intent.limit_price))
+    assert state.working_order_reservation_usd >= submitted_limit * Decimal("100")
+
+
+@pytest.mark.asyncio
+async def test_gateway_ev_uses_maximum_permitted_fill_price(
+    tmp_path, monkeypatch
+) -> None:
+    quote = _quote(ask="1.00", bid="0.95", spread="0.05")
+    gateway, svc, est, strategy, runtime, _, _ = await _gateway_stack(
+        tmp_path, quote=quote, pnl=Decimal("8")
+    )
+    _patch_validate(monkeypatch)
+    # EV 8 at $1.00; worst-case limit $1.04 → delta $4 → EV 4 still positive.
+    est2 = est.model_copy(
+        update={
+            "valid": True,
+            "expected_value_usd": Decimal("8.00"),
+            "quote_inputs": {
+                "premium_per_contract": "1.00",
+                "quantity": 1,
+                "slippage_per_contract": "0.00",
+            },
+        }
+    )
+    svc.save_strategy_estimate(est2)
+    result = await gateway.submit(_entry_request(est2, strategy, limit=1.04))
+    assert result.submitted is True
+    assert runtime.submissions
+
+
+@pytest.mark.asyncio
+async def test_gateway_clamped_limit_matches_reserved_price(
+    tmp_path, monkeypatch
+) -> None:
+    quote = _quote(ask="1.10", bid="1.00", spread="0.09")
+    gateway, svc, est, strategy, runtime, _, _ = await _gateway_stack(
+        tmp_path, quote=quote, pnl=Decimal("40")
+    )
+    _patch_validate(monkeypatch)
+    est2 = est.model_copy(
+        update={
+            "valid": True,
+            "expected_value_usd": Decimal("40.00"),
+            "quote_inputs": {
+                "premium_per_contract": "1.00",
+                "quantity": 1,
+                "slippage_per_contract": "0.00",
+            },
+        }
+    )
+    svc.save_strategy_estimate(est2)
+    # Limit below ask → worst-case = ask; submitted limit must match reservation.
+    result = await gateway.submit(_entry_request(est2, strategy, limit=1.05))
+    assert result.submitted is True
+    submitted = Decimal(str(runtime.submissions[0].intent.limit_price))
+    state = await svc.get_state()
+    assert submitted == Decimal("1.10")
+    assert state.working_order_reservation_usd == submitted * Decimal("100")
+
+
+@pytest.mark.asyncio
+async def test_normal_quote_aligned_limit_submits_once(tmp_path, monkeypatch) -> None:
+    quote = _quote(ask="1.10", bid="1.05", spread="0.05")
+    gateway, svc, est, strategy, runtime, _, _ = await _gateway_stack(
+        tmp_path, quote=quote, pnl=Decimal("25")
+    )
+    _patch_validate(monkeypatch)
+    est2 = est.model_copy(
+        update={
+            "valid": True,
+            "expected_value_usd": Decimal("25.00"),
+            "quote_inputs": {
+                "premium_per_contract": "1.00",
+                "quantity": 1,
+                "slippage_per_contract": "0.00",
+            },
+        }
+    )
+    svc.save_strategy_estimate(est2)
+    result = await gateway.submit(_entry_request(est2, strategy, limit=1.10))
+    assert result.submitted is True
+    assert len(runtime.submissions) == 1
 
 
 @pytest.mark.asyncio

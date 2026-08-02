@@ -292,6 +292,38 @@ async def score_strategies_against_objective_node(
     if current_episode_id is not None:
         current_episode_id = UUID(str(current_episode_id))
 
+    # Resolve active configuration → training/challenger dataset IDs for leakage.
+    configuration_version_id = None
+    blocked_training_dataset_ids: tuple[UUID, ...] = ()
+    challenger_dataset_ids: tuple[UUID, ...] = ()
+    configuration_dataset_provenance_resolved = True
+    evo = getattr(deps, "evolution_runtime", None)
+    cfg_repo = getattr(deps, "configuration_repo", None)
+    if evo is not None:
+        try:
+            champ_id = await evo.current_champion_id()
+        except Exception:
+            champ_id = None
+        if champ_id is not None:
+            configuration_version_id = champ_id
+            cfg = None
+            if cfg_repo is not None:
+                cfg = await cfg_repo.get_by_id(champ_id)
+            elif hasattr(evo, "repositories"):
+                cfg_repo_rt = evo.repositories.get("configurations")
+                if cfg_repo_rt is not None:
+                    cfg = await cfg_repo_rt.get_by_id(champ_id)
+            if cfg is None:
+                configuration_dataset_provenance_resolved = False
+            else:
+                blocked_training_dataset_ids = tuple(
+                    getattr(cfg, "training_dataset_ids", ()) or ()
+                )
+                challenger_dataset_ids = tuple(
+                    getattr(cfg, "challenger_dataset_ids", ()) or ()
+                )
+                configuration_dataset_provenance_resolved = True
+
     for strategy in state.get("strategies") or []:
         summary = None
         if deps.historical_outcome_service is not None:
@@ -322,6 +354,12 @@ async def score_strategies_against_objective_node(
                 premium_per_contract_usd=default_premium,
                 expected_horizon_seconds=int(strategy.expected_horizon_seconds),
                 current_episode_id=current_episode_id,
+                configuration_version_id=configuration_version_id,
+                blocked_training_dataset_ids=blocked_training_dataset_ids,
+                challenger_dataset_ids=challenger_dataset_ids,
+                configuration_dataset_provenance_resolved=(
+                    configuration_dataset_provenance_resolved
+                ),
             )
             historical_summaries.append(summary.model_dump(mode="json"))
             max_sample_seen = max(max_sample_seen, int(summary.sample_count))

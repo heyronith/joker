@@ -206,8 +206,29 @@ class HistoricalOutcomeService:
         dataset_by_id = {
             str(getattr(d, "dataset_id", "")): d for d in datasets
         }
+        # Active configuration without resolvable dataset provenance → fail closed.
+        if (
+            query.configuration_version_id is not None
+            and not query.configuration_dataset_provenance_resolved
+        ):
+            report = HistoricalLeakageReport(
+                query_id=query.query_id,
+                safe=False,
+                notes=("missing_configuration_dataset_provenance",),
+            )
+            summary = self._aggregate(
+                query, (), {"configuration_dataset_provenance_missing": 1}, report
+            )
+            if self._repo is not None:
+                self._repo.save_historical_query(query)
+                self._repo.save_historical_summary(summary)
+                self._repo.save_leakage_report(report)
+            return summary, report, ()
         # Unresolved overlap: blocked dataset IDs were supplied but loader missing.
-        if query.blocked_training_dataset_ids and self._dataset_loader is None:
+        if (
+            (query.blocked_training_dataset_ids or query.challenger_dataset_ids)
+            and self._dataset_loader is None
+        ):
             unsafe_notes.append("unresolved_dataset_overlap_no_loader")
 
         episodes = await self._load_episodes()
@@ -357,6 +378,8 @@ class HistoricalOutcomeService:
         configuration_version_id: UUID | None = None,
         current_episode_id: UUID | None = None,
         blocked_training_dataset_ids: Sequence[UUID] = (),
+        challenger_dataset_ids: Sequence[UUID] = (),
+        configuration_dataset_provenance_resolved: bool = True,
     ) -> HistoricalOutcomeSummary:
         query = HistoricalOutcomeQuery(
             objective_id=objective_id,
@@ -380,6 +403,10 @@ class HistoricalOutcomeService:
             as_of_timestamp=as_of_timestamp,
             current_episode_id=current_episode_id,
             blocked_training_dataset_ids=tuple(blocked_training_dataset_ids),
+            challenger_dataset_ids=tuple(challenger_dataset_ids),
+            configuration_dataset_provenance_resolved=(
+                configuration_dataset_provenance_resolved
+            ),
             allow_synthetic_replay=False,
         )
         summary, _report, _outcomes = await self.query_comparable_outcomes(query)
@@ -438,24 +465,28 @@ class HistoricalOutcomeService:
                     memberships.append((str(ds.dataset_id), "unspecified"))
 
         blocked = {str(x) for x in query.blocked_training_dataset_ids}
+        challenger = {str(x) for x in query.challenger_dataset_ids}
         for ds_id, partition in memberships:
             ds = dataset_by_id.get(ds_id)
-            if ds is None and blocked and ds_id in blocked:
+            if ds is None and (
+                (blocked and ds_id in blocked) or (challenger and ds_id in challenger)
+            ):
                 return "unresolved"
             if ds is None:
                 continue
             cutoff = getattr(ds, "time_end", None)
             if cutoff is not None and cutoff > as_of:
                 return "dataset_cutoff_after_as_of"
-            part = str(partition).lower()
-            if part in {"train", "training", "fit"}:
-                return "training_dataset_overlap"
+            # Only exclude when the *active* configuration used this dataset —
+            # never because the episode appeared in an unrelated historical train set.
             if ds_id in blocked:
                 return "blocked_training_dataset"
-            # Challenger partition containing the same authoritative episode.
-            if part in {"challenger", "challenger_train"}:
+            if ds_id in challenger:
                 return "challenger_dataset_overlap"
-        if blocked and self._dataset_loader is None:
+            part = str(partition).lower()
+            if part in {"challenger", "challenger_train"} and ds_id in challenger:
+                return "challenger_dataset_overlap"
+        if (blocked or challenger) and self._dataset_loader is None:
             return "unresolved"
         return None
 

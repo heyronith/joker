@@ -507,7 +507,7 @@ async def test_missing_as_of_timestamp_fails_closed(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_training_dataset_overlap_is_excluded(tmp_path) -> None:
+async def test_active_configuration_training_episode_is_excluded(tmp_path) -> None:
     svc, _, ep_repo, ev_repo, ds_repo = await make_repo_backed_hist_service(
         tmp_path, minimum_samples_for_ev=5
     )
@@ -516,7 +516,7 @@ async def test_training_dataset_overlap_is_excluded(tmp_path) -> None:
         episode_repo=ep_repo, evaluation_repo=ev_repo, as_of=as_of, n=8
     )
     overlap_ids = tuple(r[0].episode_id for r in rows[:3])
-    await persist_dataset_with_episodes(
+    ds = await persist_dataset_with_episodes(
         ds_repo,
         episode_ids=overlap_ids,
         partition="train",
@@ -532,11 +532,155 @@ async def test_training_dataset_overlap_is_excluded(tmp_path) -> None:
             maximum_samples=50,
             minimum_similarity=Decimal("0.10"),
             as_of_timestamp=as_of,
+            configuration_version_id=uuid4(),
+            blocked_training_dataset_ids=(ds.dataset_id,),
+            configuration_dataset_provenance_resolved=True,
         )
     )
     assert len(report.excluded_dataset_overlap) >= 3
     assert summary.sample_count == 5
     assert report.safe is True
+
+
+@pytest.mark.asyncio
+async def test_unrelated_old_training_dataset_does_not_exclude_episode(
+    tmp_path,
+) -> None:
+    svc, _, ep_repo, ev_repo, ds_repo = await make_repo_backed_hist_service(
+        tmp_path, minimum_samples_for_ev=5
+    )
+    as_of = datetime.now(timezone.utc)
+    rows = await persist_positive_history(
+        episode_repo=ep_repo, evaluation_repo=ev_repo, as_of=as_of, n=8
+    )
+    overlap_ids = tuple(r[0].episode_id for r in rows[:3])
+    await persist_dataset_with_episodes(
+        ds_repo,
+        episode_ids=overlap_ids,
+        partition="train",
+        time_end=as_of - timedelta(days=1),
+    )
+    # Active configuration was not trained on that old dataset → keep samples.
+    summary, report, _ = await svc.query_comparable_outcomes(
+        HistoricalOutcomeQuery(
+            objective_id=uuid4(),
+            strategy_id=uuid4(),
+            snapshot_id=uuid4(),
+            strategy_family="breakout_continuation",
+            direction="bullish",
+            maximum_samples=50,
+            minimum_similarity=Decimal("0.10"),
+            as_of_timestamp=as_of,
+            configuration_version_id=uuid4(),
+            blocked_training_dataset_ids=(),
+            configuration_dataset_provenance_resolved=True,
+        )
+    )
+    assert summary.sample_count == 8
+    assert report.excluded_dataset_overlap == ()
+
+
+@pytest.mark.asyncio
+async def test_missing_configuration_dataset_provenance_fails_closed(tmp_path) -> None:
+    svc, _, ep_repo, ev_repo, _ = await make_repo_backed_hist_service(
+        tmp_path, minimum_samples_for_ev=5
+    )
+    as_of = datetime.now(timezone.utc)
+    await persist_positive_history(
+        episode_repo=ep_repo, evaluation_repo=ev_repo, as_of=as_of, n=8
+    )
+    summary, report, _ = await svc.query_comparable_outcomes(
+        HistoricalOutcomeQuery(
+            objective_id=uuid4(),
+            strategy_id=uuid4(),
+            snapshot_id=uuid4(),
+            strategy_family="breakout_continuation",
+            as_of_timestamp=as_of,
+            configuration_version_id=uuid4(),
+            configuration_dataset_provenance_resolved=False,
+            maximum_samples=50,
+            minimum_similarity=Decimal("0.10"),
+        )
+    )
+    assert report.safe is False
+    assert summary.valid_for_ev is False
+    assert any("missing_configuration_dataset_provenance" in n for n in report.notes)
+
+
+@pytest.mark.asyncio
+async def test_holdout_episode_remains_eligible_when_not_used_for_training(
+    tmp_path,
+) -> None:
+    svc, _, ep_repo, ev_repo, ds_repo = await make_repo_backed_hist_service(
+        tmp_path, minimum_samples_for_ev=5
+    )
+    as_of = datetime.now(timezone.utc)
+    rows = await persist_positive_history(
+        episode_repo=ep_repo, evaluation_repo=ev_repo, as_of=as_of, n=8
+    )
+    holdout = tuple(r[0].episode_id for r in rows[3:])
+    train = tuple(r[0].episode_id for r in rows[:3])
+    ds = await persist_dataset_with_episodes(
+        ds_repo,
+        episode_ids=train,
+        partition="train",
+        time_end=as_of - timedelta(days=1),
+    )
+    await persist_dataset_with_episodes(
+        ds_repo,
+        episode_ids=holdout,
+        partition="holdout",
+        time_end=as_of - timedelta(days=1),
+    )
+    summary, _, outcomes = await svc.query_comparable_outcomes(
+        HistoricalOutcomeQuery(
+            objective_id=uuid4(),
+            strategy_id=uuid4(),
+            snapshot_id=uuid4(),
+            strategy_family="breakout_continuation",
+            direction="bullish",
+            maximum_samples=50,
+            minimum_similarity=Decimal("0.10"),
+            as_of_timestamp=as_of,
+            blocked_training_dataset_ids=(ds.dataset_id,),
+            configuration_dataset_provenance_resolved=True,
+        )
+    )
+    assert summary.sample_count == 5
+    assert {o.episode_id for o in outcomes}.isdisjoint(set(train))
+
+
+@pytest.mark.asyncio
+async def test_dataset_cutoff_after_as_of_is_excluded(tmp_path) -> None:
+    svc, _, ep_repo, ev_repo, ds_repo = await make_repo_backed_hist_service(
+        tmp_path, minimum_samples_for_ev=5
+    )
+    as_of = datetime.now(timezone.utc)
+    rows = await persist_positive_history(
+        episode_repo=ep_repo, evaluation_repo=ev_repo, as_of=as_of, n=8
+    )
+    future_cut = tuple(r[0].episode_id for r in rows[:3])
+    await persist_dataset_with_episodes(
+        ds_repo,
+        episode_ids=future_cut,
+        partition="holdout",
+        time_end=as_of + timedelta(days=1),
+    )
+    summary, report, _ = await svc.query_comparable_outcomes(
+        HistoricalOutcomeQuery(
+            objective_id=uuid4(),
+            strategy_id=uuid4(),
+            snapshot_id=uuid4(),
+            strategy_family="breakout_continuation",
+            direction="bullish",
+            maximum_samples=50,
+            minimum_similarity=Decimal("0.10"),
+            as_of_timestamp=as_of,
+            configuration_dataset_provenance_resolved=True,
+        )
+    )
+    assert len(report.excluded_dataset_overlap) >= 3
+    assert summary.sample_count == 5
 
 
 @pytest.mark.asyncio

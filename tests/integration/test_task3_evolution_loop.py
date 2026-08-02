@@ -13,7 +13,6 @@ from joker.evolution.champion_registry import ChampionRegistry
 from joker.evolution.config import PromotionSettings
 from joker.evolution.decision import EvolutionDecisionService
 from joker.evolution.drift import DriftMonitor
-from joker.evolution.episode_compiler import EpisodeCompiler
 from joker.evolution.experiment_runner import ExperimentRunner
 from joker.evolution.improvement import ImprovementProposalService
 from joker.evolution.migrations import apply_task3_migrations
@@ -41,8 +40,13 @@ async def test_task3_evolution_closed_loop(tmp_path) -> None:
     champion = await registry.bootstrap_champion()
     pinned_for_active_cycle = champion.configuration_version_id
 
-    compiler = EpisodeCompiler(repos["episodes"], repos["traces"])
+    from tests.evolution.compiler_test_helpers import (
+        build_complete_episode_compiler,
+        entry_terminal_timestamps,
+    )
+
     evaluator = EvaluationGraphRunner(repos["evaluations"], repos["traces"])
+    entry_ts, term_ts = entry_terminal_timestamps()
 
     episodes = []
     for i in range(24):
@@ -50,6 +54,13 @@ async def test_task3_evolution_closed_loop(tmp_path) -> None:
         contract = f"SPY:2026-07-01:{500 + i}:call"
         pnl = Decimal("10") if i % 2 == 0 else Decimal("-10")
         exit_price = Decimal("1.10") if i % 2 == 0 else Decimal("0.90")
+        compiler = build_complete_episode_compiler(
+            repos["episodes"],
+            repos["traces"],
+            contract_id=contract,
+            entry_id=f"e{i}",
+            exit_id=f"x{i}",
+        )
         ep = await compiler.compile_from_position_closed(
             session_id="task3-session",
             run_id="run-1",
@@ -74,6 +85,8 @@ async def test_task3_evolution_closed_loop(tmp_path) -> None:
             initial_snapshot_id=snap,
             terminal_snapshot_id=uuid4(),
             market_regime_tags=("trending_up" if i < 12 else "high_volatility",),
+            entry_decision_timestamp=entry_ts,
+            terminal_event_timestamp=term_ts,
         )
         evaluation = await evaluator.evaluate(
             ep,

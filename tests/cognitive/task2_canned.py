@@ -141,36 +141,37 @@ def register_full_path_canned(
         AgentRole.WORLD_MODEL_SYNTHESISER.value, _world_model_from_request
     )
 
+    pattern_ids: list[UUID] = []
     for role, name in (
         (AgentRole.PATTERN_MINER, "breakout"),
         (AgentRole.SEQUENCE_ANALYST, "sequence"),
         (AgentRole.ANALOGY_RETRIEVER, "analogy"),
     ):
-        fake.set_canned_for_role(
-            role.value,
-            PatternHypothesis(
-                session_id=session,
-                snapshot_id=sid,
-                prompt_version="2.0.0",
-                model_call_id=mc,
-                cycle_id=cycle_id,
-                name=name,
-                description=f"{name} pattern",
-                direction=MarketDirection.BULLISH,
-                expected_horizon_seconds=300,
-                novelty_score=0.5,
-                confidence=0.55,
-                agent_role=role,
-                supporting_evidence_ids=eids[:2],
-            ),
+        pattern = PatternHypothesis(
+            session_id=session,
+            snapshot_id=sid,
+            prompt_version="2.0.0",
+            model_call_id=mc,
+            cycle_id=cycle_id,
+            name=name,
+            description=f"{name} pattern",
+            direction=MarketDirection.BULLISH,
+            expected_horizon_seconds=300,
+            novelty_score=0.5,
+            confidence=0.55,
+            agent_role=role,
+            supporting_evidence_ids=eids[:2],
         )
+        pattern_ids.append(pattern.hypothesis_id)
+        fake.set_canned_for_role(role.value, pattern)
 
     strategy_id = uuid4()
+    pattern_tuple = tuple(pattern_ids)
     strategies_by_role: dict[str, StrategyHypothesis] = {}
-    for role_name, agent_role in (
-        ("bullish_inventor", AgentRole.BULLISH_INVENTOR),
-        ("bearish_inventor", AgentRole.BEARISH_INVENTOR),
-        ("neutral_advocate", AgentRole.NEUTRAL_ADVOCATE),
+    for role_name, agent_role, family in (
+        ("bullish_inventor", AgentRole.BULLISH_INVENTOR, "breakout_continuation"),
+        ("bearish_inventor", AgentRole.BEARISH_INVENTOR, "failed_breakout_reversal"),
+        ("neutral_advocate", AgentRole.NEUTRAL_ADVOCATE, "mean_reversion"),
     ):
         sid_strategy = strategy_id if role_name == "bullish_inventor" else uuid4()
         leg = StrategyLegCandidate(
@@ -195,6 +196,8 @@ def register_full_path_canned(
             else (
                 MarketDirection.BEARISH if "bear" in role_name else MarketDirection.NEUTRAL
             ),
+            strategy_family=family,
+            source_hypothesis_ids=pattern_tuple,
             candidate_legs=(leg,),
             entry_plan=EntryPlan(entry_style="immediate", preferred_order_type="limit"),
             execution_plan=ExecutionPlan(

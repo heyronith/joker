@@ -7,6 +7,10 @@ from decimal import Decimal
 from typing import Any, Protocol
 from uuid import UUID, uuid4
 
+from joker.evolution.episode_metadata import (
+    resolve_episode_similarity_metadata,
+    verify_event_horizon,
+)
 from joker.evolution.hashing import hash_model
 from joker.evolution.idempotency import episode_idempotency_key
 from joker.evolution.lifecycle import PositionLifecycleResolver
@@ -34,6 +38,8 @@ class EpisodeCompiler:
         provenance: Any | None = None,
         cycle_registry: Any | None = None,
         event_horizon_loader: Any | None = None,
+        strategy_repo: Any | None = None,
+        world_model_repo: Any | None = None,
     ) -> None:
         self._episodes = episode_repo
         self._traces = trace_repo
@@ -43,6 +49,8 @@ class EpisodeCompiler:
         self._provenance = provenance
         self._cycle_registry = cycle_registry
         self._event_horizon_loader = event_horizon_loader
+        self._strategy_repo = strategy_repo
+        self._world_model_repo = world_model_repo
 
     async def compile_from_position_closed(
         self,
@@ -172,13 +180,17 @@ class EpisodeCompiler:
         entry_event_id = resolved.entry_decision_event_id
         entry_ts = resolved.entry_decision_timestamp or entry_decision_timestamp
         terminal_ts = resolved.terminal_event_timestamp or terminal_event_timestamp
-        market_ids = source_event_ids
+
+        # Authoritative event horizon — fail closed (no silent empty fallback for EV).
+        market_ids: tuple[UUID, ...] = ()
+        horizon_complete = False
         if (
-            not market_ids
-            and self._event_horizon_loader is not None
+            self._event_horizon_loader is not None
             and entry_ts is not None
             and terminal_ts is not None
         ):
+            horizon = None
+            horizon_error: str | None = None
             try:
                 horizon = await self._event_horizon_loader.load(
                     session_id=session_id,
@@ -187,26 +199,107 @@ class EpisodeCompiler:
                     entry_decision_event_id=entry_event_id,
                     terminal_event_id=terminal_event_uuid,
                 )
-                if horizon.market_event_ids:
-                    market_ids = horizon.market_event_ids
-            except Exception:
-                pass
-        if not market_ids and terminal_event_uuid is not None:
-            ordered: list[UUID] = []
-            if entry_event_id is not None:
-                ordered.append(entry_event_id)
-            for eid in resolved.position_event_ids:
-                if eid not in ordered:
-                    ordered.append(eid)
-            if terminal_event_uuid not in ordered:
-                ordered.append(terminal_event_uuid)
-            market_ids = tuple(ordered)
+            except Exception as exc:
+                horizon_error = f"authoritative_horizon_load_failed:{type(exc).__name__}"
+            horizon_complete, horizon_findings = verify_event_horizon(
+                horizon, entry_ts=entry_ts, terminal_ts=terminal_ts
+            )
+            if horizon_error:
+                findings.append(horizon_error)
+                horizon_complete = False
+                horizon_findings = (
+                    "authoritative_horizon_incomplete",
+                    "historical_ev_eligible=false",
+                    "promotion_eligible=false",
+                    "truth_degraded=true",
+                )
+            findings.extend(horizon_findings)
+            if horizon is not None and getattr(horizon, "market_event_ids", ()):
+                market_ids = tuple(horizon.market_event_ids)
+                if getattr(horizon, "data_quality_ids", ()):
+                    data_quality_ids = tuple(
+                        dict.fromkeys((*data_quality_ids, *horizon.data_quality_ids))
+                    )
+                if getattr(horizon, "option_surface_ids", ()):
+                    option_surface_ids = tuple(
+                        dict.fromkeys((*option_surface_ids, *horizon.option_surface_ids))
+                    )
+                # Anchor entry/terminal event identities from the verified horizon
+                # when cognitive provenance did not supply them.
+                if entry_event_id is None and market_ids:
+                    entry_event_id = market_ids[0]
+                if terminal_event_uuid is None and market_ids:
+                    terminal_event_uuid = market_ids[-1]
+            if not horizon_complete:
+                completed = False
+                # Reduced diagnostic sequence for debugging — never EV/promotion eligible.
+                ordered: list[UUID] = []
+                if entry_event_id is not None:
+                    ordered.append(entry_event_id)
+                for eid in resolved.position_event_ids:
+                    if eid not in ordered:
+                        ordered.append(eid)
+                if terminal_event_uuid is not None and terminal_event_uuid not in ordered:
+                    ordered.append(terminal_event_uuid)
+                if ordered and not market_ids:
+                    market_ids = tuple(ordered)
+                    findings.append("reduced_event_sequence_diagnostic_only")
+        elif self._event_horizon_loader is None:
+            findings.extend(
+                (
+                    "authoritative_horizon_incomplete",
+                    "historical_ev_eligible=false",
+                    "promotion_eligible=false",
+                    "truth_degraded=true",
+                )
+            )
+            completed = False
+            if terminal_event_uuid is not None:
+                ordered = []
+                if entry_event_id is not None:
+                    ordered.append(entry_event_id)
+                for eid in resolved.position_event_ids:
+                    if eid not in ordered:
+                        ordered.append(eid)
+                if terminal_event_uuid not in ordered:
+                    ordered.append(terminal_event_uuid)
+                market_ids = tuple(ordered)
+                findings.append("reduced_event_sequence_diagnostic_only")
+        else:
+            findings.extend(
+                (
+                    "authoritative_horizon_incomplete",
+                    "historical_ev_eligible=false",
+                    "promotion_eligible=false",
+                    "truth_degraded=true",
+                )
+            )
+            completed = False
+
+        # Factual similarity metadata from production provenance (never invent).
+        sim = await resolve_episode_similarity_metadata(
+            contract_id=contract_id or None,
+            entry_orders=entry_orders,
+            strategy_id=resolved.original_strategy_id,
+            entry_cycle_id=resolved.entry_cycle_id or entry_cycle_id,
+            session_id=session_id,
+            strategy_repo=self._strategy_repo,
+            world_model_repo=self._world_model_repo,
+            cycle_registry=self._cycle_registry,
+            exchange_timestamp=entry_ts,
+            market_regime_tags=market_regime_tags,
+        )
+        findings.extend(sim.findings)
+        if not sim.historical_ev_eligible:
+            completed = False
+
         episode = TradingEpisode(
             episode_id=uuid4(),
             session_id=session_id,
             run_id=run_id,
             trading_date=trading_date,
             entry_cycle_id=resolved.entry_cycle_id or entry_cycle_id,
+            parent_strategy_id=sim.parent_strategy_id,
             proposal_id=resolved.proposal_id or proposal_id,
             decision_id=resolved.decision_id or decision_id,
             initial_snapshot_id=snap,
@@ -214,7 +307,13 @@ class EpisodeCompiler:
             snapshot_identity_status=snapshot_status,  # type: ignore[arg-type]
             position_lifecycle_id=lifecycle,
             contract_id=contract_id or None,
-            direction="bullish" if entry_orders else "none",
+            direction=sim.direction,
+            strategy_family=sim.strategy_family,
+            pattern_ids=sim.pattern_ids,
+            option_type=sim.option_type,
+            session_phase=sim.session_phase,
+            volatility_bucket=sim.volatility_bucket,
+            liquidity_bucket=sim.liquidity_bucket,
             action_class="closed_trade",
             entry_order_ids=tuple(o.client_order_id for o in entry_orders),
             exit_order_ids=tuple(
@@ -225,7 +324,7 @@ class EpisodeCompiler:
             quantity=entry_qty,
             realised_pnl=realised,
             total_fees=fees,
-            market_regime_tags=market_regime_tags,
+            market_regime_tags=sim.market_regime_tags,
             data_quality_ids=data_quality_ids,
             option_surface_ids=option_surface_ids,
             source_event_ids=source_event_ids or (

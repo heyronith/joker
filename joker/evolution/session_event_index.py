@@ -42,6 +42,9 @@ class SessionEventIndexRepository:
 
     async def initialize(self) -> None:
         apply_task3_migrations(self._db_path)
+        async with aiosqlite.connect(self._db_path) as db:
+            await db.execute("PRAGMA journal_mode=WAL")
+            await db.execute("PRAGMA busy_timeout = 30000")
         self._initialized = True
 
     async def _ensure(self) -> None:
@@ -53,6 +56,7 @@ class SessionEventIndexRepository:
         await self._ensure()
         created = (record.created_at or datetime.now(timezone.utc)).isoformat()
         async with aiosqlite.connect(self._db_path) as db:
+            await db.execute("PRAGMA busy_timeout = 30000")
             try:
                 await db.execute(
                     """

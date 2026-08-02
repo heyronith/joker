@@ -34,7 +34,10 @@ from joker.runtime.session_supervisor import SessionSupervisor, SessionSuperviso
 from joker.time.calendar import MarketCalendar
 from joker.time.clock import FrozenExchangeClock
 from tests.cognitive.task2_canned import CONTRACT_ID, register_full_path_canned
-from tests.objectives.historical_fixtures import persist_positive_history
+from tests.objectives.historical_fixtures import (
+    persist_compiler_produced_history,
+    persist_positive_history,
+)
 
 ET = ZoneInfo("America/New_York")
 
@@ -179,7 +182,7 @@ async def test_production_full_graph_positive_ev_reaches_paper_broker(tmp_path) 
     evo = build_evolution_repositories(db)
     for repo in evo.values():
         await repo.initialize()
-    rows = await persist_positive_history(
+    rows = await persist_compiler_produced_history(
         episode_repo=evo["episodes"],
         evaluation_repo=evo["evaluations"],
         as_of=start + timedelta(minutes=3),

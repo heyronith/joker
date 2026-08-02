@@ -347,7 +347,7 @@ async def test_task3_paper_session_active_path_auto_episode(tmp_path) -> None:
         pytest.fail("EvolutionRuntime never auto-compiled a closed_trade episode")
 
     episode = episodes[0]
-    assert episode.completed is True
+    assert episode.completed is True, episode.completeness_findings
     assert episode.realised_pnl == EXPECTED_REALIZED_PNL
     assert episode.contract_id == CONTRACT_ID
     assert episode.entry_order_ids

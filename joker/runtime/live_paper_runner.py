@@ -526,6 +526,12 @@ class LivePaperRunner:
                         engines.objective_strategy_scorer
                     )
                     cognitive_graph_deps.capital_sizer = engines.capital_sizer
+                cognitive_graph_deps.evolution_runtime = evolution_runtime
+                cognitive_graph_deps.configuration_repo = evo_repos.get(
+                    "configurations"
+                )
+                obj_exec = getattr(self.app_settings.objective, "execution", None)
+                cognitive_graph_deps.objective_execution_settings = obj_exec
                 evolution_runtime.subscribe_events()
                 injected_agent_runtime.bind_evolution_runtime(evolution_runtime)
                 task1_bridge.start_agent()

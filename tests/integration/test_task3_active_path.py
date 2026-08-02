@@ -11,7 +11,6 @@ import pytest
 
 from joker.broker.interface import PaperBroker
 from joker.evolution.champion_registry import ChampionRegistry
-from joker.evolution.episode_compiler import EpisodeCompiler
 from joker.evolution.improvement import ImprovementProposalService
 from joker.evolution.migrations import apply_task3_migrations
 from joker.evolution.repositories import build_evolution_repositories
@@ -96,10 +95,18 @@ async def test_task3_active_path_with_task1_task2_surface(tmp_path) -> None:
             await repo.initialize()
         registry = ChampionRegistry(db)
         champion = await registry.bootstrap_champion()
-        compiler = EpisodeCompiler(repos["episodes"], repos["traces"])
+        from tests.evolution.compiler_test_helpers import (
+            build_complete_episode_compiler,
+            entry_terminal_timestamps,
+        )
+
+        compiler = build_complete_episode_compiler(
+            repos["episodes"], repos["traces"], contract_id=CONTRACT_ID
+        )
         evaluator = EvaluationGraphRunner(repos["evaluations"])
 
         event_id = str(uuid4())
+        entry_ts, term_ts = entry_terminal_timestamps()
         episode = await compiler.compile_from_position_closed(
             session_id="task3-active",
             run_id="run",
@@ -121,6 +128,8 @@ async def test_task3_active_path_with_task1_task2_surface(tmp_path) -> None:
             ),
             initial_snapshot_id=tick.snapshot.snapshot_id,
             terminal_snapshot_id=uuid4(),
+            entry_decision_timestamp=entry_ts,
+            terminal_event_timestamp=term_ts,
         )
         assert episode.completed is True, episode.completeness_findings
         evaluation = await evaluator.evaluate(episode)

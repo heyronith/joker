@@ -368,6 +368,10 @@ class CognitiveConfigurationVersion(_Frozen):
     debate_policy_version_id: UUID
     routing_policy_version_id: UUID
     escalation_policy_version_id: UUID
+    # Dataset provenance for leakage-safe historical EV (fail closed when unknown).
+    training_dataset_ids: tuple[UUID, ...] = ()
+    challenger_dataset_ids: tuple[UUID, ...] = ()
+    evaluation_dataset_ids: tuple[UUID, ...] = ()
     content_hash: str
     created_by: Literal["bootstrap", "agent", "human"] = "bootstrap"
     proposer_artifact_id: UUID | None = None

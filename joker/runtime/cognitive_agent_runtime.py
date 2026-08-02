@@ -348,14 +348,17 @@ class CognitiveAgentRuntime:
         # Delayed / evidence / hold without order still count if a persist node ran.
         return False
 
-    async def shutdown(self) -> None:
-        """Checkpoint active cycles rather than merely cancelling them."""
-        self._status = "shutting_down"
+    async def pause_event_workers(self) -> None:
+        """Stop event-driven decision/position workers without tearing down deps.
+
+        Used when a caller owns a single controlled graph invoke (acceptance
+        tests / diagnostics) and must avoid concurrent SQLite writers on the
+        shared Task-1/3 database.
+        """
         self._shutdown = True
-        # Allow in-flight tasks to finish (or timeout) so LangGraph can persist.
         pending = list(self._active_decision_tasks | self._active_position_tasks)
         if pending:
-            done, still = await asyncio.wait(pending, timeout=5.0)
+            _done, still = await asyncio.wait(pending, timeout=5.0)
             for task in still:
                 task.cancel()
             for task in still:
@@ -372,6 +375,12 @@ class CognitiveAgentRuntime:
                     pass
         self._decision_worker = None
         self._position_worker = None
+        self._status = "paused"
+
+    async def shutdown(self) -> None:
+        """Checkpoint active cycles rather than merely cancelling them."""
+        self._status = "shutting_down"
+        await self.pause_event_workers()
         if self._checkpointer_helper is not None:
             await self._checkpointer_helper.close()
             self._deps.checkpointer = None

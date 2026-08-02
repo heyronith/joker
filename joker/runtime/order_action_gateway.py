@@ -458,12 +458,14 @@ class OrderActionGateway:
                         ),
                         working_orders=working,
                     )
+                from dataclasses import replace as dc_replace
+
                 from joker.objectives.execution_quote import (
                     execution_premium_from_quote,
                 )
                 from joker.objectives.repricing import reprice_long_option_estimate
 
-                premium_per = execution_premium_from_quote(current_quote)
+                ask_premium = execution_premium_from_quote(current_quote)
                 qty = int(command.intent.quantity)
                 require_ev = bool(
                     getattr(svc, "require_positive_expected_value", True)
@@ -480,6 +482,12 @@ class OrderActionGateway:
                 max_spread = float(
                     getattr(self._deps, "max_relative_spread", 0.25) or 0.25
                 )
+                max_limit_above_ask_pct = Decimal("5.0")
+                exec_settings = getattr(self._deps, "objective_execution_settings", None)
+                if exec_settings is not None:
+                    max_limit_above_ask_pct = Decimal(
+                        str(exec_settings.maximum_buy_limit_above_ask_pct)
+                    )
                 # Snapshot mismatch forces explicit revalidation (never a silent pass).
                 if str(estimate.snapshot_id) != str(request.snapshot_id):
                     if estimate.expected_value_usd is None:
@@ -489,6 +497,40 @@ class OrderActionGateway:
                             blocked_reason="objective_estimate_snapshot_mismatch",
                             working_orders=working,
                         )
+                # Reconcile proposed limit with authoritative ask for long buys.
+                proposed_limit = command.intent.limit_price
+                side = str(command.intent.side or "").lower()
+                worst_case = ask_premium
+                if side == "buy" and proposed_limit is not None:
+                    limit_dec = Decimal(str(proposed_limit))
+                    ceiling = (
+                        ask_premium
+                        * (Decimal("100") + max_limit_above_ask_pct)
+                        / Decimal("100")
+                    ).quantize(Decimal("0.0001"))
+                    if limit_dec > ceiling:
+                        return OrderActionResult(
+                            submitted=False,
+                            client_order_id=request.client_order_id,
+                            blocked_reason=(
+                                "buy_limit_exceeds_max_displacement_above_ask:"
+                                f"limit={limit_dec}:ask={ask_premium}:"
+                                f"ceiling={ceiling}"
+                            ),
+                            working_orders=working,
+                        )
+                    worst_case = max(ask_premium, limit_dec)
+                    # Submit the same validated price used for EV and reservation.
+                    command = dc_replace(
+                        command,
+                        intent=command.intent.model_copy(
+                            update={"limit_price": float(worst_case)}
+                        ),
+                    )
+                elif side == "buy":
+                    worst_case = ask_premium
+
+                premium_per = worst_case
                 repriced = reprice_long_option_estimate(
                     estimate,
                     current_premium_per_contract_usd=premium_per,

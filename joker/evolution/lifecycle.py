@@ -160,17 +160,50 @@ class PositionLifecycleResolver:
                 oid = getattr(order, "position_lifecycle_id", None)
                 if oid == lifecycle_id:
                     orders_by_lifecycle.append(order)
+            lifecycle_records: list[Any] = []
             if self.provenance is not None and hasattr(
                 self.provenance, "list_by_lifecycle_id"
             ):
                 try:
-                    records = await self.provenance.list_by_lifecycle_id(lifecycle_id)
+                    lifecycle_records = await self.provenance.list_by_lifecycle_id(
+                        lifecycle_id
+                    )
                 except Exception:
-                    records = []
-                for record in records:
+                    lifecycle_records = []
+                for record in lifecycle_records:
                     order = projection.orders.get(record.client_order_id)
                     if order is not None and order not in orders_by_lifecycle:
                         orders_by_lifecycle.append(order)
+                    # Exit provenance often omits strategy; prefer entry record.
+                    if strategy_id is None and getattr(record, "strategy_id", None):
+                        try:
+                            strategy_id = UUID(str(record.strategy_id))
+                        except Exception:
+                            pass
+                    if not entry_cycle_id and getattr(record, "cycle_id", None):
+                        entry_cycle_id = str(record.cycle_id)
+                    if (
+                        originating_entry_id is None
+                        and getattr(record, "kind", None) == "entry"
+                    ):
+                        originating_entry_id = record.client_order_id
+
+        if (
+            strategy_id is None
+            and self.provenance is not None
+            and originating_entry_id
+            and originating_entry_id != client_order_id
+        ):
+            entry_rec = await self.provenance.get_by_client_order_id(
+                originating_entry_id
+            )
+            if entry_rec is not None and getattr(entry_rec, "strategy_id", None):
+                try:
+                    strategy_id = UUID(str(entry_rec.strategy_id))
+                except Exception:
+                    pass
+            if not entry_cycle_id and entry_rec is not None and entry_rec.cycle_id:
+                entry_cycle_id = str(entry_rec.cycle_id)
 
         if not orders_by_lifecycle and allow_legacy_inference:
             legacy = True

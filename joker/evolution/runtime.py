@@ -178,6 +178,16 @@ class EvolutionRuntime:
             cycle_registry=cycle_registry,
             event_index=self.session_event_index,
         )
+        strategy_repo = (
+            getattr(self.cognitive_graph_deps, "strategy_repo", None)
+            if self.cognitive_graph_deps is not None
+            else None
+        )
+        world_model_repo = (
+            getattr(self.cognitive_graph_deps, "world_model_repo", None)
+            if self.cognitive_graph_deps is not None
+            else None
+        )
         self.episode_compiler = EpisodeCompiler(
             self._repos["episodes"],
             self._repos["traces"],
@@ -185,6 +195,8 @@ class EvolutionRuntime:
             provenance=provenance,
             cycle_registry=cycle_registry,
             event_horizon_loader=self.event_horizon_loader,
+            strategy_repo=strategy_repo,
+            world_model_repo=world_model_repo,
         )
         self.checkpointer_owner = EvolutionCheckpointerOwner(self.db_path)
         savers = await self.checkpointer_owner.open_all()
@@ -332,7 +344,7 @@ class EvolutionRuntime:
 
     async def _index_domain_event(self, event: DomainEvent) -> None:
         """Enqueue session_event_index persistence (fail-soft, non-blocking on bus)."""
-        if self.session_event_index is None:
+        if self.session_event_index is None or getattr(self, "_quiesced", False):
             return
         self._spawn_background(
             self._persist_session_event_index(event),
@@ -417,10 +429,14 @@ class EvolutionRuntime:
         await self.start_workers()
         await self.resume()
 
-    async def shutdown(self) -> None:
+    async def stop_workers(self) -> None:
+        """Stop episode/eval/orchestrator workers and drain index tasks.
+
+        Leaves repositories and checkpointers open for controlled graph invokes.
+        """
+        self._quiesced = True
         if self.orchestrator is not None:
             self.orchestrator.pause()
-        # Drain pending index writes before cancelling workers / closing DBs.
         pending_index = list(self._index_tasks)
         if pending_index:
             await asyncio.wait(pending_index, timeout=5.0)
@@ -451,6 +467,9 @@ class EvolutionRuntime:
                 raise
         self._workers.clear()
         self._workers_started = False
+
+    async def shutdown(self) -> None:
+        await self.stop_workers()
         if self.shadow is not None:
             await self.shadow.stop()
         if self.checkpointer_owner is not None:
@@ -519,7 +538,11 @@ class EvolutionRuntime:
         return None if champ is None else champ.configuration_version_id
 
     async def enqueue_episode_job(self, job: dict[str, Any]) -> bool:
-        if not self._prepared or self._episode_queue is None:
+        if (
+            not self._prepared
+            or self._episode_queue is None
+            or getattr(self, "_quiesced", False)
+        ):
             return False
         if self._episode_queue.full():
             return False
@@ -691,6 +714,24 @@ class EvolutionRuntime:
             finally:
                 self._episode_queue.task_done()
 
+    async def _flush_session_event_index(self, *, timeout: float = 5.0) -> None:
+        """Wait for in-flight session_event_index writes before horizon load."""
+        pending = []
+        for task in list(self._index_tasks):
+            if task.done():
+                continue
+            name = task.get_name() if hasattr(task, "get_name") else ""
+            if str(name).startswith("evolution-index-"):
+                pending.append(task)
+        if not pending:
+            return
+        _done, still = await asyncio.wait(pending, timeout=timeout)
+        if still:
+            logger.warning(
+                "session_event_index_flush_timeout",
+                extra={"pending": len(still)},
+            )
+
     async def _compile_job(self, job: dict[str, Any]):
         assert self.episode_compiler is not None
         champ_id = await self.current_champion_id()
@@ -702,6 +743,8 @@ class EvolutionRuntime:
             self.last_error = "missing_exchange_trading_date"
             logger.error("evolution_missing_exchange_trading_date", extra={"kind": kind})
             return None
+        # Horizon load must see the same events that triggered compilation.
+        await self._flush_session_event_index()
         if kind == "position_closed":
             payload = job["payload"]
             cycle_id = str(payload.get("cycle_id") or "")

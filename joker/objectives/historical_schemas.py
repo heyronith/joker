@@ -49,8 +49,12 @@ class HistoricalOutcomeQuery(BaseModel):
     as_of_timestamp: datetime
     current_episode_id: UUID | None = None
     allow_synthetic_replay: bool = False
-    # Datasets that trained / contaminated the decision under evaluation.
+    # Datasets that trained / contaminated the active configuration under evaluation.
     blocked_training_dataset_ids: tuple[UUID, ...] = ()
+    challenger_dataset_ids: tuple[UUID, ...] = ()
+    # When a configuration_version_id is supplied, provenance must be resolved
+    # (even if the dataset ID tuples are empty). Missing provenance fails closed.
+    configuration_dataset_provenance_resolved: bool = True
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
     @field_validator("minimum_similarity", mode="before")

@@ -94,20 +94,24 @@ class CompatibilityLivePaperBridge:
         broker_account_id: str = "paper",
         health_failure_threshold: int = 1,
         agent_runtime: AgentRuntime | None = None,
+        market_config: Any | None = None,
     ) -> None:
         self.session_id = session_id or str(uuid4())
         self._loop = asyncio.new_event_loop()
         from joker.runtime.session_supervisor import SessionSupervisor, SessionSupervisorConfig
 
+        supervisor_kwargs: dict[str, Any] = {
+            "db_path": db_path,
+            "session_id": self.session_id,
+            "run_id": run_id,
+            "broker_account_id": broker_account_id,
+        }
+        if market_config is not None:
+            supervisor_kwargs["market"] = market_config
         self._supervisor = SessionSupervisor(
             broker=broker,
             clock=clock,
-            config=SessionSupervisorConfig(
-                db_path=db_path,
-                session_id=self.session_id,
-                run_id=run_id,
-                broker_account_id=broker_account_id,
-            ),
+            config=SessionSupervisorConfig(**supervisor_kwargs),
             agent_runtime=agent_runtime,
         )
         self._started = False
@@ -141,11 +145,22 @@ class CompatibilityLivePaperBridge:
         self.run_coro(self._supervisor.start(start_agent=start_agent))
         self._started = True
 
+    async def astart(self, *, start_agent: bool = True) -> None:
+        """Async start for callers already inside a running event loop."""
+        await self._supervisor.start(start_agent=start_agent)
+        self._started = True
+
     def start_agent(self) -> None:
         """Start the injected agent runtime after cognitive binding."""
         if not self._started:
             raise RuntimeError("CompatibilityLivePaperBridge.start() required first")
         self.run_coro(self._supervisor.start_agent_runtime())
+
+    async def astart_agent(self) -> None:
+        """Async agent start for callers already inside a running event loop."""
+        if not self._started:
+            raise RuntimeError("CompatibilityLivePaperBridge.start()/astart() required first")
+        await self._supervisor.start_agent_runtime()
 
     def shutdown(self) -> None:
         if not self._started:

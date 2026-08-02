@@ -11,10 +11,13 @@ import pytest
 from joker.evaluation.dataset_builder import DatasetBuilder, DatasetBuilderError
 from joker.evaluation.graph import EvaluationGraphRunner
 from joker.evaluation.metrics import compute_deterministic_metrics
-from joker.evolution.episode_compiler import EpisodeCompiler
 from joker.evolution.migrations import apply_task3_migrations
 from joker.evolution.repositories import build_evolution_repositories
 from joker.evolution.schemas import TradingEpisode
+from tests.evolution.compiler_test_helpers import (
+    build_complete_episode_compiler,
+    entry_terminal_timestamps,
+)
 from tests.evolution.projection_helpers import (
     FakeExecutionProjection,
     closed_trade_projection,
@@ -28,11 +31,14 @@ async def test_closed_trade_and_no_trade_episodes(tmp_path) -> None:
     repos = build_evolution_repositories(db)
     await repos["episodes"].initialize()
     await repos["traces"].initialize()
-    compiler = EpisodeCompiler(repos["episodes"], repos["traces"])
+    contract = "SPY:2026-07-01:500:call"
+    compiler = build_complete_episode_compiler(
+        repos["episodes"], repos["traces"], contract_id=contract
+    )
     cfg = uuid4()
     snap = uuid4()
-    contract = "SPY:2026-07-01:500:call"
     event_id = str(uuid4())
+    entry_ts, term_ts = entry_terminal_timestamps()
     closed = await compiler.compile_from_position_closed(
         session_id="s",
         run_id="r",
@@ -53,22 +59,31 @@ async def test_closed_trade_and_no_trade_episodes(tmp_path) -> None:
             )
         ),
         initial_snapshot_id=snap,
-            terminal_snapshot_id=uuid4(),
+        terminal_snapshot_id=uuid4(),
+        entry_decision_timestamp=entry_ts,
+        terminal_event_timestamp=term_ts,
     )
-    assert closed.completed is True
+    assert closed.completed is True, closed.completeness_findings
     assert closed.action_class == "closed_trade"
     assert closed.realised_pnl == Decimal("50")
     metrics = compute_deterministic_metrics(closed)
     assert metrics.realised_pnl == Decimal("50")
 
-    incomplete = await compiler.compile_from_position_closed(
+    incomplete_compiler = build_complete_episode_compiler(
+        repos["episodes"],
+        repos["traces"],
+        contract_id="SPY:2026-07-01:501:call",
+        entry_id="e2",
+        exit_id="x2",
+    )
+    incomplete = await incomplete_compiler.compile_from_position_closed(
         session_id="s",
         run_id="r",
         trading_date=date(2026, 7, 1),
         configuration_version_id=cfg,
         event_payload={
             "contract_id": "SPY:2026-07-01:501:call",
-            "client_order_id": "exit-2",
+            "client_order_id": "x2",
             "realized_pnl": "-50",
         },
         event_id=str(uuid4()),
@@ -84,7 +99,9 @@ async def test_closed_trade_and_no_trade_episodes(tmp_path) -> None:
             )
         ),
         initial_snapshot_id=snap,
-            terminal_snapshot_id=uuid4(),
+        terminal_snapshot_id=uuid4(),
+        entry_decision_timestamp=entry_ts,
+        terminal_event_timestamp=term_ts,
     )
     assert incomplete.completed is False
     assert "quantity_identity_mismatch" in incomplete.completeness_findings

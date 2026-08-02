@@ -211,6 +211,8 @@ objective:
     confidence_level: 0.95
     require_lower_confidence_bound_positive: true
     require_same_strategy_family: true
+  execution:
+    maximum_buy_limit_above_ask_pct: 5.0
   exploration:
     enabled: false
     operator_confirmation_required: true

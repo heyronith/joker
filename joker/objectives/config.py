@@ -92,6 +92,21 @@ class ExplorationModeSettings(BaseModel):
     require_complete_truth: bool = True
 
 
+class ObjectiveExecutionSettings(BaseModel):
+    """Execution-time quote/limit reconciliation for long-option buys."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    maximum_buy_limit_above_ask_pct: float = 5.0
+
+    @field_validator("maximum_buy_limit_above_ask_pct")
+    @classmethod
+    def _pct(cls, value: float) -> float:
+        if value < 0:
+            raise ValueError("maximum_buy_limit_above_ask_pct must be >= 0")
+        return value
+
+
 class ObjectiveSettings(BaseModel):
     """Session objective gates — no default capital/target/deadline that silently arms."""
 
@@ -116,6 +131,9 @@ class ObjectiveSettings(BaseModel):
     sizing: ObjectiveSizingSettings = Field(default_factory=ObjectiveSizingSettings)
     historical_outcomes: HistoricalOutcomeSettings = Field(
         default_factory=HistoricalOutcomeSettings
+    )
+    execution: ObjectiveExecutionSettings = Field(
+        default_factory=ObjectiveExecutionSettings
     )
     exploration: ExplorationModeSettings = Field(
         default_factory=ExplorationModeSettings

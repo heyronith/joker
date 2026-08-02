@@ -45,6 +45,9 @@ class EvolutionRepository:
 
     async def initialize(self) -> None:
         apply_task3_migrations(self._db_path)
+        async with aiosqlite.connect(self._db_path) as db:
+            await db.execute("PRAGMA journal_mode=WAL")
+            await db.execute("PRAGMA busy_timeout = 30000")
         self._initialized = True
 
     async def close(self) -> None:
@@ -55,6 +58,9 @@ class EvolutionRepository:
         if not self._initialized:
             await self.initialize()
 
+    async def _configure(self, db: aiosqlite.Connection) -> None:
+        await db.execute("PRAGMA busy_timeout = 30000")
+
     async def _insert_ignore(
         self,
         sql: str,
@@ -62,6 +68,7 @@ class EvolutionRepository:
     ) -> bool:
         await self._ensure()
         async with aiosqlite.connect(self._db_path) as db:
+            await self._configure(db)
             try:
                 await db.execute(sql, params)
                 await db.commit()
@@ -72,6 +79,7 @@ class EvolutionRepository:
     async def _fetchone(self, sql: str, params: tuple[Any, ...]) -> aiosqlite.Row | None:
         await self._ensure()
         async with aiosqlite.connect(self._db_path) as db:
+            await self._configure(db)
             db.row_factory = aiosqlite.Row
             cur = await db.execute(sql, params)
             return await cur.fetchone()
@@ -79,6 +87,7 @@ class EvolutionRepository:
     async def _fetchall(self, sql: str, params: tuple[Any, ...] = ()) -> list[aiosqlite.Row]:
         await self._ensure()
         async with aiosqlite.connect(self._db_path) as db:
+            await self._configure(db)
             db.row_factory = aiosqlite.Row
             cur = await db.execute(sql, params)
             return list(await cur.fetchall())

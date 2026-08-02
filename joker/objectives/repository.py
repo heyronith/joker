@@ -272,8 +272,12 @@ class ObjectiveRepository:
             self._crash_hook(point)
 
     def _connect(self) -> sqlite3.Connection:
+        # Share the Task-1/3 SQLite file with aiosqlite workers; WAL + busy
+        # timeout avoid fail-closed on transient multi-writer contention.
         conn = sqlite3.connect(self.db_path, timeout=30.0)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout = 30000")
+        conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA foreign_keys=ON")
         return conn
 

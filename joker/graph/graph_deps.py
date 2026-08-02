@@ -94,6 +94,10 @@ class CognitiveGraphDeps:
     current_data_quality_loader: Any | None = None
     max_quote_age_seconds: int = 30
     max_relative_spread: float = 0.25
+    objective_execution_settings: Any | None = None
+    # Active Task-3 configuration for leakage-safe historical queries.
+    evolution_runtime: Any | None = None
+    configuration_repo: Any | None = None
 
     def limits_dict(self) -> dict[str, int]:
         return {
