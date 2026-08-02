@@ -429,14 +429,7 @@ class EvolutionRuntime:
         await self.start_workers()
         await self.resume()
 
-    async def stop_workers(self) -> None:
-        """Stop episode/eval/orchestrator workers and drain index tasks.
-
-        Leaves repositories and checkpointers open for controlled graph invokes.
-        """
-        self._quiesced = True
-        if self.orchestrator is not None:
-            self.orchestrator.pause()
+    async def _cancel_worker_tasks(self) -> None:
         pending_index = list(self._index_tasks)
         if pending_index:
             await asyncio.wait(pending_index, timeout=5.0)
@@ -467,6 +460,31 @@ class EvolutionRuntime:
                 raise
         self._workers.clear()
         self._workers_started = False
+
+    async def pause_workers(self) -> None:
+        """Temporarily stop workers without quiescing event ingestion.
+
+        Used by paper harnesses so cognitive entry is not raced by episode/eval
+        workers; POSITION_CLOSED jobs can still enqueue for later drain.
+        """
+        if self.orchestrator is not None:
+            self.orchestrator.pause()
+        await self._cancel_worker_tasks()
+
+    async def resume_workers(self) -> None:
+        """Restart workers after :meth:`pause_workers` (clears quiesce flag)."""
+        self._quiesced = False
+        await self.start_workers()
+
+    async def stop_workers(self) -> None:
+        """Stop episode/eval/orchestrator workers and drain index tasks.
+
+        Leaves repositories and checkpointers open for controlled graph invokes.
+        """
+        self._quiesced = True
+        if self.orchestrator is not None:
+            self.orchestrator.pause()
+        await self._cancel_worker_tasks()
 
     async def shutdown(self) -> None:
         await self.stop_workers()

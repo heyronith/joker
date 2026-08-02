@@ -460,6 +460,8 @@ async def build_paper_evolution_stack(
     assert deps.order_action_gateway is not None
     original_submit = deps.order_action_gateway.submit
 
+    gateway_blocks: list[str] = []
+
     async def _tracking_submit(request):
         result = await original_submit(request)
         if result.submitted:
@@ -467,6 +469,10 @@ async def build_paper_evolution_stack(
                 gateway_entry_ids.append(result.client_order_id)
             if request.action.value == "exit":
                 gateway_exit_ids.append(result.client_order_id)
+        elif result.blocked_reason:
+            gateway_blocks.append(
+                f"{request.action.value}:{result.blocked_reason}"
+            )
         return result
 
     deps.order_action_gateway.submit = _tracking_submit  # type: ignore[method-assign]
@@ -503,6 +509,7 @@ async def build_paper_evolution_stack(
         "deps": deps,
         "gateway_entry_ids": gateway_entry_ids,
         "gateway_exit_ids": gateway_exit_ids,
+        "gateway_blocks": gateway_blocks,
     }
 
 
@@ -795,13 +802,20 @@ async def run_closed_trade_round_trip(
     fake = stack["fake"]
     clock: FrozenExchangeClock = stack["clock"]
     start: datetime = stack["start"]
-    session_id = stack["evolution"].session_id
+    evolution: EvolutionRuntime = stack["evolution"]
+    session_id = evolution.session_id
     # Require a fresh gateway ENTRY — do not treat a leftover open position as success.
     await wait_ready_for_new_entry(stack, trade_index=trade_index)
+    # Pause evolution workers during entry so cognitive cycles own the fake
+    # provider / SQLite file; keep ingestion so POSITION_CLOSED can enqueue.
+    workers_were_running = bool(getattr(evolution, "_workers_started", False))
+    if workers_were_running:
+        await evolution.pause_workers()
     install_paper_path_factories(fake, session_id=session_id)
     set_position_action(fake, PositionAction.HOLD)
     entries_before = len(stack["gateway_entry_ids"])
     exits_before = len(stack["gateway_exit_ids"])
+    blocks_before = len(stack.get("gateway_blocks") or [])
 
     entry_start = start + timedelta(minutes=minute_offset)
     clock.set_now(entry_start)
@@ -815,34 +829,55 @@ async def run_closed_trade_round_trip(
     )
     _refresh_trade_canned(fake, trade_index)
     register_evolution_router_canned(fake)
-    await stack["supervisor"].event_bus.drain(timeout=5.0)
-    for i in range(200):
-        if len(stack["gateway_entry_ids"]) > entries_before:
-            break
-        if i > 0 and i % 15 == 0:
-            projection = await supervisor.execution_runtime.project_session()
-            pos = projection.positions.get(CONTRACT_ID)
-            if pos is not None and pos.quantity != 0:
-                await ensure_flat_position(stack, trade_index=trade_index)
-                set_position_action(fake, PositionAction.HOLD)
-            now = clock.now()
-            tick = await supervisor.market_runtime.tick(now=now + timedelta(seconds=1))
-            clock.set_now(now + timedelta(seconds=1))
-            if tick.snapshot is not None:
-                register_full_path_canned(
-                    fake,
-                    tick.snapshot.snapshot_id,
-                    f"cycle-entry-retry-{trade_index}-{i}",
-                    session=session_id,
-                    position_action=PositionAction.HOLD,
-                )
-                register_evolution_router_canned(fake)
-        await asyncio.sleep(0.15)
-    else:
-        raise AssertionError(
-            "gateway_entry_ids did not progress through OrderActionGateway "
-            f"(before={entries_before}, after={len(stack['gateway_entry_ids'])})"
+    # Immediate tick so the agent sees the seeded surface without waiting.
+    tick0 = await supervisor.market_runtime.tick(
+        now=entry_start + timedelta(seconds=3)
+    )
+    if tick0.snapshot is not None:
+        register_full_path_canned(
+            fake,
+            tick0.snapshot.snapshot_id,
+            f"cycle-entry-tick0-{trade_index}",
+            session=session_id,
+            position_action=PositionAction.HOLD,
         )
+    await stack["supervisor"].event_bus.drain(timeout=5.0)
+    try:
+        for i in range(240):
+            if len(stack["gateway_entry_ids"]) > entries_before:
+                break
+            if i % 5 == 0:
+                projection = await supervisor.execution_runtime.project_session()
+                pos = projection.positions.get(CONTRACT_ID)
+                if pos is not None and pos.quantity != 0:
+                    await ensure_flat_position(stack, trade_index=trade_index)
+                    set_position_action(fake, PositionAction.HOLD)
+                now = clock.now()
+                tick = await supervisor.market_runtime.tick(
+                    now=now + timedelta(seconds=1)
+                )
+                clock.set_now(now + timedelta(seconds=1))
+                if tick.snapshot is not None:
+                    register_full_path_canned(
+                        fake,
+                        tick.snapshot.snapshot_id,
+                        f"cycle-entry-retry-{trade_index}-{i}",
+                        session=session_id,
+                        position_action=PositionAction.HOLD,
+                    )
+                    register_evolution_router_canned(fake)
+            await asyncio.sleep(0.15)
+        else:
+            blocks = (stack.get("gateway_blocks") or [])[blocks_before:]
+            raise AssertionError(
+                "gateway_entry_ids did not progress through OrderActionGateway "
+                f"(before={entries_before}, after={len(stack['gateway_entry_ids'])}, "
+                f"blocks={blocks!r})"
+            )
+    finally:
+        if workers_were_running:
+            await evolution.resume_workers()
+
     await _wait_for_position(supervisor, want_open=True, attempts=100)
 
     exit_start = entry_start + timedelta(minutes=8)

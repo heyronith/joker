@@ -16,3 +16,6 @@ data/reports/
 data/memory/
 data/captures/
 data/capabilities/
+
+# Local verification evidence (SHA-tied manifests; regenerate via scripts/local_verify.py)
+artifacts/

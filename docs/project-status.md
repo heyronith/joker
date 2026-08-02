@@ -10,15 +10,31 @@
 | Current branch | `task3-agent-evolution` |
 | Comparison base (pre this correction) | `8cb47c69b8bbdd2888f3e12b06c892f90cbe4c63` |
 | Prior verified code tip | `569a2235a2e713bd5de9b84c3b416f913416cd99` |
-| Latest verified CI run (prior tip) | `30707444746` (803 on Python 3.11 + 3.12; Ruff passed) |
-| Tip commit (this correction) | pending commit / tip CI |
-| Latest verified CI run (this tip) | pending |
-| Local Python 3.12 | 830 passed ×3 (`ResourceWarning` as error) |
-| Local Python 3.11 | 830 passed ×3 (`ResourceWarning` as error) |
-| Focused historical-EV / compiler / gateway / public runner | 65 passed ×5 (`ResourceWarning` as error) |
+| Acceptance path | **local** `python scripts/local_verify.py` (SHA-tied evidence under `artifacts/local-verify/<sha>/`) |
+| GitHub Actions | optional `workflow_dispatch` only — **not** an acceptance gate |
+| Tip commit (this correction) | pending clean commit after verify tooling |
+| Latest local evidence | pending `scripts/local_verify.py` on clean tip |
 | Paper-only status | enforced (live trading disabled) |
 | Textual UI status | not started / not modified in this phase |
-| Known unresolved items | exact-tip CI for this correction; independent review; phase remains unapproved |
+| Known unresolved items | independent review; phase remains unapproved |
+
+## Local verification (acceptance)
+
+Do not treat GitHub Actions push/PR results as acceptance. Reproduce on a clean
+working tree at the exact commit SHA:
+
+```bash
+# Python 3.12 (example)
+.venv/bin/python scripts/local_verify.py
+
+# Python 3.11 (example)
+.venv311/bin/python scripts/local_verify.py --python .venv311/bin/python
+```
+
+Defaults (same warning gates as former CI): focused ×5, full suite ×3, soak ×3,
+Ruff, CLI help smoke, fresh-DB SQLite `PRAGMA integrity_check`.
+
+Evidence: `artifacts/local-verify/<commit_sha>/manifest.json` + `summary.txt`.
 
 ## Historical-EV phase status
 
@@ -36,4 +52,4 @@ real EpisodeCompiler output
 → one public-path PaperBroker submission
 ```
 
-plus green exact-tip CI on Python 3.11 and 3.12.
+plus green **local** verification evidence for that exact tip SHA on Python 3.11 and 3.12 (GitHub Actions is not required).

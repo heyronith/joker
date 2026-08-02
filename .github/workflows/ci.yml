@@ -1,8 +1,9 @@
 name: ci
 
+# Optional / manual only — local SHA-tied verification is the acceptance path.
+# Do not treat push/PR GitHub Actions as a merge or phase gate.
 on:
-  push:
-  pull_request:
+  workflow_dispatch:
 
 jobs:
   test:
