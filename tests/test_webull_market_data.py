@@ -216,12 +216,21 @@ def test_default_small_account_risk_config(project_root: Path, env_vars: None) -
     assert app.risk.max_open_positions == 1
     assert app.risk.policy == "agent_led"
 
-def test_live_trading_flag_must_remain_false() -> None:
-    with pytest.raises(ValueError, match="WEBULL_LIVE_TRADING_ENABLED"):
-        EnvSettings(
-            OPENAI_API_KEY="sk-test-key-for-unit-tests-only",
-            WEBULL_LIVE_TRADING_ENABLED=True,
-        )
+def test_live_trading_flag_allowed_with_separate_live_credentials() -> None:
+    """Market-data env may coexist with WEBULL_LIVE_TRADING_ENABLED=true."""
+    env = EnvSettings(
+        OPENAI_API_KEY="sk-test-key-for-unit-tests-only",
+        WEBULL_LIVE_TRADING_ENABLED=True,
+        WEBULL_LIVE_APP_KEY="live-key",
+        WEBULL_LIVE_APP_SECRET="live-secret",
+        WEBULL_LIVE_ACCESS_TOKEN="live-token",
+        WEBULL_LIVE_ACCOUNT_ID="LIVE1",
+        WEBULL_LIVE_API_ENV="prod",
+    )
+    assert env.webull_live_trading_enabled is True
+    creds = env.live_credentials_env()
+    assert creds.app_key == "live-key"
+    assert creds.account_id == "LIVE1"
 
 
 def test_provider_factory_webull_requires_env(project_root: Path, env_vars: None) -> None:

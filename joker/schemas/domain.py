@@ -343,6 +343,10 @@ class OrderIntent(VersionedModel):
     order_type: Literal["limit", "market"] = "limit"
     quantity: int = 1
     limit_price: float | None = None
+    # Explicit options position intent for broker submission (never inferred from side alone).
+    position_intent: (
+        Literal["BUY_TO_OPEN", "BUY_TO_CLOSE", "SELL_TO_OPEN", "SELL_TO_CLOSE"] | None
+    ) = None
 
 
 class BrokerOrder(VersionedModel):

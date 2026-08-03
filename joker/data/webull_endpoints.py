@@ -159,6 +159,15 @@ WEBULL_ENDPOINTS: dict[str, WebullEndpoint] = {
         docs_url="https://developer.webull.com/apis/docs/reference/account-position",
         notes="Query param account_id.",
     ),
+    "broker_order_preview": WebullEndpoint(
+        name="broker_order_preview",
+        method="POST",
+        path="/openapi/trade/order/preview",
+        verified=True,
+        rate_limit_per_minute=60,
+        docs_url="https://developer.webull.com/apis/docs/reference/common-order-preview",
+        notes="Body: {account_id, new_orders:[...]} — same payload shape as place.",
+    ),
     "broker_order_place": WebullEndpoint(
         name="broker_order_place",
         method="POST",

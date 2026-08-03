@@ -85,14 +85,18 @@ def test_missing_paper_account_id_fails(monkeypatch) -> None:
         resolve_live_paper_broker(app, env, trade_api=MagicMock())
 
 
-def test_live_trading_enabled_fails_at_settings_load() -> None:
-    with pytest.raises(Exception, match="WEBULL_LIVE_TRADING_ENABLED"):
-        EnvSettings.model_validate(
-            {
-                "OPENAI_API_KEY": "test-key",
-                "WEBULL_LIVE_TRADING_ENABLED": "true",
-            }
-        )
+def test_live_trading_enabled_does_not_activate_paper_broker() -> None:
+    env = EnvSettings.model_validate(
+        {
+            "OPENAI_API_KEY": "test-key",
+            "WEBULL_LIVE_TRADING_ENABLED": "true",
+        }
+    )
+    assert env.webull_live_trading_enabled is True
+    # Paper session resolution must still refuse live money flags.
+    app, _ = load_app_settings(PROFILE)
+    with pytest.raises(BrokerFactoryError, match="live"):
+        resolve_live_paper_broker(app, env, trade_api=MagicMock())
 
 
 def test_never_resolves_to_paper_broker() -> None:

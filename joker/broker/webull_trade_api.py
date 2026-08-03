@@ -36,6 +36,12 @@ class WebullTradeApi(ABC):
     def place_order(self, account_id: str, new_orders: list[dict[str, Any]]) -> dict[str, Any]:
         ...
 
+    def preview_order(
+        self, account_id: str, new_orders: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        """Optional preview; paper API may not implement — live client requires it."""
+        raise NotImplementedError("preview_order is not implemented for this trade API")
+
     @abstractmethod
     def cancel_order(self, account_id: str, client_order_id: str) -> dict[str, Any]:
         ...
@@ -110,8 +116,9 @@ def build_option_limit_order_payload(
     intent: OrderIntent,
     *,
     client_order_id: str | None = None,
+    account_id: str | None = None,
 ) -> dict[str, Any]:
-    """Build a single-leg OPTION LIMIT order dict for place_order new_orders[]."""
+    """Build a single-leg OPTION LIMIT order dict for preview/place new_orders[]."""
     if intent.order_type != "limit":
         raise WebullTradeConfigError(
             "Webull options only support LIMIT (or stop variants); market orders rejected."
@@ -126,11 +133,31 @@ def build_option_limit_order_payload(
     option_type = "CALL" if contract.option_type == "call" else "PUT"
     strike = f"{contract.strike:.2f}"
     qty = str(intent.quantity)
-    cid = client_order_id or new_client_order_id()
+    cid = client_order_id or intent.intent_id or new_client_order_id()
     if len(cid) > 32:
         raise WebullTradeConfigError("client_order_id must be <= 32 characters")
 
-    return {
+    position_intent = getattr(intent, "position_intent", None)
+    open_close = None
+    if position_intent in {"BUY_TO_OPEN", "SELL_TO_OPEN"}:
+        open_close = "OPEN"
+    elif position_intent in {"BUY_TO_CLOSE", "SELL_TO_CLOSE"}:
+        open_close = "CLOSE"
+
+    leg: dict[str, Any] = {
+        "side": side,
+        "quantity": qty,
+        "symbol": contract.symbol.upper(),
+        "strike_price": strike,
+        "option_expire_date": contract.expiration.isoformat(),
+        "instrument_type": "OPTION",
+        "option_type": option_type,
+        "market": "US",
+    }
+    if open_close is not None:
+        leg["open_close"] = open_close
+
+    payload: dict[str, Any] = {
         "client_order_id": cid,
         "combo_type": "NORMAL",
         "order_type": "LIMIT",
@@ -143,19 +170,15 @@ def build_option_limit_order_payload(
         "instrument_type": "OPTION",
         "market": "US",
         "symbol": contract.symbol.upper(),
-        "legs": [
-            {
-                "side": side,
-                "quantity": qty,
-                "symbol": contract.symbol.upper(),
-                "strike_price": strike,
-                "option_expire_date": contract.expiration.isoformat(),
-                "instrument_type": "OPTION",
-                "option_type": option_type,
-                "market": "US",
-            }
-        ],
+        "legs": [leg],
     }
+    if account_id:
+        payload["account_id"] = account_id
+    if position_intent:
+        payload["position_intent"] = position_intent
+    if open_close is not None:
+        payload["open_close"] = open_close
+    return payload
 
 
 def map_webull_order_status(raw: str | None) -> str:
@@ -251,6 +274,22 @@ class HttpWebullTradeApi(WebullTradeApi):
             return payload[0]
         raise WebullApiError("Unexpected place-order response shape")
 
+    def preview_order(
+        self, account_id: str, new_orders: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        ensure_paper_trading_allowed(self._env)
+        if account_id != self._env.webull_paper_account_id:
+            raise WebullTradeConfigError(
+                "Refusing preview: account_id does not match WEBULL_PAPER_ACCOUNT_ID"
+            )
+        body = {"account_id": account_id, "new_orders": new_orders}
+        payload = self._http.request_json("broker_order_preview", json_body=body)
+        if isinstance(payload, dict):
+            return payload
+        if isinstance(payload, list) and payload and isinstance(payload[0], dict):
+            return payload[0]
+        raise WebullApiError("Unexpected preview-order response shape")
+
     def cancel_order(self, account_id: str, client_order_id: str) -> dict[str, Any]:
         ensure_paper_trading_allowed(self._env)
         if account_id != self._env.webull_paper_account_id:
@@ -292,21 +331,36 @@ class HttpWebullTradeApi(WebullTradeApi):
 class MockWebullTradeApi(WebullTradeApi):
     """Offline test double — never hits the network."""
 
-    def __init__(self, account_id: str = "PAPER_ACCT_TEST") -> None:
+    def __init__(
+        self,
+        account_id: str = "PAPER_ACCT_TEST",
+        *,
+        account_label: str = "Paper Trading",
+        account_class: str = "INDIVIDUAL_CASH",
+    ) -> None:
         self.account_id = account_id
+        self.account_label = account_label
+        self.account_class = account_class
         self.placed: list[dict[str, Any]] = []
+        self.previewed: list[dict[str, Any]] = []
         self.cancelled: list[str] = []
         self._orders: dict[str, dict[str, Any]] = {}
         self._positions: list[dict[str, Any]] = []
         self.balance_usd = 100_000.0
+        self.buying_power_usd = 100_000.0
+        self.net_liquidation_usd = 100_000.0
+        self.preview_reject: str | None = None
+        self.place_timeout: bool = False
+        self.place_accepts_before_timeout: bool = False
+        self.preview_cost_usd: float | None = None
 
     def list_accounts(self) -> list[dict[str, Any]]:
         return [
             {
                 "account_id": self.account_id,
                 "account_type": "CASH",
-                "account_label": "Paper Trading",
-                "account_class": "INDIVIDUAL_CASH",
+                "account_label": self.account_label,
+                "account_class": self.account_class,
             }
         ]
 
@@ -314,15 +368,52 @@ class MockWebullTradeApi(WebullTradeApi):
         return {
             "account_id": account_id,
             "total_cash": str(self.balance_usd),
-            "buying_power": str(self.balance_usd),
+            "buying_power": str(self.buying_power_usd),
+            "total_net_liquidation_value": str(self.net_liquidation_usd),
         }
 
     def get_positions(self, account_id: str) -> list[dict[str, Any]]:
         return list(self._positions)
 
+    def preview_order(
+        self, account_id: str, new_orders: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        order = new_orders[0]
+        self.previewed.append({"account_id": account_id, **order})
+        if self.preview_reject:
+            return {
+                "accepted": False,
+                "reject_code": self.preview_reject,
+                "reject_message": self.preview_reject,
+            }
+        limit = float(order.get("limit_price") or 0)
+        qty = float(order.get("quantity") or 0)
+        cost = self.preview_cost_usd
+        if cost is None:
+            cost = limit * qty * 100.0
+        return {
+            "accepted": True,
+            "estimated_cost": str(cost),
+            "estimated_fees": "0.65",
+            "buying_power_effect": str(-cost),
+            "client_order_id": order.get("client_order_id"),
+        }
+
     def place_order(self, account_id: str, new_orders: list[dict[str, Any]]) -> dict[str, Any]:
         order = new_orders[0]
         cid = str(order["client_order_id"])
+        if self.place_timeout:
+            if self.place_accepts_before_timeout:
+                record = {
+                    "account_id": account_id,
+                    "client_order_id": cid,
+                    "order_id": f"WB-{cid[:12]}",
+                    "status": "SUBMITTED",
+                    **order,
+                }
+                self._orders[cid] = record
+                self.placed.append(record)
+            raise TimeoutError("simulated place_order timeout")
         record = {
             "account_id": account_id,
             "client_order_id": cid,
@@ -335,25 +426,26 @@ class MockWebullTradeApi(WebullTradeApi):
         if str(order.get("instrument_type", "")).upper() == "OPTION":
             legs = order.get("legs") if isinstance(order.get("legs"), list) else []
             leg = legs[0] if legs and isinstance(legs[0], dict) else {}
-            self._positions.append(
-                {
-                    "position_id": f"POS-{cid[:10]}",
-                    "instrument_type": "OPTION",
-                    "symbol": order.get("symbol") or leg.get("symbol") or "SPY",
-                    "quantity": order.get("quantity", "1"),
-                    "cost_price": order.get("limit_price", "0"),
-                    "option_strategy": "SINGLE",
-                    "legs": [
-                        {
-                            "symbol": leg.get("symbol") or order.get("symbol") or "SPY",
-                            "option_type": leg.get("option_type", "CALL"),
-                            "option_expire_date": leg.get("option_expire_date"),
-                            "option_exercise_price": leg.get("strike_price"),
-                            "quantity": order.get("quantity", "1"),
-                        }
-                    ],
-                }
-            )
+            if str(order.get("side", "")).upper() == "BUY":
+                self._positions.append(
+                    {
+                        "position_id": f"POS-{cid[:10]}",
+                        "instrument_type": "OPTION",
+                        "symbol": order.get("symbol") or leg.get("symbol") or "SPY",
+                        "quantity": order.get("quantity", "1"),
+                        "cost_price": order.get("limit_price", "0"),
+                        "option_strategy": "SINGLE",
+                        "legs": [
+                            {
+                                "symbol": leg.get("symbol") or order.get("symbol") or "SPY",
+                                "option_type": leg.get("option_type", "CALL"),
+                                "option_expire_date": leg.get("option_expire_date"),
+                                "option_exercise_price": leg.get("strike_price"),
+                                "quantity": order.get("quantity", "1"),
+                            }
+                        ],
+                    }
+                )
         return record
 
     def cancel_order(self, account_id: str, client_order_id: str) -> dict[str, Any]:
@@ -373,7 +465,7 @@ class MockWebullTradeApi(WebullTradeApi):
         return [
             o
             for o in self._orders.values()
-            if str(o.get("status", "")).upper() not in {"CANCELLED", "FILLED"}
+            if str(o.get("status", "")).upper() not in {"CANCELLED", "FILLED", "REJECTED"}
         ][:page_size]
 
 

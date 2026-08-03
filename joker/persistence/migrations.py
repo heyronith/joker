@@ -164,4 +164,9 @@ def apply_task1_migrations(db_path: str | Path) -> Path:
 
     apply_objective_migrations(path)
     apply_task3_migrations(path)
+    from joker.persistence.broker_submission_journal import (
+        apply_broker_submission_journal_migration,
+    )
+
+    apply_broker_submission_journal_migration(path)
     return path

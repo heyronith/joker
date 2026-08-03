@@ -45,6 +45,10 @@ def redact_secrets(text: str, env: EnvSettings | None = None) -> str:
             env.webull_trade_app_key,
             env.webull_trade_app_secret,
             env.webull_trade_access_token,
+            env.webull_live_app_key,
+            env.webull_live_app_secret,
+            env.webull_live_access_token,
+            env.webull_live_account_id,
         ):
             if value and len(value) > 4:
                 redacted = redacted.replace(value, "[REDACTED]")

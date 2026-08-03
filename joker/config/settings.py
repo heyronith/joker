@@ -96,14 +96,18 @@ class LoggingSettings(BaseModel):
             "WEBULL_TRADE_APP_KEY",
             "WEBULL_TRADE_APP_SECRET",
             "WEBULL_TRADE_ACCESS_TOKEN",
+            "WEBULL_LIVE_APP_KEY",
+            "WEBULL_LIVE_APP_SECRET",
+            "WEBULL_LIVE_ACCESS_TOKEN",
+            "WEBULL_LIVE_ACCOUNT_ID",
         ]
     )
 
 
 class BrokerSettings(BaseModel):
-    """Broker selection. Default local PaperBroker; webull_paper uses Webull paper account."""
+    """Broker selection. Default local PaperBroker; webull_paper / webull_live."""
 
-    provider: str = "paper"  # paper | webull_paper
+    provider: str = "paper"  # paper | webull_paper | webull_live
     require_explicit_confirmation: bool = True
     webull_paper_trading_enabled: bool = False
 
@@ -320,23 +324,25 @@ class EnvSettings(BaseSettings):
     webull_trade_access_token: str | None = Field(
         default=None, alias="WEBULL_TRADE_ACCESS_TOKEN"
     )
-
-    @field_validator("webull_live_trading_enabled")
-    @classmethod
-    def _reject_live_trading_flag(cls, value: bool) -> bool:
-        if value:
-            raise ValueError(
-                "WEBULL_LIVE_TRADING_ENABLED must remain false — "
-                "real-money broker execution is not enabled in this release. "
-                "Use WEBULL_PAPER_TRADING_ENABLED for paper-account orders."
-            )
-        return value
+    # Production live credentials — never fall back to paper/market WEBULL_* values.
+    webull_live_app_key: str | None = Field(default=None, alias="WEBULL_LIVE_APP_KEY")
+    webull_live_app_secret: str | None = Field(
+        default=None, alias="WEBULL_LIVE_APP_SECRET"
+    )
+    webull_live_access_token: str | None = Field(
+        default=None, alias="WEBULL_LIVE_ACCESS_TOKEN"
+    )
+    webull_live_account_id: str | None = Field(
+        default=None, alias="WEBULL_LIVE_ACCOUNT_ID"
+    )
+    webull_live_api_env: str = Field(default="prod", alias="WEBULL_LIVE_API_ENV")
 
     def trade_credentials_env(self) -> "EnvSettings":
         """
-        Env view used by the trade HTTP client.
+        Env view used by the paper trade HTTP client.
 
         Prefers WEBULL_TRADE_* when present so prod market-data keys can stay unchanged.
+        Never substitutes WEBULL_LIVE_* credentials.
         """
         updates: dict[str, object] = {}
         if self.webull_trade_app_key:
@@ -353,3 +359,37 @@ class EnvSettings(BaseSettings):
         if not updates:
             return self
         return self.model_copy(update=updates)
+
+    def live_credentials_env(self) -> "LiveWebullCredentials":
+        """Explicit production credential view — no paper/trade/sandbox fallback."""
+        return LiveWebullCredentials(
+            app_key=(self.webull_live_app_key or "").strip() or None,
+            app_secret=(self.webull_live_app_secret or "").strip() or None,
+            access_token=(self.webull_live_access_token or "").strip() or None,
+            account_id=(self.webull_live_account_id or "").strip() or None,
+            api_env=(self.webull_live_api_env or "prod").strip().lower(),
+            live_trading_enabled=bool(self.webull_live_trading_enabled),
+        )
+
+
+class LiveWebullCredentials(BaseModel):
+    """Production Webull credentials. Never populated from paper/trade env fields."""
+
+    app_key: str | None = None
+    app_secret: str | None = None
+    access_token: str | None = None
+    account_id: str | None = None
+    api_env: str = "prod"
+    live_trading_enabled: bool = False
+
+    def missing_fields(self) -> list[str]:
+        missing: list[str] = []
+        if not self.app_key:
+            missing.append("WEBULL_LIVE_APP_KEY")
+        if not self.app_secret:
+            missing.append("WEBULL_LIVE_APP_SECRET")
+        if not self.access_token:
+            missing.append("WEBULL_LIVE_ACCESS_TOKEN")
+        if not self.account_id:
+            missing.append("WEBULL_LIVE_ACCOUNT_ID")
+        return missing

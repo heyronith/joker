@@ -66,9 +66,12 @@ def test_trade_endpoints_use_documented_paths() -> None:
     assert get_endpoint("broker_account_positions").path == "/openapi/assets/positions"
 
 
-def test_live_trading_env_still_rejected() -> None:
-    with pytest.raises(ValidationError, match="WEBULL_LIVE_TRADING_ENABLED"):
-        _env(WEBULL_LIVE_TRADING_ENABLED=True)
+def test_live_trading_env_still_blocks_paper_helpers() -> None:
+    """Live flag may be true for WebullLiveClient, but paper helpers refuse it."""
+    env = _env(WEBULL_LIVE_TRADING_ENABLED=True)
+    assert env.webull_live_trading_enabled is True
+    with pytest.raises(WebullTradeConfigError, match="WEBULL_LIVE_TRADING_ENABLED"):
+        ensure_paper_trading_allowed(env)
 
 
 def test_paper_trading_requires_flag() -> None:

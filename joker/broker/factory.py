@@ -1,12 +1,15 @@
-"""Broker factory — paper local simulator vs Webull paper account."""
+"""Broker factory — local paper, Webull paper, Webull live."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 
+from joker.app.safety import SafetyMode
 from joker.broker.interface import BrokerClient, PaperBroker
 from joker.broker.webull import WebullClient
 from joker.config.settings import AppSettings, EnvSettings
+from joker.persistence.broker_submission_journal import SyncBrokerSubmissionJournal
 
 
 class BrokerFactoryError(Exception):
@@ -15,10 +18,10 @@ class BrokerFactoryError(Exception):
 
 @dataclass(frozen=True)
 class BrokerSelection:
-    """Resolved broker for a session (never real-money live)."""
+    """Resolved broker for a session."""
 
     client: BrokerClient
-    kind: str  # local_paper | webull_paper
+    kind: str  # local_paper | webull_paper | webull_live
     auto_orders: bool
     label: str
 
@@ -37,12 +40,14 @@ def create_broker(
     env: EnvSettings,
     *,
     trade_api: object | None = None,
+    journal_db_path: str | Path | None = None,
 ) -> BrokerClient:
     """
     Create a broker client from config.
 
     - provider=paper (default): local PaperBroker — no Webull orders
     - provider=webull_paper: Webull paper-account API (requires env flags)
+    - provider=webull_live: production WebullLiveClient (fail closed, no fallback)
     """
     provider = (app_settings.broker.provider or "paper").strip().lower()
     if provider == "paper":
@@ -57,21 +62,77 @@ def create_broker(
             raise BrokerFactoryError(
                 "broker.provider=webull_paper requires WEBULL_PAPER_TRADING_ENABLED=true "
                 "(or broker.webull_paper_trading_enabled in YAML). "
-                "Real-money live remains disabled."
+                "Use provider=webull_live for production."
             )
-        # Prefer env flag; YAML flag can enable when env also set.
         if not env.webull_paper_trading_enabled:
             raise BrokerFactoryError(
                 "WEBULL_PAPER_TRADING_ENABLED must be true for Webull paper broker"
             )
         if env.webull_live_trading_enabled or app_settings.live_trading_enabled:
             raise BrokerFactoryError(
-                "Refusing Webull broker: live money trading flags must remain false"
+                "Refusing Webull paper broker: live money trading flags must remain false"
             )
         return WebullClient(env, trade_api=trade_api)  # type: ignore[arg-type]
+    if provider == "webull_live":
+        return create_live_broker(
+            app_settings,
+            env,
+            trade_api=trade_api,
+            journal_db_path=journal_db_path,
+        )
     raise BrokerFactoryError(
-        f"Unknown broker.provider={provider!r}. Use 'paper' or 'webull_paper'."
+        f"Unknown broker.provider={provider!r}. "
+        "Use 'paper', 'webull_paper', or 'webull_live'."
     )
+
+
+def create_live_broker(
+    app_settings: AppSettings,
+    env: EnvSettings,
+    *,
+    trade_api: object | None = None,
+    journal_db_path: str | Path | None = None,
+    capture_only: bool = False,
+    skip_account_list_check: bool = False,
+) -> BrokerClient:
+    """Construct WebullLiveClient. Never falls back to paper or local PaperBroker."""
+    from joker.broker.webull_live import WebullLiveClient
+
+    if (app_settings.broker.provider or "").strip().lower() not in {
+        "webull_live",
+        "",
+    } and app_settings.mode is not SafetyMode.LIVE_GATED:
+        # Explicit factory call may omit provider when constructing for live runner.
+        pass
+    if app_settings.mode is not SafetyMode.LIVE_GATED:
+        raise BrokerFactoryError(
+            "create_live_broker requires mode LIVE_GATED — refusing fallback"
+        )
+    if not app_settings.live_trading_enabled:
+        raise BrokerFactoryError(
+            "create_live_broker requires live_trading_enabled=true — refusing fallback"
+        )
+    if not env.webull_live_trading_enabled:
+        raise BrokerFactoryError(
+            "create_live_broker requires WEBULL_LIVE_TRADING_ENABLED=true — refusing fallback"
+        )
+    journal = None
+    if journal_db_path is not None:
+        journal = SyncBrokerSubmissionJournal(journal_db_path)
+    try:
+        return WebullLiveClient(
+            env,
+            app_settings=app_settings,
+            trade_api=trade_api,  # type: ignore[arg-type]
+            journal=journal,
+            capture_only=capture_only,
+            skip_account_list_check=skip_account_list_check,
+        )
+    except Exception as exc:
+        raise BrokerFactoryError(
+            f"webull_live initialization failed: {exc}. "
+            "Refusing PaperBroker / webull_paper fallback."
+        ) from exc
 
 
 def resolve_live_paper_broker(
@@ -88,6 +149,12 @@ def resolve_live_paper_broker(
     auto-orders (even when YAML still says provider=paper). Real money stays off.
     """
     if broker is not None:
+        from joker.broker.webull_live import WebullLiveClient
+
+        if isinstance(broker, WebullLiveClient):
+            raise BrokerFactoryError(
+                "resolve_live_paper_broker refuses webull_live broker"
+            )
         kind = "webull_paper" if isinstance(broker, WebullClient) else "local_paper"
         return BrokerSelection(
             client=broker,
@@ -97,6 +164,10 @@ def resolve_live_paper_broker(
         )
 
     yaml_provider = (app_settings.broker.provider or "paper").strip().lower()
+    if yaml_provider == "webull_live":
+        raise BrokerFactoryError(
+            "resolve_live_paper_broker refuses provider=webull_live"
+        )
     use_webull_paper = yaml_provider in {"webull_paper", "webull"} or webull_paper_env_ready(
         env
     )

@@ -32,17 +32,19 @@ class WebullApiEnv(str, Enum):
 
 
 def ensure_live_trading_disabled(env: EnvSettings) -> None:
+    """Paper-trade / legacy gate — market-data validation no longer requires this."""
     if env.webull_live_trading_enabled:
         raise WebullMarketConfigError(
-            "WEBULL_LIVE_TRADING_ENABLED must remain false. "
-            "Real-money broker execution is disabled. "
-            "Paper-account orders use WEBULL_PAPER_TRADING_ENABLED separately."
+            "WEBULL_LIVE_TRADING_ENABLED is true. "
+            "Paper-account order helpers refuse live mode; use WebullLiveClient."
         )
 
 
 def validate_webull_market_env(env: EnvSettings) -> None:
-    """Require market-data credentials when using Webull provider."""
-    ensure_live_trading_disabled(env)
+    """Require market-data credentials when using Webull provider.
+
+    Market data may run alongside live trading; live credentials are separate.
+    """
     missing: list[str] = []
     if not env.webull_app_key:
         missing.append("WEBULL_APP_KEY")
