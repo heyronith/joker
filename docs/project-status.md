@@ -6,55 +6,69 @@
 | Task 2 | approved |
 | Task 3 | approved project foundation |
 | Goal-driven objective layer | implemented |
-| Current phase | historical EV entry-anchor / training-provenance correction (**not approved**) |
-| Current branch | `task3-agent-evolution` |
-| Comparison base | `33678b1c6ac1b2a8da4232e3d4645061264ce09a` |
-| Verified code commit | `c58aa933f6e36a2f483010711cbf321c2f2f555e` |
+| Historical-EV architecture | implemented at `c58aa93` (pending independent review) |
+| Current phase | live trading implementation Steps 1+2 (**not operationally approved**) |
+| Current branch | `live-trading-implementation` |
+| Approved historical-EV base | `c58aa933f6e36a2f483010711cbf321c2f2f555e` |
+| Step 1 SHA | `778d7d9d873d016538b8d21245bcf9137e6659a3` |
+| Step 2 SHA / verified tip | `e36f09f6980dfa637dd167d880f6fbc592a91cca` |
 | Acceptance path | **local** SHA-tied evidence under `artifacts/local-verify/<sha>/` |
 | GitHub Actions | `workflow_dispatch` only — **not** an acceptance gate |
-| Latest local evidence (3.12) | `c58aa93` — **PASS** |
-| Paper-only status | enforced (live trading disabled) |
-| Textual UI status | not started / not modified in this phase |
-| Known unresolved items | independent review of production EV path at `c58aa93`; phase remains unapproved |
+| Latest local evidence (3.12) | `e36f09f` — **PASS** |
+| Paper-only default | enforced unless LIVE_GATED + live flags + LiveActivation |
+| Textual UI / paper-live selector | not built |
+| Real-money operational approval | **not claimed** — market-open acceptance pending |
 
-## Local verification evidence (`c58aa93`)
+## Local verification evidence (`e36f09f`)
 
 | Field | Value |
 | --- | --- |
-| Verified code SHA | `c58aa933f6e36a2f483010711cbf321c2f2f555e` |
+| Verified code SHA | `e36f09f6980dfa637dd167d880f6fbc592a91cca` |
 | Result | **PASS** |
-| Manifest | `artifacts/local-verify/c58aa933f6e36a2f483010711cbf321c2f2f555e/manifest.json` |
+| Manifest | `artifacts/local-verify/e36f09f6980dfa637dd167d880f6fbc592a91cca/manifest.json` |
 | Python | 3.12 (`.venv`) |
-| Focused | 48 passed ×3 (dataset provenance, episode compiler, horizon verify, strategy family, live runner) |
-| Full suite | 861 passed ×1 |
-| Soak | 9 passed ×1 (`live_runner` + `production_promotion_rollback`) |
+| Focused | 46 passed ×3 |
+| Full suite | 907 passed ×1 |
+| Recovery soak | 9 passed ×1 |
 | Ruff | ok |
-| CLI | `joker --help`, `joker evolve --help` ok |
+| CLI | `joker --help`, `broker --help`, `live --help`, `live preflight --help` ok |
 | SQLite integrity | ok |
-| Git during verify | clean implementation tree at `c58aa93` |
+| Git during verify | clean at `e36f09f` |
 
-## Correction summary
+## Implementation summary
 
-1. `verify_event_horizon` fails closed when `entry_event_id` or `terminal_event_id` is `None` (`authoritative_horizon_entry_missing` / `authoritative_horizon_terminal_missing`); no skip-on-None.
-2. EpisodeCompiler no longer invents entry from the first window event; missing entry causation → incomplete, EV/promotion ineligible, truth degraded.
-3. Entry `causation_event_id` flows `OrderActionRequest` → `ExecutionProvenanceRecord` (decision-completed → proposal → cycle trigger; never a fill).
-4. Production fixtures (`persist_compiler_produced_history`) use exact factual entry/terminal anchors; horizon loaders do not mint missing IDs.
-5. `resolve_dataset_provenance_status`: non-bootstrap `resolved` requires `training_dataset_ids`; challenger/evaluation IDs alone → `unknown`. Explicit `construction_method` (`bootstrap` / `human_static`) for genuine no-training cases; agent challengers never auto `not_applicable`.
+### Step 1 — Production Webull execution subsystem
+- Separate `WebullLiveClient` (paper `WebullClient` unchanged / still refuses live)
+- Explicit `WEBULL_LIVE_*` credentials via `live_credentials_env()` (no paper fallback)
+- Order preview, options `position_intent`, durable `broker_submission_journal`
+- Ambiguous timeout → `submission_unknown` + order-detail reconcile
+- `BrokerReconciliationService` with typed mismatch classifications
 
-## Historical-EV phase status
+### Step 2 — Agentic live runtime
+- Shared `prepare_agentic_trading_session` used by paper and live wrappers
+- `LiveTradingRunner` + process-local `LiveActivation`
+- Live preview inside `OrderActionGateway` (no agent bypass)
+- Read-only `joker live preflight`
+- Paper/live command equivalence tests (capture mode)
 
-**Not complete / not approved.** Independent review should verify:
+## Capability matrix
 
-```text
-explicit entry causation event
-→ exact entry-to-terminal horizon
-→ anchored and contiguous factual episode
-→ explicit strategy family
-→ active configuration with known training datasets
-→ leakage-safe historical sample
-→ supported positive EV
-→ price-covered paper execution
-```
+| Capability | Offline verified | Sandbox verified | Production read-only verified | Production order verified |
+| --- | ---: | ---: | ---: | ---: |
+| Authentication | yes | pending | pending | no |
+| Account identity | yes | pending | pending | no |
+| Preview | yes | pending | pending | no |
+| Placement | yes (mock) | pending | n/a | no |
+| Cancellation | yes (mock) | pending | n/a | no |
+| Partial fill | yes (mock/status) | pending | n/a | no |
+| Position reconciliation | yes | pending | pending | no |
+| Restart recovery | yes | pending | n/a | no |
+| Agent-managed exit | yes (intent/payload) | pending | n/a | no |
+| Episode compilation | yes (existing path) | pending | n/a | no |
 
-GitHub Actions is not required for acceptance. Do not claim real-money readiness.
-Do not merge into `main`.
+## Not claimed
+
+- Real-money operational readiness
+- Market-open production order verification
+- Final CLI paper/live selector UI
+- Merge to `main`
