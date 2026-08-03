@@ -984,7 +984,7 @@ async def test_polling_event_source_starts_and_stops_with_runner(tmp_path) -> No
     activation = create_live_activation(
         account_id_hash=hash_account_id("LIVE_ACCT_1"),
         objective_id=definition.objective_id,
-        authorized_capital_usd=Decimal("5000"),
+        authorized_capital_usd=Decimal("500"),
     )
     runner = LiveTradingRunner(
         app_settings=app,
@@ -999,7 +999,11 @@ async def test_polling_event_source_starts_and_stops_with_runner(tmp_path) -> No
     session = await runner.start(
         start_cognitive_agent=False,
         start_evolution_workers=False,
+        start_market_loop=False,
         session_id="poll-session",
+        fake_model_provider=__import__(
+            "joker.models.fake_provider", fromlist=["FakeModelProvider"]
+        ).FakeModelProvider(available=True),
     )
     assert runner._poll_task is not None
     assert runner._poller is not None
@@ -1110,6 +1114,8 @@ def test_preflight_checks_actual_database(tmp_path) -> None:
         env=live_env(),
         trade_api=create_mock_live_trade_api("LIVE_ACCT_1"),
         skip_network=False,
+        check_market_data=False,
     )
-    assert any("sqlite: ok" in c for c in report.checks)
-    assert report.ok is True
+    assert any("database: ok" in c for c in report.checks)
+    assert report.database_ok is True
+    assert report.operational_ready is False

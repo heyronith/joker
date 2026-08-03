@@ -76,3 +76,24 @@ def live_paper_cognitive_session_id(
         account_identity=paper_account_identity(broker_kind=broker_kind, env=env),
         mode=mode,
     )
+
+
+def live_gated_cognitive_session_id(
+    *,
+    account_id_hash: str,
+    trading_date: date | None = None,
+    scope: str = "live",
+) -> str:
+    """Stable LIVE_GATED session identity — account hash + exchange trading date.
+
+    ``run_id`` may remain process-unique; ``session_id`` must survive restart so
+    Task-1 projection and checkpoints recover the prior day/account session.
+    """
+    identity = (account_id_hash or "").strip().lower()
+    if not identity:
+        raise ValueError("live_gated_cognitive_session_id requires account_id_hash")
+    return stable_cognitive_session_id(
+        trading_date=trading_date or exchange_trading_date(),
+        account_identity=f"live:{identity}",
+        mode=scope or "live",
+    )

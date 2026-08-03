@@ -6,6 +6,7 @@ CognitiveGraphDeps / OrderActionGateway / HistoricalOutcomeService.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -34,7 +35,7 @@ from joker.runtime.cognitive_agent_runtime import (
     build_default_repositories,
 )
 from joker.runtime.cognitive_binding import bind_cognitive_graph_to_task1
-from joker.runtime.cognitive_startup import validate_cognitive_providers
+from joker.runtime.cognitive_startup import FAKE_OVERRIDE_ENV, validate_cognitive_providers
 from joker.runtime.compatibility import CompatibilityLivePaperBridge
 from joker.runtime.entry_permission import EntryPermissionState
 from joker.runtime.objective_recovery import recover_session_objective
@@ -137,26 +138,43 @@ async def prepare_agentic_trading_session(
     sid = session_id or f"sess-{uuid4().hex[:12]}"
     rid = run_id or f"run-{uuid4().hex[:12]}"
 
-    fake = fake_model_provider or FakeModelProvider(available=True)
-    profiles = {
-        name: profile.model_copy(update={"provider": "fake", "model": "fake-model"})
-        for name, profile in default_model_profiles().items()
+    fake_env = os.environ.get(FAKE_OVERRIDE_ENV, "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
     }
-    cfg = ModelsConfig(profiles=profiles)
-    cfg = cfg.model_copy(
-        update={
-            "ollama": cfg.ollama.model_copy(update={"enabled": False}),
-            "openai": cfg.openai.model_copy(update={"enabled": False}),
+    use_fake = (
+        fake_model_provider is not None
+        or bool(getattr(getattr(app_settings, "agents", None), "mock_agents", False))
+        or fake_env
+    )
+    if use_fake:
+        fake = fake_model_provider or FakeModelProvider(available=True)
+        profiles = {
+            name: profile.model_copy(update={"provider": "fake", "model": "fake-model"})
+            for name, profile in default_model_profiles().items()
         }
-    )
-    registry = ModelRegistry(cfg, providers={"fake": fake})
-    startup = await validate_cognitive_providers(
-        cfg, mock_agents=True, registry=registry
-    )
-    registry = startup.registry
-    # Keep the caller-supplied FakeModelProvider so canned role bindings survive
-    # validate_cognitive_providers' remap (which otherwise constructs a new fake).
-    registry.register_provider("fake", fake)
+        cfg = ModelsConfig(profiles=profiles)
+        cfg = cfg.model_copy(
+            update={
+                "ollama": cfg.ollama.model_copy(update={"enabled": False}),
+                "openai": cfg.openai.model_copy(update={"enabled": False}),
+            }
+        )
+        registry = ModelRegistry(cfg, providers={"fake": fake})
+        startup = await validate_cognitive_providers(
+            cfg, mock_agents=True, registry=registry
+        )
+        registry = startup.registry
+        # Keep the caller-supplied FakeModelProvider so canned role bindings survive
+        # validate_cognitive_providers' remap (which otherwise constructs a new fake).
+        registry.register_provider("fake", fake)
+    else:
+        # Production path — use configured providers; fail closed if unavailable.
+        cfg = app_settings.models
+        startup = await validate_cognitive_providers(cfg, mock_agents=False)
+        registry = startup.registry
     router = ModelRouter(registry, session_id=sid)
     repos = build_default_repositories(task1_db)
     for repo in repos.values():

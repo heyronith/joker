@@ -697,7 +697,9 @@ class WebullLiveClient(BrokerClient):
     ) -> SessionPnlBaseline | None:
         if self._baseline_store is None or nlv is None:
             return None
-        trading_date = datetime.now(timezone.utc).date().isoformat()
+        from joker.runtime.cognitive_session import exchange_trading_date
+
+        trading_date = exchange_trading_date().isoformat()
         existing = self._baseline_store.get(
             account_id_hash=self._account_id_hash,
             trading_date=trading_date,
@@ -769,15 +771,27 @@ class WebullLiveClient(BrokerClient):
                 or 0
             )
         )
-        filled = int(
-            float(
-                detail.get("filled_quantity")
-                or detail.get("cumulative_filled_quantity")
-                or (qty if status == "filled" else 0)
+        raw_filled = detail.get("filled_quantity")
+        if raw_filled is None:
+            raw_filled = detail.get("cumulative_filled_quantity")
+        if raw_filled is None and status == "filled":
+            raw_filled = qty
+        if status == "partially_filled" and raw_filled is None:
+            # Never invent fill quantity — leave fill truth unavailable.
+            self._truth_unavailable = True
+            logger.error(
+                "partial_fill_quantity_unavailable",
+                extra={"client_order_id": client_order_id},
             )
-        )
+            return None
+        filled = int(float(raw_filled or 0))
         if status == "partially_filled" and filled <= 0:
-            filled = max(1, qty // 2) if qty else 0
+            self._truth_unavailable = True
+            logger.error(
+                "partial_fill_quantity_non_positive",
+                extra={"client_order_id": client_order_id, "filled": filled},
+            )
+            return None
         remaining = max(0, qty - filled)
         limit = detail.get("limit_price")
         if limit is None and journal_row is not None:

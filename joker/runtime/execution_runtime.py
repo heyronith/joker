@@ -420,12 +420,22 @@ class ExecutionRuntime:
                 written.append(event)
                 await self._publish_order_event(EventType.ORDER_REJECTED, client_id, now)
         elif order.status in {"partially_filled", "filled"}:
-            cumulative = int(
-                getattr(order, "filled_quantity", 0)
-                or (order.quantity if order.status == "filled" else 0)
-            )
-            if order.status == "filled" and cumulative <= 0:
-                cumulative = int(order.quantity)
+            raw_filled = getattr(order, "filled_quantity", None)
+            if raw_filled is None or int(raw_filled) <= 0:
+                if order.status == "filled":
+                    cumulative = int(order.quantity)
+                else:
+                    # Partial without authoritative cumulative — fail closed.
+                    logger.error(
+                        "partial_fill_truth_unavailable",
+                        extra={
+                            "client_order_id": client_id,
+                            "broker_order_id": order.order_id,
+                        },
+                    )
+                    return written
+            else:
+                cumulative = int(raw_filled)
             already = await self._persisted_fill_quantity(client_id)
             delta = cumulative - already
             if delta > 0:
@@ -438,26 +448,19 @@ class ExecutionRuntime:
                         client_order_id=client_id,
                         fill_price=fill_price,
                         fill_qty=Decimal(delta),
+                        cumulative_filled_quantity=Decimal(cumulative),
                         final=order.status == "filled",
                     )
                     written.extend(fill_events)
                 else:
-                    await self._publish_order_event(
-                        (
-                            EventType.ORDER_FILLED
-                            if order.status == "filled"
-                            else EventType.ORDER_PARTIALLY_FILLED
-                        ),
-                        client_id,
-                        now,
+                    logger.error(
+                        "fill_price_unavailable_no_mutation",
                         extra={
-                            "broker_order_id": order.order_id,
-                            "fill_price_available": False,
+                            "client_order_id": client_id,
                             "cumulative_filled_quantity": cumulative,
                         },
                     )
-            # delta <= 0: already persisted — do not republish ORDER_FILLED
-            # (spurious domain events confuse episode/position workers).
+            # delta <= 0: already persisted — do not republish ORDER_FILLED.
         return written
 
     async def _on_broker_order_update(
@@ -573,12 +576,15 @@ class ExecutionRuntime:
         client_order_id: str,
         fill_price: Decimal,
         fill_qty: Decimal | None = None,
+        cumulative_filled_quantity: Decimal | None = None,
         final: bool = True,
     ) -> list[LedgerEvent]:
         """Record a fill with a verified price (never derived from limit).
 
         Position domain events are published by comparing projection before/after.
         No separate POSITION_* ledger events are appended for fill quantities.
+        Idempotency keys include the new authoritative cumulative filled quantity
+        so two equal-sized partial fills at the same price are both persisted.
         """
         before = await self.project_session()
         qty = fill_qty if fill_qty is not None else Decimal(order.quantity)
@@ -587,6 +593,11 @@ class ExecutionRuntime:
         now = self._now()
         cid = contract_id_for(order.contract)
         self._client_to_broker.setdefault(client_order_id, order.order_id)
+        if cumulative_filled_quantity is not None:
+            cum_key = cumulative_filled_quantity
+        else:
+            already = await self._persisted_fill_quantity(client_order_id)
+            cum_key = Decimal(already) + qty
         event = make_ledger_event(
             event_type,
             broker_account_id=self._broker_account_id,
@@ -596,11 +607,13 @@ class ExecutionRuntime:
             quantity=qty,
             exchange_timestamp=now,
             idempotency_key=(
-                f"fill:{client_order_id}:{order.order_id}:{event_type.value}:{qty}:{fill_price}"
+                f"fill:{client_order_id}:{order.order_id}:{event_type.value}"
+                f":{cum_key}:{fill_price}"
             ),
             session_id=self._session_id,
             broker_order_id=order.order_id,
             price=fill_price,
+            metadata={"cumulative_filled_quantity": str(cum_key)},
         )
         written: list[LedgerEvent] = []
         if await self._ledger.append(event):

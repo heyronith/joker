@@ -117,8 +117,12 @@ def test_live_paper_runner_constructs_bridge_on_run_start(tmp_path: Path, monkey
         def authenticate(self):
             return False
 
+        def close(self):
+            return None
+
+    # Shared market loop constructs the stock provider; patch at that import site.
     monkeypatch.setattr(
-        "joker.runtime.live_paper_runner.WebullMarketDataProvider",
+        "joker.runtime.live_market_data_loop.WebullMarketDataProvider",
         BoomProvider,
     )
 

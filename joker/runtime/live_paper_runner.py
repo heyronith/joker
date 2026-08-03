@@ -25,11 +25,7 @@ from joker.broker.interface import BrokerClient
 from joker.config.settings import AppSettings, EnvSettings
 from joker.data.provider_factory import ProviderKind
 from joker.data.webull_capability import capability_usable_for_shadow
-from joker.data.webull_market_provider import WebullMarketDataProvider
-from joker.data.webull_options_provider import (
-    WebullOptionsDataProvider,
-    create_webull_options_provider,
-)
+from joker.runtime.live_market_data_loop import LiveMarketDataError, LiveMarketDataLoop
 from joker.execution.exit_manager import ExitManager
 from joker.execution.option_selector import OptionSelector, OptionSelectorConfig
 from joker.features.engine import FeatureEngine
@@ -48,7 +44,7 @@ from joker.runtime.premarket import PremarketWorkflow
 from joker.runtime.reactive_engine import ReactiveEngine, StateMachineError
 from joker.runtime.run_manager import RunManager
 from joker.schemas.domain import DailyState, Playbook, RiskConfig
-from joker.schemas.replay import ReplaySummary, SpyQuoteEvent
+from joker.schemas.replay import ReplaySummary
 from joker.storage.database import Database, ensure_database
 from joker.storage.models import (
     AgentDecisionRecord,
@@ -625,22 +621,18 @@ class LivePaperRunner:
             },
         )
 
-        provider = WebullMarketDataProvider(
-            self.env_settings,
-            api=config.webull_api,
-            quote_max_age_seconds=self.app_settings.risk.quote_max_age_seconds,
-            feed_max_silence_seconds=self.app_settings.risk.feed_max_silence_seconds,
-            allow_delayed_quotes=self.app_settings.risk.allow_delayed_quotes,
-            poll_interval_seconds=self.app_settings.data.quote_poll_interval_seconds,
+        market_loop = LiveMarketDataLoop(
+            app_settings=self.app_settings,
+            env=self.env_settings,
+            stock_api=config.webull_api,
+            options_api=config.webull_options_api,
+            require_options=config.require_options,
+            source_label="live_paper",
+            log=log,
         )
-        _http_clients.append(provider)
-
         try:
-            ok = provider.authenticate()
-            log("webull.auth.result", {"success": ok})
-            if not ok:
-                raise LivePaperError("Webull market-data authentication failed")
-        except Exception as exc:
+            market_loop.authenticate()
+        except LiveMarketDataError as exc:
             msg = str(exc)
             result.errors.append(msg)
             result.feed_health = "ERROR"
@@ -662,95 +654,23 @@ class LivePaperRunner:
             shutdown_task1()
             return result
 
-        options_provider: WebullOptionsDataProvider | None = None
-        try:
-            options_provider = create_webull_options_provider(
-                self.env_settings,
-                api=config.webull_options_api,
-                app_settings=self.app_settings,
-            )
-            _http_clients.append(options_provider)
-            options_provider.authenticate()
-            if capability_usable_for_shadow():
-                options_provider.verified = True
-                result.options_available = True
-            log("options.capability",
-                {
-                    "usable": capability_usable_for_shadow(),
-                    "verified": options_provider.verified,
-                },
-            )
-        except Exception as exc:
-            msg = f"options_provider_failed: {exc}"
-            log("options.unavailable", {"reason": str(exc)})
-            if config.require_options:
-                result.errors.append(msg)
-                result.failures.append(msg)
-                run_manager.end_run(run_id)
-                shutdown_task1()
-                return result
+        provider = market_loop.provider
+        options_provider = market_loop.options_provider
+        if options_provider is not None and (
+            getattr(options_provider, "verified", False)
+            or capability_usable_for_shadow()
+        ):
+            result.options_available = True
+        for client in market_loop._http_clients:
+            if client not in _http_clients:
+                _http_clients.append(client)
 
         # Warm snapshot from real Webull. Feature candles remain for FeatureEngine;
         # Task 1 market truth is owned by MarketRuntime (see poll loop ingest).
         try:
-            try:
-                candle_events = provider.fetch_candle_events("1m")
-                log("market.candles_loaded",
-                    {"count": len(candle_events), "source": "webull_stock"},
-                )
-            except Exception as candle_exc:
-                log("market.candles_unavailable",
-                    {
-                        "reason": str(candle_exc),
-                        "fallback": "quote_derived_candles_for_features_only",
-                    },
-                )
-
-            snapshot_event = provider.fetch_snapshot_event()
-            # Seed feature candles only; MarketRuntime owns exchange-aligned bars.
-            snap0 = provider.get_latest_snapshot()
-            if snap0 is not None and not snap0.candles:
-                provider.append_quote_as_candle(snapshot_event)
-
-            snapshot = provider.get_latest_snapshot()
-            if snapshot is None:
-                raise LivePaperError("No SPY snapshot from Webull")
-            # Seed Task 1 MarketRuntime with the warmup quote.
-            try:
-                task1_bridge.ingest_underlying_quote(
-                    symbol=snapshot.symbol,
-                    last=Decimal(str(snapshot.price)),
-                    bid=Decimal(str(snapshot.bid)) if snapshot.bid is not None else None,
-                    ask=Decimal(str(snapshot.ask)) if snapshot.ask is not None else None,
-                    source_timestamp=snapshot.timestamp,
-                    received_timestamp=datetime.now(timezone.utc),
-                    source="live_paper_warmup",
-                )
-            except Exception as ingest_exc:
-                log(
-                    "task1.market_ingest_failed",
-                    {
-                        "reason": str(ingest_exc),
-                        "degraded": task1_bridge.health.degraded,
-                        "consecutive_failures": (
-                            task1_bridge.health.consecutive_failures
-                        ),
-                    },
-                )
-            log("market.warmup",
-                {
-                    "candles": len(snapshot.candles),
-                    "price": snapshot.price,
-                    "delayed": provider.last_quote_delayed,
-                    "feed_health": provider.feed_health,
-                    "candle_source": getattr(provider, "candle_source", "unknown"),
-                    "has_volume_bars": bool(getattr(provider, "has_volume_bars", False)),
-                    "snapshot_event_id": snapshot_event.event_id,
-                    "task1_market_runtime": True,
-                },
-            )
-        except Exception as exc:
-            msg = f"warmup_failed: {exc}"
+            snapshot = market_loop.warmup(task1_bridge)
+        except LiveMarketDataError as exc:
+            msg = str(exc)
             result.errors.append(msg)
             result.failures.append(msg)
             log("provider.error", {"error": msg})
@@ -1045,148 +965,12 @@ class LivePaperRunner:
                 )
 
                 while _time.monotonic() < deadline:
-                    try:
-                        event = provider.fetch_snapshot_event()
-                    except Exception as exc:
-                        log("provider.poll_error", {"reason": str(exc)})
+                    event = market_loop.poll_once(task1_bridge)
+                    if event is None:
                         _time.sleep(poll)
                         continue
 
                     events_processed += 1
-                    if isinstance(event, SpyQuoteEvent):
-                        # FeatureEngine still uses provider candles; Task 1 truth
-                        # is ingested into MarketRuntime (not LivePaperRunner bars).
-                        try:
-                            task1_bridge.ingest_underlying_quote(
-                                symbol=getattr(event, "symbol", None) or "SPY",
-                                last=Decimal(str(event.price)),
-                                bid=(
-                                    Decimal(str(event.bid))
-                                    if getattr(event, "bid", None) is not None
-                                    else None
-                                ),
-                                ask=(
-                                    Decimal(str(event.ask))
-                                    if getattr(event, "ask", None) is not None
-                                    else None
-                                ),
-                                source_timestamp=event.timestamp,
-                                received_timestamp=datetime.now(timezone.utc),
-                                source="live_paper_poll",
-                            )
-                            if options_provider is not None:
-                                try:
-                                    from joker.runtime.option_surface_ingest import (
-                                        convert_option_snapshots_to_surface_rows,
-                                    )
-
-                                    trading_day = None
-                                    try:
-                                        trading_day = (
-                                            task1_bridge.supervisor.clock.trading_date()
-                                        )
-                                    except Exception:
-                                        trading_day = None
-                                    fetch = options_provider.fetch_surface_snapshots(
-                                        float(event.price),
-                                        trading_date=trading_day,
-                                        max_contracts=None,
-                                    )
-                                    conversion = convert_option_snapshots_to_surface_rows(
-                                        fetch.snapshots,
-                                        trading_date=fetch.trading_date,
-                                    )
-                                    rows = conversion.rows
-                                    if rows:
-                                        task1_bridge.ingest_option_quotes(rows)
-                                    findings = list(fetch.to_data_quality_findings())
-                                    findings.extend(conversion.to_data_quality_findings())
-                                    if (
-                                        fetch.complete
-                                        and conversion.converted_count
-                                        != fetch.selected_count
-                                    ):
-                                        from joker.market.quality import (
-                                            DataQualityCode,
-                                            DataQualityFinding,
-                                            DataQualitySeverity,
-                                        )
-
-                                        findings.append(
-                                            DataQualityFinding(
-                                                code=DataQualityCode.PARTIAL_OPTION_SURFACE,
-                                                severity=DataQualitySeverity.ERROR,
-                                                message=(
-                                                    "persisted option rows differ from "
-                                                    "selected SPY 0DTE contract count"
-                                                ),
-                                                symbol="SPY",
-                                                details={
-                                                    "selected_count": fetch.selected_count,
-                                                    "persisted_rows": len(rows),
-                                                    "fetched_count": fetch.fetched_count,
-                                                },
-                                            )
-                                        )
-                                    market = task1_bridge.supervisor.market_runtime
-                                    if market is not None and findings:
-                                        market.enqueue_quality_findings(findings)
-                                    log(
-                                        "task1.option_surface_ingested",
-                                        {
-                                            "contract_count": len(rows),
-                                            "discovered_count": fetch.discovered_count,
-                                            "fetched_count": fetch.fetched_count,
-                                            "complete": fetch.complete
-                                            and conversion.complete,
-                                            "failed_batches": list(fetch.failed_batches),
-                                            "conversion_failures": list(
-                                                conversion.conversion_failures
-                                            ),
-                                        },
-                                    )
-                                except Exception as opt_exc:
-                                    log(
-                                        "task1.option_surface_ingest_failed",
-                                        {"reason": str(opt_exc)},
-                                    )
-                                    market = task1_bridge.supervisor.market_runtime
-                                    if market is not None:
-                                        from joker.market.quality import (
-                                            DataQualityCode,
-                                            DataQualityFinding,
-                                            DataQualitySeverity,
-                                        )
-
-                                        market.enqueue_quality_findings(
-                                            [
-                                                DataQualityFinding(
-                                                    code=DataQualityCode.OPTION_SURFACE_UNAVAILABLE,
-                                                    severity=DataQualitySeverity.ERROR,
-                                                    message=(
-                                                        "option surface fetch failed; "
-                                                        "do not treat the previous "
-                                                        "surface as the current complete "
-                                                        "SPY 0DTE chain"
-                                                    ),
-                                                    symbol="SPY",
-                                                    details={"reason": str(opt_exc)[:500]},
-                                                )
-                                            ]
-                                        )
-                            task1_bridge.tick()
-                        except Exception as ingest_exc:
-                            log(
-                                "task1.market_ingest_failed",
-                                {
-                                    "reason": str(ingest_exc),
-                                    "degraded": task1_bridge.health.degraded,
-                                    "consecutive_failures": (
-                                        task1_bridge.health.consecutive_failures
-                                    ),
-                                },
-                            )
-                        provider.append_quote_as_candle(event)
 
                     if task1_bridge.health.degraded:
                         log(

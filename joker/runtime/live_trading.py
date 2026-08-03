@@ -19,12 +19,14 @@ from joker.broker.webull_live import WebullLiveClient
 from joker.config.settings import AppSettings, EnvSettings
 from joker.objectives.service import SessionObjectiveService
 from joker.persistence.broker_submission_journal import SyncBrokerSubmissionJournal
+from joker.runtime.cognitive_session import live_gated_cognitive_session_id
 from joker.runtime.cognitive_session_factory import (
     PreparedTradingSession,
     prepare_cognitive_live_session,
 )
 from joker.runtime.entry_permission import EntryPermissionState
 from joker.runtime.live_activation import LiveActivation
+from joker.runtime.live_market_data_loop import LiveMarketDataLoop
 from joker.schemas.domain import BrokerOrder, Position
 
 logger = logging.getLogger(__name__)
@@ -62,6 +64,8 @@ class LiveTradingRunner:
         objective_service: SessionObjectiveService,
         activation: LiveActivation,
         trade_api: Any | None = None,
+        stock_api: Any | None = None,
+        options_api: Any | None = None,
         capture_only: bool = False,
         db_path: Path | None = None,
         poll_interval_seconds: float = 2.0,
@@ -88,6 +92,8 @@ class LiveTradingRunner:
         self.objective_service = objective_service
         self.activation = activation
         self._trade_api = trade_api
+        self._stock_api = stock_api
+        self._options_api = options_api
         self._capture_only = capture_only
         self._db_path = Path(db_path or app_settings.db_path)
         self._poll_interval_seconds = poll_interval_seconds
@@ -96,8 +102,12 @@ class LiveTradingRunner:
         self.entry_permission = EntryPermissionState(permitted=False, reasons=("startup",))
         self._poller: OrderDetailPollingEventSource | None = None
         self._poll_task: asyncio.Task[None] | None = None
+        self._market_loop: LiveMarketDataLoop | None = None
+        self._market_task: asyncio.Task[None] | None = None
+        self._market_stop: asyncio.Event | None = None
         self._market_data_healthy = False
         self._option_surface_healthy = False
+        self.session_id: str | None = None
 
     async def start(
         self,
@@ -105,6 +115,7 @@ class LiveTradingRunner:
         fake_model_provider: Any | None = None,
         start_cognitive_agent: bool = True,
         start_evolution_workers: bool = True,
+        start_market_loop: bool | None = None,
         clock: Any | None = None,
         session_id: str | None = None,
     ) -> PreparedTradingSession:
@@ -116,8 +127,24 @@ class LiveTradingRunner:
         }:
             raise LiveTradingError("LiveTradingRunner requires confirmed objective")
 
+        obj_id = getattr(state, "objective_id", None)
+        if obj_id is None or str(obj_id) != str(self.activation.objective_id):
+            raise LiveTradingError(
+                "LiveActivation.objective_id does not match confirmed objective"
+            )
+        obj_capital = Decimal(str(getattr(state, "authorised_capital_usd", "0") or "0"))
+        if obj_capital != self.activation.authorized_capital_usd:
+            raise LiveTradingError(
+                "LiveActivation.authorized_capital_usd does not match "
+                f"objective authorised_capital_usd ({obj_capital})"
+            )
+
+        resolved_session_id = session_id or live_gated_cognitive_session_id(
+            account_id_hash=self.activation.account_id_hash,
+        )
+        self.session_id = resolved_session_id
+
         journal = SyncBrokerSubmissionJournal(self._db_path)
-        obj_id = str(getattr(state, "objective_id", None) or self.activation.objective_id)
         broker = create_live_broker(
             self.app_settings,
             self.env,
@@ -126,8 +153,8 @@ class LiveTradingRunner:
             journal_db_path=self._db_path,
             capture_only=self._capture_only,
             skip_account_list_check=self._trade_api is not None,
-            session_id=session_id,
-            objective_id=obj_id,
+            session_id=resolved_session_id,
+            objective_id=str(self.activation.objective_id),
         )
         if not isinstance(broker, WebullLiveClient):
             raise LiveTradingError("create_live_broker did not return WebullLiveClient")
@@ -143,7 +170,7 @@ class LiveTradingRunner:
             objective_service=self.objective_service,
             broker=broker,
             db_path=self._db_path,
-            session_id=session_id,
+            session_id=resolved_session_id,
             fake_model_provider=fake_model_provider,
             clock=clock,
             start_cognitive_agent=False,
@@ -220,6 +247,14 @@ class LiveTradingRunner:
         # Start order-detail polling after reconciliation; owned by this session.
         await self._start_order_poller(session, broker)
 
+        run_market = (
+            (not self._capture_only)
+            if start_market_loop is None
+            else bool(start_market_loop)
+        )
+        if run_market:
+            await self._start_market_loop(session)
+
         # Restore position lifecycles / start workers after truth is restored.
         if start_cognitive_agent:
             # Position management starts even when entries are blocked.
@@ -230,6 +265,38 @@ class LiveTradingRunner:
 
         self.session = session
         return session
+
+    async def _start_market_loop(self, session: PreparedTradingSession) -> None:
+        """Authenticate Webull market providers, warm snapshot, then poll."""
+        from joker.runtime.live_market_data_loop import LiveMarketDataError
+
+        loop = LiveMarketDataLoop(
+            app_settings=self.app_settings,
+            env=self.env,
+            stock_api=self._stock_api,
+            options_api=self._options_api,
+            require_options=False,
+            source_label="live_gated",
+        )
+        try:
+            loop.authenticate()
+            await loop.awarmup(session.bridge)
+            # One immediate poll so health reflects a real observation.
+            await loop.apoll_once(session.bridge)
+        except LiveMarketDataError as exc:
+            loop.close()
+            raise LiveTradingError(f"live market-data loop failed: {exc}") from exc
+        self._market_loop = loop
+        self._market_stop = asyncio.Event()
+        self._market_task = asyncio.create_task(
+            loop.run(
+                session.bridge,
+                poll_interval_seconds=self.app_settings.data.quote_poll_interval_seconds,
+                stop_event=self._market_stop,
+            )
+        )
+        self._market_data_healthy = loop.observations_received > 0
+        self._option_surface_healthy = bool(loop.last_surface_complete)
 
     async def _start_order_poller(
         self, session: PreparedTradingSession, broker: WebullLiveClient
@@ -270,6 +337,11 @@ class LiveTradingRunner:
         self._poll_task = asyncio.create_task(self._poller.start())
 
     def _refresh_market_health(self, session: PreparedTradingSession) -> None:
+        if self._market_loop is not None and self._market_loop.observations_received > 0:
+            self._market_data_healthy = True
+            self._option_surface_healthy = bool(self._market_loop.last_surface_complete)
+            return
+
         market = getattr(session.bridge, "supervisor", None)
         runtime = getattr(market, "market_runtime", None) if market else None
         if runtime is not None:
@@ -348,6 +420,19 @@ class LiveTradingRunner:
         )
 
     async def shutdown(self) -> None:
+        if self._market_stop is not None:
+            self._market_stop.set()
+        if self._market_task is not None:
+            self._market_task.cancel()
+            try:
+                await asyncio.wait_for(self._market_task, timeout=2.0)
+            except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
+                pass
+            self._market_task = None
+        if self._market_loop is not None:
+            self._market_loop.close()
+            self._market_loop = None
+        self._market_stop = None
         if self._poller is not None:
             await self._poller.stop()
             self._poller = None

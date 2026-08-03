@@ -133,12 +133,16 @@ def test_production_preflight_performs_no_mutation(tmp_path) -> None:
         env=_live_env(),
         trade_api=api,
         skip_network=False,
+        check_market_data=False,
     )
     assert report.mutated is False
     assert any("mutation: none" in c for c in report.checks)
-    assert report.ok is True
+    assert report.configuration_ok is True
+    assert report.account_truth_ok is True
+    assert report.database_ok is True
+    assert report.operational_ready is False  # market checks skipped → not ready
     assert api.placed == []
-    assert any("sqlite: ok" in c for c in report.checks)
+    assert any("database: ok" in c for c in report.checks)
 
 
 def test_live_health_exposes_unresolved_broker_state(tmp_path) -> None:
