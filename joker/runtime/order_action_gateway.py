@@ -586,14 +586,32 @@ class OrderActionGateway:
                     working_orders=working,
                 )
 
+        # Live broker preview — same validated limit/quantity as reservation & placement.
+        preview_block = await self._maybe_live_preview(command, request)
+        if preview_block is not None:
+            if reserved and self._deps.objective_service is not None:
+                await self._deps.objective_service.release_for_order(
+                    client_order_id=command.client_order_id,
+                    reason="broker_preview_rejected",
+                )
+            return preview_block
+
         try:
             order = await self._deps.execution_runtime.submit_execution_command(command)
         except Exception as exc:
             if reserved and self._deps.objective_service is not None:
-                await self._deps.objective_service.release_for_order(
-                    client_order_id=command.client_order_id,
-                    reason="broker_submission_failed",
-                )
+                # Retain reservation on ambiguous unknown submission.
+                msg = str(exc).lower()
+                if "unknown" in msg or "timeout" in msg:
+                    logger.error(
+                        "submission_unknown_retaining_reservation",
+                        extra={"client_order_id": command.client_order_id},
+                    )
+                else:
+                    await self._deps.objective_service.release_for_order(
+                        client_order_id=command.client_order_id,
+                        reason="broker_submission_failed",
+                    )
             raise
         if reserved and self._deps.objective_service is not None and order is not None:
             await self._deps.objective_service.associate_broker_order(
@@ -811,6 +829,12 @@ class OrderActionGateway:
                     "replacement quantity exceeds remaining authoritative quantity"
                 )
 
+        position_intent = _resolve_gateway_position_intent(
+            action=action,
+            side=request.side,
+            contract_id=request.contract_id,
+            open_positions=open_positions,
+        )
         intent = OrderIntent(
             intent_id=request.client_order_id,
             candidate_id=request.proposal_id or request.decision_id or request.client_order_id,
@@ -825,6 +849,7 @@ class OrderActionGateway:
             order_type=request.order_type,
             quantity=request.quantity,
             limit_price=request.limit_price,
+            position_intent=position_intent,
         )
         return ExecutionCommand(
             client_order_id=request.client_order_id,
@@ -907,6 +932,114 @@ class OrderActionGateway:
                 raise CognitiveValidationError(
                     f"quote age {age:.1f}s exceeds proposal limit {max_quote_age_seconds}s"
                 )
+
+    async def _maybe_live_preview(
+        self,
+        command: ExecutionCommand,
+        request: OrderActionRequest,
+    ) -> OrderActionResult | None:
+        """Run Webull live preview when the bound broker is WebullLiveClient."""
+        from joker.broker.webull_live import WebullLiveClient
+
+        broker = getattr(self._deps.execution_runtime, "_broker", None)
+        if not isinstance(broker, WebullLiveClient):
+            return None
+        if getattr(broker, "_capture_only", False):
+            # Capture mode still builds/previews for equivalence tests when requested.
+            pass
+        try:
+            positions = broker.list_positions()
+            expected = None
+            if command.intent.limit_price is not None:
+                expected = (
+                    Decimal(str(command.intent.limit_price))
+                    * Decimal("100")
+                    * Decimal(command.intent.quantity)
+                )
+            preview = broker.preview_order(
+                command.intent,
+                client_order_id=command.client_order_id,
+                open_positions=positions,
+                expected_notional_usd=expected,
+            )
+        except Exception as exc:
+            return OrderActionResult(
+                submitted=False,
+                client_order_id=command.client_order_id,
+                blocked_reason=f"broker_preview_failed: {exc}",
+            )
+        if not preview.accepted:
+            return OrderActionResult(
+                submitted=False,
+                client_order_id=command.client_order_id,
+                blocked_reason=(
+                    f"broker_preview_rejected: "
+                    f"{preview.rejection_code or 'rejected'}"
+                ),
+            )
+        return None
+
+
+def _resolve_gateway_position_intent(
+    *,
+    action: OrderActionKind,
+    side: str,
+    contract_id: str,
+    open_positions: dict[str, Any],
+) -> str | None:
+    from joker.broker.position_intent import resolve_position_intent
+    from joker.schemas.domain import Position
+
+    positions: list[Position] = []
+    for cid, pos in (open_positions or {}).items():
+        qty = int(
+            getattr(pos, "quantity", None)
+            or (pos.get("quantity") if isinstance(pos, dict) else 0)
+            or 0
+        )
+        if qty <= 0:
+            continue
+        # Minimal stand-in — resolve_position_intent matches on contract_id helper.
+        try:
+            parsed = parse_contract_id(cid)
+            positions.append(
+                Position(
+                    contract=OptionContract(
+                        symbol=parsed.symbol,
+                        expiration=parsed.expiration,
+                        strike=parsed.strike,
+                        option_type=parsed.option_type,
+                        is_0dte=True,
+                    ),
+                    quantity=qty,
+                    avg_entry_price=float(
+                        getattr(pos, "avg_entry_price", None)
+                        or (pos.get("avg_entry_price") if isinstance(pos, dict) else 0)
+                        or 0
+                    ),
+                )
+            )
+        except Exception:
+            continue
+    action_name = "entry" if action in {
+        OrderActionKind.ENTRY,
+        OrderActionKind.PROBE,
+        OrderActionKind.ADD,
+    } else "exit"
+    try:
+        return resolve_position_intent(
+            action=action_name,
+            side=side,  # type: ignore[arg-type]
+            contract_id=contract_id,
+            open_positions=positions,
+        )
+    except Exception:
+        # Paper brokers may not require intent; live client validates again.
+        if action_name == "entry" and side == "buy":
+            return "BUY_TO_OPEN"
+        if action_name == "exit" and side == "sell":
+            return "SELL_TO_CLOSE"
+        return None
 
 
 def provenanced_to_action_request(

@@ -40,8 +40,8 @@ from joker.runtime.objective_recovery import recover_session_objective
 
 
 @dataclass
-class PreparedCognitivePaperSession:
-    """Public handles for a prepared Task-1/2/3 paper cognitive session."""
+class PreparedTradingSession:
+    """Public handles for a prepared Task-1/2/3 agentic trading session."""
 
     app_settings: AppSettings
     broker: BrokerClient
@@ -52,6 +52,8 @@ class PreparedCognitivePaperSession:
     session_id: str
     run_id: str
     db_path: Path
+    broker_kind: str = "local_paper"
+    safety_mode: str = "PAPER"
 
     @property
     def supervisor(self):
@@ -101,25 +103,32 @@ class PreparedCognitivePaperSession:
             loop.close()
 
 
-async def prepare_cognitive_paper_session(
+# Backward-compatible alias — paper and live share the same session type.
+PreparedCognitivePaperSession = PreparedTradingSession
+
+
+async def prepare_agentic_trading_session(
     *,
     app_settings: AppSettings,
     objective_service: SessionObjectiveService,
-    broker: BrokerClient | None = None,
+    broker: BrokerClient,
+    broker_kind: str,
+    safety_mode: str,
     db_path: Path | None = None,
     session_id: str | None = None,
     run_id: str | None = None,
     fake_model_provider: FakeModelProvider | None = None,
     clock: Any | None = None,
     start_cognitive_agent: bool = True,
-) -> PreparedCognitivePaperSession:
-    """Build supervisor + evolution + cognitive deps via production bindings."""
+    broker_account_id: str = "local_paper",
+) -> PreparedTradingSession:
+    """Shared session construction for paper and live — identical graph/EV/sizing."""
     if not bool(getattr(app_settings.evolution, "enabled", False)):
-        raise ValueError("prepare_cognitive_paper_session requires evolution.enabled")
+        raise ValueError("prepare_agentic_trading_session requires evolution.enabled")
     if not bool(getattr(app_settings.objective, "enabled", False)):
-        raise ValueError("prepare_cognitive_paper_session requires objective.enabled")
+        raise ValueError("prepare_agentic_trading_session requires objective.enabled")
 
-    paper = broker or PaperBroker(slippage_pct=0)
+    paper = broker
     task1_db = Path(db_path or app_settings.db_path)
     task1_db.parent.mkdir(parents=True, exist_ok=True)
     sid = session_id or f"sess-{uuid4().hex[:12]}"
@@ -219,7 +228,7 @@ async def prepare_cognitive_paper_session(
         session_id=sid,
         run_id=rid,
         clock=clock,
-        broker_account_id="local_paper",
+        broker_account_id=broker_account_id,
         agent_runtime=agent_runtime,
         market_config=MarketRuntimeConfig(
             min_option_contracts=1,
@@ -284,7 +293,7 @@ async def prepare_cognitive_paper_session(
     await evolution_runtime.start_workers()
     await evolution_runtime.resume()
 
-    return PreparedCognitivePaperSession(
+    return PreparedTradingSession(
         app_settings=app_settings,
         broker=paper,
         bridge=bridge,
@@ -294,4 +303,84 @@ async def prepare_cognitive_paper_session(
         session_id=sid,
         run_id=rid,
         db_path=task1_db,
+        broker_kind=broker_kind,
+        safety_mode=safety_mode,
+    )
+
+
+async def prepare_cognitive_paper_session(
+    *,
+    app_settings: AppSettings,
+    objective_service: SessionObjectiveService,
+    broker: BrokerClient | None = None,
+    db_path: Path | None = None,
+    session_id: str | None = None,
+    run_id: str | None = None,
+    fake_model_provider: FakeModelProvider | None = None,
+    clock: Any | None = None,
+    start_cognitive_agent: bool = True,
+) -> PreparedTradingSession:
+    """Paper wrapper around the shared agentic session factory."""
+    from joker.broker.webull_live import WebullLiveClient
+
+    paper = broker or PaperBroker(slippage_pct=0)
+    if isinstance(paper, WebullLiveClient):
+        raise ValueError("prepare_cognitive_paper_session rejects webull_live broker")
+    kind = "webull_paper" if paper.__class__.__name__ == "WebullClient" else "local_paper"
+    return await prepare_agentic_trading_session(
+        app_settings=app_settings,
+        objective_service=objective_service,
+        broker=paper,
+        broker_kind=kind,
+        safety_mode="PAPER",
+        db_path=db_path,
+        session_id=session_id,
+        run_id=run_id,
+        fake_model_provider=fake_model_provider,
+        clock=clock,
+        start_cognitive_agent=start_cognitive_agent,
+        broker_account_id="local_paper" if kind == "local_paper" else "webull_paper",
+    )
+
+
+async def prepare_cognitive_live_session(
+    *,
+    app_settings: AppSettings,
+    objective_service: SessionObjectiveService,
+    broker: BrokerClient,
+    db_path: Path | None = None,
+    session_id: str | None = None,
+    run_id: str | None = None,
+    fake_model_provider: FakeModelProvider | None = None,
+    clock: Any | None = None,
+    start_cognitive_agent: bool = True,
+) -> PreparedTradingSession:
+    """Live wrapper — same graph/EV/sizing as paper; live broker only."""
+    from joker.app.safety import SafetyMode
+    from joker.broker.webull_live import WebullLiveClient
+
+    if app_settings.mode is not SafetyMode.LIVE_GATED:
+        raise ValueError("prepare_cognitive_live_session requires mode LIVE_GATED")
+    if not app_settings.live_trading_enabled:
+        raise ValueError(
+            "prepare_cognitive_live_session requires live_trading_enabled=true"
+        )
+    if not isinstance(broker, WebullLiveClient):
+        raise ValueError(
+            "prepare_cognitive_live_session requires WebullLiveClient "
+            "(refusing paper broker)"
+        )
+    return await prepare_agentic_trading_session(
+        app_settings=app_settings,
+        objective_service=objective_service,
+        broker=broker,
+        broker_kind="webull_live",
+        safety_mode="LIVE_GATED",
+        db_path=db_path,
+        session_id=session_id,
+        run_id=run_id,
+        fake_model_provider=fake_model_provider,
+        clock=clock,
+        start_cognitive_agent=start_cognitive_agent,
+        broker_account_id=broker.account_id_hash,
     )

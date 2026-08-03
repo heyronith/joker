@@ -314,6 +314,10 @@ from joker.cli.broker import broker_app
 
 app.add_typer(broker_app, name="broker")
 
+from joker.cli.live import live_app
+
+app.add_typer(live_app, name="live")
+
 
 @app.command("watch")
 def watch_spy(
