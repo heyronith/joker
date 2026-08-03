@@ -99,14 +99,25 @@ class _FakeProvenance:
         strategy_id: UUID | None,
         entry_id: str = "entry-1",
         contract_id: str = "SPY:2026-07-01:500.0:call",
+        entry_causation_id: UUID | None = None,
+        omit_entry_causation: bool = False,
     ) -> None:
         self._strategy_id = strategy_id
         self._entry_id = entry_id
         self._contract_id = contract_id
+        self.entry_causation_id = (
+            None if omit_entry_causation else (entry_causation_id or uuid4())
+        )
 
     async def get_by_client_order_id(self, client_order_id: str):
         if client_order_id not in {self._entry_id, "exit-1", "exit-put"}:
             return None
+        kind = "entry" if client_order_id == self._entry_id else "exit"
+        causation = (
+            str(self.entry_causation_id)
+            if kind == "entry" and self.entry_causation_id is not None
+            else None
+        )
         return SimpleNamespace(
             client_order_id=client_order_id,
             strategy_id=str(self._strategy_id) if self._strategy_id else None,
@@ -115,10 +126,12 @@ class _FakeProvenance:
             cycle_id="c1",
             snapshot_id=str(uuid4()),
             contract_id=self._contract_id,
-            kind="entry" if client_order_id == self._entry_id else "exit",
+            kind=kind,
+            causation_event_id=causation,
             extra={
                 "position_lifecycle_id": f"s:{self._entry_id}:{self._contract_id}",
                 "originating_entry_client_order_id": self._entry_id,
+                "causation_event_id": causation,
             },
         )
 
@@ -131,9 +144,11 @@ class _FakeHorizonLoader:
         self.fail = fail
         self.empty = empty
         self.calls = 0
+        self.last_kwargs: dict | None = None
 
     async def load(self, **kwargs):
         self.calls += 1
+        self.last_kwargs = dict(kwargs)
         if self.fail:
             raise RuntimeError("horizon backend unavailable")
         if self.empty:
@@ -142,25 +157,26 @@ class _FakeHorizonLoader:
         end = kwargs["end_timestamp"]
         raw_e1 = kwargs.get("entry_decision_event_id")
         raw_e2 = kwargs.get("terminal_event_id")
-        e1 = raw_e1 if isinstance(raw_e1, UUID) else uuid4()
-        e2 = raw_e2 if isinstance(raw_e2, UUID) else uuid4()
+        if not isinstance(raw_e1, UUID) or not isinstance(raw_e2, UUID):
+            # Fail closed — never invent anchors for missing IDs.
+            return Task1EventHorizon(session_id=kwargs["session_id"])
         return Task1EventHorizon(
             session_id=kwargs["session_id"],
             events=(
                 Task1HorizonEvent(
-                    event_id=e1,
-                    event_type="MARKET_SNAPSHOT_CREATED",
+                    event_id=raw_e1,
+                    event_type="COGNITIVE_CYCLE_STARTED",
                     exchange_timestamp=start,
                     sequence=1,
                 ),
                 Task1HorizonEvent(
-                    event_id=e2,
+                    event_id=raw_e2,
                     event_type="POSITION_CLOSED",
                     exchange_timestamp=end,
                     sequence=2,
                 ),
             ),
-            market_event_ids=(e1, e2),
+            market_event_ids=(raw_e1, raw_e2),
         )
 
 
@@ -191,21 +207,31 @@ async def _compile(
     horizon: _FakeHorizonLoader | None = None,
     world_model=None,
     entry_id: str = "entry-1",
+    entry_causation_id: UUID | None = None,
+    omit_entry_causation: bool = False,
+    terminal_event_id: UUID | None = None,
 ):
     apply_task3_migrations(tmp_path / "ep.db")
     repos = build_evolution_repositories(tmp_path / "ep.db")
     await repos["episodes"].initialize()
     sid = strategy.strategy_id if strategy is not None else strategy_id
+    entry_anchor = entry_causation_id or uuid4()
+    terminal_anchor = terminal_event_id or uuid4()
     prov = _FakeProvenance(
-        strategy_id=sid, entry_id=entry_id, contract_id=contract_id
+        strategy_id=sid,
+        entry_id=entry_id,
+        contract_id=contract_id,
+        entry_causation_id=entry_anchor,
+        omit_entry_causation=omit_entry_causation,
     )
     wm_id = uuid4()
+    horizon_loader = horizon if horizon is not None else _FakeHorizonLoader()
     compiler = EpisodeCompiler(
         repos["episodes"],
         lifecycle_resolver=None,
         provenance=prov,
         cycle_registry=_FakeCycleRegistry(wm_id) if world_model is not None else None,
-        event_horizon_loader=horizon if horizon is not None else _FakeHorizonLoader(),
+        event_horizon_loader=horizon_loader,
         strategy_repo=_FakeStrategyRepo(strategy),
         world_model_repo=_FakeWorldModelRepo(world_model) if world_model else None,
     )
@@ -239,7 +265,7 @@ async def _compile(
             "client_order_id": "exit-1" if "call" in contract_id else "exit-put",
             "position_lifecycle_id": f"s:{entry_id}:{contract_id}",
         },
-        event_id=str(uuid4()),
+        event_id=str(terminal_anchor),
         execution=FakeExecutionProjection(projection),
         initial_snapshot_id=uuid4(),
         terminal_snapshot_id=uuid4(),
@@ -247,6 +273,10 @@ async def _compile(
         entry_decision_timestamp=start,
         terminal_event_timestamp=end,
     )
+    compiler._test_entry_anchor = entry_anchor  # type: ignore[attr-defined]
+    compiler._test_terminal_anchor = terminal_anchor  # type: ignore[attr-defined]
+    compiler._test_horizon = horizon_loader  # type: ignore[attr-defined]
+    compiler._test_provenance = prov  # type: ignore[attr-defined]
     return episode, compiler, repos
 
 
@@ -460,3 +490,84 @@ async def test_complete_authoritative_horizon_remains_eligible(tmp_path) -> None
     assert "authoritative_horizon_incomplete" not in episode.completeness_findings
     assert "historical_ev_eligible=false" not in episode.completeness_findings
     assert len(episode.market_event_ids) >= 2
+
+
+@pytest.mark.asyncio
+async def test_compiler_does_not_assign_first_horizon_event_as_entry(tmp_path) -> None:
+    """Missing entry causation must not be filled by the first window event."""
+    strategy = _strategy(pattern_ids=(uuid4(),))
+    horizon = _FakeHorizonLoader()
+    first_window = uuid4()
+
+    async def _load_with_window(**kwargs):
+        # Simulate a loader that has window events but must not invent entry.
+        start = kwargs["start_timestamp"]
+        end = kwargs["end_timestamp"]
+        raw_e1 = kwargs.get("entry_decision_event_id")
+        raw_e2 = kwargs.get("terminal_event_id")
+        assert raw_e1 is None
+        assert isinstance(raw_e2, UUID)
+        return Task1EventHorizon(
+            session_id=kwargs["session_id"],
+            events=(
+                Task1HorizonEvent(
+                    event_id=first_window,
+                    event_type="MARKET_SNAPSHOT_CREATED",
+                    exchange_timestamp=start,
+                    sequence=1,
+                ),
+                Task1HorizonEvent(
+                    event_id=raw_e2,
+                    event_type="POSITION_CLOSED",
+                    exchange_timestamp=end,
+                    sequence=2,
+                ),
+            ),
+            market_event_ids=(first_window, raw_e2),
+        )
+
+    horizon.load = _load_with_window  # type: ignore[method-assign]
+    episode, compiler, _ = await _compile(
+        tmp_path,
+        strategy=strategy,
+        horizon=horizon,
+        omit_entry_causation=True,
+    )
+    assert episode.entry_decision_event_id is None
+    assert episode.entry_decision_event_id != first_window
+    assert episode.completed is False
+    assert "authoritative_horizon_entry_missing" in episode.completeness_findings
+
+
+@pytest.mark.asyncio
+async def test_compiler_missing_entry_causation_is_ev_ineligible(tmp_path) -> None:
+    strategy = _strategy(pattern_ids=(uuid4(),))
+    episode, _, _ = await _compile(
+        tmp_path, strategy=strategy, omit_entry_causation=True
+    )
+    assert episode.completed is False
+    assert "authoritative_horizon_entry_missing" in episode.completeness_findings
+    assert "historical_ev_eligible=false" in episode.completeness_findings
+    assert "promotion_eligible=false" in episode.completeness_findings
+    assert "truth_degraded=true" in episode.completeness_findings
+
+
+@pytest.mark.asyncio
+async def test_compiler_preserves_exact_entry_anchor(tmp_path) -> None:
+    strategy = _strategy(pattern_ids=(uuid4(),))
+    entry_anchor = uuid4()
+    terminal_anchor = uuid4()
+    episode, compiler, _ = await _compile(
+        tmp_path,
+        strategy=strategy,
+        entry_causation_id=entry_anchor,
+        terminal_event_id=terminal_anchor,
+    )
+    assert episode.completed is True
+    assert episode.entry_decision_event_id == entry_anchor
+    assert episode.terminal_event_id == terminal_anchor
+    assert episode.market_event_ids[0] == entry_anchor
+    assert episode.market_event_ids[-1] == terminal_anchor
+    assert compiler._test_horizon.last_kwargs is not None
+    assert compiler._test_horizon.last_kwargs["entry_decision_event_id"] == entry_anchor
+    assert compiler._test_horizon.last_kwargs["terminal_event_id"] == terminal_anchor

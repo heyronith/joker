@@ -264,6 +264,7 @@ class ImprovementProposalService:
             training_dataset_ids=train_ids,
             challenger_dataset_ids=chall_ids,
             evaluation_dataset_ids=eval_ids,
+            construction_method="agent",
         )
         challenger = CognitiveConfigurationVersion(
             configuration_version_id=uuid4(),
@@ -280,6 +281,7 @@ class ImprovementProposalService:
             challenger_dataset_ids=chall_ids,
             evaluation_dataset_ids=eval_ids,
             dataset_provenance_status=provenance,
+            construction_method="agent",
             content_hash="",
             created_by="agent",
             created_at=now,

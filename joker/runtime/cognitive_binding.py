@@ -53,6 +53,10 @@ def bind_cognitive_graph_to_task1(
                     contract_id=contract_id,
                     session_id=deps.session_id,
                     kind="entry",
+                    causation_event_id=str(
+                        getattr(provenanced, "causation_event_id", None) or ""
+                    )
+                    or None,
                 )
             )
         return await runtime.submit_execution_command(provenanced.command)

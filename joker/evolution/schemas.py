@@ -354,11 +354,20 @@ def resolve_dataset_provenance_status(
     training_dataset_ids: tuple[UUID, ...] = (),
     challenger_dataset_ids: tuple[UUID, ...] = (),
     evaluation_dataset_ids: tuple[UUID, ...] = (),
+    construction_method: Literal["bootstrap", "human_static", "agent"] | None = None,
 ) -> Literal["not_applicable", "resolved", "unknown"]:
-    """Derive provenance status. Empty tuples never auto-resolve for non-bootstrap."""
-    if created_by == "bootstrap":
+    """Derive provenance status.
+
+    Non-bootstrap ``resolved`` requires known *training* dataset IDs.
+    Challenger/evaluation IDs alone never resolve provenance. Agent-generated
+    configs are never auto-marked ``not_applicable``.
+    """
+    del challenger_dataset_ids, evaluation_dataset_ids  # not resolution inputs
+    if created_by == "bootstrap" or construction_method == "bootstrap":
         return "not_applicable"
-    if training_dataset_ids or challenger_dataset_ids or evaluation_dataset_ids:
+    if created_by == "human" and construction_method == "human_static":
+        return "not_applicable"
+    if training_dataset_ids:
         return "resolved"
     return "unknown"
 
@@ -393,6 +402,8 @@ class CognitiveConfigurationVersion(_Frozen):
         "resolved",
         "unknown",
     ] = "unknown"
+    # Explicit construction path when status is not_applicable without training data.
+    construction_method: Literal["bootstrap", "human_static", "agent"] | None = None
     content_hash: str
     created_by: Literal["bootstrap", "agent", "human"] = "bootstrap"
     proposer_artifact_id: UUID | None = None

@@ -91,6 +91,9 @@ class OrderActionRequest:
     degraded_exit_reason: str | None = None
     evidence_ids: tuple[str, ...] = ()
     broker_account_id: str = "default"
+    # Factual horizon-start anchor for entry provenance (never a fill event).
+    # Prefer decision-completed → execution-proposal → cognitive-cycle trigger.
+    causation_event_id: str | None = None
 
 
 @dataclass
@@ -312,6 +315,7 @@ class OrderActionGateway:
                             contract_id=request.contract_id,
                             session_id=self._deps.session_id,
                             kind=request.action.value,
+                            causation_event_id=request.causation_event_id,
                             extra={
                                 "degraded_exit": True,
                                 "degraded_exit_reason": reason,
@@ -643,10 +647,12 @@ class OrderActionGateway:
                     position_lifecycle_id=lifecycle_id,
                     originating_entry_client_order_id=originating,
                     parent_client_order_id=parent,
+                    causation_event_id=request.causation_event_id,
                     extra={
                         "replace_of": request.replace_of_client_order_id,
                         "position_lifecycle_id": lifecycle_id,
                         "originating_entry_client_order_id": originating,
+                        "causation_event_id": request.causation_event_id,
                     },
                 )
             )
@@ -907,6 +913,7 @@ def provenanced_to_action_request(
     provenanced: ProvenancedExecutionCommand,
     *,
     action: OrderActionKind = OrderActionKind.ENTRY,
+    causation_event_id: str | None = None,
 ) -> OrderActionRequest:
     """Adapt a compiled entry/probe ProvenancedExecutionCommand into a gateway request."""
     cmd = provenanced.command
@@ -928,4 +935,6 @@ def provenanced_to_action_request(
         cycle_id=provenanced.cycle_id,
         evidence_ids=provenanced.evidence_ids,
         broker_account_id=cmd.broker_account_id,
+        causation_event_id=causation_event_id
+        or getattr(provenanced, "causation_event_id", None),
     )

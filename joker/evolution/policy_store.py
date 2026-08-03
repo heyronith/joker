@@ -217,6 +217,7 @@ class PolicyVersionStore:
             challenger_dataset_ids=(),
             evaluation_dataset_ids=(),
             dataset_provenance_status="not_applicable",
+            construction_method="bootstrap",
             content_hash="",
             created_by="bootstrap",
             created_at=now,

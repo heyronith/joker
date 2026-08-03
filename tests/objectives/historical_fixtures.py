@@ -164,31 +164,39 @@ async def persist_compiler_produced_history(
             end = kwargs["end_timestamp"]
             raw_e1 = kwargs.get("entry_decision_event_id")
             raw_e2 = kwargs.get("terminal_event_id")
-            e1 = raw_e1 if isinstance(raw_e1, UUID) else uuid4()
-            e2 = raw_e2 if isinstance(raw_e2, UUID) else uuid4()
+            if not isinstance(raw_e1, UUID):
+                raise AssertionError(
+                    "horizon loader requires factual entry_decision_event_id"
+                )
+            if not isinstance(raw_e2, UUID):
+                raise AssertionError(
+                    "horizon loader requires factual terminal_event_id"
+                )
             return Task1EventHorizon(
                 session_id=kwargs["session_id"],
                 events=(
                     Task1HorizonEvent(
-                        event_id=e1,
-                        event_type="MARKET_SNAPSHOT_CREATED",
+                        event_id=raw_e1,
+                        event_type="COGNITIVE_CYCLE_STARTED",
                         exchange_timestamp=start,
                         sequence=1,
                     ),
                     Task1HorizonEvent(
-                        event_id=e2,
+                        event_id=raw_e2,
                         event_type="POSITION_CLOSED",
                         exchange_timestamp=end,
                         sequence=2,
                     ),
                 ),
-                market_event_ids=(e1, e2),
+                market_event_ids=(raw_e1, raw_e2),
             )
 
     for i in range(n):
         entry_id = f"entry-{i}"
         exit_id = f"exit-{i}"
         strategy_id = uuid4()
+        entry_anchor = uuid4()
+        terminal_anchor = uuid4()
         strategy = StrategyHypothesis(
             session_id="hist",
             snapshot_id=uuid4(),
@@ -240,9 +248,13 @@ async def persist_compiler_produced_history(
                     snapshot_id=str(uuid4()),
                     contract_id=contract,
                     kind="entry" if coid == entry_id else "exit",
+                    causation_event_id=str(entry_anchor) if coid == entry_id else None,
                     extra={
                         "position_lifecycle_id": f"hist:{entry_id}:{contract}",
                         "originating_entry_client_order_id": entry_id,
+                        "causation_event_id": str(entry_anchor)
+                        if coid == entry_id
+                        else None,
                     },
                 )
 
@@ -270,7 +282,6 @@ async def persist_compiler_produced_history(
         # Prefer explicit realised matching closed_trade_projection default path.
         entry_ts = as_of - timedelta(hours=24 + i, minutes=10)
         term_ts = as_of - timedelta(hours=24 + i)
-        event_id = str(uuid4())
         episode = await compiler.compile_from_position_closed(
             session_id="hist",
             run_id=f"run-{i}",
@@ -281,7 +292,7 @@ async def persist_compiler_produced_history(
                 "client_order_id": exit_id,
                 "position_lifecycle_id": f"hist:{entry_id}:{contract}",
             },
-            event_id=event_id,
+            event_id=str(terminal_anchor),
             execution=FakeExecutionProjection(projection),
             initial_snapshot_id=uuid4(),
             terminal_snapshot_id=uuid4(),
@@ -290,6 +301,8 @@ async def persist_compiler_produced_history(
             terminal_event_timestamp=term_ts,
         )
         assert episode.strategy_family == strategy_family
+        assert episode.entry_decision_event_id == entry_anchor
+        assert episode.terminal_event_id == terminal_anchor
         assert episode.completed is True
         evaluation = EpisodeEvaluation(
             episode_id=episode.episode_id,

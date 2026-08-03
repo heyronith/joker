@@ -488,7 +488,12 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
                 if getattr(proposal, "action", None) == "probe"
                 else OrderActionKind.ENTRY
             )
-            action_request = provenanced_to_action_request(provenanced, action=action)
+            causation = _resolve_entry_causation_event_id(state)
+            action_request = provenanced_to_action_request(
+                provenanced,
+                action=action,
+                causation_event_id=causation,
+            )
             sizing = state.get("_sizing_decision") or {}
             estimate_id = sizing.get("estimate_id")
             if estimate_id:
@@ -529,6 +534,7 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
                         contract_id=contract_id_for(provenanced.command.intent.contract),
                         session_id=deps.session_id,
                         kind="entry",
+                        causation_event_id=_resolve_entry_causation_event_id(state),
                     )
                 )
             result = await deps.submit_callback(provenanced)
@@ -691,6 +697,41 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
     if deps.checkpointer is not None:
         compiled_kwargs["checkpointer"] = deps.checkpointer
     return graph.compile(**compiled_kwargs)
+
+
+def _resolve_entry_causation_event_id(state: CognitiveGraphState) -> str | None:
+    """Factual horizon-start event for entry provenance (never a fill).
+
+    Preference order:
+    1. explicit decision-completed event ID
+    2. explicit execution-proposal event ID
+    3. typed cognitive-cycle start/trigger event ID
+    4. unavailable (None)
+    """
+    for key in (
+        "decision_completed_event_id",
+        "execution_proposal_event_id",
+    ):
+        raw = state.get(key)  # type: ignore[literal-required]
+        if raw:
+            return str(raw)
+    proposal = state.get("execution_proposal")
+    if proposal is not None:
+        for attr in ("event_id", "proposal_event_id", "causation_event_id"):
+            raw = getattr(proposal, attr, None)
+            if raw:
+                return str(raw)
+    meta = state.get("meta_decision")
+    if meta is not None:
+        for attr in ("event_id", "decision_event_id", "causation_event_id"):
+            raw = getattr(meta, attr, None)
+            if raw:
+                return str(raw)
+    trigger = state.get("trigger_event_id")
+    if trigger:
+        # Explicit cycle-start/trigger anchor — not an inferred first window event.
+        return str(trigger)
+    return None
 
 
 async def _publish_cycle_completed(

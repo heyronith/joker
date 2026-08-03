@@ -38,6 +38,8 @@ class ProvenancedExecutionCommand:
     evidence_ids: tuple[str, ...]
     max_quote_age_seconds: int | None = 3600
     estimate_id: str | None = None
+    # Horizon-start anchor persisted into entry execution provenance.
+    causation_event_id: str | None = None
 
 
 @dataclass(frozen=True)

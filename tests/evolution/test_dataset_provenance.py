@@ -217,6 +217,78 @@ async def test_active_training_episode_is_excluded(tmp_path) -> None:
     assert summary.sample_count == 5
 
 
+def test_evaluation_dataset_only_provenance_is_unknown() -> None:
+    status = resolve_dataset_provenance_status(
+        created_by="agent",
+        evaluation_dataset_ids=(uuid4(),),
+    )
+    assert status == "unknown"
+
+
+def test_challenger_dataset_only_provenance_is_unknown() -> None:
+    status = resolve_dataset_provenance_status(
+        created_by="agent",
+        challenger_dataset_ids=(uuid4(),),
+    )
+    assert status == "unknown"
+
+
+def test_non_bootstrap_training_dataset_is_required_for_resolved() -> None:
+    assert (
+        resolve_dataset_provenance_status(
+            created_by="agent",
+            training_dataset_ids=(),
+            challenger_dataset_ids=(uuid4(),),
+            evaluation_dataset_ids=(uuid4(),),
+        )
+        == "unknown"
+    )
+    assert (
+        resolve_dataset_provenance_status(
+            created_by="human",
+            training_dataset_ids=(),
+        )
+        == "unknown"
+    )
+
+
+def test_training_dataset_provenance_is_resolved() -> None:
+    assert (
+        resolve_dataset_provenance_status(
+            created_by="agent",
+            training_dataset_ids=(uuid4(),),
+        )
+        == "resolved"
+    )
+
+
+@pytest.mark.asyncio
+async def test_unknown_training_provenance_blocks_historical_ev(tmp_path) -> None:
+    svc, _, ep_repo, ev_repo, _ = await make_repo_backed_hist_service(
+        tmp_path, minimum_samples_for_ev=5
+    )
+    as_of = datetime.now(timezone.utc)
+    await persist_positive_history(
+        episode_repo=ep_repo, evaluation_repo=ev_repo, as_of=as_of, n=8
+    )
+    summary, report, _ = await svc.query_comparable_outcomes(
+        HistoricalOutcomeQuery(
+            objective_id=uuid4(),
+            strategy_id=uuid4(),
+            snapshot_id=uuid4(),
+            strategy_family="breakout_continuation",
+            as_of_timestamp=as_of,
+            configuration_version_id=uuid4(),
+            configuration_dataset_provenance_resolved=False,
+            maximum_samples=50,
+            minimum_similarity=Decimal("0.10"),
+        )
+    )
+    assert report.safe is False
+    assert summary.valid_for_ev is False
+    assert any("unknown_configuration_dataset_provenance" in n for n in report.notes)
+
+
 @pytest.mark.asyncio
 async def test_unrelated_training_dataset_remains_eligible(tmp_path) -> None:
     svc, _, ep_repo, ev_repo, ds_repo = await make_repo_backed_hist_service(

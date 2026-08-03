@@ -251,6 +251,13 @@ def verify_event_horizon(
     findings: list[str] = []
     if horizon is None:
         return _horizon_fail(findings, "authoritative_horizon_incomplete")
+
+    # Both anchors are mandatory — None is never "skip the check".
+    if entry_event_id is None:
+        return _horizon_fail(findings, "authoritative_horizon_entry_missing")
+    if terminal_event_id is None:
+        return _horizon_fail(findings, "authoritative_horizon_terminal_missing")
+
     events = tuple(getattr(horizon, "events", ()) or ())
     market_ids = tuple(getattr(horizon, "market_event_ids", ()) or ())
     if not events or not market_ids:
@@ -277,9 +284,9 @@ def verify_event_horizon(
         return _horizon_fail(findings, "authoritative_horizon_duplicate_event")
 
     id_set = set(event_ids)
-    if entry_event_id is not None and entry_event_id not in id_set:
+    if entry_event_id not in id_set:
         return _horizon_fail(findings, "authoritative_horizon_entry_missing")
-    if terminal_event_id is not None and terminal_event_id not in id_set:
+    if terminal_event_id not in id_set:
         return _horizon_fail(findings, "authoritative_horizon_terminal_missing")
 
     timestamps: list[datetime] = []

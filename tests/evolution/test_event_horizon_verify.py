@@ -55,6 +55,44 @@ def _horizon(
     )
 
 
+def test_verify_horizon_missing_entry_id_fails() -> None:
+    """None entry anchor fails closed — never skipped."""
+    terminal = uuid4()
+    horizon = _horizon(entry_id=uuid4(), terminal_id=terminal)
+    ok, findings = verify_event_horizon(
+        horizon,
+        entry_ts=_ts(0),
+        terminal_ts=_ts(5),
+        entry_event_id=None,
+        terminal_event_id=terminal,
+        sequence_policy="globally_contiguous",
+    )
+    assert ok is False
+    assert "authoritative_horizon_entry_missing" in findings
+    assert "historical_ev_eligible=false" in findings
+    assert "promotion_eligible=false" in findings
+    assert "truth_degraded=true" in findings
+
+
+def test_verify_horizon_missing_terminal_id_fails() -> None:
+    """None terminal anchor fails closed — never skipped."""
+    entry = uuid4()
+    horizon = _horizon(entry_id=entry, terminal_id=uuid4())
+    ok, findings = verify_event_horizon(
+        horizon,
+        entry_ts=_ts(0),
+        terminal_ts=_ts(5),
+        entry_event_id=entry,
+        terminal_event_id=None,
+        sequence_policy="globally_contiguous",
+    )
+    assert ok is False
+    assert "authoritative_horizon_terminal_missing" in findings
+    assert "historical_ev_eligible=false" in findings
+    assert "promotion_eligible=false" in findings
+    assert "truth_degraded=true" in findings
+
+
 def test_horizon_missing_entry_event_fails() -> None:
     entry = uuid4()
     terminal = uuid4()

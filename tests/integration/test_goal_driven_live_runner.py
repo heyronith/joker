@@ -203,6 +203,13 @@ async def test_public_live_runner_positive_ev_reaches_paper_broker(tmp_path) -> 
             "historical_ev_eligible=false" not in ep.completeness_findings
             for ep, _ in rows
         )
+        assert all(
+            ep.entry_decision_event_id is not None
+            and ep.terminal_event_id is not None
+            and ep.entry_decision_event_id in ep.market_event_ids
+            and ep.terminal_event_id in ep.market_event_ids
+            for ep, _ in rows
+        )
 
         cycle_id = "live-cycle"
         register_full_path_canned(
@@ -492,6 +499,33 @@ async def test_public_live_runner_horizon_failure_blocks(tmp_path) -> None:
         estimates = result.get("_strategy_estimates") or []
         assert not any(e.get("valid") for e in estimates)
         await ckpt.close()
+    finally:
+        await session.shutdown()
+        await drain_aiosqlite_workers(timeout=1.0)
+
+
+@pytest.mark.asyncio
+async def test_public_live_runner_history_uses_factual_entry_anchors(tmp_path) -> None:
+    session, _, _ = await _prepare_confirmed_session(
+        tmp_path, session_id="anchor-sess"
+    )
+    try:
+        _, as_of = await _ingest_market(session)
+        rows = await persist_compiler_produced_history(
+            episode_repo=session.evolution_runtime.repositories["episodes"],
+            evaluation_repo=session.evolution_runtime.repositories["evaluations"],
+            as_of=as_of,
+            n=5,
+            pnl=Decimal("18.00"),
+        )
+        for ep, _ in rows:
+            assert ep.entry_decision_event_id is not None
+            assert ep.terminal_event_id is not None
+            assert ep.entry_decision_event_id in ep.market_event_ids
+            assert ep.terminal_event_id in ep.market_event_ids
+            assert ep.completed is True
+            assert "authoritative_horizon_entry_missing" not in ep.completeness_findings
+            assert "historical_ev_eligible=false" not in ep.completeness_findings
     finally:
         await session.shutdown()
         await drain_aiosqlite_workers(timeout=1.0)

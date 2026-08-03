@@ -241,12 +241,8 @@ class EpisodeCompiler:
                     option_surface_ids = tuple(
                         dict.fromkeys((*option_surface_ids, *horizon.option_surface_ids))
                     )
-                # Anchor entry/terminal event identities from the verified horizon
-                # when cognitive provenance did not supply them.
-                if entry_event_id is None and market_ids:
-                    entry_event_id = market_ids[0]
-                if terminal_event_uuid is None and market_ids:
-                    terminal_event_uuid = market_ids[-1]
+                # Never invent entry/terminal anchors from the first/last window
+                # event — unresolved causation stays unresolved (fail closed).
             if not horizon_complete:
                 completed = False
                 # Reduced diagnostic sequence for debugging — never EV/promotion eligible.

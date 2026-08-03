@@ -434,7 +434,8 @@ class PositionLifecycleResolver:
             except Exception:
                 cycle = None
             if cycle is not None:
-                # Best durable identity when no explicit decision-completed event exists.
+                # Typed cognitive-cycle start/trigger as horizon-start when no
+                # decision-completed / proposal causation was persisted.
                 trigger = getattr(cycle, "trigger_event_id", None)
                 if trigger:
                     try:
