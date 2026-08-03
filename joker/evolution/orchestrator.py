@@ -598,12 +598,18 @@ class EvolutionOrchestrator:
         window = hashlib.sha256(
             "".join(state.get("source_evaluation_ids") or []).encode()
         ).hexdigest()[:16]
+        dataset_raw = state.get("dataset_id")
+        dataset_ids: tuple[UUID, ...] = (
+            (UUID(str(dataset_raw)),) if dataset_raw else ()
+        )
         if self._rt.improvement_graph is not None:
             proposal, challenger = await self._rt.improvement_graph.run(
                 parent_champion=champion,
                 episodes=episodes,
                 evaluations=evaluations,
                 evaluation_window_hash=window,
+                training_dataset_ids=dataset_ids,
+                challenger_dataset_ids=dataset_ids,
             )
         else:
             from joker.evolution.schemas import PromptPatch
@@ -618,6 +624,8 @@ class EvolutionOrchestrator:
                     replacement_template="Reject theses lacking snapshot/evidence IDs.",
                     change_rationale="orchestrator_auto",
                 ),
+                training_dataset_ids=dataset_ids,
+                challenger_dataset_ids=dataset_ids,
                 supporting_episode_ids=tuple(e.episode_id for e in episodes[:5]),
                 metrics_to_improve=("evidence_grounding_score",),
                 metrics_must_not_regress=("tail_loss",),

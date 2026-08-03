@@ -154,7 +154,10 @@ _PROMPTS: dict[AgentRole, PromptSpec] = {
         ),
         output_schema_name="StrategyHypothesis",
         required_context_schema="strategy_context",
-        focus="Include adverse paths and invalidation; limits are not fills.",
+        focus=(
+            "Include adverse paths and invalidation; limits are not fills. "
+            "Always set strategy_family explicitly; never omit or invent from role."
+        ),
     ),
     AgentRole.BEARISH_INVENTOR: _build_prompt(
         prompt_id="strategy.bearish_inventor",
@@ -165,7 +168,10 @@ _PROMPTS: dict[AgentRole, PromptSpec] = {
         ),
         output_schema_name="StrategyHypothesis",
         required_context_schema="strategy_context",
-        focus="Include adverse paths and invalidation; limits are not fills.",
+        focus=(
+            "Include adverse paths and invalidation; limits are not fills. "
+            "Always set strategy_family explicitly; never omit or invent from role."
+        ),
     ),
     AgentRole.NEUTRAL_ADVOCATE: _build_prompt(
         prompt_id="strategy.neutral_advocate",
@@ -176,7 +182,10 @@ _PROMPTS: dict[AgentRole, PromptSpec] = {
         ),
         output_schema_name="StrategyHypothesis",
         required_context_schema="strategy_context",
-        focus="Neutral/no-trade thesis with explicit uncertainty sources.",
+        focus=(
+            "Neutral/no-trade thesis with explicit uncertainty sources. "
+            "Always set strategy_family explicitly; never omit or invent from role."
+        ),
     ),
     AgentRole.STRATEGY_ADVOCATE: _build_prompt(
         prompt_id="debate.strategy_advocate",

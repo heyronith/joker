@@ -140,6 +140,7 @@ async def test_task3_active_path_with_task1_task2_surface(tmp_path) -> None:
         )
         proposal, challenger = await improvement.propose(
             parent_champion=champion,
+            training_dataset_ids=(uuid4(),),
             weakness="execution_quality",
             hypothesis="emphasize spread discipline",
             patch=PromptPatch(

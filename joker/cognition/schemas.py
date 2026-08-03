@@ -503,6 +503,8 @@ class StrategyHypothesis(CycleArtifactBase):
     name: str
     market_thesis: str
     direction: MarketDirection
+    # Required for positive-EV historical comparison when objectives are armed.
+    # Legacy records may omit it; compilers/objective graph fail closed if absent.
     strategy_family: str | None = None
     candidate_legs: tuple[StrategyLegCandidate, ...] = ()
     entry_plan: EntryPlan

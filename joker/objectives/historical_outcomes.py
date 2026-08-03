@@ -206,7 +206,7 @@ class HistoricalOutcomeService:
         dataset_by_id = {
             str(getattr(d, "dataset_id", "")): d for d in datasets
         }
-        # Active configuration without resolvable dataset provenance → fail closed.
+        # Active configuration with unknown/unresolved dataset provenance → fail closed.
         if (
             query.configuration_version_id is not None
             and not query.configuration_dataset_provenance_resolved
@@ -214,7 +214,10 @@ class HistoricalOutcomeService:
             report = HistoricalLeakageReport(
                 query_id=query.query_id,
                 safe=False,
-                notes=("missing_configuration_dataset_provenance",),
+                notes=(
+                    "missing_configuration_dataset_provenance",
+                    "unknown_configuration_dataset_provenance",
+                ),
             )
             summary = self._aggregate(
                 query, (), {"configuration_dataset_provenance_missing": 1}, report

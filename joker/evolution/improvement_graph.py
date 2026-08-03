@@ -27,6 +27,9 @@ class ImprovementGraphState(TypedDict, total=False):
     parent_champion: CognitiveConfigurationVersion
     episodes: list[TradingEpisode]
     evaluations: list[EpisodeEvaluation]
+    training_dataset_ids: tuple[UUID, ...]
+    challenger_dataset_ids: tuple[UUID, ...]
+    evaluation_dataset_ids: tuple[UUID, ...]
     weakness_codes: list[str]
     proposal_draft: ImprovementAgentProposal
     critic_ok: bool
@@ -155,6 +158,9 @@ def build_improvement_graph(
             weakness=draft.weakness or ",".join(state.get("weakness_codes") or []),
             hypothesis=draft.hypothesis,
             patch=patch,
+            training_dataset_ids=tuple(state.get("training_dataset_ids") or ()),
+            challenger_dataset_ids=tuple(state.get("challenger_dataset_ids") or ()),
+            evaluation_dataset_ids=tuple(state.get("evaluation_dataset_ids") or ()),
             supporting_episode_ids=tuple(e.episode_id for e in episodes[:20]),
             supporting_evaluation_ids=tuple(e.evaluation_id for e in evaluations[:20]),
             metrics_to_improve=draft.metrics_to_improve,
@@ -208,6 +214,9 @@ class ImprovementGraphRunner:
         parent_champion: CognitiveConfigurationVersion,
         episodes: list[TradingEpisode],
         evaluations: list[EpisodeEvaluation],
+        training_dataset_ids: tuple[UUID, ...],
+        challenger_dataset_ids: tuple[UUID, ...] = (),
+        evaluation_dataset_ids: tuple[UUID, ...] = (),
         evaluation_window_hash: str | None = None,
     ) -> tuple[ImprovementProposal, CognitiveConfigurationVersion]:
         state: ImprovementGraphState = {
@@ -215,6 +224,9 @@ class ImprovementGraphRunner:
             "parent_champion": parent_champion,
             "episodes": episodes,
             "evaluations": evaluations,
+            "training_dataset_ids": tuple(training_dataset_ids),
+            "challenger_dataset_ids": tuple(challenger_dataset_ids),
+            "evaluation_dataset_ids": tuple(evaluation_dataset_ids),
             "model_call_ids": [],
         }
         compiled = self._graph()

@@ -105,6 +105,7 @@ async def test_activation_completed_false_when_history_missing(tmp_path):
     )
     _, challenger = await improvement.propose(
         parent_champion=champion,
+        training_dataset_ids=(uuid4(),),
         weakness="x",
         hypothesis="y",
         patch=PromptPatch(

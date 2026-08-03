@@ -113,6 +113,7 @@ async def test_task3_evolution_closed_loop(tmp_path) -> None:
     )
     proposal, challenger = await improvement.propose(
         parent_champion=champion,
+        training_dataset_ids=(uuid4(),),
         weakness="evidence_grounding",
         hypothesis="Require explicit evidence IDs in critic prompt",
         patch=PromptPatch(

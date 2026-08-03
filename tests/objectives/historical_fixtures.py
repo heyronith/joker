@@ -162,7 +162,10 @@ async def persist_compiler_produced_history(
         async def load(self, **kwargs):
             start = kwargs["start_timestamp"]
             end = kwargs["end_timestamp"]
-            e1, e2 = uuid4(), uuid4()
+            raw_e1 = kwargs.get("entry_decision_event_id")
+            raw_e2 = kwargs.get("terminal_event_id")
+            e1 = raw_e1 if isinstance(raw_e1, UUID) else uuid4()
+            e2 = raw_e2 if isinstance(raw_e2, UUID) else uuid4()
             return Task1EventHorizon(
                 session_id=kwargs["session_id"],
                 events=(

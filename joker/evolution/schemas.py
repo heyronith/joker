@@ -348,6 +348,21 @@ class EscalationPolicyVersion(_PolicyVersion):
     pass
 
 
+def resolve_dataset_provenance_status(
+    *,
+    created_by: Literal["bootstrap", "agent", "human"],
+    training_dataset_ids: tuple[UUID, ...] = (),
+    challenger_dataset_ids: tuple[UUID, ...] = (),
+    evaluation_dataset_ids: tuple[UUID, ...] = (),
+) -> Literal["not_applicable", "resolved", "unknown"]:
+    """Derive provenance status. Empty tuples never auto-resolve for non-bootstrap."""
+    if created_by == "bootstrap":
+        return "not_applicable"
+    if training_dataset_ids or challenger_dataset_ids or evaluation_dataset_ids:
+        return "resolved"
+    return "unknown"
+
+
 class CognitiveConfigurationVersion(_Frozen):
     configuration_version_id: UUID = Field(default_factory=uuid4)
     parent_version_id: UUID | None = None
@@ -369,9 +384,15 @@ class CognitiveConfigurationVersion(_Frozen):
     routing_policy_version_id: UUID
     escalation_policy_version_id: UUID
     # Dataset provenance for leakage-safe historical EV (fail closed when unknown).
+    # Empty tuples are never auto-resolved for non-bootstrap configurations.
     training_dataset_ids: tuple[UUID, ...] = ()
     challenger_dataset_ids: tuple[UUID, ...] = ()
     evaluation_dataset_ids: tuple[UUID, ...] = ()
+    dataset_provenance_status: Literal[
+        "not_applicable",
+        "resolved",
+        "unknown",
+    ] = "unknown"
     content_hash: str
     created_by: Literal["bootstrap", "agent", "human"] = "bootstrap"
     proposer_artifact_id: UUID | None = None

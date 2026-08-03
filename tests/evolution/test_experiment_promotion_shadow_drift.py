@@ -59,6 +59,7 @@ async def test_experiment_resume_and_no_broker(tmp_path) -> None:
     svc = ImprovementProposalService(repos["proposals"], repos["configurations"], registry.policy_store)
     _proposal, challenger = await svc.propose(
         parent_champion=champ,
+        training_dataset_ids=(uuid4(),),
         weakness="w",
         hypothesis="h",
         patch=PromptPatch(
@@ -131,6 +132,7 @@ async def test_promotion_blocked_and_agent_reject(tmp_path) -> None:
     svc = ImprovementProposalService(repos["proposals"], repos["configurations"], registry.policy_store)
     proposal, challenger = await svc.propose(
         parent_champion=champ,
+        training_dataset_ids=(uuid4(),),
         weakness="calibration",
         hypothesis="h",
         patch=PromptPatch(
@@ -216,6 +218,7 @@ async def test_shadow_isolation_and_backpressure(tmp_path) -> None:
     )
     _, challenger = await svc.propose(
         parent_champion=champ,
+        training_dataset_ids=(uuid4(),),
         weakness="w",
         hypothesis="h",
         patch=PromptPatch(
@@ -269,6 +272,7 @@ async def test_safety_rollback_and_idempotent(tmp_path) -> None:
     svc = ImprovementProposalService(repos["proposals"], repos["configurations"], registry.policy_store)
     _, challenger = await svc.propose(
         parent_champion=champ,
+        training_dataset_ids=(uuid4(),),
         weakness="w",
         hypothesis="h",
         patch=PromptPatch(

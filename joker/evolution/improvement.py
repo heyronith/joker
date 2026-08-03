@@ -30,6 +30,7 @@ from joker.evolution.schemas import (
     RoutingPolicyPatch,
     RoutingPolicyVersion,
     assert_no_chain_of_thought,
+    resolve_dataset_provenance_status,
 )
 
 
@@ -74,6 +75,9 @@ class ImprovementProposalService:
         weakness: str,
         hypothesis: str,
         patch: CognitivePatch | dict[str, Any],
+        training_dataset_ids: tuple[UUID, ...],
+        challenger_dataset_ids: tuple[UUID, ...] = (),
+        evaluation_dataset_ids: tuple[UUID, ...] = (),
         supporting_episode_ids: tuple[UUID, ...] = (),
         supporting_evaluation_ids: tuple[UUID, ...] = (),
         metrics_to_improve: tuple[str, ...] = ("calibration_score",),
@@ -114,7 +118,13 @@ class ImprovementProposalService:
             idempotency_key=key,
         )
         await self._proposals.append(proposal)
-        challenger = await self.compile_challenger(parent_champion, parsed)
+        challenger = await self.compile_challenger(
+            parent_champion,
+            parsed,
+            training_dataset_ids=training_dataset_ids,
+            challenger_dataset_ids=challenger_dataset_ids,
+            evaluation_dataset_ids=evaluation_dataset_ids,
+        )
         await self._configs.append(challenger)
         ok, problems = await self._policies.verify_configuration_resolvable(challenger)
         if not ok:
@@ -127,6 +137,10 @@ class ImprovementProposalService:
         self,
         parent: CognitiveConfigurationVersion,
         patch: CognitivePatch,
+        *,
+        training_dataset_ids: tuple[UUID, ...],
+        challenger_dataset_ids: tuple[UUID, ...] = (),
+        evaluation_dataset_ids: tuple[UUID, ...] = (),
     ) -> CognitiveConfigurationVersion:
         profiles = dict(parent.role_model_profiles)
         prompts = dict(parent.prompt_versions)
@@ -242,6 +256,15 @@ class ImprovementProposalService:
         else:
             raise ImprovementError(f"unsupported patch: {type(patch)}")
 
+        train_ids = tuple(training_dataset_ids)
+        chall_ids = tuple(challenger_dataset_ids)
+        eval_ids = tuple(evaluation_dataset_ids)
+        provenance = resolve_dataset_provenance_status(
+            created_by="agent",
+            training_dataset_ids=train_ids,
+            challenger_dataset_ids=chall_ids,
+            evaluation_dataset_ids=eval_ids,
+        )
         challenger = CognitiveConfigurationVersion(
             configuration_version_id=uuid4(),
             parent_version_id=parent.configuration_version_id,
@@ -253,6 +276,10 @@ class ImprovementProposalService:
             debate_policy_version_id=debate_id,
             routing_policy_version_id=routing_id,
             escalation_policy_version_id=escalation_id,
+            training_dataset_ids=train_ids,
+            challenger_dataset_ids=chall_ids,
+            evaluation_dataset_ids=eval_ids,
+            dataset_provenance_status=provenance,
             content_hash="",
             created_by="agent",
             created_at=now,

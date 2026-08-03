@@ -35,10 +35,11 @@ from tests.evolution.projection_helpers import (
 def _strategy(
     *,
     strategy_id: UUID | None = None,
-    family: str = "breakout_continuation",
+    family: str | None = "breakout_continuation",
     direction: MarketDirection = MarketDirection.BULLISH,
     pattern_ids: tuple[UUID, ...] = (),
     option_type: str = "call",
+    role: AgentRole = AgentRole.BULLISH_INVENTOR,
 ) -> StrategyHypothesis:
     sid = strategy_id or uuid4()
     contract = f"SPY:2026-07-01:500.0:{option_type}"
@@ -75,7 +76,7 @@ def _strategy(
         expected_horizon_seconds=600,
         confidence=0.7,
         novelty_score=0.5,
-        agent_role=AgentRole.BULLISH_INVENTOR,
+        agent_role=role,
     )
 
 
@@ -139,8 +140,10 @@ class _FakeHorizonLoader:
             return Task1EventHorizon(session_id=kwargs["session_id"])
         start = kwargs["start_timestamp"]
         end = kwargs["end_timestamp"]
-        e1 = uuid4()
-        e2 = uuid4()
+        raw_e1 = kwargs.get("entry_decision_event_id")
+        raw_e2 = kwargs.get("terminal_event_id")
+        e1 = raw_e1 if isinstance(raw_e1, UUID) else uuid4()
+        e2 = raw_e2 if isinstance(raw_e2, UUID) else uuid4()
         return Task1EventHorizon(
             session_id=kwargs["session_id"],
             events=(
@@ -357,6 +360,39 @@ async def test_compiler_populates_session_regime_volatility_and_liquidity(
 async def test_compiler_missing_strategy_provenance_is_ev_ineligible(tmp_path) -> None:
     episode, _, _ = await _compile(tmp_path, strategy=None, strategy_id=None)
     assert "historical_strategy_family_missing" in episode.completeness_findings
+    assert "historical_ev_eligible=false" in episode.completeness_findings
+    assert episode.completed is False
+
+
+@pytest.mark.asyncio
+async def test_missing_strategy_family_is_not_inferred_from_role(tmp_path) -> None:
+    strategy = _strategy(
+        family=None,
+        pattern_ids=(uuid4(),),
+        role=AgentRole.BULLISH_INVENTOR,
+    )
+    episode, _, _ = await _compile(tmp_path, strategy=strategy)
+    assert episode.strategy_family is None
+    assert "historical_strategy_family_missing" in episode.completeness_findings
+    assert "historical_ev_eligible=false" in episode.completeness_findings
+
+
+@pytest.mark.asyncio
+async def test_bullish_inventor_mean_reversion_family_is_preserved(tmp_path) -> None:
+    strategy = _strategy(
+        family="mean_reversion",
+        pattern_ids=(uuid4(),),
+        role=AgentRole.BULLISH_INVENTOR,
+    )
+    episode, _, _ = await _compile(tmp_path, strategy=strategy)
+    assert episode.strategy_family == "mean_reversion"
+
+
+@pytest.mark.asyncio
+async def test_legacy_strategy_without_family_is_ev_ineligible(tmp_path) -> None:
+    strategy = _strategy(family=None, pattern_ids=(uuid4(),))
+    episode, _, _ = await _compile(tmp_path, strategy=strategy)
+    assert episode.strategy_family is None
     assert "historical_ev_eligible=false" in episode.completeness_findings
     assert episode.completed is False
 

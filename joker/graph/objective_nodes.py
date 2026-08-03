@@ -316,53 +316,71 @@ async def score_strategies_against_objective_node(
             if cfg is None:
                 configuration_dataset_provenance_resolved = False
             else:
-                blocked_training_dataset_ids = tuple(
-                    getattr(cfg, "training_dataset_ids", ()) or ()
+                provenance = str(
+                    getattr(cfg, "dataset_provenance_status", "unknown") or "unknown"
                 )
-                challenger_dataset_ids = tuple(
-                    getattr(cfg, "challenger_dataset_ids", ()) or ()
-                )
-                configuration_dataset_provenance_resolved = True
+                if provenance == "unknown":
+                    configuration_dataset_provenance_resolved = False
+                    blocked_training_dataset_ids = ()
+                    challenger_dataset_ids = ()
+                elif provenance == "not_applicable":
+                    configuration_dataset_provenance_resolved = True
+                    blocked_training_dataset_ids = ()
+                    challenger_dataset_ids = ()
+                else:
+                    # resolved — only configuration-linked datasets are blocked
+                    blocked_training_dataset_ids = tuple(
+                        getattr(cfg, "training_dataset_ids", ()) or ()
+                    )
+                    challenger_dataset_ids = tuple(
+                        getattr(cfg, "challenger_dataset_ids", ()) or ()
+                    )
+                    configuration_dataset_provenance_resolved = True
 
     for strategy in state.get("strategies") or []:
         summary = None
         if deps.historical_outcome_service is not None:
             direction = str(getattr(strategy.direction, "value", strategy.direction))
+            # Never invent strategy_family from agent role.
             family = getattr(strategy, "strategy_family", None)
-            if not family:
-                role = str(getattr(strategy.agent_role, "value", strategy.agent_role))
-                family = {
-                    "bullish_inventor": "breakout_continuation",
-                    "bearish_inventor": "failed_breakout_reversal",
-                    "neutral_advocate": "mean_reversion",
-                }.get(role, "liquidity_probe")
-            summary = await deps.historical_outcome_service.summarize_for_strategy(
-                objective_id=obj_state.objective_id,
-                strategy_id=strategy.strategy_id,
-                snapshot_id=snapshot_id,
-                as_of_timestamp=as_of,
-                direction=direction,
-                strategy_family=str(family),
-                pattern_ids=tuple(
-                    getattr(strategy, "source_hypothesis_ids", ()) or ()
-                ),
-                regime_labels=tuple(r for r in regime_labels if r),
-                session_phase=session_phase,
-                option_type=option_type,
-                volatility_bucket=volatility_bucket,
-                liquidity_bucket=liquidity_bucket,
-                premium_per_contract_usd=default_premium,
-                expected_horizon_seconds=int(strategy.expected_horizon_seconds),
-                current_episode_id=current_episode_id,
-                configuration_version_id=configuration_version_id,
-                blocked_training_dataset_ids=blocked_training_dataset_ids,
-                challenger_dataset_ids=challenger_dataset_ids,
-                configuration_dataset_provenance_resolved=(
-                    configuration_dataset_provenance_resolved
-                ),
-            )
-            historical_summaries.append(summary.model_dump(mode="json"))
-            max_sample_seen = max(max_sample_seen, int(summary.sample_count))
+            if family:
+                summary = await deps.historical_outcome_service.summarize_for_strategy(
+                    objective_id=obj_state.objective_id,
+                    strategy_id=strategy.strategy_id,
+                    snapshot_id=snapshot_id,
+                    as_of_timestamp=as_of,
+                    direction=direction,
+                    strategy_family=str(family),
+                    pattern_ids=tuple(
+                        getattr(strategy, "source_hypothesis_ids", ()) or ()
+                    ),
+                    regime_labels=tuple(r for r in regime_labels if r),
+                    session_phase=session_phase,
+                    option_type=option_type,
+                    volatility_bucket=volatility_bucket,
+                    liquidity_bucket=liquidity_bucket,
+                    premium_per_contract_usd=default_premium,
+                    expected_horizon_seconds=int(strategy.expected_horizon_seconds),
+                    current_episode_id=current_episode_id,
+                    configuration_version_id=configuration_version_id,
+                    blocked_training_dataset_ids=blocked_training_dataset_ids,
+                    challenger_dataset_ids=challenger_dataset_ids,
+                    configuration_dataset_provenance_resolved=(
+                        configuration_dataset_provenance_resolved
+                    ),
+                )
+                historical_summaries.append(summary.model_dump(mode="json"))
+                max_sample_seen = max(max_sample_seen, int(summary.sample_count))
+            else:
+                # Explicit family required — never invent from agent role.
+                historical_summaries.append(
+                    {
+                        "strategy_id": str(strategy.strategy_id),
+                        "valid_for_ev": False,
+                        "sample_count": 0,
+                        "invalidation_reasons": ["historical_strategy_family_missing"],
+                    }
+                )
         estimate = builder.build(
             strategy=strategy,
             objective_state=obj_state,
@@ -371,6 +389,21 @@ async def score_strategies_against_objective_node(
             historical_summary=summary,
             evidence_ids=tuple(getattr(strategy, "supporting_evidence_ids", ()) or ()),
         )
+        if not getattr(strategy, "strategy_family", None):
+            estimate = estimate.model_copy(
+                update={
+                    "expected_value_usd": None,
+                    "calculation_method": "ev_unavailable",
+                    "uncertainty_reasons": tuple(
+                        dict.fromkeys(
+                            (
+                                *estimate.uncertainty_reasons,
+                                "historical_strategy_family_missing",
+                            )
+                        )
+                    ),
+                }
+            )
         deps.objective_service.save_strategy_estimate(estimate)
         estimates.append(estimate.model_dump(mode="json"))
         candidates.append(

@@ -52,12 +52,17 @@ class SessionEventIndexRepository:
             await self.initialize()
 
     async def record(self, record: SessionEventIndexRecord) -> bool:
-        """Insert event; ignore duplicate event_id (idempotent). Returns True if inserted."""
+        """Insert event; ignore duplicate event_id (idempotent). Returns True if inserted.
+
+        When ``sequence`` is omitted, assign the next session-local sequence so
+        horizon verification can use a globally_contiguous policy.
+        """
         await self._ensure()
         created = (record.created_at or datetime.now(timezone.utc)).isoformat()
         async with aiosqlite.connect(self._db_path) as db:
             await db.execute("PRAGMA busy_timeout = 30000")
             try:
+                await db.execute("BEGIN IMMEDIATE")
                 await db.execute(
                     """
                     INSERT INTO session_event_index (
@@ -85,10 +90,35 @@ class SessionEventIndexRepository:
                         created,
                     ),
                 )
+                # Keep session sequences authoritative in exchange-time order so
+                # horizon verification can require timestamp + sequence monotonicity.
+                if record.sequence is None:
+                    cur = await db.execute(
+                        """
+                        SELECT event_id FROM session_event_index
+                        WHERE session_id = ?
+                        ORDER BY exchange_timestamp ASC, event_id ASC
+                        """,
+                        (record.session_id,),
+                    )
+                    ordered = await cur.fetchall()
+                    for seq_num, (eid,) in enumerate(ordered, start=1):
+                        await db.execute(
+                            """
+                            UPDATE session_event_index
+                            SET sequence = ?
+                            WHERE event_id = ?
+                            """,
+                            (seq_num, eid),
+                        )
                 await db.commit()
                 return True
             except aiosqlite.IntegrityError:
+                await db.rollback()
                 return False
+            except Exception:
+                await db.rollback()
+                raise
 
     async def list_horizon(
         self,
@@ -118,6 +148,32 @@ class SessionEventIndexRepository:
                     start_timestamp.isoformat(),
                     end_timestamp.isoformat(),
                 ),
+            )
+            rows = await cur.fetchall()
+        return [self._row_to_record(r) for r in rows]
+
+    async def list_sequence_range(
+        self,
+        session_id: str,
+        *,
+        start_sequence: int,
+        end_sequence: int,
+    ) -> list[SessionEventIndexRecord]:
+        """Return events with sequence in [start_sequence, end_sequence]."""
+        await self._ensure()
+        lo, hi = sorted((int(start_sequence), int(end_sequence)))
+        async with aiosqlite.connect(self._db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                """
+                SELECT * FROM session_event_index
+                WHERE session_id = ?
+                  AND sequence IS NOT NULL
+                  AND sequence >= ?
+                  AND sequence <= ?
+                ORDER BY sequence ASC, exchange_timestamp ASC, event_id ASC
+                """,
+                (session_id, lo, hi),
             )
             rows = await cur.fetchall()
         return [self._row_to_record(r) for r in rows]

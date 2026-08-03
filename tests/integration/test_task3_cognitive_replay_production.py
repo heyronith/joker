@@ -161,6 +161,7 @@ async def test_production_cognitive_replay_and_shadow_challenger(tmp_path) -> No
         )
         _, challenger = await improvement.propose(
             parent_champion=champion,
+            training_dataset_ids=(uuid4(),),
             weakness="calibration",
             hypothesis="prefer calibrated exits",
             patch=PromptPatch(

@@ -73,6 +73,7 @@ async def test_champion_cas_and_uniqueness(tmp_path) -> None:
     svc = ImprovementProposalService(repos["proposals"], repos["configurations"], registry.policy_store)
     proposal, challenger = await svc.propose(
         parent_champion=first,
+        training_dataset_ids=(uuid4(),),
         weakness="calibration",
         hypothesis="tighten critic",
         patch=PromptPatch(
@@ -112,6 +113,7 @@ async def test_improvement_rejects_prohibited_mutation(tmp_path) -> None:
     with pytest.raises(ImprovementError):
         await svc.propose(
             parent_champion=champ,
+            training_dataset_ids=(uuid4(),),
             weakness="x",
             hypothesis="y",
             patch={"patch_type": "prompt", "mutation_target": "order_action_gateway"},

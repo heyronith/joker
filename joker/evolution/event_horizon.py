@@ -80,27 +80,48 @@ class Task1EventHorizonLoader:
         entry_decision_event_id: UUID | None = None,
         terminal_event_id: UUID | None = None,
     ) -> Task1EventHorizon:
-        """Return ordered events (sequence → exchange_ts → event_id) in the window."""
+        """Return ordered events for the entry→terminal horizon.
+
+        Prefer the contiguous session sequence range between entry and terminal
+        when both anchors resolve with sequences; otherwise fall back to the
+        exchange-timestamp window (still merging explicit anchors).
+        """
         if end_timestamp < start_timestamp:
             return Task1EventHorizon(session_id=session_id)
 
-        records = await self._index.list_horizon(
-            session_id,
-            start_timestamp=start_timestamp,
-            end_timestamp=end_timestamp,
-        )
+        entry_rec = None
+        term_rec = None
         if entry_decision_event_id is not None:
-            entry_str = str(entry_decision_event_id)
-            if not any(r.event_id == entry_str for r in records):
-                entry_rec = await self._index.get_by_event_id(entry_str)
-                if entry_rec is not None:
-                    records = [entry_rec, *records]
+            entry_rec = await self._index.get_by_event_id(str(entry_decision_event_id))
         if terminal_event_id is not None:
-            term_str = str(terminal_event_id)
-            if not any(r.event_id == term_str for r in records):
-                term_rec = await self._index.get_by_event_id(term_str)
-                if term_rec is not None:
-                    records = [*records, term_rec]
+            term_rec = await self._index.get_by_event_id(str(terminal_event_id))
+
+        records: list[SessionEventIndexRecord]
+        if (
+            entry_rec is not None
+            and term_rec is not None
+            and entry_rec.sequence is not None
+            and term_rec.sequence is not None
+        ):
+            records = await self._index.list_sequence_range(
+                session_id,
+                start_sequence=int(entry_rec.sequence),
+                end_sequence=int(term_rec.sequence),
+            )
+        else:
+            records = await self._index.list_horizon(
+                session_id,
+                start_timestamp=start_timestamp,
+                end_timestamp=end_timestamp,
+            )
+            if entry_rec is not None and not any(
+                r.event_id == entry_rec.event_id for r in records
+            ):
+                records = [entry_rec, *records]
+            if term_rec is not None and not any(
+                r.event_id == term_rec.event_id for r in records
+            ):
+                records = [*records, term_rec]
 
         records = _sort_records(records)
         events: list[Task1HorizonEvent] = []

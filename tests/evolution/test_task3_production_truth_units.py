@@ -205,6 +205,7 @@ async def test_orchestrator_runs_required_adversarial_suite(tmp_path) -> None:
     )
     _, chall = await improvement.propose(
         parent_champion=champ,
+        training_dataset_ids=(uuid4(),),
         weakness="w",
         hypothesis="h",
         patch=PromptPatch(
@@ -283,6 +284,7 @@ async def test_optional_scenario_failure_is_reported(tmp_path) -> None:
         repos["proposals"], repos["configurations"], registry.policy_store
     ).propose(
         parent_champion=champ,
+        training_dataset_ids=(uuid4(),),
         weakness="w",
         hypothesis="h",
         patch=PromptPatch(

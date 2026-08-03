@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import date
 from decimal import Decimal
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 from uuid import UUID, uuid4
 
 from joker.evolution.episode_metadata import (
@@ -201,8 +201,25 @@ class EpisodeCompiler:
                 )
             except Exception as exc:
                 horizon_error = f"authoritative_horizon_load_failed:{type(exc).__name__}"
+            sequence_policy: Literal[
+                "globally_contiguous", "monotonic_only", "unavailable"
+            ] = "unavailable"
+            if horizon is not None:
+                horiz_events = tuple(getattr(horizon, "events", ()) or ())
+                seqs = [getattr(ev, "sequence", None) for ev in horiz_events]
+                if horiz_events and all(isinstance(s, int) for s in seqs):
+                    sequence_policy = "globally_contiguous"
             horizon_complete, horizon_findings = verify_event_horizon(
-                horizon, entry_ts=entry_ts, terminal_ts=terminal_ts
+                horizon,
+                entry_ts=entry_ts,
+                terminal_ts=terminal_ts,
+                entry_event_id=entry_event_id
+                if isinstance(entry_event_id, UUID)
+                else None,
+                terminal_event_id=terminal_event_uuid
+                if isinstance(terminal_event_uuid, UUID)
+                else None,
+                sequence_policy=sequence_policy,
             )
             if horizon_error:
                 findings.append(horizon_error)

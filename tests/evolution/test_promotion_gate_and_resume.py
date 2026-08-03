@@ -75,6 +75,7 @@ async def test_experiment_keys_survive_process_restart(tmp_path) -> None:
     )
     _, challenger = await svc.propose(
         parent_champion=champ,
+        training_dataset_ids=(uuid4(),),
         weakness="w",
         hypothesis="h",
         patch=PromptPatch(

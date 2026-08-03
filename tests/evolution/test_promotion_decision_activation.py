@@ -59,6 +59,7 @@ async def test_decision_persistence_does_not_activate_champion(tmp_path) -> None
     )
     _, challenger = await improvement.propose(
         parent_champion=champion,
+        training_dataset_ids=(uuid4(),),
         weakness="x",
         hypothesis="y",
         patch=PromptPatch(
@@ -114,6 +115,7 @@ async def test_apply_persisted_decision_activates_once(tmp_path) -> None:
     )
     _, challenger = await improvement.propose(
         parent_champion=champion,
+        training_dataset_ids=(uuid4(),),
         weakness="x",
         hypothesis="y",
         patch=PromptPatch(
@@ -174,6 +176,7 @@ async def test_activation_restart_reuses_existing_decision(tmp_path) -> None:
     )
     _, challenger = await improvement.propose(
         parent_champion=champion,
+        training_dataset_ids=(uuid4(),),
         weakness="x",
         hypothesis="y",
         patch=PromptPatch(
@@ -236,6 +239,7 @@ async def test_rejected_decision_never_activates(tmp_path) -> None:
     )
     _, challenger = await improvement.propose(
         parent_champion=champion,
+        training_dataset_ids=(uuid4(),),
         weakness="x",
         hypothesis="y",
         patch=PromptPatch(

@@ -11,6 +11,7 @@ from joker.objectives.historical_outcomes import session_phase_from_exchange_ts
 
 
 DirectionLabel = Literal["bullish", "bearish", "neutral", "none"]
+SequencePolicy = Literal["globally_contiguous", "monotonic_only", "unavailable"]
 
 
 @dataclass
@@ -137,15 +138,7 @@ async def resolve_episode_similarity_metadata(
         meta.findings.append("historical_pattern_provenance_missing")
     else:
         family = getattr(strategy, "strategy_family", None)
-        if not family:
-            # Role-based fallback is production mapping, not invention of family labels.
-            role = str(getattr(strategy, "agent_role", "") or "")
-            role_val = getattr(getattr(strategy, "agent_role", None), "value", role)
-            family = {
-                "bullish_inventor": "breakout_continuation",
-                "bearish_inventor": "failed_breakout_reversal",
-                "neutral_advocate": "mean_reversion",
-            }.get(str(role_val), None)
+        # Never invent family from agent role — explicit StrategyHypothesis only.
         if family:
             meta.strategy_family = str(family)
         else:
@@ -232,68 +225,112 @@ async def resolve_episode_similarity_metadata(
     return meta
 
 
+def _horizon_fail(findings: list[str], *codes: str) -> tuple[bool, tuple[str, ...]]:
+    findings.extend(codes)
+    findings.extend(
+        (
+            "historical_ev_eligible=false",
+            "promotion_eligible=false",
+            "truth_degraded=true",
+        )
+    )
+    return False, tuple(dict.fromkeys(findings))
+
+
 def verify_event_horizon(
     horizon: Any | None,
     *,
     entry_ts: datetime | None,
     terminal_ts: datetime | None,
+    entry_event_id: UUID | None = None,
+    terminal_event_id: UUID | None = None,
+    sequence_policy: SequencePolicy = "unavailable",
+    legitimate_sequence_gaps: frozenset[int] | None = None,
 ) -> tuple[bool, tuple[str, ...]]:
-    """Return (complete, findings). Fail closed on gaps / non-monotonic / missing."""
+    """Return (complete, findings). Fail closed on gaps / anchors / duplicates."""
     findings: list[str] = []
     if horizon is None:
-        findings.extend(
-            (
-                "authoritative_horizon_incomplete",
-                "historical_ev_eligible=false",
-                "promotion_eligible=false",
-                "truth_degraded=true",
-            )
-        )
-        return False, tuple(findings)
+        return _horizon_fail(findings, "authoritative_horizon_incomplete")
     events = tuple(getattr(horizon, "events", ()) or ())
     market_ids = tuple(getattr(horizon, "market_event_ids", ()) or ())
     if not events or not market_ids:
-        findings.extend(
-            (
-                "authoritative_horizon_incomplete",
-                "historical_ev_eligible=false",
-                "promotion_eligible=false",
-                "truth_degraded=true",
-            )
-        )
-        return False, tuple(findings)
-    prev_ts: datetime | None = None
-    prev_seq: int | None = None
+        return _horizon_fail(findings, "authoritative_horizon_incomplete")
+
+    if sequence_policy not in {
+        "globally_contiguous",
+        "monotonic_only",
+        "unavailable",
+    }:
+        return _horizon_fail(findings, "authoritative_horizon_sequence_gap")
+
+    event_ids: list[UUID] = []
+    for ev in events:
+        eid = getattr(ev, "event_id", None)
+        if eid is None:
+            return _horizon_fail(findings, "authoritative_horizon_incomplete")
+        try:
+            event_ids.append(eid if isinstance(eid, UUID) else UUID(str(eid)))
+        except Exception:
+            return _horizon_fail(findings, "authoritative_horizon_incomplete")
+
+    if len(event_ids) != len(set(event_ids)):
+        return _horizon_fail(findings, "authoritative_horizon_duplicate_event")
+
+    id_set = set(event_ids)
+    if entry_event_id is not None and entry_event_id not in id_set:
+        return _horizon_fail(findings, "authoritative_horizon_entry_missing")
+    if terminal_event_id is not None and terminal_event_id not in id_set:
+        return _horizon_fail(findings, "authoritative_horizon_terminal_missing")
+
+    timestamps: list[datetime] = []
+    sequences: list[int | None] = []
     for ev in events:
         ts = getattr(ev, "exchange_timestamp", None)
         if ts is None:
-            findings.append("authoritative_horizon_incomplete")
-            break
-        if prev_ts is not None and ts < prev_ts:
-            findings.append("authoritative_horizon_non_monotonic")
-            break
+            return _horizon_fail(findings, "authoritative_horizon_incomplete")
+        timestamps.append(ts)
         seq = getattr(ev, "sequence", None)
-        if (
-            prev_seq is not None
-            and seq is not None
-            and isinstance(seq, int)
-            and isinstance(prev_seq, int)
-            and seq < prev_seq
-        ):
-            findings.append("authoritative_horizon_non_monotonic")
-            break
-        prev_ts = ts
-        if seq is not None:
-            prev_seq = seq
+        sequences.append(seq if isinstance(seq, int) else None)
+
+    # Horizon list order is authoritative (sequence → timestamp → event_id).
+    for i in range(1, len(timestamps)):
+        if timestamps[i] < timestamps[i - 1]:
+            return _horizon_fail(findings, "authoritative_horizon_non_monotonic")
+
+    if entry_ts is not None and timestamps[0] > entry_ts:
+        return _horizon_fail(findings, "authoritative_horizon_time_coverage_incomplete")
+    if terminal_ts is not None and timestamps[-1] < terminal_ts:
+        return _horizon_fail(findings, "authoritative_horizon_time_coverage_incomplete")
     if entry_ts is not None and terminal_ts is not None and terminal_ts < entry_ts:
-        findings.append("authoritative_horizon_incomplete")
+        return _horizon_fail(findings, "authoritative_horizon_time_coverage_incomplete")
+
+    present_seqs = [s for s in sequences if s is not None]
+    if sequence_policy == "unavailable":
+        return _horizon_fail(findings, "authoritative_horizon_sequence_gap")
+
+    if len(present_seqs) != len(sequences):
+        return _horizon_fail(findings, "authoritative_horizon_sequence_gap")
+
+    for i in range(1, len(present_seqs)):
+        if present_seqs[i] < present_seqs[i - 1]:
+            return _horizon_fail(findings, "authoritative_horizon_non_monotonic")
+
+    if sequence_policy == "globally_contiguous":
+        lo, hi = min(present_seqs), max(present_seqs)
+        expected = set(range(lo, hi + 1))
+        if set(present_seqs) != expected or len(present_seqs) != (hi - lo + 1):
+            return _horizon_fail(findings, "authoritative_horizon_sequence_gap")
+    elif sequence_policy == "monotonic_only":
+        for i in range(1, len(present_seqs)):
+            gap = present_seqs[i] - present_seqs[i - 1]
+            if gap <= 0:
+                return _horizon_fail(findings, "authoritative_horizon_non_monotonic")
+            if gap > 1:
+                missing = set(range(present_seqs[i - 1] + 1, present_seqs[i]))
+                allowed = legitimate_sequence_gaps or frozenset()
+                if not missing.issubset(allowed):
+                    return _horizon_fail(findings, "authoritative_horizon_sequence_gap")
+
     if findings:
-        findings.extend(
-            (
-                "historical_ev_eligible=false",
-                "promotion_eligible=false",
-                "truth_degraded=true",
-            )
-        )
-        return False, tuple(dict.fromkeys(findings))
+        return _horizon_fail(findings)
     return True, ()
