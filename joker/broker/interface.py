@@ -14,6 +14,17 @@ class BrokerError(Exception):
     pass
 
 
+class BrokerSubmissionUnknown(BrokerError):
+    """Placement outcome is unresolved — must not be treated as rejection."""
+
+    def __init__(self, client_order_id: str, message: str | None = None) -> None:
+        self.client_order_id = client_order_id
+        super().__init__(
+            message
+            or f"Broker submission unknown for client_order_id={client_order_id}"
+        )
+
+
 class BrokerClient(ABC):
     @abstractmethod
     def submit_order(self, intent: OrderIntent) -> BrokerOrder:
@@ -111,6 +122,9 @@ class PaperBroker(BrokerClient):
         )
         self._fills[fill.fill_id] = fill
         order.status = "filled"
+        order.filled_quantity = order.quantity
+        order.remaining_quantity = 0
+        order.average_fill_price = fill_price
         cost = fill_price * order.quantity * 100
         if order.side == "buy":
             self.cash_balance -= cost

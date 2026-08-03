@@ -17,6 +17,7 @@ class LedgerEventType(StrEnum):
     """Canonical ledger event types for order and position truth."""
 
     ORDER_SUBMISSION_REQUESTED = "order_submission_requested"
+    SUBMISSION_UNKNOWN = "submission_unknown"
     BROKER_ORDER_ACCEPTED = "broker_order_accepted"
     PARTIAL_FILL = "partial_fill"
     FINAL_FILL = "final_fill"

@@ -59,9 +59,17 @@ class OrderDetailPollingEventSource:
         import asyncio
 
         self._running = True
-        while self._running:
-            await self.poll_once()
-            await asyncio.sleep(self._poll_interval)
+        try:
+            while self._running:
+                await self.poll_once()
+                if not self._running:
+                    break
+                try:
+                    await asyncio.sleep(self._poll_interval)
+                except asyncio.CancelledError:
+                    break
+        finally:
+            self._running = False
 
     async def stop(self) -> None:
         self._running = False
@@ -97,6 +105,7 @@ def _map_status(status: str) -> BrokerEventKind:
     mapping: dict[str, BrokerEventKind] = {
         "pending": "submitted",
         "open": "accepted",
+        "partially_filled": "partially_filled",
         "filled": "filled",
         "cancelled": "cancelled",
         "rejected": "rejected",

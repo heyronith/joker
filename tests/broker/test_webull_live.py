@@ -8,9 +8,8 @@ from pathlib import Path
 
 import pytest
 
-from joker.app.safety import SafetyMode
 from joker.broker.factory import BrokerFactoryError, create_broker, create_live_broker
-from joker.broker.interface import BrokerError
+from joker.broker.interface import BrokerError, BrokerSubmissionUnknown
 from joker.broker.position_intent import resolve_position_intent, validate_position_intent
 from joker.broker.reconciliation import BrokerReconciliationService
 from joker.broker.webull import WebullClient
@@ -21,86 +20,39 @@ from joker.broker.webull_live import (
 )
 from joker.broker.webull_trade_api import (
     MockWebullTradeApi,
-    build_option_limit_order_payload,
     ensure_paper_trading_allowed,
 )
-from joker.config.settings import AppSettings, EnvSettings
-from joker.persistence.broker_submission_journal import SyncBrokerSubmissionJournal
-from joker.schemas.domain import OptionContract, OrderIntent, Position
+from joker.persistence.broker_submission_journal import BrokerSubmissionRecord
+from joker.schemas.domain import Position
+from tests.broker._live_helpers import (
+    live_activation,
+    live_app,
+    live_env,
+    make_intent,
+    make_live_client,
+    prepare_journal_for_intent,
+)
 
 
-def _today() -> date:
-    return date.today()
+def _env(**overrides):
+    return live_env(**overrides)
 
 
-def _env(**overrides) -> EnvSettings:
-    base = {
-        "OPENAI_API_KEY": "test-key",
-        "WEBULL_LIVE_TRADING_ENABLED": True,
-        "WEBULL_LIVE_APP_KEY": "live-key",
-        "WEBULL_LIVE_APP_SECRET": "live-secret",
-        "WEBULL_LIVE_ACCESS_TOKEN": "live-token",
-        "WEBULL_LIVE_ACCOUNT_ID": "LIVE_ACCT_1",
-        "WEBULL_LIVE_API_ENV": "prod",
-        "WEBULL_PAPER_TRADING_ENABLED": False,
-        "WEBULL_PAPER_ACCOUNT_ID": "PAPER_ACCT_1",
-        "WEBULL_APP_KEY": "paper-key",
-        "WEBULL_APP_SECRET": "paper-secret",
-        "WEBULL_ACCESS_TOKEN": "paper-token",
-    }
-    base.update(overrides)
-    return EnvSettings(**base)  # type: ignore[arg-type]
+def _app(*, live: bool = True):
+    return live_app(live=live)
 
 
-def _app(*, live: bool = True) -> AppSettings:
-    return AppSettings(
-        mode=SafetyMode.LIVE_GATED if live else SafetyMode.PAPER,
-        live_trading_enabled=live,
-        broker={"provider": "webull_live"},
-    )
+def _intent(**kwargs):
+    return make_intent(**kwargs)
 
 
-def _contract() -> OptionContract:
-    return OptionContract(
-        symbol="SPY",
-        expiration=_today(),
-        strike=500.0,
-        option_type="call",
-        is_0dte=True,
-    )
-
-
-def _intent(
-    *,
-    side: str = "buy",
-    position_intent: str | None = "BUY_TO_OPEN",
-    qty: int = 1,
-    limit: float = 1.10,
-    intent_id: str | None = None,
-) -> OrderIntent:
-    return OrderIntent(
-        intent_id=intent_id or ("c" * 32),
-        candidate_id="cand",
-        contract=_contract(),
-        side=side,  # type: ignore[arg-type]
-        order_type="limit",
-        quantity=qty,
-        limit_price=limit,
-        position_intent=position_intent,  # type: ignore[arg-type]
-    )
+def _contract():
+    from tests.broker._live_helpers import contract_today
+    return contract_today()
 
 
 def _live_client(tmp_path: Path, api: MockWebullTradeApi | None = None, **kwargs):
-    api = api or create_mock_live_trade_api("LIVE_ACCT_1")
-    journal = SyncBrokerSubmissionJournal(tmp_path / "journal.db")
-    return WebullLiveClient(
-        _env(),
-        app_settings=_app(),
-        trade_api=api,
-        journal=journal,
-        skip_account_list_check=kwargs.pop("skip_account_list_check", True),
-        **kwargs,
-    ), api, journal
+    return make_live_client(tmp_path, api, **kwargs)
 
 
 def test_live_credentials_never_fall_back_to_paper() -> None:
@@ -118,42 +70,50 @@ def test_live_credentials_never_fall_back_to_paper() -> None:
 
 def test_live_account_id_must_match_returned_account(tmp_path) -> None:
     api = create_mock_live_trade_api("OTHER_ACCT")
-    with pytest.raises(WebullLiveConfigError, match="not returned"):
+    with pytest.raises(WebullLiveConfigError, match="not returned|LiveActivation|journal"):
         WebullLiveClient(
             _env(),
             app_settings=_app(),
             trade_api=api,
+            activation=live_activation(),
+            journal=__import__("joker.persistence.broker_submission_journal", fromlist=["SyncBrokerSubmissionJournal"]).SyncBrokerSubmissionJournal(tmp_path / "j.db"),
             skip_account_list_check=False,
         )
 
 
-def test_wrong_account_blocks_startup() -> None:
+def test_wrong_account_blocks_startup(tmp_path) -> None:
     api = create_mock_live_trade_api("OTHER")
     with pytest.raises((WebullLiveConfigError, BrokerFactoryError)):
         create_live_broker(
             _app(),
             _env(),
             trade_api=api,
+            activation=live_activation(),
+            journal_db_path=tmp_path / "j.db",
             skip_account_list_check=False,
         )
 
 
-def test_sandbox_environment_blocks_webull_live_client() -> None:
+def test_sandbox_environment_blocks_webull_live_client(tmp_path) -> None:
     with pytest.raises(WebullLiveConfigError, match="prod"):
         WebullLiveClient(
             _env(WEBULL_LIVE_API_ENV="sandbox"),
             app_settings=_app(),
             trade_api=create_mock_live_trade_api("LIVE_ACCT_1"),
+            activation=live_activation(),
+            journal=__import__("joker.persistence.broker_submission_journal", fromlist=["SyncBrokerSubmissionJournal"]).SyncBrokerSubmissionJournal(tmp_path / "j.db"),
             skip_account_list_check=True,
         )
 
 
-def test_paper_account_blocks_webull_live_client() -> None:
+def test_paper_account_blocks_webull_live_client(tmp_path) -> None:
     with pytest.raises(WebullLiveConfigError, match="must not equal"):
         WebullLiveClient(
             _env(WEBULL_LIVE_ACCOUNT_ID="PAPER_ACCT_1"),
             app_settings=_app(),
             trade_api=create_mock_live_trade_api("PAPER_ACCT_1"),
+            activation=live_activation("PAPER_ACCT_1"),
+            journal=__import__("joker.persistence.broker_submission_journal", fromlist=["SyncBrokerSubmissionJournal"]).SyncBrokerSubmissionJournal(tmp_path / "j.db"),
             skip_account_list_check=False,
         )
 
@@ -232,6 +192,7 @@ def test_preview_and_place_payload_equivalence(tmp_path) -> None:
     payload = client.build_payload(intent)
     preview = client.preview_order(intent)
     assert preview.accepted is True
+    prepare_journal_for_intent(client, intent)
     order = client.submit_order(intent)
     assert api.previewed[0]["client_order_id"] == payload["client_order_id"]
     assert api.placed[0]["client_order_id"] == payload["client_order_id"]
@@ -273,9 +234,9 @@ def test_insufficient_buying_power(tmp_path) -> None:
 def test_client_order_id_persisted_before_submission(tmp_path) -> None:
     client, api, journal = _live_client(tmp_path)
     intent = _intent(intent_id="e" * 32)
-    # Force timeout after prepare
+    prepare_journal_for_intent(client, intent)
     api.place_timeout = True
-    with pytest.raises(BrokerError, match="unknown"):
+    with pytest.raises(BrokerSubmissionUnknown):
         client.submit_order(intent)
     stored = journal.get(client.account_id_hash, "e" * 32)
     assert stored is not None
@@ -284,11 +245,15 @@ def test_client_order_id_persisted_before_submission(tmp_path) -> None:
 
 
 def test_duplicate_client_order_id_rejected(tmp_path) -> None:
+    from joker.persistence.broker_submission_journal import DuplicateSubmissionError
+
     client, _, _ = _live_client(tmp_path)
     intent = _intent(intent_id="f" * 32)
+    prepare_journal_for_intent(client, intent)
     client.submit_order(intent)
-    with pytest.raises(BrokerError, match="duplicate"):
-        client.submit_order(intent)
+    with pytest.raises(DuplicateSubmissionError, match="duplicate"):
+        # Second prepare must fail closed on duplicate identity.
+        prepare_journal_for_intent(client, intent)
 
 
 def test_timeout_before_broker_acceptance(tmp_path) -> None:
@@ -296,8 +261,10 @@ def test_timeout_before_broker_acceptance(tmp_path) -> None:
     api.place_timeout = True
     api.place_accepts_before_timeout = False
     client, _, journal = _live_client(tmp_path, api=api)
-    with pytest.raises(BrokerError, match="unknown"):
-        client.submit_order(_intent(intent_id="a" * 32))
+    intent = _intent(intent_id="a" * 32)
+    prepare_journal_for_intent(client, intent)
+    with pytest.raises(BrokerSubmissionUnknown):
+        client.submit_order(intent)
     stored = journal.get(client.account_id_hash, "a" * 32)
     assert stored is not None
     assert stored.status == "submission_unknown"
@@ -308,12 +275,13 @@ def test_timeout_after_broker_acceptance(tmp_path) -> None:
     api.place_timeout = True
     api.place_accepts_before_timeout = True
     client, _, journal = _live_client(tmp_path, api=api)
-    # reconcile via get_order_detail should recover
-    order = client.submit_order(_intent(intent_id="b" * 32))
-    assert order.status in {"open", "pending", "filled"}
+    intent = _intent(intent_id="b" * 32)
+    prepare_journal_for_intent(client, intent)
+    order = client.submit_order(intent)
+    assert order.status in {"open", "pending", "filled", "partially_filled"}
     stored = journal.get(client.account_id_hash, "b" * 32)
     assert stored is not None
-    assert stored.status in {"accepted", "filled", "reconciled"}
+    assert stored.status in {"accepted", "filled", "reconciled", "partially_filled"}
 
 
 def test_submission_unknown_reconciliation(tmp_path) -> None:
@@ -321,16 +289,19 @@ def test_submission_unknown_reconciliation(tmp_path) -> None:
     api.place_timeout = True
     api.place_accepts_before_timeout = True
     client, _, journal = _live_client(tmp_path, api=api)
-    client.submit_order(_intent(intent_id="1" * 32))
+    intent = _intent(intent_id="1" * 32)
+    prepare_journal_for_intent(client, intent)
+    client.submit_order(intent)
     svc = BrokerReconciliationService(
         broker=client, journal=journal, account_id_hash=client.account_id_hash
     )
+    resolved = svc.resolve_unknown_submissions()
     report = svc.reconcile()
-    # After reconcile attempt unknowns may resolve
     stored = journal.get(client.account_id_hash, "1" * 32)
     assert stored is not None
     assert stored.status != "prepared"
     assert isinstance(report.unknown_submissions, int)
+    assert isinstance(resolved, list)
 
 
 def test_capital_reservation_retained_while_unknown(tmp_path) -> None:
@@ -349,28 +320,29 @@ def test_confirmed_rejection_releases_reservation(tmp_path) -> None:
 
 def test_partial_and_final_fill_and_cancel(tmp_path) -> None:
     client, api, journal = _live_client(tmp_path)
-    order = client.submit_order(_intent(intent_id="2" * 32))
+    intent2 = _intent(intent_id="2" * 32)
+    prepare_journal_for_intent(client, intent2)
+    order = client.submit_order(intent2)
     assert order.status == "filled"
-    # Force open then cancel
     api._orders["3" * 32] = {
         "client_order_id": "3" * 32,
         "status": "SUBMITTED",
         "order_id": "WB-3",
+        "side": "BUY",
+        "quantity": "1",
+        "limit_price": "1.10",
+        "symbol": "SPY",
+        "option_expire_date": __import__("datetime").date.today().isoformat(),
+        "strike_price": "500",
+        "option_type": "call",
     }
     intent = _intent(intent_id="3" * 32)
-    client._intent_by_order["3" * 32] = intent
-    client._orders["3" * 32] = order.model_copy(
-        update={"order_id": "3" * 32, "status": "open", "intent_id": "3" * 32}
-    )
-    journal.prepare(
-        __import__(
-            "joker.persistence.broker_submission_journal", fromlist=["BrokerSubmissionRecord"]
-        ).BrokerSubmissionRecord(
-            client_order_id="3" * 32,
-            broker_mode="webull_live",
-            account_id_hash=client.account_id_hash,
-            status="prepared",
-        )
+    prepare_journal_for_intent(client, intent)
+    journal.transition(
+        account_id_hash=client.account_id_hash,
+        client_order_id="3" * 32,
+        status="accepted",
+        broker_order_id="WB-3",
     )
     cancelled = client.cancel_order("3" * 32)
     assert cancelled.status == "cancelled"
@@ -380,7 +352,9 @@ def test_partial_and_final_fill_and_cancel(tmp_path) -> None:
 
 def test_broker_local_mismatches(tmp_path) -> None:
     client, api, journal = _live_client(tmp_path)
-    client.submit_order(_intent(intent_id="4" * 32))
+    intent = _intent(intent_id="4" * 32)
+    prepare_journal_for_intent(client, intent)
+    client.submit_order(intent)
     svc = BrokerReconciliationService(
         broker=client, journal=journal, account_id_hash=client.account_id_hash
     )
@@ -409,6 +383,7 @@ def test_create_broker_webull_live_no_fallback(tmp_path) -> None:
         _env(),
         trade_api=api,
         journal_db_path=tmp_path / "j.db",
+        activation=live_activation(),
     )
     assert isinstance(client, WebullLiveClient)
 

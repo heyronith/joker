@@ -16,7 +16,6 @@ from joker.broker.webull_live import (
 )
 from joker.config.settings import AppSettings, EnvSettings
 from joker.config.validation import redact_secrets
-from joker.persistence.migrations import apply_task1_migrations
 
 
 @dataclass(frozen=True)
@@ -77,25 +76,27 @@ def run_production_preflight(
         )
     checks.append("api_env: ok prod")
 
-    # SQLite integrity on ephemeral migrate.
-    try:
-        import tempfile
-
-        with tempfile.TemporaryDirectory(prefix="joker-live-preflight-") as tmp:
-            db = Path(tmp) / "preflight.db"
-            apply_task1_migrations(db)
-            conn = sqlite3.connect(db)
+    # SQLite integrity against the configured production database (read-only).
+    db_path = Path(app_settings.db_path)
+    if not db_path.exists():
+        checks.append(f"sqlite: fail — configured database missing: {db_path}")
+    else:
+        try:
+            uri = f"file:{db_path.resolve()}?mode=ro"
+            conn = sqlite3.connect(uri, uri=True)
             try:
                 integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
                 fk = conn.execute("PRAGMA foreign_key_check").fetchall()
             finally:
                 conn.close()
-        if integrity != "ok" or fk:
-            checks.append("sqlite: fail")
-        else:
-            checks.append("sqlite: ok")
-    except Exception as exc:
-        checks.append(f"sqlite: fail — {type(exc).__name__}")
+            if integrity != "ok" or fk:
+                checks.append(
+                    f"sqlite: fail — integrity={integrity!r} fk_rows={len(fk)}"
+                )
+            else:
+                checks.append(f"sqlite: ok (read-only {db_path.name})")
+        except Exception as exc:
+            checks.append(f"sqlite: fail — {type(exc).__name__}: {exc}")
 
     account_hash = hash_account_id(str(creds.account_id))
     masked = mask_account_id(str(creds.account_id))
@@ -151,13 +152,7 @@ def run_production_preflight(
         checks.append("open orders: fail — " + redact_secrets(str(exc), env=env))
 
     if check_market_data:
-        if env.webull_market_data_enabled and env.webull_app_key:
-            checks.append("market-data credentials: present")
-        else:
-            checks.append(
-                "market-data / SPY surface: unavailable or not configured "
-                "(may be closed session)"
-            )
+        _append_market_data_checks(checks, env=env, app_settings=app_settings)
 
     # Explicit: no order placement performed.
     checks.append("mutation: none (read-only preflight)")
@@ -170,3 +165,81 @@ def run_production_preflight(
         captured_at=captured,
         mutated=False,
     )
+
+
+def _append_market_data_checks(
+    checks: list[str],
+    *,
+    env: EnvSettings,
+    app_settings: AppSettings,
+) -> None:
+    """Distinguish credentials / market closed / live snapshot / 0DTE surface."""
+    creds_present = bool(env.webull_market_data_enabled and env.webull_app_key)
+    if not creds_present:
+        checks.append("market-data credentials: absent")
+        checks.append("market-data live snapshot: not verified")
+        checks.append("market-data 0DTE surface: not verified")
+        return
+    checks.append("market-data credentials: present")
+
+    # Session clock — closed market is not a credentials failure.
+    try:
+        from joker.time.clock import ExchangeClock
+
+        clock = ExchangeClock()
+        if hasattr(clock, "is_market_open") and not clock.is_market_open():
+            checks.append("market-data session: market closed")
+            checks.append("market-data live snapshot: not verified (market closed)")
+            checks.append("market-data 0DTE surface: not verified (market closed)")
+            return
+        checks.append("market-data session: open or clock unavailable")
+    except Exception:
+        checks.append("market-data session: clock unavailable")
+
+    # Prefer persisted snapshot / surface from the configured production DB.
+    db_path = Path(app_settings.db_path)
+    if not db_path.exists():
+        checks.append("market-data live snapshot: not verified (no database)")
+        checks.append("market-data 0DTE surface: not verified (no database)")
+        return
+    try:
+        uri = f"file:{db_path.resolve()}?mode=ro"
+        conn = sqlite3.connect(uri, uri=True)
+        try:
+            tables = {
+                row[0]
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                ).fetchall()
+            }
+            snap_ok = False
+            surface_ok = False
+            if "market_snapshots" in tables or "snapshots" in tables:
+                table = "market_snapshots" if "market_snapshots" in tables else "snapshots"
+                row = conn.execute(
+                    f"SELECT 1 FROM {table} ORDER BY 1 DESC LIMIT 1"
+                ).fetchone()
+                snap_ok = row is not None
+            if "option_surfaces" in tables or "option_surface" in tables:
+                table = (
+                    "option_surfaces"
+                    if "option_surfaces" in tables
+                    else "option_surface"
+                )
+                row = conn.execute(
+                    f"SELECT 1 FROM {table} ORDER BY 1 DESC LIMIT 1"
+                ).fetchone()
+                surface_ok = row is not None
+        finally:
+            conn.close()
+        checks.append(
+            "market-data live snapshot: "
+            + ("verified (persisted)" if snap_ok else "not verified")
+        )
+        checks.append(
+            "market-data 0DTE surface: "
+            + ("verified (persisted)" if surface_ok else "not verified")
+        )
+    except Exception as exc:
+        checks.append(f"market-data live snapshot: not verified ({type(exc).__name__})")
+        checks.append("market-data 0DTE surface: not verified")

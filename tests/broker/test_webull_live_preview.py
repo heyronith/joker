@@ -67,17 +67,8 @@ def test_preview_endpoint_registered() -> None:
 
 
 def test_live_preview_uses_same_payload_as_builder(tmp_path) -> None:
-    api = create_mock_live_trade_api("LIVE_ACCT_1")
-    client = WebullLiveClient(
-        _env(),
-        app_settings=AppSettings(
-            mode=SafetyMode.LIVE_GATED,
-            live_trading_enabled=True,
-            broker={"provider": "webull_live"},
-        ),
-        trade_api=api,
-        skip_account_list_check=True,
-    )
+    from tests.broker._live_helpers import make_live_client
+    client, api, _ = make_live_client(tmp_path)
     intent = _intent()
     built = client.build_payload(intent)
     preview = client.preview_order(intent)

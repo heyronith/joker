@@ -20,6 +20,7 @@ class EventType(StrEnum):
     MARKET_SNAPSHOT_CREATED = "market_snapshot_created"
     OPTION_SURFACE_CREATED = "option_surface_created"
     ORDER_SUBMITTED = "order_submitted"
+    ORDER_SUBMISSION_UNKNOWN = "order_submission_unknown"
     ORDER_ACCEPTED = "order_accepted"
     ORDER_PARTIALLY_FILLED = "order_partially_filled"
     ORDER_FILLED = "order_filled"

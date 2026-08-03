@@ -171,7 +171,6 @@ class BrokerReconciliationService:
                         detail="Ambiguous submission awaiting order-detail reconciliation",
                     )
                 )
-                self._try_resolve_unknown(rec)
 
         if account_truth is not None and self.account_id_hash:
             if account_truth.account_id_hash != self.account_id_hash:
@@ -196,28 +195,50 @@ class BrokerReconciliationService:
             unknown_submissions=unknown,
         )
 
-    def _try_resolve_unknown(self, rec: BrokerSubmissionRecord) -> None:
+    def resolve_unknown_submissions(self) -> list[BrokerSubmissionRecord]:
+        """Query broker detail for submission_unknown rows; transition journal.
+
+        Returns records that were resolved. Caller should append ledger events and
+        re-run ``reconcile()`` — do not keep stale unknown findings after resolve.
+        """
+        if self.journal is None or not self.account_id_hash:
+            return []
+        resolved: list[BrokerSubmissionRecord] = []
+        unknowns = self.journal.list_by_status(
+            "submission_unknown", account_id_hash=self.account_id_hash
+        )
+        for rec in unknowns:
+            if self._try_resolve_unknown(rec):
+                updated = self.journal.get(rec.account_id_hash, rec.client_order_id)
+                if updated is not None:
+                    resolved.append(updated)
+        return resolved
+
+    def _try_resolve_unknown(self, rec: BrokerSubmissionRecord) -> bool:
         get_order = getattr(self.broker, "get_order", None)
         if not callable(get_order) or self.journal is None:
-            return
+            return False
         order = get_order(rec.client_order_id)
         if order is None:
-            return
+            return False
         status = str(getattr(order, "status", "") or "")
         mapped = {
             "filled": "filled",
+            "partially_filled": "partially_filled",
             "cancelled": "cancelled",
             "rejected": "rejected",
             "open": "accepted",
             "pending": "accepted",
         }.get(status)
-        if mapped:
-            self.journal.transition(
-                account_id_hash=rec.account_id_hash,
-                client_order_id=rec.client_order_id,
-                status=mapped,  # type: ignore[arg-type]
-                broker_order_id=str(getattr(order, "order_id", rec.client_order_id)),
-            )
+        if not mapped:
+            return False
+        self.journal.transition(
+            account_id_hash=rec.account_id_hash,
+            client_order_id=rec.client_order_id,
+            status=mapped,  # type: ignore[arg-type]
+            broker_order_id=str(getattr(order, "order_id", rec.client_order_id)),
+        )
+        return True
 
 
 def _contract_key(pos: Any) -> str:

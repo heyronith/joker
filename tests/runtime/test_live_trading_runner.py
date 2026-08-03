@@ -124,7 +124,9 @@ async def test_live_runner_requires_confirmed_objective(tmp_path) -> None:
 
 
 def test_production_preflight_performs_no_mutation(tmp_path) -> None:
+    from joker.persistence.migrations import apply_task1_migrations
     app = _live_app(tmp_path)
+    apply_task1_migrations(tmp_path / "live.db")
     api = create_mock_live_trade_api("LIVE_ACCT_1")
     report = run_production_preflight(
         app_settings=app,
@@ -136,6 +138,7 @@ def test_production_preflight_performs_no_mutation(tmp_path) -> None:
     assert any("mutation: none" in c for c in report.checks)
     assert report.ok is True
     assert api.placed == []
+    assert any("sqlite: ok" in c for c in report.checks)
 
 
 def test_live_health_exposes_unresolved_broker_state(tmp_path) -> None:
@@ -173,8 +176,9 @@ def test_live_health_exposes_unresolved_broker_state(tmp_path) -> None:
         entries_blocked=True,
         unknown_submissions=1,
     )
-    runner._degraded_reasons = ["submission_unknown"]
+    runner.entry_permission.block("submission_unknown")
     health = runner.health()
     assert health.unknown_submissions == 1
     assert health.reconciliation_clean is False
     assert health.entries_permitted is False
+    assert health.market_data_healthy is False  # not hardcoded True without session

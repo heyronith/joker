@@ -70,6 +70,26 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
                     recoverable=False,
                 ),
             }
+        perm = getattr(deps, "entry_permission", None)
+        if perm is not None and not bool(getattr(perm, "permitted", True)):
+            reasons = getattr(perm, "reasons", ()) or ()
+            return {
+                "_block_new_entries": True,
+                **append_error(
+                    state,
+                    node_name="validate_trigger",
+                    error_code="entry_permission_blocked",
+                    message=(
+                        "entries blocked: " + (", ".join(reasons) or "reconciliation")
+                    ),
+                    recoverable=True,
+                ),
+                **trace_update(
+                    append_trace(
+                        state, node_name="validate_trigger", status="completed"
+                    )
+                ),
+            }
         gate = await gate_objective_confirmed(deps, state)
         return {
             **(gate or {}),

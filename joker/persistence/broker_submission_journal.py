@@ -401,6 +401,7 @@ class SyncBrokerSubmissionJournal:
         preview_hash: str | None = None,
         payload_hash_value: str | None = None,
         last_error_code: str | None = None,
+        extra_update: dict[str, Any] | None = None,
     ) -> BrokerSubmissionRecord:
         import sqlite3
 
@@ -408,6 +409,9 @@ class SyncBrokerSubmissionJournal:
         if existing is None:
             raise KeyError(f"submission not found: {client_order_id}")
         now = datetime.now(timezone.utc).isoformat()
+        extra = dict(existing.extra or {})
+        if extra_update:
+            extra.update(extra_update)
         conn = sqlite3.connect(self._db_path)
         try:
             conn.execute(
@@ -418,7 +422,8 @@ class SyncBrokerSubmissionJournal:
                     preview_hash = COALESCE(?, preview_hash),
                     payload_hash = COALESCE(?, payload_hash),
                     last_error_code = COALESCE(?, last_error_code),
-                    updated_at = ?
+                    updated_at = ?,
+                    extra_json = ?
                 WHERE account_id_hash = ? AND client_order_id = ?
                 """,
                 (
@@ -428,6 +433,7 @@ class SyncBrokerSubmissionJournal:
                     payload_hash_value,
                     last_error_code,
                     now,
+                    json.dumps(extra),
                     account_id_hash,
                     client_order_id,
                 ),

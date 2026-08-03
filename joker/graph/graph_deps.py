@@ -89,6 +89,8 @@ class CognitiveGraphDeps:
     historical_outcome_settings: Any | None = None
     # Risk kill switch — stronger than objective approval for ENTRY/PROBE/ADD.
     kill_switch: bool = False
+    # Shared entry-permission gate (startup reconciliation / truth uncertainty).
+    entry_permission: Any | None = None
     # Authoritative Task-1 quote / quality loaders for execution-time EV.
     current_option_quote_loader: Any | None = None
     current_data_quality_loader: Any | None = None

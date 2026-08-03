@@ -36,6 +36,7 @@ from joker.runtime.cognitive_agent_runtime import (
 from joker.runtime.cognitive_binding import bind_cognitive_graph_to_task1
 from joker.runtime.cognitive_startup import validate_cognitive_providers
 from joker.runtime.compatibility import CompatibilityLivePaperBridge
+from joker.runtime.entry_permission import EntryPermissionState
 from joker.runtime.objective_recovery import recover_session_objective
 
 
@@ -120,7 +121,9 @@ async def prepare_agentic_trading_session(
     fake_model_provider: FakeModelProvider | None = None,
     clock: Any | None = None,
     start_cognitive_agent: bool = True,
+    start_evolution_workers: bool = True,
     broker_account_id: str = "local_paper",
+    entry_permission: Any | None = None,
 ) -> PreparedTradingSession:
     """Shared session construction for paper and live — identical graph/EV/sizing."""
     if not bool(getattr(app_settings.evolution, "enabled", False)):
@@ -198,6 +201,7 @@ async def prepare_agentic_trading_session(
         historical_outcome_settings=engines.historical_outcome_settings,
         objective_execution_settings=getattr(app_settings.objective, "execution", None),
         kill_switch=bool(app_settings.risk.kill_switch),
+        entry_permission=entry_permission or EntryPermissionState(),
         max_quote_age_seconds=max_quote_age,
         max_relative_spread=max_spread,
         configuration_repo=evo_repos.get("configurations"),
@@ -290,8 +294,9 @@ async def prepare_agentic_trading_session(
     agent_runtime.bind_evolution_runtime(evolution_runtime)
     if start_cognitive_agent:
         await bridge.astart_agent()
-    await evolution_runtime.start_workers()
-    await evolution_runtime.resume()
+    if start_evolution_workers:
+        await evolution_runtime.start_workers()
+        await evolution_runtime.resume()
 
     return PreparedTradingSession(
         app_settings=app_settings,
@@ -319,6 +324,8 @@ async def prepare_cognitive_paper_session(
     fake_model_provider: FakeModelProvider | None = None,
     clock: Any | None = None,
     start_cognitive_agent: bool = True,
+    start_evolution_workers: bool = True,
+    entry_permission: Any | None = None,
 ) -> PreparedTradingSession:
     """Paper wrapper around the shared agentic session factory."""
     from joker.broker.webull_live import WebullLiveClient
@@ -339,6 +346,8 @@ async def prepare_cognitive_paper_session(
         fake_model_provider=fake_model_provider,
         clock=clock,
         start_cognitive_agent=start_cognitive_agent,
+        start_evolution_workers=start_evolution_workers,
+        entry_permission=entry_permission,
         broker_account_id="local_paper" if kind == "local_paper" else "webull_paper",
     )
 
@@ -354,6 +363,8 @@ async def prepare_cognitive_live_session(
     fake_model_provider: FakeModelProvider | None = None,
     clock: Any | None = None,
     start_cognitive_agent: bool = True,
+    start_evolution_workers: bool = True,
+    entry_permission: Any | None = None,
 ) -> PreparedTradingSession:
     """Live wrapper — same graph/EV/sizing as paper; live broker only."""
     from joker.app.safety import SafetyMode
@@ -382,5 +393,7 @@ async def prepare_cognitive_live_session(
         fake_model_provider=fake_model_provider,
         clock=clock,
         start_cognitive_agent=start_cognitive_agent,
+        start_evolution_workers=start_evolution_workers,
+        entry_permission=entry_permission,
         broker_account_id=broker.account_id_hash,
     )

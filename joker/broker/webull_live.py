@@ -22,7 +22,8 @@ from joker.broker.account_truth import (
     mask_account_id,
     parse_balance_truth,
 )
-from joker.broker.interface import BrokerClient, BrokerError
+from joker.broker.interface import BrokerClient, BrokerError, BrokerSubmissionUnknown
+from joker.broker.order_update import BrokerOrderUpdate
 from joker.broker.position_intent import validate_position_intent
 from joker.broker.webull_trade_api import (
     MockWebullTradeApi,
@@ -37,12 +38,14 @@ from joker.config.validation import redact_secrets
 from joker.data.webull_errors import WebullApiError
 from joker.data.webull_http import WebullHttpClient
 from joker.persistence.broker_submission_journal import (
-    BrokerSubmissionRecord,
-    DuplicateSubmissionError,
     SyncBrokerSubmissionJournal,
-    payload_hash,
 )
-from joker.schemas.domain import BrokerOrder, OrderIntent, Position
+from joker.persistence.session_pnl_baseline import (
+    SessionPnlBaseline,
+    SessionPnlBaselineStore,
+)
+from joker.runtime.live_activation import LiveActivation
+from joker.schemas.domain import BrokerOrder, OptionContract, OrderIntent, Position
 
 logger = logging.getLogger(__name__)
 
@@ -249,11 +252,14 @@ class WebullLiveClient(BrokerClient):
         env: EnvSettings,
         *,
         app_settings: AppSettings,
-        trade_api: WebullTradeApi | None = None,
+        activation: LiveActivation | None = None,
         journal: SyncBrokerSubmissionJournal | None = None,
+        trade_api: WebullTradeApi | None = None,
         capture_only: bool = False,
         skip_account_list_check: bool = False,
-        process_armed: bool = True,
+        session_id: str | None = None,
+        baseline_store: SessionPnlBaselineStore | None = None,
+        objective_id: str | None = None,
     ) -> None:
         if app_settings.mode is not SafetyMode.LIVE_GATED:
             raise WebullLiveConfigError(
@@ -264,10 +270,17 @@ class WebullLiveClient(BrokerClient):
                 "WebullLiveClient requires app_settings.live_trading_enabled=true"
             )
         credentials = env.live_credentials_env()
-        if not process_armed:
-            raise WebullLiveConfigError(
-                "Live broker process is not armed for the current process"
-            )
+        if not capture_only:
+            if activation is None:
+                raise WebullLiveConfigError(
+                    "WebullLiveClient requires LiveActivation for placement"
+                )
+            if journal is None:
+                raise WebullLiveConfigError(
+                    "WebullLiveClient requires durable submission journal for placement"
+                )
+            if not activation.is_active():
+                raise WebullLiveConfigError("LiveActivation is expired or inactive")
         if not skip_account_list_check:
             validate_live_broker_startup(
                 app_settings=app_settings, env=env, trade_api=trade_api
@@ -289,18 +302,38 @@ class WebullLiveClient(BrokerClient):
         self._credentials = credentials
         self._account_id = str(credentials.account_id)
         self._account_id_hash = hash_account_id(self._account_id)
+        if activation is not None:
+            if activation.account_id_hash != self._account_id_hash:
+                raise WebullLiveConfigError(
+                    "LiveActivation account_id_hash does not match production account"
+                )
+            if objective_id is not None and str(activation.objective_id) != str(
+                objective_id
+            ):
+                raise WebullLiveConfigError(
+                    "LiveActivation objective_id mismatch"
+                )
+        self._activation = activation
         self._api = trade_api or HttpWebullLiveTradeApi(credentials)
         self._journal = journal
         self._capture_only = capture_only
         self._captured_payloads: list[dict[str, Any]] = []
         self._orders: dict[str, BrokerOrder] = {}
-        self._intent_by_order: dict[str, OrderIntent] = {}
-        self._session_baseline_nlv: Decimal | None = None
-        self._armed = process_armed
+        self._session_id = session_id or "live-session"
+        self._baseline_store = baseline_store
+        self._truth_unavailable = False
 
     @property
     def account_id_hash(self) -> str:
         return self._account_id_hash
+
+    @property
+    def journal(self) -> SyncBrokerSubmissionJournal | None:
+        return self._journal
+
+    @property
+    def activation(self) -> LiveActivation | None:
+        return self._activation
 
     @property
     def captured_payloads(self) -> list[dict[str, Any]]:
@@ -312,12 +345,19 @@ class WebullLiveClient(BrokerClient):
             close()
 
     def _assert_armed(self) -> None:
-        if not self._armed:
-            raise WebullLiveConfigError("Live mode is not armed for this process")
         if self._credentials.api_env != "prod":
             raise WebullLiveConfigError("Live API environment must remain prod")
         if not self._app.live_trading_enabled or not self._env.webull_live_trading_enabled:
             raise WebullLiveConfigError("Live trading flags must remain enabled")
+        if not self._capture_only:
+            if self._activation is None or not self._activation.is_active():
+                raise WebullLiveConfigError(
+                    "LiveActivation required and must be active for placement"
+                )
+            if self._journal is None:
+                raise WebullLiveConfigError(
+                    "Durable journal required for live placement"
+                )
 
     def build_payload(
         self,
@@ -427,12 +467,19 @@ class WebullLiveClient(BrokerClient):
                 side=intent.side,
                 quantity=intent.quantity,
                 limit_price=intent.limit_price,
+                position_intent=intent.position_intent,
+                remaining_quantity=intent.quantity,
             )
             self._orders[cid] = order
-            self._intent_by_order[cid] = intent
             return order
 
-        self._journal_prepare(intent, payload, cid)
+        # Journal prepare is owned by gateway before preview; require existing row.
+        assert self._journal is not None
+        existing = self._journal.get(self._account_id_hash, cid)
+        if existing is None:
+            raise BrokerError(
+                f"missing journal row before placement for {cid} — fail closed"
+            )
         self._journal_transition(cid, "submission_started")
         try:
             response = self._api.place_order(self._account_id, [payload])
@@ -443,11 +490,8 @@ class WebullLiveClient(BrokerClient):
             reconciled = self._reconcile_unknown(cid, intent)
             if reconciled is not None:
                 return reconciled
-            raise BrokerError(
-                f"Live submission unknown after timeout for {cid}"
-            ) from exc
+            raise BrokerSubmissionUnknown(cid) from exc
         except Exception as exc:
-            # Ambiguous network failures → unknown; clear rejects stay rejected.
             if _looks_ambiguous(exc):
                 self._journal_transition(
                     cid,
@@ -457,10 +501,9 @@ class WebullLiveClient(BrokerClient):
                 reconciled = self._reconcile_unknown(cid, intent)
                 if reconciled is not None:
                     return reconciled
-                raise BrokerError(
-                    redact_secrets(
-                        f"Live submission unknown: {exc}", env=self._env
-                    )
+                raise BrokerSubmissionUnknown(
+                    cid,
+                    redact_secrets(f"Live submission unknown: {exc}", env=self._env),
                 ) from exc
             self._journal_transition(
                 cid, "rejected", last_error_code=type(exc).__name__
@@ -475,23 +518,14 @@ class WebullLiveClient(BrokerClient):
         broker_order_id = str(
             response.get("order_id") or response.get("broker_order_id") or cid
         )
-        journal_status = "filled" if status == "filled" else "accepted"
-        if status == "rejected":
-            journal_status = "rejected"
+        journal_status = _journal_status_for(status)
         self._journal_transition(
-            cid, journal_status, broker_order_id=broker_order_id  # type: ignore[arg-type]
+            cid, journal_status, broker_order_id=broker_order_id
         )
-        order = BrokerOrder(
-            order_id=cid,
-            intent_id=intent.intent_id,
-            status=status,  # type: ignore[arg-type]
-            contract=intent.contract,
-            side=intent.side,
-            quantity=intent.quantity,
-            limit_price=intent.limit_price,
+        order = self._order_from_detail_or_intent(
+            cid, response, intent=intent, status=status, broker_order_id=broker_order_id
         )
         self._orders[cid] = order
-        self._intent_by_order[cid] = intent
         return order
 
     def cancel_order(self, order_id: str) -> BrokerOrder:
@@ -504,66 +538,75 @@ class WebullLiveClient(BrokerClient):
                 redact_secrets(f"Webull live cancel failed: {exc}", env=self._env)
             ) from exc
         self._journal_transition(order_id, "cancelled")
-        order = self._orders.get(order_id)
+        order = self.get_order(order_id)
         if order is None:
-            intent = self._intent_by_order.get(order_id)
-            if intent is None:
-                raise BrokerError(f"Unknown local order_id: {order_id}")
-            order = BrokerOrder(
-                order_id=order_id,
-                intent_id=intent.intent_id,
-                status="cancelled",
-                contract=intent.contract,
-                side=intent.side,
-                quantity=intent.quantity,
-                limit_price=intent.limit_price,
-            )
-        else:
-            order.status = "cancelled"
-        self._orders[order_id] = order
-        return order
+            raise BrokerError(f"Unknown order_id after cancel: {order_id}")
+        cancelled = order.model_copy(update={"status": "cancelled"})
+        self._orders[order_id] = cancelled
+        return cancelled
 
     def get_order(self, order_id: str) -> BrokerOrder | None:
+        """Reconstruct from broker detail + journal — never silent local-only truth."""
         try:
             detail = self._api.get_order_detail(self._account_id, order_id)
         except Exception:
-            return self._orders.get(order_id)
-        status = map_webull_order_status(
-            str(detail.get("status") or detail.get("order_status") or "")
-        )
-        local = self._orders.get(order_id)
-        intent = self._intent_by_order.get(order_id)
-        if local is not None:
-            local.status = status  # type: ignore[assignment]
-            return local
-        if intent is None:
+            self._truth_unavailable = True
             return None
-        order = BrokerOrder(
-            order_id=order_id,
-            intent_id=intent.intent_id,
-            status=status,  # type: ignore[arg-type]
-            contract=intent.contract,
-            side=intent.side,
-            quantity=intent.quantity,
-            limit_price=intent.limit_price,
-        )
-        self._orders[order_id] = order
-        return order
+        self._truth_unavailable = False
+        return self._reconstruct_order(order_id, detail)
 
     def list_open_orders(self) -> list[BrokerOrder]:
         try:
             rows = self._api.list_open_orders(self._account_id)
-        except Exception:
-            return [o for o in self._orders.values() if o.status in {"open", "pending"}]
+        except Exception as exc:
+            self._truth_unavailable = True
+            raise BrokerError(
+                redact_secrets(
+                    f"Live open-orders unavailable: {exc}", env=self._env
+                )
+            ) from exc
+        self._truth_unavailable = False
         result: list[BrokerOrder] = []
         for row in rows:
             cid = str(row.get("client_order_id") or "")
             if not cid:
                 continue
-            local = self.get_order(cid)
-            if local is not None and local.status in {"open", "pending"}:
-                result.append(local)
+            order = self._reconstruct_order(cid, row)
+            if order is not None and order.status in {
+                "open",
+                "pending",
+                "partially_filled",
+            }:
+                result.append(order)
         return result
+
+    def to_order_update(self, order: BrokerOrder) -> BrokerOrderUpdate:
+        filled = int(order.filled_quantity or 0)
+        remaining = (
+            order.remaining_quantity
+            if order.remaining_quantity is not None
+            else max(0, order.quantity - filled)
+        )
+        return BrokerOrderUpdate(
+            client_order_id=order.order_id,
+            broker_order_id=order.order_id,
+            status=order.status,  # type: ignore[arg-type]
+            quantity=order.quantity,
+            cumulative_filled_quantity=filled,
+            remaining_quantity=int(remaining),
+            average_fill_price=(
+                Decimal(str(order.average_fill_price))
+                if order.average_fill_price is not None
+                else None
+            ),
+            limit_price=(
+                Decimal(str(order.limit_price))
+                if order.limit_price is not None
+                else None
+            ),
+            side=order.side,
+            position_intent=order.position_intent,
+        )
 
     def list_positions(self) -> list[Position]:
         try:
@@ -615,9 +658,9 @@ class WebullLiveClient(BrokerClient):
             ) from exc
         parsed = parse_balance_truth(balance)
         nlv = parsed["net_liquidation_value_usd"]
+        cash = parsed["cash_usd"]
         session_pnl: Decimal | None = None
         session_available = False
-        # Prefer explicit day PnL from broker when present.
         explicit = decimal_or_none(
             balance.get("day_pnl")
             or balance.get("today_pnl")
@@ -626,17 +669,20 @@ class WebullLiveClient(BrokerClient):
         if explicit is not None:
             session_pnl = explicit
             session_available = True
-        elif nlv is not None:
-            if self._session_baseline_nlv is None:
-                self._session_baseline_nlv = nlv
-                session_pnl = Decimal("0")
+        else:
+            baseline = self._load_or_create_baseline(nlv=nlv, cash=cash)
+            if baseline is not None and baseline.starting_nlv is not None and nlv is not None:
+                session_pnl = nlv - baseline.starting_nlv
+                if baseline.external_cash_adjustment is not None:
+                    session_pnl -= baseline.external_cash_adjustment
                 session_available = True
             else:
-                session_pnl = nlv - self._session_baseline_nlv
-                session_available = True
+                # Unavailable — never fabricate zero.
+                session_pnl = None
+                session_available = False
         return BrokerAccountTruth(
             account_id_hash=self._account_id_hash,
-            cash_usd=parsed["cash_usd"],
+            cash_usd=cash,
             buying_power_usd=parsed["buying_power_usd"],
             net_liquidation_value_usd=nlv,
             session_pnl_usd=session_pnl,
@@ -645,6 +691,30 @@ class WebullLiveClient(BrokerClient):
             working_orders=tuple(self.list_open_orders()),
             captured_at=datetime.now(timezone.utc),
         )
+
+    def _load_or_create_baseline(
+        self, *, nlv: Decimal | None, cash: Decimal | None
+    ) -> SessionPnlBaseline | None:
+        if self._baseline_store is None or nlv is None:
+            return None
+        trading_date = datetime.now(timezone.utc).date().isoformat()
+        existing = self._baseline_store.get(
+            account_id_hash=self._account_id_hash,
+            trading_date=trading_date,
+            session_id=self._session_id,
+        )
+        if existing is not None:
+            return existing
+        baseline = SessionPnlBaseline(
+            account_id_hash=self._account_id_hash,
+            trading_date=trading_date,
+            session_id=self._session_id,
+            starting_nlv=nlv,
+            starting_cash=cash,
+            captured_at=datetime.now(timezone.utc),
+        )
+        self._baseline_store.put(baseline)
+        return baseline
 
     def _reconcile_unknown(
         self, client_order_id: str, intent: OrderIntent
@@ -657,59 +727,115 @@ class WebullLiveClient(BrokerClient):
             str(detail.get("status") or detail.get("order_status") or "")
         )
         broker_order_id = str(detail.get("order_id") or client_order_id)
-        journal_status: Literal[
-            "accepted", "filled", "rejected", "cancelled", "partially_filled", "reconciled"
-        ]
-        if status == "filled":
-            journal_status = "filled"
-        elif status == "rejected":
-            journal_status = "rejected"
-        elif status == "cancelled":
-            journal_status = "cancelled"
-        else:
-            journal_status = "accepted"
         self._journal_transition(
-            client_order_id, journal_status, broker_order_id=broker_order_id
+            client_order_id,
+            _journal_status_for(status),
+            broker_order_id=broker_order_id,
         )
+        order = self._order_from_detail_or_intent(
+            client_order_id,
+            detail,
+            intent=intent,
+            status=status,
+            broker_order_id=broker_order_id,
+        )
+        self._orders[client_order_id] = order
+        return order
+
+    def _reconstruct_order(
+        self, client_order_id: str, detail: dict[str, Any]
+    ) -> BrokerOrder | None:
+        journal_row = None
+        if self._journal is not None:
+            journal_row = self._journal.get(self._account_id_hash, client_order_id)
+        status = map_webull_order_status(
+            str(detail.get("status") or detail.get("order_status") or "")
+        )
+        contract = _contract_from_detail(detail)
+        if contract is None and journal_row is not None and journal_row.contract_id:
+            contract = _contract_from_contract_id(journal_row.contract_id)
+        if contract is None:
+            return None
+        side_raw = str(
+            detail.get("side")
+            or (journal_row.side if journal_row else "")
+            or "buy"
+        ).lower()
+        side = "sell" if side_raw.startswith("sell") else "buy"
+        qty = int(
+            float(
+                detail.get("quantity")
+                or (journal_row.quantity if journal_row else 0)
+                or 0
+            )
+        )
+        filled = int(
+            float(
+                detail.get("filled_quantity")
+                or detail.get("cumulative_filled_quantity")
+                or (qty if status == "filled" else 0)
+            )
+        )
+        if status == "partially_filled" and filled <= 0:
+            filled = max(1, qty // 2) if qty else 0
+        remaining = max(0, qty - filled)
+        limit = detail.get("limit_price")
+        if limit is None and journal_row is not None:
+            limit = journal_row.limit_price
+        avg = detail.get("avg_filled_price") or detail.get("average_fill_price")
+        position_intent = None
+        if journal_row is not None:
+            position_intent = journal_row.position_intent
+        position_intent = position_intent or detail.get("position_intent")
         order = BrokerOrder(
             order_id=client_order_id,
+            intent_id=client_order_id,
+            status=status,  # type: ignore[arg-type]
+            contract=contract,
+            side=side,  # type: ignore[arg-type]
+            quantity=qty,
+            limit_price=float(limit) if limit is not None else None,
+            filled_quantity=filled,
+            remaining_quantity=remaining,
+            average_fill_price=float(avg) if avg is not None else None,
+            position_intent=position_intent,  # type: ignore[arg-type]
+        )
+        self._orders[client_order_id] = order
+        return order
+
+    def _order_from_detail_or_intent(
+        self,
+        cid: str,
+        detail: dict[str, Any],
+        *,
+        intent: OrderIntent,
+        status: str,
+        broker_order_id: str,
+    ) -> BrokerOrder:
+        filled = int(
+            float(
+                detail.get("filled_quantity")
+                or detail.get("cumulative_filled_quantity")
+                or (intent.quantity if status == "filled" else 0)
+            )
+        )
+        return BrokerOrder(
+            order_id=cid,
             intent_id=intent.intent_id,
             status=status,  # type: ignore[arg-type]
             contract=intent.contract,
             side=intent.side,
             quantity=intent.quantity,
             limit_price=intent.limit_price,
-        )
-        self._orders[client_order_id] = order
-        self._intent_by_order[client_order_id] = intent
-        return order
-
-    def _journal_prepare(
-        self, intent: OrderIntent, payload: dict[str, Any], cid: str
-    ) -> None:
-        if self._journal is None:
-            return
-        record = BrokerSubmissionRecord(
-            client_order_id=cid,
-            broker_mode="webull_live",
-            account_id_hash=self._account_id_hash,
-            status="prepared",
-            contract_id=(
-                f"{intent.contract.symbol}:{intent.contract.expiration.isoformat()}:"
-                f"{intent.contract.strike}:{intent.contract.option_type}"
+            filled_quantity=filled,
+            remaining_quantity=max(0, intent.quantity - filled),
+            average_fill_price=(
+                float(detail["avg_filled_price"])
+                if detail.get("avg_filled_price") is not None
+                else None
             ),
-            side=intent.side,
             position_intent=intent.position_intent,
-            quantity=intent.quantity,
-            limit_price=(
-                f"{intent.limit_price:.2f}" if intent.limit_price is not None else None
-            ),
-            payload_hash=payload_hash(payload),
         )
-        try:
-            self._journal.prepare(record)
-        except DuplicateSubmissionError as exc:
-            raise BrokerError(str(exc)) from exc
 
     def _journal_transition(
         self,
@@ -718,9 +844,12 @@ class WebullLiveClient(BrokerClient):
         *,
         broker_order_id: str | None = None,
         last_error_code: str | None = None,
+        preview_hash: str | None = None,
     ) -> None:
         if self._journal is None:
-            return
+            if self._capture_only:
+                return
+            raise BrokerError("journal required for live transition — fail closed")
         try:
             self._journal.transition(
                 account_id_hash=self._account_id_hash,
@@ -728,9 +857,67 @@ class WebullLiveClient(BrokerClient):
                 status=status,  # type: ignore[arg-type]
                 broker_order_id=broker_order_id,
                 last_error_code=last_error_code,
+                preview_hash=preview_hash,
             )
-        except KeyError:
-            pass
+        except KeyError as exc:
+            raise BrokerError(
+                f"missing journal row for transition {cid}/{status} — fail closed"
+            ) from exc
+
+
+def _journal_status_for(status: str) -> str:
+    if status == "filled":
+        return "filled"
+    if status == "partially_filled":
+        return "partially_filled"
+    if status == "rejected":
+        return "rejected"
+    if status == "cancelled":
+        return "cancelled"
+    return "accepted"
+
+
+def _contract_from_detail(detail: dict[str, Any]) -> OptionContract | None:
+    legs = detail.get("legs") if isinstance(detail.get("legs"), list) else []
+    leg = legs[0] if legs and isinstance(legs[0], dict) else detail
+    try:
+        from datetime import date as date_cls
+
+        symbol = str(leg.get("symbol") or detail.get("symbol") or "").upper()
+        expire = leg.get("option_expire_date") or detail.get("option_expire_date")
+        strike = leg.get("strike_price") or leg.get("option_exercise_price")
+        opt = str(leg.get("option_type") or "").lower()
+        if not symbol or not expire or strike is None or opt not in {"call", "put"}:
+            return None
+        expiration = date_cls.fromisoformat(str(expire)[:10])
+        return OptionContract(
+            symbol=symbol,
+            expiration=expiration,
+            strike=float(strike),
+            option_type=opt,  # type: ignore[arg-type]
+            is_0dte=expiration == date_cls.today(),
+        )
+    except Exception:
+        return None
+
+
+def _contract_from_contract_id(contract_id: str) -> OptionContract | None:
+    parts = contract_id.split(":")
+    if len(parts) != 4:
+        return None
+    try:
+        from datetime import date as date_cls
+
+        expiration = date_cls.fromisoformat(parts[1])
+        return OptionContract(
+            symbol=parts[0],
+            expiration=expiration,
+            strike=float(parts[2]),
+            option_type=parts[3],  # type: ignore[arg-type]
+            is_0dte=expiration == date_cls.today(),
+        )
+    except Exception:
+        return None
 
 
 def _looks_ambiguous(exc: Exception) -> bool:

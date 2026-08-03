@@ -14,7 +14,8 @@ from decimal import Decimal
 from typing import Any
 from uuid import uuid4
 
-from joker.broker.interface import BrokerClient
+from joker.broker.interface import BrokerClient, BrokerSubmissionUnknown
+from joker.broker.order_update import BrokerOrderUpdate
 from joker.events.bus import InProcessAsyncEventBus
 from joker.events.schemas import EventType, make_event
 from joker.ledger.projector import LedgerProjector, ProjectionState
@@ -201,6 +202,31 @@ class ExecutionRuntime:
 
         try:
             order = self._broker.submit_order(intent)
+        except BrokerSubmissionUnknown as exc:
+            # Truthfully unknown — never append REJECTION / publish ORDER_REJECTED.
+            # Preserve client_order_id mapping absence until broker confirms; reservation
+            # is retained by the gateway. Duplicate placement is blocked by journal +
+            # _resolve_existing_submission / SUBMISSION_UNKNOWN ledger identity.
+            unknown = make_ledger_event(
+                LedgerEventType.SUBMISSION_UNKNOWN,
+                broker_account_id=command.broker_account_id or self._broker_account_id,
+                client_order_id=command.client_order_id,
+                contract_id=cid,
+                side=intent.side,
+                quantity=Decimal(intent.quantity),
+                exchange_timestamp=self._now(),
+                idempotency_key=f"unknown:{command.client_order_id}",
+                session_id=self._session_id,
+                metadata={"error": str(exc), "client_order_id": exc.client_order_id},
+            )
+            await self._ledger.append(unknown)
+            await self._publish_order_event(
+                EventType.ORDER_SUBMISSION_UNKNOWN,
+                command.client_order_id,
+                self._now(),
+                extra={"error": str(exc)},
+            )
+            raise
         except Exception as exc:
             rejected = make_ledger_event(
                 LedgerEventType.REJECTION,
@@ -347,11 +373,14 @@ class ExecutionRuntime:
 
     async def on_broker_update(
         self,
-        order: BrokerOrder,
+        order: BrokerOrder | BrokerOrderUpdate,
         *,
         client_order_id: str | None = None,
     ) -> list[LedgerEvent]:
         """Apply a broker order update into the ledger (idempotent keys)."""
+        if isinstance(order, BrokerOrderUpdate):
+            return await self._on_broker_order_update(order, client_order_id=client_order_id)
+
         client_id = client_order_id or order.intent_id
         self._client_to_broker.setdefault(client_id, order.order_id)
         written: list[LedgerEvent] = []
@@ -390,25 +419,152 @@ class ExecutionRuntime:
             if await self._ledger.append(event):
                 written.append(event)
                 await self._publish_order_event(EventType.ORDER_REJECTED, client_id, now)
-        elif order.status == "filled":
-            fill_price = _verified_fill_price(self._broker, order)
-            if fill_price is not None:
-                fill_events = await self.record_verified_fill(
-                    order,
-                    client_order_id=client_id,
-                    fill_price=fill_price,
-                    fill_qty=Decimal(order.quantity),
-                    final=True,
-                )
-                written.extend(fill_events)
-            else:
-                await self._publish_order_event(
-                    EventType.ORDER_FILLED,
-                    client_id,
-                    now,
-                    extra={"broker_order_id": order.order_id, "fill_price_available": False},
-                )
+        elif order.status in {"partially_filled", "filled"}:
+            cumulative = int(
+                getattr(order, "filled_quantity", 0)
+                or (order.quantity if order.status == "filled" else 0)
+            )
+            if order.status == "filled" and cumulative <= 0:
+                cumulative = int(order.quantity)
+            already = await self._persisted_fill_quantity(client_id)
+            delta = cumulative - already
+            if delta > 0:
+                fill_price = _verified_fill_price(self._broker, order)
+                if fill_price is None and order.average_fill_price is not None:
+                    fill_price = Decimal(str(order.average_fill_price))
+                if fill_price is not None:
+                    fill_events = await self.record_verified_fill(
+                        order,
+                        client_order_id=client_id,
+                        fill_price=fill_price,
+                        fill_qty=Decimal(delta),
+                        final=order.status == "filled",
+                    )
+                    written.extend(fill_events)
+                else:
+                    await self._publish_order_event(
+                        (
+                            EventType.ORDER_FILLED
+                            if order.status == "filled"
+                            else EventType.ORDER_PARTIALLY_FILLED
+                        ),
+                        client_id,
+                        now,
+                        extra={
+                            "broker_order_id": order.order_id,
+                            "fill_price_available": False,
+                            "cumulative_filled_quantity": cumulative,
+                        },
+                    )
+            # delta <= 0: already persisted — do not republish ORDER_FILLED
+            # (spurious domain events confuse episode/position workers).
         return written
+
+    async def _on_broker_order_update(
+        self,
+        update: BrokerOrderUpdate,
+        *,
+        client_order_id: str | None = None,
+    ) -> list[LedgerEvent]:
+        client_id = client_order_id or update.client_order_id
+        self._client_to_broker.setdefault(client_id, update.broker_order_id)
+        order = self._broker.get_order(update.broker_order_id) or self._broker.get_order(
+            client_id
+        )
+        if order is None:
+            # Reconstruct a minimal BrokerOrder for fill recording when broker
+            # detail is momentarily unavailable but the typed update is authoritative.
+            return []
+        patched = order.model_copy(
+            update={
+                "status": update.status,
+                "filled_quantity": update.cumulative_filled_quantity,
+                "remaining_quantity": update.remaining_quantity,
+                "average_fill_price": (
+                    float(update.average_fill_price)
+                    if update.average_fill_price is not None
+                    else order.average_fill_price
+                ),
+            }
+        )
+        return await self.on_broker_update(patched, client_order_id=client_id)
+
+    async def _persisted_fill_quantity(self, client_order_id: str) -> int:
+        events = await self._ledger.get_by_session(self._session_id)
+        total = Decimal("0")
+        for event in events:
+            if event.client_order_id != client_order_id:
+                continue
+            if event.event_type in {
+                LedgerEventType.PARTIAL_FILL,
+                LedgerEventType.FINAL_FILL,
+            }:
+                total += Decimal(event.quantity or 0)
+        return int(total)
+
+    async def resolve_submission_unknown(
+        self,
+        client_order_id: str,
+        *,
+        side: str = "buy",
+        quantity: Decimal | None = None,
+        contract_id: str | None = None,
+    ) -> LedgerEvent | None:
+        """Transition SUBMISSION_UNKNOWN → ACCEPT or REJECT from broker truth."""
+        order = self._broker.get_order(client_order_id)
+        if order is None:
+            return None
+        now = self._now()
+        cid = contract_id or contract_id_for(order.contract)
+        qty = quantity if quantity is not None else Decimal(order.quantity)
+        if order.status == "rejected":
+            event = make_ledger_event(
+                LedgerEventType.REJECTION,
+                broker_account_id=self._broker_account_id,
+                client_order_id=client_order_id,
+                contract_id=cid,
+                side=order.side or side,  # type: ignore[arg-type]
+                quantity=qty,
+                exchange_timestamp=now,
+                idempotency_key=f"reject:{client_order_id}:{order.order_id}",
+                session_id=self._session_id,
+                broker_order_id=order.order_id,
+                metadata={"resolved_from": "submission_unknown"},
+            )
+            await self._ledger.append(event)
+            await self._publish_order_event(EventType.ORDER_REJECTED, client_order_id, now)
+            return event
+        if order.status in {"open", "pending", "partially_filled", "filled", "cancelled"}:
+            self._client_to_broker[client_order_id] = order.order_id
+            event = make_ledger_event(
+                LedgerEventType.BROKER_ORDER_ACCEPTED,
+                broker_account_id=self._broker_account_id,
+                client_order_id=client_order_id,
+                contract_id=cid,
+                side=order.side or side,  # type: ignore[arg-type]
+                quantity=qty,
+                exchange_timestamp=now,
+                idempotency_key=f"accept:{client_order_id}:{order.order_id}",
+                session_id=self._session_id,
+                broker_order_id=order.order_id,
+                price=(
+                    Decimal(str(order.limit_price))
+                    if order.limit_price is not None
+                    else None
+                ),
+                metadata={"resolved_from": "submission_unknown"},
+            )
+            await self._ledger.append(event)
+            await self._publish_order_event(
+                EventType.ORDER_ACCEPTED,
+                client_order_id,
+                now,
+                extra={"broker_order_id": order.order_id, "status": order.status},
+            )
+            if order.status in {"partially_filled", "filled"}:
+                await self.on_broker_update(order, client_order_id=client_order_id)
+            return event
+        return None
 
     async def record_verified_fill(
         self,
@@ -535,7 +691,10 @@ class ExecutionRuntime:
                 contract_id=contract_id_for(o.contract),
                 side=o.side,
                 quantity=Decimal(o.quantity),
-                filled_qty=Decimal(o.quantity) if o.status == "filled" else Decimal("0"),
+                filled_qty=Decimal(
+                    int(getattr(o, "filled_quantity", 0) or 0)
+                    or (o.quantity if o.status == "filled" else 0)
+                ),
                 status=o.status,
             )
             for o in self._broker.list_open_orders()
@@ -555,8 +714,9 @@ class ExecutionRuntime:
                         contract_id=contract_id_for(order.contract),
                         side=order.side,
                         quantity=Decimal(order.quantity),
-                        filled_qty=(
-                            Decimal(order.quantity) if order.status == "filled" else Decimal("0")
+                        filled_qty=Decimal(
+                            int(getattr(order, "filled_quantity", 0) or 0)
+                            or (order.quantity if order.status == "filled" else 0)
                         ),
                         status=order.status,
                     )

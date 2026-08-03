@@ -249,6 +249,29 @@ class OrderActionGateway:
                 broker_order=None,
             )
 
+        # Authoritative entry-permission gate — EXIT/REDUCE remain available.
+        entry_actions = {
+            OrderActionKind.ENTRY,
+            OrderActionKind.PROBE,
+            OrderActionKind.ADD,
+            OrderActionKind.REPLACE,
+        }
+        perm = getattr(self._deps, "entry_permission", None)
+        if (
+            request.action in entry_actions
+            and perm is not None
+            and not bool(getattr(perm, "permitted", True))
+        ):
+            reasons = getattr(perm, "reasons", ()) or ()
+            return OrderActionResult(
+                submitted=False,
+                client_order_id=request.client_order_id,
+                blocked_reason=(
+                    "entry_permission_blocked: " + (",".join(reasons) or "blocked")
+                ),
+                working_orders={},
+            )
+
         snapshot, data_quality, surface, _slice = await load_snapshot_truth(
             self._deps, request.snapshot_id
         )
@@ -298,6 +321,9 @@ class OrderActionGateway:
                     open_positions=open_positions,
                     degraded_reason=reason,
                 )
+                preview_block = await self._maybe_live_preview(command, request)
+                if preview_block is not None:
+                    return preview_block
                 order = await self._deps.execution_runtime.submit_execution_command(command)
                 if self._deps.provenance_registry is not None:
                     from joker.persistence.cognitive_execution_provenance import (
@@ -599,10 +625,10 @@ class OrderActionGateway:
         try:
             order = await self._deps.execution_runtime.submit_execution_command(command)
         except Exception as exc:
+            from joker.broker.interface import BrokerSubmissionUnknown
+
             if reserved and self._deps.objective_service is not None:
-                # Retain reservation on ambiguous unknown submission.
-                msg = str(exc).lower()
-                if "unknown" in msg or "timeout" in msg:
+                if isinstance(exc, BrokerSubmissionUnknown):
                     logger.error(
                         "submission_unknown_retaining_reservation",
                         extra={"client_order_id": command.client_order_id},
@@ -895,6 +921,7 @@ class OrderActionGateway:
             order_type=request.order_type,
             quantity=qty,
             limit_price=request.limit_price,
+            position_intent="SELL_TO_CLOSE",
         )
         logger.info(
             "compiled_degraded_exit",
@@ -902,6 +929,7 @@ class OrderActionGateway:
                 "client_order_id": request.client_order_id,
                 "reason": degraded_reason,
                 "quantity": qty,
+                "position_intent": "SELL_TO_CLOSE",
             },
         )
         return ExecutionCommand(
@@ -938,24 +966,79 @@ class OrderActionGateway:
         command: ExecutionCommand,
         request: OrderActionRequest,
     ) -> OrderActionResult | None:
-        """Run Webull live preview when the bound broker is WebullLiveClient."""
+        """Journal prepare → live preview → previewed. Sole journal owner."""
         from joker.broker.webull_live import WebullLiveClient
+        from joker.persistence.broker_submission_journal import (
+            BrokerSubmissionRecord,
+            DuplicateSubmissionError,
+            payload_hash,
+        )
 
         broker = getattr(self._deps.execution_runtime, "_broker", None)
         if not isinstance(broker, WebullLiveClient):
             return None
-        if getattr(broker, "_capture_only", False):
-            # Capture mode still builds/previews for equivalence tests when requested.
-            pass
-        try:
-            positions = broker.list_positions()
-            expected = None
-            if command.intent.limit_price is not None:
-                expected = (
-                    Decimal(str(command.intent.limit_price))
-                    * Decimal("100")
-                    * Decimal(command.intent.quantity)
+
+        journal = broker.journal
+        if journal is None and not getattr(broker, "_capture_only", False):
+            return OrderActionResult(
+                submitted=False,
+                client_order_id=command.client_order_id,
+                blocked_reason="live_journal_required",
+            )
+
+        positions = broker.list_positions()
+        payload = broker.build_payload(
+            command.intent,
+            client_order_id=command.client_order_id,
+            open_positions=positions,
+        )
+        if journal is not None:
+            contract_id = (
+                f"{command.intent.contract.symbol}:"
+                f"{command.intent.contract.expiration.isoformat()}:"
+                f"{command.intent.contract.strike}:"
+                f"{command.intent.contract.option_type}"
+            )
+            try:
+                journal.prepare(
+                    BrokerSubmissionRecord(
+                        client_order_id=command.client_order_id,
+                        broker_mode="webull_live",
+                        account_id_hash=broker.account_id_hash,
+                        status="prepared",
+                        session_id=self._deps.session_id,
+                        cycle_id=request.cycle_id,
+                        proposal_id=request.proposal_id,
+                        decision_id=request.decision_id,
+                        strategy_id=request.strategy_id,
+                        position_lifecycle_id=request.position_lifecycle_id,
+                        contract_id=contract_id,
+                        side=command.intent.side,
+                        position_intent=command.intent.position_intent,
+                        quantity=command.intent.quantity,
+                        limit_price=(
+                            f"{command.intent.limit_price:.2f}"
+                            if command.intent.limit_price is not None
+                            else None
+                        ),
+                        payload_hash=payload_hash(payload),
+                    )
                 )
+            except DuplicateSubmissionError as exc:
+                return OrderActionResult(
+                    submitted=False,
+                    client_order_id=command.client_order_id,
+                    blocked_reason=f"duplicate_submission: {exc}",
+                )
+
+        expected = None
+        if command.intent.limit_price is not None:
+            expected = (
+                Decimal(str(command.intent.limit_price))
+                * Decimal("100")
+                * Decimal(command.intent.quantity)
+            )
+        try:
             preview = broker.preview_order(
                 command.intent,
                 client_order_id=command.client_order_id,
@@ -968,7 +1051,41 @@ class OrderActionGateway:
                 client_order_id=command.client_order_id,
                 blocked_reason=f"broker_preview_failed: {exc}",
             )
+
+        if journal is not None:
+            try:
+                journal.transition(
+                    account_id_hash=broker.account_id_hash,
+                    client_order_id=command.client_order_id,
+                    status="previewed",
+                    preview_hash=preview.raw_response_hash,
+                    extra_update={
+                        "preview_accepted": preview.accepted,
+                        "estimated_cost_usd": (
+                            str(preview.estimated_cost_usd)
+                            if preview.estimated_cost_usd is not None
+                            else None
+                        ),
+                        "estimated_fees_usd": (
+                            str(preview.estimated_fees_usd)
+                            if preview.estimated_fees_usd is not None
+                            else None
+                        ),
+                    },
+                )
+            except KeyError as exc:
+                raise RuntimeError(
+                    "missing journal row during live preview transition — fail closed"
+                ) from exc
+
         if not preview.accepted:
+            if journal is not None:
+                journal.transition(
+                    account_id_hash=broker.account_id_hash,
+                    client_order_id=command.client_order_id,
+                    status="rejected",
+                    last_error_code=preview.rejection_code or "preview_rejected",
+                )
             return OrderActionResult(
                 submitted=False,
                 client_order_id=command.client_order_id,

@@ -186,11 +186,13 @@ def map_webull_order_status(raw: str | None) -> str:
     value = (raw or "").strip().upper()
     if value in {"FILLED", "FILLED_ALL", "COMPLETED"}:
         return "filled"
+    if value in {"PARTIAL_FILLED", "PARTIALLY_FILLED", "PARTIAL"}:
+        return "partially_filled"
     if value in {"CANCELLED", "CANCELED", "CANCEL"}:
         return "cancelled"
     if value in {"REJECTED", "FAILED", "EXPIRED"}:
         return "rejected"
-    if value in {"PENDING", "SUBMITTED", "WORKING", "PARTIAL_FILLED", "OPEN", ""}:
+    if value in {"PENDING", "SUBMITTED", "WORKING", "OPEN", ""}:
         return "open" if value else "pending"
     if value in {"PENDING_SUBMIT", "WAIT"}:
         return "pending"

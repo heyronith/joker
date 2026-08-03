@@ -41,6 +41,8 @@ def create_broker(
     *,
     trade_api: object | None = None,
     journal_db_path: str | Path | None = None,
+    activation: object | None = None,
+    capture_only: bool = False,
 ) -> BrokerClient:
     """
     Create a broker client from config.
@@ -79,6 +81,8 @@ def create_broker(
             env,
             trade_api=trade_api,
             journal_db_path=journal_db_path,
+            activation=activation,
+            capture_only=capture_only,
         )
     raise BrokerFactoryError(
         f"Unknown broker.provider={provider!r}. "
@@ -91,12 +95,20 @@ def create_live_broker(
     env: EnvSettings,
     *,
     trade_api: object | None = None,
+    activation: object | None = None,
     journal_db_path: str | Path | None = None,
     capture_only: bool = False,
     skip_account_list_check: bool = False,
+    session_id: str | None = None,
+    objective_id: str | None = None,
 ) -> BrokerClient:
-    """Construct WebullLiveClient. Never falls back to paper or local PaperBroker."""
+    """Construct WebullLiveClient. Never falls back to paper or local PaperBroker.
+
+    Placement-capable construction requires ``activation`` and ``journal_db_path``.
+    ``capture_only=True`` may omit both for non-submitting tests.
+    """
     from joker.broker.webull_live import WebullLiveClient
+    from joker.persistence.session_pnl_baseline import SessionPnlBaselineStore
 
     if (app_settings.broker.provider or "").strip().lower() not in {
         "webull_live",
@@ -116,17 +128,32 @@ def create_live_broker(
         raise BrokerFactoryError(
             "create_live_broker requires WEBULL_LIVE_TRADING_ENABLED=true — refusing fallback"
         )
+    if not capture_only:
+        if activation is None:
+            raise BrokerFactoryError(
+                "create_live_broker requires LiveActivation for placement"
+            )
+        if journal_db_path is None:
+            raise BrokerFactoryError(
+                "create_live_broker requires journal_db_path for placement"
+            )
     journal = None
+    baseline_store = None
     if journal_db_path is not None:
         journal = SyncBrokerSubmissionJournal(journal_db_path)
+        baseline_store = SessionPnlBaselineStore(journal_db_path)
     try:
         return WebullLiveClient(
             env,
             app_settings=app_settings,
+            activation=activation,  # type: ignore[arg-type]
             trade_api=trade_api,  # type: ignore[arg-type]
             journal=journal,
             capture_only=capture_only,
             skip_account_list_check=skip_account_list_check,
+            session_id=session_id,
+            baseline_store=baseline_store,
+            objective_id=objective_id,
         )
     except Exception as exc:
         raise BrokerFactoryError(

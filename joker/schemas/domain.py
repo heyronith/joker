@@ -352,11 +352,19 @@ class OrderIntent(VersionedModel):
 class BrokerOrder(VersionedModel):
     order_id: str
     intent_id: str
-    status: Literal["pending", "open", "filled", "cancelled", "rejected"]
+    status: Literal[
+        "pending", "open", "partially_filled", "filled", "cancelled", "rejected"
+    ]
     contract: OptionContract
     side: Literal["buy", "sell"]
     quantity: int
     limit_price: float | None = None
+    filled_quantity: int = 0
+    remaining_quantity: int | None = None
+    average_fill_price: float | None = None
+    position_intent: (
+        Literal["BUY_TO_OPEN", "BUY_TO_CLOSE", "SELL_TO_OPEN", "SELL_TO_CLOSE"] | None
+    ) = None
     submitted_at: datetime = Field(default_factory=datetime.utcnow)
 
 

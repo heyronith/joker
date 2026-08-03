@@ -167,6 +167,10 @@ def apply_task1_migrations(db_path: str | Path) -> Path:
     from joker.persistence.broker_submission_journal import (
         apply_broker_submission_journal_migration,
     )
+    from joker.persistence.session_pnl_baseline import (
+        apply_session_pnl_baseline_migration,
+    )
 
     apply_broker_submission_journal_migration(path)
+    apply_session_pnl_baseline_migration(path)
     return path

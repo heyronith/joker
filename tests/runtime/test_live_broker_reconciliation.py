@@ -16,29 +16,8 @@ from joker.schemas.domain import OptionContract, OrderIntent, Position
 
 
 def _client(tmp_path):
-    api = create_mock_live_trade_api("LIVE_ACCT_1")
-    journal = SyncBrokerSubmissionJournal(tmp_path / "j.db")
-    env = EnvSettings(  # type: ignore[call-arg]
-        OPENAI_API_KEY="k",
-        WEBULL_LIVE_TRADING_ENABLED=True,
-        WEBULL_LIVE_APP_KEY="lk",
-        WEBULL_LIVE_APP_SECRET="ls",
-        WEBULL_LIVE_ACCESS_TOKEN="lt",
-        WEBULL_LIVE_ACCOUNT_ID="LIVE_ACCT_1",
-        WEBULL_LIVE_API_ENV="prod",
-    )
-    client = WebullLiveClient(
-        env,
-        app_settings=AppSettings(
-            mode=SafetyMode.LIVE_GATED,
-            live_trading_enabled=True,
-            broker={"provider": "webull_live"},
-        ),
-        trade_api=api,
-        journal=journal,
-        skip_account_list_check=True,
-    )
-    return client, api, journal
+    from tests.broker._live_helpers import make_live_client, prepare_journal_for_intent
+    return make_live_client(tmp_path)
 
 
 def test_order_detail_polling_resolves_unknown(tmp_path) -> None:
@@ -59,6 +38,8 @@ def test_order_detail_polling_resolves_unknown(tmp_path) -> None:
         limit_price=1.0,
         position_intent="BUY_TO_OPEN",
     )
+    from tests.broker._live_helpers import prepare_journal_for_intent
+    prepare_journal_for_intent(client, intent)
     client.submit_order(intent)
     svc = BrokerReconciliationService(
         broker=client, journal=journal, account_id_hash=client.account_id_hash
@@ -79,6 +60,10 @@ def test_restart_with_working_order(tmp_path) -> None:
         "side": "BUY",
         "quantity": "1",
         "limit_price": "1.00",
+        "symbol": "SPY",
+        "option_expire_date": date.today().isoformat(),
+        "strike_price": "500",
+        "option_type": "call",
     }
     journal.prepare(
         BrokerSubmissionRecord(
