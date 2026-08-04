@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-import json
 import sqlite3
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
+from uuid import UUID
 
 from joker.app.safety import SafetyMode
 from joker.broker.account_truth import hash_account_id, mask_account_id
@@ -15,10 +16,27 @@ from joker.broker.webull_live import (
     HttpWebullLiveTradeApi,
     validate_live_broker_startup,
 )
+from joker.broker.webull_trade_api import (
+    build_option_limit_order_payload,
+    new_client_order_id,
+)
 from joker.config.settings import AppSettings, EnvSettings
 from joker.config.validation import redact_secrets
+from joker.market.option_surface import OptionContractSnapshot, OptionSurfaceSnapshot
+from joker.market.quality import DataQualityCode, DataQualityReport
+from joker.market.snapshots import MarketSnapshot
+from joker.schemas.domain import OptionContract, OrderIntent
 from joker.time.calendar import MarketCalendar
 from joker.time.clock import SessionPhase, SystemExchangeClock
+
+_BLOCKING_SURFACE_CODES = frozenset(
+    {
+        DataQualityCode.PARTIAL_OPTION_SURFACE,
+        DataQualityCode.OPTION_SURFACE_UNAVAILABLE,
+        DataQualityCode.INSUFFICIENT_OPTION_SURFACE,
+        DataQualityCode.REPORT_UNAVAILABLE,
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -39,6 +57,14 @@ class LivePreflightReport:
     checks: tuple[str, ...]
     captured_at: datetime
     mutated: bool = False  # always False for this service
+
+
+@dataclass(frozen=True)
+class _VerifiedMarketTruth:
+    snapshot: MarketSnapshot
+    surface: OptionSurfaceSnapshot
+    quality: DataQualityReport
+    preview_contract: OptionContractSnapshot
 
 
 def run_production_preflight(
@@ -145,6 +171,7 @@ def run_production_preflight(
 
     if skip_network:
         checks.append("account_truth: skipped (skip_network)")
+        checks.append("production_preview: fail — skipped (skip_network)")
         checks.append("mutation: none (read-only preflight)")
         return _report(
             checks=checks,
@@ -211,25 +238,44 @@ def run_production_preflight(
     try:
         orders = api.list_open_orders(str(creds.account_id))
         checks.append(f"account_truth: ok open_orders count={len(orders)}")
-        production_preview_ok = True
-        checks.append("production_preview: ok read-only open-order listing")
     except Exception as exc:
         checks.append(
             "account_truth: fail — open_orders " + redact_secrets(str(exc), env=env)
         )
         account_truth_ok = False
-        production_preview_ok = False
-        checks.append("production_preview: fail — open order listing unavailable")
 
+    verified: _VerifiedMarketTruth | None = None
     if check_market_data:
-        market_session_open, live_snapshot_ok, current_0dte_surface_ok = (
+        market_session_open, live_snapshot_ok, current_0dte_surface_ok, verified = (
             _evaluate_market_readiness(checks, env=env, app_settings=app_settings)
         )
     else:
         checks.append("market_session_open: skipped (check_market_data=false)")
         checks.append("live_snapshot: skipped")
         checks.append("current_0dte_surface: skipped")
+        checks.append("production_preview: fail — market checks skipped")
 
+    if (
+        check_market_data
+        and account_truth_ok
+        and live_snapshot_ok
+        and current_0dte_surface_ok
+        and verified is not None
+    ):
+        production_preview_ok = _run_production_preview(
+            checks,
+            api=api,
+            account_id=str(creds.account_id),
+            env=env,
+            verified=verified,
+        )
+    elif check_market_data:
+        checks.append(
+            "production_preview: fail — verified current SPY 0DTE market truth required"
+        )
+        production_preview_ok = False
+
+    # Explicit: no order placement performed.
     checks.append("mutation: none (read-only preflight)")
     return _report(
         checks=checks,
@@ -296,14 +342,14 @@ def _evaluate_market_readiness(
     *,
     env: EnvSettings,
     app_settings: AppSettings,
-) -> tuple[bool, bool, bool]:
-    """Return (market_session_open, live_snapshot_ok, current_0dte_surface_ok)."""
+) -> tuple[bool, bool, bool, _VerifiedMarketTruth | None]:
+    """Return session/snapshot/surface flags and linked verified market truth."""
     creds_present = bool(env.webull_market_data_enabled and env.webull_app_key)
     if not creds_present:
         checks.append("market_session_open: fail — market-data credentials absent")
         checks.append("live_snapshot: fail — credentials absent")
         checks.append("current_0dte_surface: fail — credentials absent")
-        return False, False, False
+        return False, False, False, None
     checks.append("market-data credentials: present")
 
     clock = SystemExchangeClock(calendar=MarketCalendar())
@@ -317,7 +363,7 @@ def _evaluate_market_readiness(
         )
         checks.append("live_snapshot: fail — market session not open")
         checks.append("current_0dte_surface: fail — market session not open")
-        return False, False, False
+        return False, False, False, None
     checks.append(
         f"market_session_open: ok regular (exchange_date={trading_day.isoformat()})"
     )
@@ -326,209 +372,333 @@ def _evaluate_market_readiness(
     if not db_path.exists():
         checks.append("live_snapshot: fail — no database")
         checks.append("current_0dte_surface: fail — no database")
-        return True, False, False
+        return True, False, False, None
 
-    snap_ok = _verify_current_snapshot(
-        checks, db_path=db_path, trading_day=trading_day, app_settings=app_settings
+    verified = _load_verified_market_truth(
+        checks,
+        db_path=db_path,
+        trading_day=trading_day,
+        app_settings=app_settings,
     )
-    surface_ok = _verify_current_0dte_surface(
-        checks, db_path=db_path, trading_day=trading_day, app_settings=app_settings
-    )
-    return True, snap_ok, surface_ok
+    if verified is None:
+        return True, False, False, None
+    return True, True, True, verified
 
 
-def _verify_current_snapshot(
+def _load_verified_market_truth(
     checks: list[str],
     *,
     db_path: Path,
     trading_day: date,
     app_settings: AppSettings,
-) -> bool:
-    stale_limit = float(
+) -> _VerifiedMarketTruth | None:
+    """Latest snapshot → linked surface → DQ report → preview contract."""
+    stale_underlying = float(
         getattr(app_settings.data_quality, "underlying_stale_seconds", 5.0) or 5.0
     )
-    # Allow a slightly wider window for preflight persistence lag.
-    max_age = max(stale_limit, 60.0)
-    try:
-        uri = f"file:{db_path.resolve()}?mode=ro"
-        conn = sqlite3.connect(uri, uri=True)
-        try:
-            tables = {
-                row[0]
-                for row in conn.execute(
-                    "SELECT name FROM sqlite_master WHERE type='table'"
-                ).fetchall()
-            }
-            if "market_snapshots" not in tables:
-                checks.append("live_snapshot: fail — market_snapshots table missing")
-                return False
-            row = conn.execute(
-                """
-                SELECT trading_date, exchange_time, payload_json
-                FROM market_snapshots
-                ORDER BY exchange_time DESC
-                LIMIT 1
-                """
-            ).fetchone()
-        finally:
-            conn.close()
-    except Exception as exc:
-        checks.append(f"live_snapshot: fail — {type(exc).__name__}: {exc}")
-        return False
-
-    if row is None:
-        checks.append("live_snapshot: fail — no persisted snapshot")
-        return False
-
-    row_date, exchange_time_raw, payload_json = row
-    if str(row_date) != trading_day.isoformat():
-        checks.append(
-            f"live_snapshot: fail — trading_date={row_date} "
-            f"!= exchange_date={trading_day.isoformat()}"
-        )
-        return False
-    try:
-        exchange_time = datetime.fromisoformat(str(exchange_time_raw))
-        if exchange_time.tzinfo is None:
-            exchange_time = exchange_time.replace(tzinfo=timezone.utc)
-    except Exception:
-        checks.append("live_snapshot: fail — unparseable exchange_time")
-        return False
-    age = (datetime.now(timezone.utc) - exchange_time.astimezone(timezone.utc)).total_seconds()
-    if age > max_age:
-        checks.append(
-            f"live_snapshot: fail — stale age_seconds={age:.1f} max={max_age}"
-        )
-        return False
-    try:
-        payload = json.loads(payload_json) if payload_json else {}
-    except Exception:
-        payload = {}
-    symbol = str(payload.get("symbol") or payload.get("underlying_symbol") or "")
-    if symbol and symbol.upper() != "SPY":
-        checks.append(f"live_snapshot: fail — symbol={symbol!r} (require SPY)")
-        return False
-    checks.append(
-        f"live_snapshot: ok trading_date={row_date} age_seconds={age:.1f}"
-    )
-    return True
-
-
-def _verify_current_0dte_surface(
-    checks: list[str],
-    *,
-    db_path: Path,
-    trading_day: date,
-    app_settings: AppSettings,
-) -> bool:
-    stale_limit = float(
+    max_snap_age = max(stale_underlying, 60.0)
+    stale_option = float(
         getattr(app_settings.data_quality, "option_stale_seconds", 10.0) or 10.0
     )
-    max_age = max(stale_limit, 120.0)
+    max_surface_age = max(stale_option, 120.0)
+
     try:
         uri = f"file:{db_path.resolve()}?mode=ro"
         conn = sqlite3.connect(uri, uri=True)
-        try:
-            tables = {
-                row[0]
-                for row in conn.execute(
-                    "SELECT name FROM sqlite_master WHERE type='table'"
-                ).fetchall()
-            }
-            if "option_surfaces" not in tables:
-                checks.append(
-                    "current_0dte_surface: fail — option_surfaces table missing"
-                )
-                return False
-            row = conn.execute(
-                """
-                SELECT trading_date, exchange_time, underlying_symbol, payload_json
-                FROM option_surfaces
-                ORDER BY exchange_time DESC
-                LIMIT 1
-                """
-            ).fetchone()
-        finally:
-            conn.close()
     except Exception as exc:
-        checks.append(f"current_0dte_surface: fail — {type(exc).__name__}: {exc}")
-        return False
-
-    if row is None:
-        checks.append("current_0dte_surface: fail — no persisted surface")
-        return False
-
-    row_date, exchange_time_raw, underlying, payload_json = row
-    if str(row_date) != trading_day.isoformat():
-        checks.append(
-            f"current_0dte_surface: fail — trading_date={row_date} "
-            f"!= exchange_date={trading_day.isoformat()}"
-        )
-        return False
-    if str(underlying or "").upper() != "SPY":
-        checks.append(
-            f"current_0dte_surface: fail — underlying={underlying!r} (require SPY)"
-        )
-        return False
-    try:
-        exchange_time = datetime.fromisoformat(str(exchange_time_raw))
-        if exchange_time.tzinfo is None:
-            exchange_time = exchange_time.replace(tzinfo=timezone.utc)
-    except Exception:
-        checks.append("current_0dte_surface: fail — unparseable exchange_time")
-        return False
-    age = (datetime.now(timezone.utc) - exchange_time.astimezone(timezone.utc)).total_seconds()
-    if age > max_age:
-        checks.append(
-            f"current_0dte_surface: fail — stale age_seconds={age:.1f} max={max_age}"
-        )
-        return False
+        checks.append(f"live_snapshot: fail — {type(exc).__name__}: {exc}")
+        checks.append("current_0dte_surface: fail — database unavailable")
+        return None
 
     try:
-        payload = json.loads(payload_json) if payload_json else {}
-    except Exception:
-        checks.append("current_0dte_surface: fail — unparseable payload")
-        return False
+        tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        if "market_snapshots" not in tables:
+            checks.append("live_snapshot: fail — market_snapshots table missing")
+            checks.append("current_0dte_surface: fail — snapshot missing")
+            return None
+        row = conn.execute(
+            """
+            SELECT payload_json
+            FROM market_snapshots
+            ORDER BY exchange_time DESC
+            LIMIT 1
+            """
+        ).fetchone()
+        if row is None:
+            checks.append("live_snapshot: fail — no persisted snapshot")
+            checks.append("current_0dte_surface: fail — snapshot missing")
+            return None
+        try:
+            snapshot = MarketSnapshot.model_validate_json(row[0])
+        except Exception as exc:
+            checks.append(
+                f"live_snapshot: fail — invalid MarketSnapshot ({type(exc).__name__})"
+            )
+            checks.append("current_0dte_surface: fail — snapshot invalid")
+            return None
 
-    contracts = payload.get("contracts") or payload.get("quotes") or []
-    if not contracts:
-        checks.append("current_0dte_surface: fail — empty contract set")
-        return False
-
-    # Require at least one contract with today's expiration (0DTE).
-    expiry_ok = False
-    for c in contracts:
-        if not isinstance(c, dict):
-            continue
-        exp = c.get("expiry") or c.get("expiration") or c.get("expiration_date")
-        if exp is None:
-            continue
-        exp_s = str(exp)[:10]
-        if exp_s == trading_day.isoformat():
-            expiry_ok = True
-            break
-        # Nested contract object
-        nested = c.get("contract") if isinstance(c.get("contract"), dict) else None
-        if nested:
-            exp2 = nested.get("expiry") or nested.get("expiration")
-            if exp2 is not None and str(exp2)[:10] == trading_day.isoformat():
-                expiry_ok = True
-                break
-    if not expiry_ok:
-        # Also accept surfaces tagged is_0dte / trading_date match with contracts.
-        if any(
-            isinstance(c, dict) and (c.get("is_0dte") or (c.get("contract") or {}).get("is_0dte"))
-            for c in contracts
-        ):
-            expiry_ok = True
-    if not expiry_ok:
+        if snapshot.trading_date != trading_day:
+            checks.append(
+                f"live_snapshot: fail — trading_date={snapshot.trading_date.isoformat()} "
+                f"!= exchange_date={trading_day.isoformat()}"
+            )
+            checks.append("current_0dte_surface: fail — snapshot trading date mismatch")
+            return None
+        age = (
+            datetime.now(timezone.utc)
+            - snapshot.exchange_time.astimezone(timezone.utc)
+        ).total_seconds()
+        if age > max_snap_age:
+            checks.append(
+                f"live_snapshot: fail — stale age_seconds={age:.1f} max={max_snap_age}"
+            )
+            checks.append("current_0dte_surface: fail — snapshot stale")
+            return None
+        symbol = str(snapshot.underlying.symbol or "").upper()
+        if symbol != "SPY":
+            checks.append(
+                f"live_snapshot: fail — underlying.symbol={symbol!r} (require SPY)"
+            )
+            checks.append("current_0dte_surface: fail — non-SPY snapshot")
+            return None
+        if snapshot.option_surface_id is None:
+            checks.append("live_snapshot: fail — option_surface_id missing")
+            checks.append("current_0dte_surface: fail — snapshot has no linked surface")
+            return None
         checks.append(
-            "current_0dte_surface: fail — no SPY 0DTE contracts for exchange date"
+            f"live_snapshot: ok trading_date={snapshot.trading_date.isoformat()} "
+            f"age_seconds={age:.1f} snapshot_id={snapshot.snapshot_id}"
+        )
+
+        if "option_surfaces" not in tables:
+            checks.append("current_0dte_surface: fail — option_surfaces table missing")
+            return None
+        surface_row = conn.execute(
+            """
+            SELECT payload_json
+            FROM option_surfaces
+            WHERE surface_id = ?
+            """,
+            (str(snapshot.option_surface_id),),
+        ).fetchone()
+        if surface_row is None:
+            checks.append(
+                "current_0dte_surface: fail — linked option_surface_id not found "
+                f"({snapshot.option_surface_id})"
+            )
+            return None
+        try:
+            surface = OptionSurfaceSnapshot.model_validate_json(surface_row[0])
+        except Exception as exc:
+            checks.append(
+                "current_0dte_surface: fail — invalid OptionSurfaceSnapshot "
+                f"({type(exc).__name__})"
+            )
+            return None
+        if surface.surface_id != snapshot.option_surface_id:
+            checks.append(
+                "current_0dte_surface: fail — surface_id mismatch vs snapshot link"
+            )
+            return None
+        if surface.trading_date != trading_day:
+            checks.append(
+                "current_0dte_surface: fail — trading_date="
+                f"{surface.trading_date.isoformat()} "
+                f"!= exchange_date={trading_day.isoformat()}"
+            )
+            return None
+        if str(surface.underlying_symbol or "").upper() != "SPY":
+            checks.append(
+                "current_0dte_surface: fail — underlying_symbol="
+                f"{surface.underlying_symbol!r} (require SPY)"
+            )
+            return None
+        surface_age = (
+            datetime.now(timezone.utc)
+            - surface.exchange_time.astimezone(timezone.utc)
+        ).total_seconds()
+        if surface_age > max_surface_age:
+            checks.append(
+                "current_0dte_surface: fail — stale "
+                f"age_seconds={surface_age:.1f} max={max_surface_age}"
+            )
+            return None
+        if not surface.contracts:
+            checks.append("current_0dte_surface: fail — empty contract set")
+            return None
+
+        if "data_quality_reports" not in tables:
+            checks.append(
+                "current_0dte_surface: fail — data_quality_reports table missing"
+            )
+            return None
+        dq_row = conn.execute(
+            "SELECT payload FROM data_quality_reports WHERE report_id = ?",
+            (str(snapshot.data_quality_id),),
+        ).fetchone()
+        if dq_row is None:
+            checks.append(
+                "current_0dte_surface: fail — linked data_quality_id not found "
+                f"({snapshot.data_quality_id})"
+            )
+            return None
+        try:
+            quality = DataQualityReport.model_validate_json(dq_row[0])
+        except Exception as exc:
+            checks.append(
+                "current_0dte_surface: fail — invalid DataQualityReport "
+                f"({type(exc).__name__})"
+            )
+            return None
+        if quality.report_id != snapshot.data_quality_id:
+            checks.append(
+                "current_0dte_surface: fail — data_quality report_id mismatch"
+            )
+            return None
+        if not quality.usable_for_execution:
+            checks.append(
+                "current_0dte_surface: fail — data quality not usable_for_execution"
+            )
+            return None
+        blocking = [
+            f.code.value
+            for f in quality.findings
+            if f.code in _BLOCKING_SURFACE_CODES
+        ]
+        if blocking:
+            checks.append(
+                "current_0dte_surface: fail — blocking surface findings: "
+                + ",".join(sorted(set(blocking)))
+            )
+            return None
+
+        preview_contract = _choose_preview_contract(
+            surface, trading_day=trading_day
+        )
+        if preview_contract is None:
+            checks.append(
+                "current_0dte_surface: fail — no SPY 0DTE contract with usable ask"
+            )
+            return None
+        checks.append(
+            "current_0dte_surface: ok "
+            f"surface_id={surface.surface_id} "
+            f"contracts={len(surface.contracts)} "
+            f"preview_contract={preview_contract.contract_id}"
+        )
+        return _VerifiedMarketTruth(
+            snapshot=snapshot,
+            surface=surface,
+            quality=quality,
+            preview_contract=preview_contract,
+        )
+    finally:
+        conn.close()
+
+
+def _choose_preview_contract(
+    surface: OptionSurfaceSnapshot,
+    *,
+    trading_day: date,
+) -> OptionContractSnapshot | None:
+    """Pick one verified 0DTE contract with a positive ask for the preview."""
+    underlying = surface.underlying_price
+    candidates = [
+        c
+        for c in surface.contracts
+        if c.expiry == trading_day and c.ask is not None and Decimal(c.ask) > 0
+    ]
+    if not candidates:
+        return None
+    if underlying is None:
+        return candidates[0]
+
+    def _distance(c: OptionContractSnapshot) -> Decimal:
+        return abs(Decimal(c.strike) - Decimal(underlying))
+
+    return min(candidates, key=_distance)
+
+
+def _run_production_preview(
+    checks: list[str],
+    *,
+    api: Any,
+    account_id: str,
+    env: EnvSettings,
+    verified: _VerifiedMarketTruth,
+) -> bool:
+    """Call Webull preview_order only — never place_order."""
+    contract_snap = verified.preview_contract
+    limit = float(contract_snap.ask) if contract_snap.ask is not None else None
+    if limit is None or limit <= 0:
+        checks.append("production_preview: fail — preview contract ask unavailable")
+        return False
+    intent = OrderIntent(
+        intent_id=new_client_order_id(),
+        candidate_id="production_preflight",
+        contract=OptionContract(
+            symbol="SPY",
+            expiration=contract_snap.expiry,
+            strike=float(contract_snap.strike),
+            option_type=contract_snap.option_type,
+            is_0dte=True,
+        ),
+        side="buy",
+        order_type="limit",
+        quantity=1,
+        limit_price=limit,
+        position_intent="BUY_TO_OPEN",
+    )
+    try:
+        payload = build_option_limit_order_payload(
+            intent, client_order_id=intent.intent_id, account_id=account_id
+        )
+    except Exception as exc:
+        checks.append(
+            "production_preview: fail — payload "
+            + redact_secrets(str(exc), env=env)
+        )
+        return False
+
+    try:
+        raw = api.preview_order(account_id, [payload])
+    except Exception as exc:
+        checks.append(
+            "production_preview: fail — "
+            + redact_secrets(str(exc), env=env)
+        )
+        return False
+
+    if not isinstance(raw, dict):
+        checks.append("production_preview: fail — unexpected preview response shape")
+        return False
+    if not _preview_accepted(raw):
+        code = raw.get("reject_code") or raw.get("code") or "rejected"
+        msg = raw.get("reject_message") or raw.get("message") or ""
+        checks.append(
+            "production_preview: fail — preview not accepted "
+            f"code={code!r} message={redact_secrets(str(msg), env=env)[:120]!r}"
         )
         return False
 
     checks.append(
-        f"current_0dte_surface: ok contracts={len(contracts)} "
-        f"age_seconds={age:.1f}"
+        "production_preview: ok accepted "
+        f"contract={contract_snap.contract_id} qty=1 BUY_TO_OPEN "
+        f"limit={limit:.2f} (no placement)"
     )
     return True
+
+
+def _preview_accepted(raw: dict[str, Any]) -> bool:
+    accepted = bool(raw.get("accepted", True))
+    reject_code = str(raw.get("reject_code") or raw.get("code") or "") or None
+    if reject_code and str(reject_code).upper() not in {"0", "OK", "SUCCESS"}:
+        accepted = False
+    if raw.get("accepted") is False:
+        accepted = False
+    return accepted

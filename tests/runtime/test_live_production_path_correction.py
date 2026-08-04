@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import sqlite3
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
@@ -489,49 +488,87 @@ def test_preflight_not_ready_without_current_snapshot(tmp_path) -> None:
 
 
 def test_preflight_rejects_stale_or_non_0dte_surface(tmp_path) -> None:
+    """Non-0DTE linked surface fails the typed readiness chain."""
+    from joker.market.option_surface import OptionContractSnapshot, OptionSurfaceSnapshot
+    from joker.market.quality import DataQualityReport, DataQualitySeverity
+    from joker.market.snapshots import MarketSnapshot, UnderlyingSnapshot
+
     db = tmp_path / "live.db"
     apply_task1_migrations(db)
     trading_day = date(2026, 7, 1)
     now = datetime.now(timezone.utc)
+    surface_id = uuid4()
+    dq_id = uuid4()
+    snap_id = uuid4()
+    contract = OptionContractSnapshot(
+        contract_id="SPY260702C00500000",
+        symbol="SPY",
+        expiry=date(2026, 7, 2),
+        strike=Decimal("500"),
+        option_type="call",
+        bid=Decimal("1.00"),
+        ask=Decimal("1.10"),
+        quote_timestamp=now,
+        quote_age_ms=0,
+    )
+    surface = OptionSurfaceSnapshot(
+        surface_id=surface_id,
+        exchange_time=now,
+        trading_date=trading_day,
+        underlying_symbol="SPY",
+        contracts=(contract,),
+    )
+    quality = DataQualityReport(
+        report_id=dq_id,
+        snapshot_id=snap_id,
+        severity=DataQualitySeverity.OK,
+        usable_for_execution=True,
+    )
+    snapshot = MarketSnapshot(
+        snapshot_id=snap_id,
+        exchange_time=now,
+        trading_date=trading_day,
+        underlying=UnderlyingSnapshot(
+            symbol="SPY", exchange_time=now, last=Decimal("500"), source="t"
+        ),
+        option_surface_id=surface_id,
+        data_quality_id=dq_id,
+    )
     conn = sqlite3.connect(db)
     conn.execute(
-        """
-        INSERT INTO market_snapshots
-            (snapshot_id, trading_date, exchange_time, payload_json, created_at)
-        VALUES (?, ?, ?, ?, ?)
-        """,
+        "INSERT INTO market_snapshots VALUES (?, ?, ?, ?, ?)",
         (
-            str(uuid4()),
+            str(snap_id),
             trading_day.isoformat(),
             now.isoformat(),
-            json.dumps({"symbol": "SPY", "price": 500}),
+            snapshot.model_dump_json(),
+            now.isoformat(),
+        ),
+    )
+    conn.execute(
+        "INSERT INTO option_surfaces VALUES (?, ?, ?, ?, ?, ?)",
+        (
+            str(surface_id),
+            trading_day.isoformat(),
+            now.isoformat(),
+            "SPY",
+            surface.model_dump_json(),
             now.isoformat(),
         ),
     )
     conn.execute(
         """
-        INSERT INTO option_surfaces
-            (surface_id, trading_date, exchange_time, underlying_symbol,
-             payload_json, created_at)
-        VALUES (?, ?, ?, ?, ?, ?)
+        INSERT INTO data_quality_reports
+            (report_id, snapshot_id, session_id, severity,
+             usable_for_reasoning, usable_for_execution, payload, created_at)
+        VALUES (?, ?, ?, ?, 1, 1, ?, ?)
         """,
         (
-            str(uuid4()),
-            trading_day.isoformat(),
-            now.isoformat(),
-            "SPY",
-            json.dumps(
-                {
-                    "contracts": [
-                        {
-                            "expiration": "2026-07-02",
-                            "strike": 500,
-                            "option_type": "call",
-                            "is_0dte": False,
-                        }
-                    ]
-                }
-            ),
+            str(dq_id),
+            str(snap_id),
+            "t",
+            "ok",
+            quality.model_dump_json(),
             now.isoformat(),
         ),
     )
@@ -553,4 +590,4 @@ def test_preflight_rejects_stale_or_non_0dte_surface(tmp_path) -> None:
         )
     assert report.current_0dte_surface_ok is False
     assert report.operational_ready is False
-    assert any("0dte" in c.lower() or "0DTE" in c for c in report.checks)
+    assert any("0DTE" in c or "0dte" in c.lower() for c in report.checks)
