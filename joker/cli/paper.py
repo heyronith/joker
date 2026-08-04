@@ -163,7 +163,23 @@ def paper_preflight(
 @paper_app.command("run")
 def paper_run(
     symbol: str = typer.Option("SPY", "--symbol"),
-    duration_minutes: float = typer.Option(30.0, "--duration-minutes"),
+    duration_minutes: Optional[float] = typer.Option(
+        None,
+        "--duration-minutes",
+        help=(
+            "Wall-clock runtime minutes. When omitted, equals the objective duration "
+            "(default 60). Must be >= objective duration when both are set."
+        ),
+    ),
+    objective_duration_minutes: Optional[float] = typer.Option(
+        None,
+        "--objective-duration-minutes",
+        help=(
+            "Objective deadline = current exchange time + N minutes "
+            f"(default {60.0} when neither this nor --target-deadline is set). "
+            "Mutually exclusive with --target-deadline."
+        ),
+    ),
     config: Optional[str] = typer.Option(
         "config/paper.yaml", "--config", "-c", envvar="JOKER_CONFIG"
     ),
@@ -194,7 +210,10 @@ def paper_run(
     target_deadline: Optional[str] = typer.Option(
         None,
         "--target-deadline",
-        help='Deadline as "15:30 ET" or timezone-aware ISO timestamp',
+        help=(
+            'Absolute deadline as "15:30 ET" or timezone-aware ISO timestamp. '
+            "Mutually exclusive with --objective-duration-minutes."
+        ),
     ),
     max_concurrent_positions: Optional[int] = typer.Option(
         None,
@@ -219,8 +238,31 @@ def paper_run(
     ),
 ) -> None:
     """Run the full live paper loop: monitor → decide → risk → auto order → log."""
+    import asyncio
+    import subprocess
+
+    from joker.broker.account_truth import hash_account_id
+    from joker.cli.paper_goal_timing import (
+        PaperGoalTimingError,
+        format_timing_banner,
+        resolve_paper_goal_timing,
+    )
+    from joker.cli.session_confirm import confirm_session_capital, confirm_session_objective
     from joker.config.validation import validate_startup
+    from joker.objectives.deadline import time_remaining_seconds
     from joker.runtime.live_paper_runner import LivePaperRunConfig, LivePaperRunner
+    from joker.runtime.paper_goal_result import (
+        PaperGoalResult,
+        append_jsonl,
+        build_manifest,
+        classify_paper_goal,
+        evidence_dir,
+        sqlite_checks,
+        write_json,
+    )
+    from joker.storage.models import new_run_id
+    from joker.time.calendar import MarketCalendar
+    from joker.time.clock import SystemExchangeClock
 
     if symbol.upper() != "SPY":
         console.print("[red]Only SPY is supported.[/red]")
@@ -243,6 +285,12 @@ def paper_run(
             console.print("[red]live_trading_enabled must be false[/red]")
             raise typer.Exit(code=1)
 
+    if result.env_settings.webull_live_trading_enabled:
+        console.print(
+            "[red]WEBULL_LIVE_TRADING_ENABLED must remain false for paper goal tests.[/red]"
+        )
+        raise typer.Exit(code=1)
+
     if require_webull_paper and not webull_paper_env_ready(result.env_settings):
         console.print(
             "[red]--require-webull-paper set but Webull paper env is not ready. "
@@ -264,28 +312,82 @@ def paper_run(
         )
         raise typer.Exit(code=1)
 
+    if require_webull_paper and not use_openai:
+        console.print(
+            "[red]Paper goal test refuses --mock-agents when --require-webull-paper "
+            "is set. Use configured non-fake model providers.[/red]"
+        )
+        raise typer.Exit(code=1)
+
     if result.app_settings.mode.value != "PAPER":
         console.print("[yellow]Forcing PAPER mode for this session.[/yellow]")
         result.app_settings = result.app_settings.model_copy(
             update={"mode": "PAPER", "live_trading_enabled": False}
         )
 
+    # Goal-test timing: resolve before objective creation.
+    exchange_tz = str(result.app_settings.exchange.timezone)
+    try:
+        timing = resolve_paper_goal_timing(
+            objective_duration_minutes=objective_duration_minutes,
+            target_deadline=target_deadline,
+            duration_minutes=duration_minutes,
+            exchange_tz=exchange_tz,
+            calendar=MarketCalendar(),
+            require_regular_session=True,
+        )
+    except PaperGoalTimingError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1) from exc
+
+    banner = format_timing_banner(timing)
+    console.print(
+        f"[bold]Exchange now[/bold] {banner['exchange_now']}  "
+        f"[bold]objective deadline[/bold] {banner['objective_deadline']}  "
+        f"[bold]market session remaining[/bold] "
+        f"{banner['remaining_market_session_seconds']}s"
+    )
+
+    # Enable objective path for goal-test workflow when duration flags are used
+    # or YAML already enables it.
+    objective_enabled = bool(getattr(result.app_settings.objective, "enabled", False))
+    if not objective_enabled and (
+        objective_duration_minutes is not None
+        or target_deadline is not None
+        or require_webull_paper
+    ):
+        console.print(
+            "[yellow]Enabling session objective for paper goal-test workflow.[/yellow]"
+        )
+        result.app_settings = result.app_settings.model_copy(
+            update={
+                "objective": result.app_settings.objective.model_copy(
+                    update={"enabled": True}
+                )
+            }
+        )
+        objective_enabled = True
+
     broker_ready = webull_paper_env_ready(result.env_settings)
+    if require_webull_paper and not broker_ready:
+        console.print("[red]Webull paper broker required; refusing local PaperBroker.[/red]")
+        raise typer.Exit(code=1)
     broker_label = (
         "Webull paper account (auto orders)"
         if broker_ready
         else "local PaperBroker (simulated fills)"
     )
+    paper_account_hash = None
+    if result.env_settings.webull_paper_account_id:
+        paper_account_hash = hash_account_id(
+            str(result.env_settings.webull_paper_account_id).strip()
+        )
 
-    from joker.cli.session_confirm import confirm_session_capital, confirm_session_objective
-    from joker.storage.models import new_run_id
-    import asyncio
-
-    objective_enabled = bool(getattr(result.app_settings.objective, "enabled", False))
     session_id = f"paper-{new_run_id()}"
     task1_db = Path(result.app_settings.db_path).resolve().parent / "joker_task1.db"
 
     objective_service = None
+    objective_id = None
     if objective_enabled:
         bundle = asyncio.run(
             confirm_session_objective(
@@ -295,14 +397,17 @@ def paper_run(
                 console=console,
                 authorized_usd=authorized_capital,
                 target_profit_pct=target_profit_pct,
-                target_deadline=target_deadline,
+                target_deadline=None,
+                deadline_exchange_time=timing.objective_deadline,
                 max_concurrent_positions=max_concurrent_positions,
                 acknowledge_total_loss=acknowledge_total_loss,
                 yes=yes,
+                exchange_tz=exchange_tz,
             )
         )
         capital_budget = bundle.capital_budget
         objective_service = bundle.objective_service
+        objective_id = bundle.objective_id
     else:
         capital_budget = confirm_session_capital(
             result.app_settings.capital,
@@ -313,23 +418,175 @@ def paper_run(
             yes=yes,
         )
 
+    # Final confirmed objective banner (required for goal-test).
+    target_profit_usd = float(capital_budget.plan.target_profit_usd)
+    obj_table = Table(title="Confirmed paper goal session")
+    obj_table.add_column("Field")
+    obj_table.add_column("Value")
+    obj_table.add_row("objective_id", str(objective_id or "—"))
+    obj_table.add_row("session_id", session_id)
+    obj_table.add_row("authorized capital", f"${capital_budget.authorized_usd:,.2f}")
+    obj_table.add_row(
+        "target profit percent", f"{capital_budget.plan.target_profit_pct:.2f}%"
+    )
+    obj_table.add_row("target profit USD", f"${target_profit_usd:,.2f}")
+    obj_table.add_row("exchange start time", timing.exchange_now.isoformat())
+    obj_table.add_row("exchange deadline", timing.objective_deadline.isoformat())
+    obj_table.add_row(
+        "objective duration", f"{timing.objective_duration_minutes:.2f} minutes"
+    )
+    obj_table.add_row(
+        "runtime duration", f"{timing.runtime_duration_minutes:.2f} minutes"
+    )
+    obj_table.add_row(
+        "maximum concurrent positions",
+        str(capital_budget.plan.max_concurrent_positions),
+    )
+    obj_table.add_row("paper broker account hash", paper_account_hash or "—")
+    console.print(obj_table)
+
+    # Evidence package root (created up-front; filled after run).
+    code_sha = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+    branch = subprocess.check_output(
+        ["git", "rev-parse", "--abbrev-ref", "HEAD"], text=True
+    ).strip()
+    exchange_date = SystemExchangeClock(calendar=MarketCalendar()).trading_date()
+    artifacts = evidence_dir(
+        code_sha=code_sha, exchange_date=exchange_date, session_id=session_id
+    )
+    write_json(
+        artifacts / "objective.json",
+        {
+            "objective_id": objective_id,
+            "session_id": session_id,
+            "authorized_capital_usd": capital_budget.authorized_usd,
+            "target_profit_pct": capital_budget.plan.target_profit_pct,
+            "target_profit_usd": target_profit_usd,
+            **banner,
+            "paper_account_hash": paper_account_hash,
+        },
+    )
+    write_json(
+        artifacts / "environment-summary.json",
+        {
+            "code_sha": code_sha,
+            "branch": branch,
+            "mode": "PAPER",
+            "live_trading_enabled": False,
+            "webull_live_trading_enabled": False,
+            "webull_paper_trading_enabled": bool(
+                result.env_settings.webull_paper_trading_enabled
+            ),
+            "webull_trade_api_env": result.env_settings.webull_trade_api_env,
+            "broker_provider": result.app_settings.broker.provider,
+            "require_webull_paper": require_webull_paper,
+            "paper_account_hash": paper_account_hash,
+            "mock_agents": not use_openai,
+            "objective_enabled": objective_enabled,
+        },
+    )
+
     runner = LivePaperRunner(result.app_settings, result.env_settings)
     last_heartbeat = 0.0
+    latest_graph_action = "—"
+    latest_no_trade_reason = "—"
+    progress_peaks = {
+        "max_unrealized": 0.0,
+        "min_realized": 0.0,
+        "reserved_peak": 0.0,
+    }
+    starting_realized = 0.0
+    graph_cycles = 0
+    no_trade_decisions = 0
+    entry_proposals = 0
+    entry_approvals = 0
 
     def on_event(event_type: str, payload: dict) -> None:
+        nonlocal latest_graph_action, latest_no_trade_reason
+        nonlocal graph_cycles, no_trade_decisions, entry_proposals, entry_approvals
         line = format_live_event(event_type, payload)
-        if event_type.startswith("order.") or event_type in (
+        latest_graph_action = f"{event_type}"
+        if event_type in {
+            "agent.decision",
+            "agent.propose",
+            "agent.prefilter_skip",
+            "risk.decision",
+            "cognitive.no_trade",
+            "graph.no_trade",
+        }:
+            reason = (
+                payload.get("reason")
+                or payload.get("blocked_reason")
+                or payload.get("summary")
+                or payload.get("action")
+            )
+            if reason and payload.get("approved") is False:
+                latest_no_trade_reason = str(reason)[:120]
+                no_trade_decisions += 1
+            if payload.get("action") in {"propose", "enter"} or event_type.endswith(
+                "propose"
+            ):
+                entry_proposals += 1
+            if payload.get("approved") is True or payload.get("action") in {
+                "confirm",
+                "enter",
+            }:
+                entry_approvals += 1
+        if "cycle" in event_type or event_type in {
+            "cognitive.cycle",
+            "graph.cycle_complete",
+        }:
+            graph_cycles += 1
+
+        # Evidence streams (redacted on write).
+        if "historical" in event_type or "ev" in event_type:
+            append_jsonl(
+                artifacts / "historical-ev-decisions.jsonl",
+                {"event": event_type, "payload": payload},
+            )
+        if "capital" in event_type or event_type == "capital.sized":
+            append_jsonl(
+                artifacts / "capital-sizing.jsonl",
+                {"event": event_type, "payload": payload},
+            )
+        if event_type.startswith("order.") or "fill" in event_type:
+            append_jsonl(
+                artifacts / "order-lifecycle.jsonl",
+                {"event": event_type, "payload": payload},
+            )
+        if "position" in event_type or "exit" in event_type:
+            append_jsonl(
+                artifacts / "position-lifecycle.jsonl",
+                {"event": event_type, "payload": payload},
+            )
+        if event_type.startswith("agent.") or event_type.startswith("cognitive.") or event_type.startswith("graph.") or event_type.startswith("risk."):
+            append_jsonl(
+                artifacts / "graph-decisions.jsonl",
+                {"event": event_type, "payload": payload},
+            )
+
+        important = {
+            "order.accepted",
+            "order.partial_fill",
+            "order.final_fill",
+            "order.submitted",
             "signal.detected",
             "agent.execute",
-        ):
+            "agent.propose",
+            "agent.confirm_executed",
+            "agent.outcome",
+            "capital.sized",
+            "risk.decision",
+            "objective.achieved",
+            "objective.missed",
+        }
+        if event_type.startswith("order.") or event_type in important:
             console.print(f"[bold cyan]» {line}[/bold cyan]")
         elif event_type in ("agent.decision",) and payload.get("action") in (
             "propose",
             "confirm",
             "enter",
         ):
-            console.print(f"[bold green]» {line}[/bold green]")
-        elif event_type in ("agent.propose", "agent.confirm_executed", "agent.outcome"):
             console.print(f"[bold green]» {line}[/bold green]")
         elif event_type in ("capital.sized", "option.advisory", "agent.prefilter_skip"):
             console.print(f"[cyan]» {line}[/cyan]")
@@ -344,25 +601,62 @@ def paper_run(
 
     def on_state(state: dict) -> None:
         nonlocal last_heartbeat
-        now = time.monotonic()
-        if now - last_heartbeat < max(0.5, heartbeat_seconds):
+        now_m = time.monotonic()
+        if now_m - last_heartbeat < max(0.5, heartbeat_seconds):
             return
-        last_heartbeat = now
-        mode = state.get("execution_mode") or ""
-        decisions = state.get("decision_calls")
-        decision_bit = f"  ai={decisions}" if decisions is not None else ""
+        last_heartbeat = now_m
+
+        realized = float(state.get("paper_pnl") or state.get("realized_pnl") or 0.0)
+        unrealized = float(state.get("unrealized_pnl") or 0.0)
+        reserved = float(state.get("capital_reserved") or 0.0)
+        available = float(
+            state.get("capital_available")
+            if state.get("capital_available") is not None
+            else capital_budget.available_usd
+        )
+        progress_peaks["max_unrealized"] = max(
+            progress_peaks["max_unrealized"], unrealized
+        )
+        progress_peaks["min_realized"] = min(progress_peaks["min_realized"], realized)
+        progress_peaks["reserved_peak"] = max(
+            progress_peaks["reserved_peak"], reserved
+        )
+        goal_gap = target_profit_usd - realized
+        rem = time_remaining_seconds(
+            timing.objective_deadline, exchange_tz=exchange_tz
+        )
+        exchange_now = SystemExchangeClock(calendar=MarketCalendar()).now()
+        append_jsonl(
+            artifacts / "objective-progress.jsonl",
+            {
+                "exchange_time": exchange_now.isoformat(),
+                "time_remaining_seconds": rem,
+                "spy": state.get("market_price"),
+                "realized_pnl": realized,
+                "unrealized_pnl": unrealized,
+                "goal_gap_usd": goal_gap,
+                "authorized": capital_budget.authorized_usd,
+                "available": available,
+                "reserved": reserved,
+                "open": state.get("open_trade"),
+                "pending": state.get("pending_order"),
+                "latest_graph_action": latest_graph_action,
+                "latest_no_trade_reason": latest_no_trade_reason,
+            },
+        )
         console.print(
-            f"  SPY ${state.get('market_price', '—')}  "
-            f"health={state.get('feed_health')}  "
-            f"state={state.get('engine_state')}  "
-            f"mode={mode}{decision_bit}  "
-            f"cap=${state.get('capital_available', '—')} "
-            f"goal={state.get('capital_goal_pct', '—')}%  "
-            f"signals={state.get('signals')}  "
-            f"orders={state.get('trades_entered')}/{state.get('trades_exited')}  "
-            f"open={state.get('open_trade')} pending={state.get('pending_order')}  "
-            f"pnl=${state.get('paper_pnl', 0):.2f}  "
-            f"broker={state.get('broker')}"
+            f"  ET {exchange_now.strftime('%H:%M:%S')}  rem={rem}s  "
+            f"SPY ${state.get('market_price', '—')}  "
+            f"md={state.get('feed_health')}  "
+            f"opt={'ok' if state.get('options_available') else 'n/a'}  "
+            f"tgt=${target_profit_usd:,.2f}  "
+            f"realized=${realized:,.2f}  unreal=${unrealized:,.2f}  "
+            f"gap=${goal_gap:,.2f}  "
+            f"auth=${capital_budget.authorized_usd:,.0f}  "
+            f"avail=${available:,.2f}  res=${reserved:,.2f}  "
+            f"open={state.get('open_trade')}  working={state.get('pending_order')}  "
+            f"action={latest_graph_action}  "
+            f"no_trade={latest_no_trade_reason}"
         )
 
     exec_mode = (
@@ -370,7 +664,9 @@ def paper_run(
     ).strip().lower()
     risk_policy = (result.app_settings.risk.policy or "strict").strip().lower()
     console.print(
-        f"[bold]Starting live paper loop[/bold] — duration={duration_minutes}m, "
+        f"[bold]Starting live paper loop[/bold] — "
+        f"runtime={timing.runtime_duration_minutes:.1f}m, "
+        f"objective={timing.objective_duration_minutes:.1f}m, "
         f"agents={'openai' if use_openai else 'mock'}, broker={broker_label}"
     )
     console.print(
@@ -390,12 +686,14 @@ def paper_run(
     run_result = runner.run(
         LivePaperRunConfig(
             symbol=symbol,
-            duration_seconds=duration_minutes * 60.0,
+            duration_seconds=timing.runtime_seconds,
             mock_agents=not use_openai,
             require_options=True,
             capital_budget=capital_budget,
             objective_service=objective_service,
             cognitive_session_id_override=session_id if objective_enabled else None,
+            objective_deadline_exchange=timing.objective_deadline,
+            shutdown_grace_seconds=timing.shutdown_grace_seconds,
         ),
         on_state=on_state,
         on_event=on_event,
@@ -405,6 +703,167 @@ def paper_run(
         console.print(f"[yellow]{err}[/yellow]")
     for fail in run_result.failures:
         console.print(f"[red]failure:[/red] {fail}")
+
+    ending_realized = float(
+        getattr(run_result.summary, "final_pnl_usd", None)
+        if run_result.summary is not None
+        else run_result.paper_pnl_usd
+    )
+    open_remaining = int(run_result.open_positions_remaining or 0)
+    working_remaining = int(run_result.working_orders_remaining or 0)
+    recon_clean: bool | None = run_result.reconciliation_clean
+    deadline_reached = (
+        time_remaining_seconds(timing.objective_deadline, exchange_tz=exchange_tz) == 0
+        or bool(run_result.objective_deadline_reached)
+    )
+    classification, reason = classify_paper_goal(
+        ending_realized_pnl_usd=ending_realized,
+        target_profit_usd=target_profit_usd,
+        open_positions_remaining=open_remaining,
+        working_orders_remaining=working_remaining,
+        reconciliation_clean=recon_clean if recon_clean is not None else True,
+        deadline_reached=bool(
+            getattr(run_result, "objective_deadline_reached", False) or deadline_reached
+        ),
+        system_operational=not bool(run_result.failures),
+        session_failed_errors=list(run_result.failures),
+    )
+    goal_result = PaperGoalResult(
+        classification=classification,
+        objective_id=objective_id,
+        session_id=session_id,
+        authorized_capital_usd=float(capital_budget.authorized_usd),
+        target_profit_pct=float(capital_budget.plan.target_profit_pct),
+        target_profit_usd=target_profit_usd,
+        objective_duration_minutes=timing.objective_duration_minutes,
+        starting_realized_pnl_usd=starting_realized,
+        ending_realized_pnl_usd=ending_realized,
+        max_unrealized_gain_usd=progress_peaks["max_unrealized"],
+        max_drawdown_usd=abs(min(0.0, progress_peaks["min_realized"])),
+        capital_reserved_peak_usd=progress_peaks["reserved_peak"],
+        graph_cycles=graph_cycles or int(
+            getattr(run_result.summary, "events_processed", 0) or 0
+        ),
+        entry_proposals=entry_proposals,
+        entry_approvals=entry_approvals,
+        trades_entered=int(
+            getattr(run_result.summary, "trades_entered", 0) or 0
+        ),
+        trades_exited=int(getattr(run_result.summary, "trades_exited", 0) or 0),
+        no_trade_decisions=no_trade_decisions,
+        goal_achieved=classification == "PAPER_OBJECTIVE_ACHIEVED",
+        open_positions_remaining=open_remaining,
+        working_orders_remaining=working_remaining,
+        reconciliation_clean=recon_clean if recon_clean is not None else True,
+        reason=reason,
+    )
+    write_json(artifacts / "final-result.json", goal_result.to_dict())
+    write_json(
+        artifacts / "episode-summary.json",
+        {
+            "session_id": session_id,
+            "summary": (
+                run_result.summary.model_dump()
+                if run_result.summary is not None and hasattr(run_result.summary, "model_dump")
+                else None
+            ),
+            "events_processed": run_result.events_processed,
+            "feed_health": run_result.feed_health,
+            "broker_kind": run_result.broker_kind,
+            "errors": run_result.errors,
+            "failures": run_result.failures,
+        },
+    )
+    write_json(
+        artifacts / "reconciliation.json",
+        {
+            "reconciliation_clean": goal_result.reconciliation_clean,
+            "open_positions_remaining": open_remaining,
+            "working_orders_remaining": working_remaining,
+            "broker_kind": run_result.broker_kind,
+        },
+    )
+    write_json(
+        artifacts / "sqlite-checks.json",
+        sqlite_checks(
+            [
+                Path(result.app_settings.db_path),
+                task1_db,
+            ]
+        ),
+    )
+    # Placeholder market/surface summaries if not populated by runner hooks.
+    if not (artifacts / "market-data-summary.json").exists():
+        write_json(
+            artifacts / "market-data-summary.json",
+            {
+                "feed_health": run_result.feed_health,
+                "options_available": run_result.options_available,
+            },
+        )
+    if not (artifacts / "option-surface-summary.json").exists():
+        write_json(
+            artifacts / "option-surface-summary.json",
+            {"options_available": run_result.options_available},
+        )
+
+    model_providers: list[str] = []
+    models = getattr(result.app_settings, "models", None)
+    if models is not None:
+        if getattr(getattr(models, "ollama", None), "enabled", False):
+            model_providers.append("ollama")
+        if getattr(getattr(models, "openai", None), "enabled", False):
+            model_providers.append("openai")
+    write_json(
+        artifacts / "manifest.json",
+        build_manifest(
+            code_sha=code_sha,
+            branch=branch,
+            timing=banner,
+            objective_id=objective_id,
+            session_id=session_id,
+            paper_account_hash=paper_account_hash,
+            model_providers=model_providers,
+            artifact_dir=artifacts,
+        ),
+    )
+
+    # Final metrics table
+    metrics = Table(title="Paper goal-test result")
+    metrics.add_column("Metric")
+    metrics.add_column("Value")
+    rows = [
+        ("Authorized capital", f"${goal_result.authorized_capital_usd:,.2f}"),
+        ("Target profit percentage", f"{goal_result.target_profit_pct:.2f}%"),
+        ("Target profit USD", f"${goal_result.target_profit_usd:,.2f}"),
+        ("Objective duration", f"{goal_result.objective_duration_minutes:.0f} minutes"),
+        ("Starting realized P&L baseline", f"${goal_result.starting_realized_pnl_usd:,.2f}"),
+        ("Ending realized P&L", f"${goal_result.ending_realized_pnl_usd:,.2f}"),
+        ("Maximum unrealized gain", f"${goal_result.max_unrealized_gain_usd or 0:,.2f}"),
+        ("Maximum drawdown", f"${goal_result.max_drawdown_usd or 0:,.2f}"),
+        ("Capital reserved peak", f"${goal_result.capital_reserved_peak_usd or 0:,.2f}"),
+        ("Number of graph cycles", str(goal_result.graph_cycles)),
+        ("Entry proposals", str(goal_result.entry_proposals)),
+        ("Entry approvals", str(goal_result.entry_approvals)),
+        ("Trades entered", str(goal_result.trades_entered)),
+        ("Trades exited", str(goal_result.trades_exited)),
+        ("Wins", str(goal_result.wins)),
+        ("Losses", str(goal_result.losses)),
+        ("No-trade decisions", str(goal_result.no_trade_decisions)),
+        ("Goal achieved", "yes" if goal_result.goal_achieved else "no"),
+        ("Time goal achieved", goal_result.time_goal_achieved or "—"),
+        ("Open positions remaining", str(goal_result.open_positions_remaining)),
+        ("Working orders remaining", str(goal_result.working_orders_remaining)),
+        (
+            "Reconciliation clean",
+            str(goal_result.reconciliation_clean),
+        ),
+        ("Final classification", goal_result.classification),
+    ]
+    for k, v in rows:
+        metrics.add_row(k, v)
+    console.print(metrics)
+    console.print(f"Evidence: {artifacts}")
 
     if run_result.summary:
         s = run_result.summary
@@ -434,7 +893,7 @@ def paper_run(
             "Enable WEBULL_PAPER_TRADING_ENABLED for Webull paper-account auto orders.[/yellow]"
         )
 
-    if run_result.failures or run_result.errors:
+    if classification == "PAPER_SESSION_FAILED" or run_result.failures:
         raise typer.Exit(code=1)
 
 

@@ -167,6 +167,8 @@ evolution:
     strategic_rollback_requires_agent: true
 
 # Daily authorized capital + profit goal (confirmed at session start)
+# When objective.enabled, session capital/target/deadline must be confirmed
+# explicitly via CLI — YAML authorized_usd is not a silent arming default.
 capital:
   authorized_usd: 500.0
   target_profit_pct: 20.0
@@ -180,3 +182,39 @@ capital:
   min_win_probability: 0.45
   behind_goal_boost: 0.15
   ahead_goal_dampen: 0.15
+
+objective:
+  enabled: true
+  require_session_confirmation: true
+  require_total_loss_acknowledgement: true
+  require_deadline: true
+  pause_entries_when_goal_met: true
+  stop_new_entries_at_deadline: true
+  minimum_win_probability: 0.45
+  require_positive_expected_value: true
+  default_max_concurrent_positions: 1
+  maximum_authorised_contracts: 20
+  feasibility:
+    enabled: true
+    minimum_samples_for_numeric_probability: 20
+    allow_ordinal_scoring_when_probability_unavailable: true
+  sizing:
+    mode: objective_adaptive
+    max_capital_fraction: 0.85
+    max_probe_fraction: 0.15
+    prohibit_loss_multiplier: true
+  historical_outcomes:
+    minimum_samples_for_ev: 20
+    maximum_samples: 200
+    minimum_similarity: 0.65
+    minimum_effective_sample_size: 15
+    maximum_episode_age_days: 90
+    confidence_level: 0.95
+    require_lower_confidence_bound_positive: true
+    require_same_strategy_family: true
+  execution:
+    maximum_buy_limit_above_ask_pct: 5.0
+  exploration:
+    enabled: false
+    operator_confirmation_required: true
+    paper_only: true

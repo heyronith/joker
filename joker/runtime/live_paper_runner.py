@@ -77,6 +77,11 @@ class LivePaperRunConfig:
     # Task-1 durable objective service (required when objective.enabled)
     objective_service: Any | None = None
     cognitive_session_id_override: str | None = None
+    # Exchange-aware objective deadline (blocks new entries via objective service).
+    objective_deadline_exchange: datetime | None = None
+    # Extra wall-clock seconds after duration to finish agent-managed exits only.
+    # Default 0 so existing short paper tests are not extended; CLI goal-test sets 120.
+    shutdown_grace_seconds: float = 0.0
 
 
 @dataclass
@@ -95,6 +100,10 @@ class LivePaperRunResult:
     errors: list[str] = field(default_factory=list)
     broker_kind: str = "local_paper"
     broker_label: str = "local PaperBroker"
+    open_positions_remaining: int = 0
+    working_orders_remaining: int = 0
+    reconciliation_clean: bool | None = None
+    objective_deadline_reached: bool = False
 
 
 def _risk_config_from_settings(
@@ -954,7 +963,15 @@ class LivePaperRunner:
                 from joker.strategy.playbook_patch import PatchError, apply_patch
 
                 poll = max(0.5, self.app_settings.data.quote_poll_interval_seconds)
-                deadline = _time.monotonic() + max(config.duration_seconds, poll)
+                objective_deadline_mono = _time.monotonic() + max(
+                    config.duration_seconds, poll
+                )
+                # Grace window only for finishing agent-managed exits — does not
+                # extend the objective deadline itself.
+                hard_stop_mono = objective_deadline_mono + max(
+                    0.0, float(config.shutdown_grace_seconds or 0.0)
+                )
+                deadline = hard_stop_mono
                 last_intraday_at = 0.0
                 last_decision_at = 0.0
                 decision_interval = float(
@@ -963,8 +980,43 @@ class LivePaperRunner:
                 max_decision_calls = int(
                     getattr(agent_cfg, "max_decision_calls_per_session", 40) or 40
                 )
+                objective_entries_blocked = False
 
                 while _time.monotonic() < deadline:
+                    now_mono = _time.monotonic()
+                    past_objective = now_mono >= objective_deadline_mono
+                    if past_objective and not objective_entries_blocked:
+                        objective_entries_blocked = True
+                        result.objective_deadline_reached = True
+                        log(
+                            "objective.deadline_reached",
+                            {
+                                "new_entries_blocked": True,
+                                "grace_seconds": float(
+                                    config.shutdown_grace_seconds or 0.0
+                                ),
+                            },
+                        )
+                        if config.objective_service is not None:
+                            try:
+                                task1_bridge.run_coro(
+                                    config.objective_service.recompute_from_truth()
+                                )
+                            except Exception as exc:
+                                log(
+                                    "objective.deadline_recompute_failed",
+                                    {"reason": str(exc)},
+                                )
+                    # After objective deadline with no open/pending work, finish.
+                    if past_objective and (
+                        handler.state.open_trade is None
+                        and handler.state.pending_entry is None
+                    ):
+                        log(
+                            "objective.session_complete_flat",
+                            {"past_objective_deadline": True},
+                        )
+                        break
                     event = market_loop.poll_once(task1_bridge)
                     if event is None:
                         _time.sleep(poll)
@@ -1036,6 +1088,7 @@ class LivePaperRunner:
                     )
                     if (
                         agent_led
+                        and not objective_entries_blocked
                         and agent_cfg.intraday_enabled
                         and decision_calls < max_decision_calls
                         and proposals_acted < agent_cfg.max_proposals_per_session
@@ -1632,5 +1685,23 @@ class LivePaperRunner:
         result.playbook_validation = playbook_validation
         result.events_processed = events_processed
         result.paper_pnl_usd = broker.get_daily_pnl()
+        try:
+            result.open_positions_remaining = len(broker.list_positions() or [])
+            result.working_orders_remaining = len(broker.list_open_orders() or [])
+        except Exception as exc:
+            result.errors.append(f"broker_flat_check_failed: {exc}")
+            result.open_positions_remaining = 1 if handler.state.open_trade else 0
+            result.working_orders_remaining = 1 if handler.state.pending_entry else 0
+        if task1_bridge is not None and task1_bridge.supervisor.execution_runtime is not None:
+            try:
+                recon = task1_bridge.run_coro(
+                    task1_bridge.supervisor.execution_runtime.run_reconciliation()
+                )
+                result.reconciliation_clean = bool(
+                    getattr(recon, "is_consistent", False)
+                )
+            except Exception as exc:
+                result.reconciliation_clean = False
+                result.errors.append(f"reconciliation_failed: {exc}")
         shutdown_task1()
         return result

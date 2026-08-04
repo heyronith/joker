@@ -139,16 +139,27 @@ async def confirm_session_objective(
     authorized_usd: float | None = None,
     target_profit_pct: float | None = None,
     target_deadline: str | None = None,
+    deadline_exchange_time: datetime | None = None,
     max_concurrent_positions: int | None = None,
     acknowledge_total_loss: bool = False,
     yes: bool = False,
     exchange_tz: str | None = None,
 ) -> SessionObjectiveBundle:
-    """Confirm and persist a durable Task-1 session objective before Task 2 starts."""
+    """Confirm and persist a durable Task-1 session objective before Task 2 starts.
+
+    Provide either ``target_deadline`` (string) or a pre-resolved timezone-aware
+    ``deadline_exchange_time``. When ``deadline_exchange_time`` is set, the CLI
+    skips deadline prompting / ``--target-deadline`` requirements.
+    """
     out = console or Console()
     obj_settings = app_settings.objective
     capital = app_settings.capital
     tz = exchange_tz or str(app_settings.exchange.timezone)
+
+    if target_deadline and deadline_exchange_time is not None:
+        raise typer.BadParameter(
+            "pass only one of target_deadline or deadline_exchange_time"
+        )
 
     if yes:
         missing: list[str] = []
@@ -156,8 +167,12 @@ async def confirm_session_objective(
             missing.append("--authorized-capital")
         if target_profit_pct is None:
             missing.append("--target-profit-pct")
-        if obj_settings.require_deadline and not target_deadline:
-            missing.append("--target-deadline")
+        if (
+            obj_settings.require_deadline
+            and not target_deadline
+            and deadline_exchange_time is None
+        ):
+            missing.append("--target-deadline or --objective-duration-minutes")
         if max_concurrent_positions is None:
             missing.append("--max-concurrent-positions")
         if obj_settings.require_total_loss_acknowledgement and not acknowledge_total_loss:
@@ -193,12 +208,13 @@ async def confirm_session_objective(
                 type=float,
             )
         )
-        deadline_raw = str(
-            typer.prompt(
-                "Target deadline (e.g. 15:30 ET or ISO timestamp)",
-                default=deadline_raw or "15:30 ET",
+        if deadline_exchange_time is None:
+            deadline_raw = str(
+                typer.prompt(
+                    "Target deadline (e.g. 15:30 ET or ISO timestamp)",
+                    default=deadline_raw or "15:30 ET",
+                )
             )
-        )
         concurrent = int(
             typer.prompt(
                 "Max concurrent positions",
@@ -223,15 +239,24 @@ async def confirm_session_objective(
         raise typer.BadParameter("target profit % must be >= 0")
     if concurrent is None or int(concurrent) < 1:
         raise typer.BadParameter("max concurrent positions must be >= 1")
-    if obj_settings.require_deadline and not deadline_raw:
+    if (
+        obj_settings.require_deadline
+        and not deadline_raw
+        and deadline_exchange_time is None
+    ):
         raise typer.BadParameter("target deadline is required")
     if obj_settings.require_total_loss_acknowledgement and not ack:
         raise typer.BadParameter("total-loss acknowledgement is required")
 
-    try:
-        deadline = resolve_deadline(str(deadline_raw), exchange_tz=tz)
-    except DeadlineParseError as exc:
-        raise typer.BadParameter(str(exc)) from exc
+    if deadline_exchange_time is not None:
+        if deadline_exchange_time.tzinfo is None:
+            raise typer.BadParameter("deadline_exchange_time must be timezone-aware")
+        deadline = deadline_exchange_time
+    else:
+        try:
+            deadline = resolve_deadline(str(deadline_raw), exchange_tz=tz)
+        except DeadlineParseError as exc:
+            raise typer.BadParameter(str(exc)) from exc
 
     profit = Decimal(str(auth)) * Decimal(str(target)) / Decimal("100")
     ending = Decimal(str(auth)) + profit

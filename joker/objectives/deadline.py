@@ -88,3 +88,29 @@ def time_remaining_seconds(
         raise DeadlineParseError("deadline must be timezone-aware")
     remaining = int((deadline.astimezone(tz) - clock).total_seconds())
     return max(0, remaining)
+
+
+def deadline_from_duration_minutes(
+    minutes: float,
+    *,
+    exchange_tz: str = "America/New_York",
+    now: datetime | None = None,
+) -> datetime:
+    """Return timezone-aware deadline = exchange_now + minutes.
+
+    Uses the exchange timezone clock — not naive host-local time and not
+    UTC date arithmetic alone.
+    """
+    from datetime import timedelta
+
+    if minutes <= 0:
+        raise DeadlineParseError(
+            f"objective duration must be > 0 minutes (got {minutes})"
+        )
+    tz = ZoneInfo(exchange_tz)
+    clock = now or datetime.now(tz=tz)
+    if clock.tzinfo is None:
+        clock = clock.replace(tzinfo=tz)
+    else:
+        clock = clock.astimezone(tz)
+    return clock + timedelta(minutes=float(minutes))
