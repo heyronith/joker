@@ -44,6 +44,8 @@ class SessionObjectiveService:
         stop_new_entries_at_deadline: bool = True,
         require_positive_expected_value: bool = True,
         minimum_win_probability: float = 0.45,
+        objective_policy: str = "positive_ev_baseline",
+        shadow_baseline_enabled: bool = False,
     ) -> None:
         self._repo = repository
         self._exchange_tz = exchange_tz
@@ -52,6 +54,8 @@ class SessionObjectiveService:
         self.stop_new_entries_at_deadline = stop_new_entries_at_deadline
         self.require_positive_expected_value = require_positive_expected_value
         self.minimum_win_probability = minimum_win_probability
+        self.objective_policy = objective_policy
+        self.shadow_baseline_enabled = shadow_baseline_enabled
         self._objective_id: UUID | None = None
         self._broker_submission_seen = False
         self._reconciliation_unresolved = False

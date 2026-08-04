@@ -33,7 +33,12 @@ class FeasibilityInputs:
 
 
 class GoalFeasibilityEngine:
-    """Classify objective achievability without fabricating probabilities."""
+    """Classify objective achievability without fabricating probabilities.
+
+    Under ``target_attainment``, high/extreme required returns are ``low``
+    (low_probability evidence), not hard ``infeasible``. Physical blocks
+    (deadline, no capital, no contracts, closed session) remain ``infeasible``.
+    """
 
     def __init__(
         self,
@@ -41,10 +46,12 @@ class GoalFeasibilityEngine:
         minimum_samples_for_numeric_probability: int = 20,
         max_quote_age_seconds: float = 10.0,
         max_spread_pct: float = 0.35,
+        policy: str = "positive_ev_baseline",
     ) -> None:
         self.minimum_samples = minimum_samples_for_numeric_probability
         self.max_quote_age_seconds = max_quote_age_seconds
         self.max_spread_pct = max_spread_pct
+        self.policy = policy
 
     def assess(
         self,
@@ -112,6 +119,7 @@ class GoalFeasibilityEngine:
         if required_pct >= Decimal("100") and minutes_left < 60:
             constraints.append("extreme_target_vs_time")
 
+        target_attainment = self.policy == "target_attainment"
         if (
             "premium_exceeds_available_capital" in constraints
             or "no_affordable_contract" in constraints
@@ -119,8 +127,17 @@ class GoalFeasibilityEngine:
             classification: str = "infeasible"
         elif "session_not_regular" in constraints:
             classification = "infeasible"
-        elif "extreme_target_vs_time" in constraints or "high_target_insufficient_time" in constraints:
-            classification = "low" if required_pct < Decimal("100") else "infeasible"
+        elif (
+            "extreme_target_vs_time" in constraints
+            or "high_target_insufficient_time" in constraints
+        ):
+            # Low probability ≠ physical impossibility under target_attainment.
+            if target_attainment:
+                classification = "low"
+            else:
+                classification = (
+                    "low" if required_pct < Decimal("100") else "infeasible"
+                )
         elif "wide_spreads" in constraints or "stale_quotes" in constraints:
             classification = "low"
         elif required_pct <= Decimal("10") and minutes_left >= 60:

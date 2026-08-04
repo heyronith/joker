@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 
 from joker.cognition.schemas import AgentRole, PromptSpec
 
-_PROMPT_VERSION = "2.0.0"
+_PROMPT_VERSION = "2.1.0"
 _CREATED_AT = datetime(2026, 7, 25, tzinfo=timezone.utc)
 
 _COMMON_RULES = """
@@ -20,6 +20,18 @@ Rules (non-negotiable):
 - You cannot invent unavailable data, historical win rates, or fill prices.
 - Limit prices and quantities are requests, not fills.
 - Provide concise auditable rationale, not prose labels like "price looked strong."
+""".strip()
+
+_TARGET_ATTAINMENT_MANDATE = """
+Session objective (when objective context is present):
+- Maximize the estimated probability of reaching the exact profit target within the remaining time.
+- Loss of the authorised capital is accepted by the operator; do not preserve capital merely for its own sake.
+- Never exceed authorised capital. Never bypass execution correctness.
+- Compare the value of acting now with the value of waiting (no-trade opportunity cost).
+- Prefer strategies and quantities capable of closing the remaining goal gap.
+- A lower-win-rate strategy may be rational when it materially increases P(goal by deadline).
+- Do not force a trade when no valid action improves target-hit probability over waiting.
+- Low probability is not physical impossibility; only correctness failures must hard-block.
 """.strip()
 
 
@@ -35,10 +47,14 @@ def _build_prompt(
     output_schema_name: str,
     required_context_schema: str,
     focus: str,
+    include_target_attainment: bool = False,
 ) -> PromptSpec:
+    mandate = role_mandate.strip()
+    if include_target_attainment:
+        mandate = f"{mandate}\n\n{_TARGET_ATTAINMENT_MANDATE}"
     system_template = (
         f"You are the Joker cognitive agent: {role.value}.\n\n"
-        f"Role mandate:\n{role_mandate.strip()}\n\n"
+        f"Role mandate:\n{mandate}\n\n"
         f"Focus for this invocation:\n{focus.strip()}\n\n"
         f"Required output schema: {output_schema_name}\n"
         f"Required context schema: {required_context_schema}\n\n"
@@ -156,8 +172,11 @@ _PROMPTS: dict[AgentRole, PromptSpec] = {
         required_context_schema="strategy_context",
         focus=(
             "Include adverse paths and invalidation; limits are not fills. "
-            "Always set strategy_family explicitly; never omit or invent from role."
+            "Always set strategy_family explicitly; never omit or invent from role. "
+            "Prefer payoff capability that can close the remaining goal gap when objective "
+            "context is present."
         ),
+        include_target_attainment=True,
     ),
     AgentRole.BEARISH_INVENTOR: _build_prompt(
         prompt_id="strategy.bearish_inventor",
@@ -170,8 +189,11 @@ _PROMPTS: dict[AgentRole, PromptSpec] = {
         required_context_schema="strategy_context",
         focus=(
             "Include adverse paths and invalidation; limits are not fills. "
-            "Always set strategy_family explicitly; never omit or invent from role."
+            "Always set strategy_family explicitly; never omit or invent from role. "
+            "Prefer payoff capability that can close the remaining goal gap when objective "
+            "context is present."
         ),
+        include_target_attainment=True,
     ),
     AgentRole.NEUTRAL_ADVOCATE: _build_prompt(
         prompt_id="strategy.neutral_advocate",
@@ -184,8 +206,10 @@ _PROMPTS: dict[AgentRole, PromptSpec] = {
         required_context_schema="strategy_context",
         focus=(
             "Neutral/no-trade thesis with explicit uncertainty sources. "
-            "Always set strategy_family explicitly; never omit or invent from role."
+            "Always set strategy_family explicitly; never omit or invent from role. "
+            "Waiting may be rational when P(goal|wait) exceeds P(goal|candidate)."
         ),
+        include_target_attainment=True,
     ),
     AgentRole.STRATEGY_ADVOCATE: _build_prompt(
         prompt_id="debate.strategy_advocate",
@@ -264,22 +288,27 @@ _PROMPTS: dict[AgentRole, PromptSpec] = {
         role=AgentRole.META_DECISION,
         role_mandate=(
             "Choose among EXECUTE, PROBE, DELAY, REQUEST_MORE_EVIDENCE, SWITCH_STRATEGY, "
-            "or ABANDON by weighing evidence and debate — not majority vote."
+            "or ABANDON by weighing evidence and debate — not majority vote. "
+            "Deterministic target-attainment scoring remains authoritative for quantity "
+            "and whether a candidate improves P(goal by deadline) versus waiting."
         ),
         output_schema_name="MetaDecision",
         required_context_schema="decision_context",
         focus="Route action; do not select contracts or prices.",
+        include_target_attainment=True,
     ),
     AgentRole.ENTRY_TACTICIAN: _build_prompt(
         prompt_id="execution.entry_tactician",
         role=AgentRole.ENTRY_TACTICIAN,
         role_mandate=(
             "Translate an approved strategy into a typed ExecutionProposal: contract, "
-            "quantity, limit, timing, and fill policies."
+            "quantity, limit, timing, and fill policies. Quantity is advisory; "
+            "deterministic target-attainment / capital sizing is authoritative."
         ),
         output_schema_name="ExecutionProposal",
         required_context_schema="execution_context",
         focus="Propose limits only; never treat them as fills.",
+        include_target_attainment=True,
     ),
     AgentRole.ORDER_MANAGER: _build_prompt(
         prompt_id="execution.order_manager",

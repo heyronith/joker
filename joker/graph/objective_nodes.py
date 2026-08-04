@@ -241,7 +241,12 @@ async def score_strategies_against_objective_node(
         require_positive_expected_value=bool(
             getattr(deps.objective_service, "require_positive_expected_value", True)
         ),
-        require_lower_confidence_bound_positive=require_lcb,
+        require_lower_confidence_bound_positive=(
+            require_lcb
+            if getattr(deps, "objective_policy", "positive_ev_baseline")
+            != "target_attainment"
+            else False
+        ),
         estimate_ttl_seconds=ttl,
     )
     as_of = datetime.now(timezone.utc)
@@ -456,23 +461,142 @@ async def score_strategies_against_objective_node(
     for score in scores:
         if score.is_no_trade:
             deps.objective_service.save_strategy_score(score)
-    valid_trade = [s for s in scores if s.valid and not s.is_no_trade]
-    if (
-        not valid_trade
-        and deps.historical_outcome_service is not None
-        and max_sample_seen < min_samples
-    ):
-        await deps.objective_service.mark_insufficient_historical_evidence(
-            sample_count=max_sample_seen,
-            minimum_required=min_samples,
+
+    policy = str(
+        getattr(deps, "objective_policy", None)
+        or getattr(deps.objective_service, "objective_policy", "positive_ev_baseline")
+    )
+    shadow_enabled = bool(
+        getattr(deps, "shadow_baseline_enabled", False)
+        or getattr(deps.objective_service, "shadow_baseline_enabled", False)
+    )
+    ta_decision_dump: dict[str, Any] | None = None
+    ta_no_valid = False
+    if policy == "target_attainment" and deps.target_attainment_policy is not None:
+        from joker.objectives.target_attainment import (
+            TargetAttainmentContext,
+            candidate_from_score_input,
+            run_positive_ev_baseline_shadow,
         )
-    return {
+
+        baseline_shadow = None
+        if shadow_enabled:
+            baseline_shadow = run_positive_ev_baseline_shadow(
+                obj_state,
+                candidates,
+                snapshot_id=snapshot_id,
+                require_positive_expected_value=True,
+                minimum_win_probability=0.45,
+            )
+        ta_settings = getattr(deps, "target_attainment_settings", None)
+        allow_full = True
+        max_frac = 1.0
+        min_cal = 20
+        max_contracts = 20
+        if ta_settings is not None:
+            allow_full = bool(getattr(ta_settings, "allow_full_remaining_capital", True))
+            max_frac = float(getattr(ta_settings, "maximum_capital_fraction", 1.0))
+            min_cal = int(getattr(ta_settings, "minimum_calibrated_samples", 20))
+        max_contracts = int(
+            getattr(deps.capital_sizer, "maximum_authorised_contracts", 20)
+            if deps.capital_sizer is not None
+            else 20
+        )
+        duration_s = None
+        if getattr(obj_state, "deadline_exchange_time", None) is not None:
+            # Prefer elapsed+remaining when available; otherwise use remaining.
+            duration_s = max(int(obj_state.time_remaining_seconds), 1)
+        ctx = TargetAttainmentContext.from_state(
+            obj_state,
+            snapshot_id=snapshot_id,
+            objective_duration_seconds=duration_s,
+            maximum_authorised_contracts=max_contracts,
+            allow_full_remaining_capital=allow_full,
+            maximum_capital_fraction=max_frac,
+            minimum_calibrated_samples=min_cal,
+            session_phase=session_phase,
+            market_usable_for_execution=True,
+            option_surface_usable=bool(surface_slice),
+        )
+        ta_cands = [
+            candidate_from_score_input(
+                c,
+                premium_per_contract_usd=default_premium,
+            )
+            for c in candidates
+        ]
+        from dataclasses import replace as dc_replace
+
+        for i, summary in enumerate(historical_summaries):
+            if i >= len(ta_cands):
+                break
+            rate = summary.get("hit_rate") or summary.get("win_rate")
+            if rate is None:
+                continue
+            c0 = ta_cands[i]
+            ta_cands[i] = dc_replace(
+                c0,
+                historical_hit_rate=Decimal(str(rate)),
+                sample_count=int(summary.get("sample_count") or c0.sample_count),
+            )
+        decision = deps.target_attainment_policy.decide(
+            ctx, ta_cands, baseline_shadow=baseline_shadow
+        )
+        ta_decision_dump = decision.as_dict()
+        from joker.objectives.target_attainment import TargetAttainmentAction
+
+        if decision.action == TargetAttainmentAction.ENTER:
+            ta_no_valid = False
+            for idx, score in enumerate(scores):
+                if score.is_no_trade:
+                    continue
+                if (
+                    decision.selected_strategy_id is not None
+                    and score.strategy_id == decision.selected_strategy_id
+                ):
+                    scores[idx] = score.model_copy(
+                        update={
+                            "valid": True,
+                            "invalidation_codes": tuple(
+                                c
+                                for c in (score.invalidation_codes or ())
+                                if c
+                                not in {
+                                    "non_positive_expected_value",
+                                    "expected_value_unavailable",
+                                    "win_probability_below_minimum",
+                                }
+                            ),
+                        }
+                    )
+        else:
+            ta_no_valid = True
+
+    valid_trade = [s for s in scores if s.valid and not s.is_no_trade]
+    if policy == "target_attainment":
+        no_valid = ta_no_valid or (
+            ta_decision_dump is not None
+            and ta_decision_dump.get("action") != "enter"
+        )
+    else:
+        no_valid = len(valid_trade) == 0
+        if (
+            not valid_trade
+            and deps.historical_outcome_service is not None
+            and max_sample_seen < min_samples
+        ):
+            await deps.objective_service.mark_insufficient_historical_evidence(
+                sample_count=max_sample_seen,
+                minimum_required=min_samples,
+            )
+    result: dict[str, Any] = {
         "_strategy_scores": [s.model_dump(mode="json") for s in scores],
         "_strategy_estimates": estimates,
         "_historical_summaries": historical_summaries,
-        "_no_valid_strategy": len(valid_trade) == 0,
+        "_no_valid_strategy": no_valid,
         "_historical_sample_count": max_sample_seen,
         "_historical_minimum_required": min_samples,
+        "_objective_policy": policy,
         **trace_update(
             append_trace(
                 state,
@@ -481,6 +605,15 @@ async def score_strategies_against_objective_node(
             )
         ),
     }
+    if ta_decision_dump is not None:
+        result["_target_attainment_decision"] = ta_decision_dump
+        result["_target_attainment_quantity"] = int(
+            ta_decision_dump.get("selected_quantity") or 0
+        )
+        result["_target_attainment_strategy_id"] = ta_decision_dump.get(
+            "selected_strategy_id"
+        )
+    return result
 
 
 def _estimate_for_strategy(
@@ -522,7 +655,11 @@ async def deterministic_sizing_node(
     proposal = state.get("execution_proposal")
     obj_state = await deps.objective_service.get_state()
     estimate = _estimate_for_strategy(state, meta.selected_strategy_id)
-    if estimate is None or not estimate.get("valid"):
+    target_mode = (
+        str(getattr(deps, "objective_policy", "positive_ev_baseline"))
+        == "target_attainment"
+    )
+    if estimate is None or (not estimate.get("valid") and not target_mode):
         return {
             "_sizing_decision": {
                 "approved": False,
@@ -533,6 +670,19 @@ async def deterministic_sizing_node(
                 node_name="deterministic_sizing",
                 error_code="estimate_invalid",
                 message="selected strategy lacks a valid objective estimate",
+            ),
+        }
+    if estimate is None:
+        return {
+            "_sizing_decision": {
+                "approved": False,
+                "reason_codes": ["estimate_missing_or_invalid"],
+            },
+            **append_error(
+                state,
+                node_name="deterministic_sizing",
+                error_code="estimate_invalid",
+                message="selected strategy lacks an objective estimate",
             ),
         }
     ev = estimate.get("expected_value_usd")
@@ -546,15 +696,27 @@ async def deterministic_sizing_node(
         px = getattr(leg, "limit_price", None)
         if px is not None:
             premium = Decimal(str(px))
+    ta_qty = state.get("_target_attainment_quantity")
+    ta_sid = state.get("_target_attainment_strategy_id")
+    if (
+        target_mode
+        and ta_qty
+        and int(ta_qty) > 0
+        and (
+            ta_sid is None
+            or str(ta_sid) == str(meta.selected_strategy_id)
+        )
+    ):
+        requested = int(ta_qty)
     is_probe = meta.action == MetaDecisionAction.PROBE
     decision = deps.capital_sizer.size(
         obj_state,
         strategy_id=meta.selected_strategy_id,
         premium_per_contract_usd=premium,
         requested_quantity=requested,
-        expected_value_usd=ev,
-        estimated_win_probability=win_p,
-        expected_r=payoff,
+        expected_value_usd=None if target_mode else ev,
+        estimated_win_probability=None if target_mode else win_p,
+        expected_r=payoff if not target_mode else None,
         is_probe=is_probe,
     )
     dump = decision.model_dump(mode="json")
@@ -609,16 +771,36 @@ async def apply_objective_sizing_to_proposal(
         proposal, "strategy_id", None
     )
     estimate = _estimate_for_strategy(state, strategy_id)
-    if estimate is None or not estimate.get("valid"):
+    target_mode = (
+        str(getattr(deps, "objective_policy", "positive_ev_baseline"))
+        == "target_attainment"
+    )
+    if estimate is None or (not estimate.get("valid") and not target_mode):
         return append_error(
             state,
             node_name="apply_objective_sizing",
             error_code="estimate_invalid",
-            message="cannot size without a valid positive-EV estimate",
+            message="cannot size without a valid objective estimate",
+        )
+    if estimate is None:
+        return append_error(
+            state,
+            node_name="apply_objective_sizing",
+            error_code="estimate_invalid",
+            message="cannot size without an objective estimate",
         )
     leg = proposal.legs[0]
     premium = Decimal(str(leg.limit_price or "0.10"))
     requested = int(leg.quantity)
+    ta_qty = state.get("_target_attainment_quantity")
+    ta_sid = state.get("_target_attainment_strategy_id")
+    if (
+        target_mode
+        and ta_qty
+        and int(ta_qty) > 0
+        and (ta_sid is None or str(ta_sid) == str(strategy_id))
+    ):
+        requested = int(ta_qty)
     is_probe = bool(
         meta is not None and meta.action == MetaDecisionAction.PROBE
     ) or getattr(proposal, "action", None) == "probe"
@@ -627,9 +809,15 @@ async def apply_objective_sizing_to_proposal(
         strategy_id=strategy_id,
         premium_per_contract_usd=premium,
         requested_quantity=requested,
-        expected_value_usd=estimate.get("expected_value_usd"),
-        estimated_win_probability=estimate.get("estimated_win_probability"),
-        expected_r=estimate.get("estimated_payoff_ratio"),
+        expected_value_usd=(
+            None if target_mode else estimate.get("expected_value_usd")
+        ),
+        estimated_win_probability=(
+            None if target_mode else estimate.get("estimated_win_probability")
+        ),
+        expected_r=(
+            None if target_mode else estimate.get("estimated_payoff_ratio")
+        ),
         is_probe=is_probe,
     )
     if not decision.approved or decision.approved_quantity <= 0:

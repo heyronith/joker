@@ -80,12 +80,30 @@ def test_runtime_cannot_end_before_objective_deadline() -> None:
 
 def test_objective_window_must_fit_before_market_close() -> None:
     # 15:30 + 60m = 16:30 > 16:00 close
-    with pytest.raises(PaperGoalTimingError, match="does not fit before regular-session"):
+    now = _regular_now(15, 30)
+    with pytest.raises(PaperGoalTimingError) as exc_info:
         resolve_paper_goal_timing(
             objective_duration_minutes=60,
             target_deadline=None,
             duration_minutes=None,
-            now=_regular_now(15, 30),
+            now=now,
+        )
+    msg = str(exc_info.value)
+    assert "does not fit before regular-session" in msg
+    assert "current exchange time=" in msg
+    assert "requested deadline=" in msg
+    assert "regular-session close=" in msg
+    assert "maximum valid duration=" in msg
+    assert now.isoformat() in msg
+
+
+def test_duration_and_absolute_deadline_mutually_exclusive() -> None:
+    with pytest.raises(PaperGoalTimingError, match="mutually exclusive"):
+        resolve_paper_goal_timing(
+            objective_duration_minutes=45,
+            target_deadline="11:30 ET",
+            duration_minutes=None,
+            now=_regular_now(10, 0),
         )
 
 

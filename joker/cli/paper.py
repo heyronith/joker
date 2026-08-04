@@ -326,11 +326,39 @@ def paper_run(
         )
 
     # Goal-test timing: resolve before objective creation.
+    # Interactive mode: prompt for deadline mode when flags omitted.
     exchange_tz = str(result.app_settings.exchange.timezone)
+    resolved_objective_duration = objective_duration_minutes
+    resolved_target_deadline = target_deadline
+    if (
+        not yes
+        and objective_duration_minutes is None
+        and target_deadline is None
+    ):
+        console.print("\n[bold]Deadline mode[/bold]")
+        mode = typer.prompt(
+            "Deadline mode (1=Relative duration, 2=Absolute exchange deadline)",
+            default="1",
+        )
+        if str(mode).strip() in {"2", "absolute", "Absolute", "A", "a"}:
+            resolved_target_deadline = str(
+                typer.prompt(
+                    "Target deadline (e.g. 11:30 ET or ISO timestamp)",
+                    default="15:30 ET",
+                )
+            )
+        else:
+            resolved_objective_duration = float(
+                typer.prompt(
+                    "Objective duration in minutes",
+                    default=60.0,
+                    type=float,
+                )
+            )
     try:
         timing = resolve_paper_goal_timing(
-            objective_duration_minutes=objective_duration_minutes,
-            target_deadline=target_deadline,
+            objective_duration_minutes=resolved_objective_duration,
+            target_deadline=resolved_target_deadline,
             duration_minutes=duration_minutes,
             exchange_tz=exchange_tz,
             calendar=MarketCalendar(),
@@ -459,11 +487,39 @@ def paper_run(
         {
             "objective_id": objective_id,
             "session_id": session_id,
+            "policy": str(getattr(result.app_settings.objective, "policy", None)),
+            "shadow_baseline_enabled": bool(
+                getattr(result.app_settings.objective, "shadow_baseline_enabled", False)
+            ),
+            "deadline_mode": (
+                "absolute"
+                if timing.objective_source == "absolute_deadline"
+                else "relative"
+            ),
             "authorized_capital_usd": capital_budget.authorized_usd,
             "target_profit_pct": capital_budget.plan.target_profit_pct,
             "target_profit_usd": target_profit_usd,
             **banner,
             "paper_account_hash": paper_account_hash,
+        },
+    )
+    # Ensure target-attainment evidence streams exist even if no cycles emit.
+    for name in (
+        "target-attainment-context.jsonl",
+        "candidate-quantity-evaluations.jsonl",
+        "target-probability-estimates.jsonl",
+        "no-trade-evaluations.jsonl",
+        "baseline-shadow-decisions.jsonl",
+        "urgency-transitions.jsonl",
+    ):
+        (artifacts / name).touch(exist_ok=True)
+    write_json(
+        artifacts / "deadline-state.json",
+        {
+            "objective_deadline": timing.objective_deadline.isoformat(),
+            "exchange_now_at_start": timing.exchange_now.isoformat(),
+            "session_close": timing.session_close.isoformat(),
+            "shutdown_grace_seconds": timing.shutdown_grace_seconds,
         },
     )
     write_json(
@@ -564,6 +620,60 @@ def paper_run(
                 artifacts / "graph-decisions.jsonl",
                 {"event": event_type, "payload": payload},
             )
+        ta = payload.get("target_attainment_decision") or payload.get(
+            "_target_attainment_decision"
+        )
+        if ta and isinstance(ta, dict):
+            append_jsonl(
+                artifacts / "target-attainment-context.jsonl",
+                {
+                    "event": event_type,
+                    "snapshot_id": payload.get("snapshot_id"),
+                    "decision": {
+                        k: ta.get(k)
+                        for k in (
+                            "decision_id",
+                            "action",
+                            "feasibility",
+                            "selected_strategy_id",
+                            "selected_quantity",
+                            "selected_capital_usd",
+                            "probability_delta",
+                            "reason_codes",
+                        )
+                    },
+                },
+            )
+            for qev in ta.get("quantity_evaluations") or []:
+                append_jsonl(
+                    artifacts / "candidate-quantity-evaluations.jsonl",
+                    {"event": event_type, "evaluation": qev},
+                )
+                if isinstance(qev, dict) and qev.get("p_goal"):
+                    append_jsonl(
+                        artifacts / "target-probability-estimates.jsonl",
+                        {
+                            "kind": "candidate_quantity",
+                            "strategy_id": qev.get("strategy_id"),
+                            "quantity": qev.get("quantity"),
+                            "p_goal": qev.get("p_goal"),
+                        },
+                    )
+            if ta.get("no_trade"):
+                append_jsonl(
+                    artifacts / "no-trade-evaluations.jsonl",
+                    {"event": event_type, "evaluation": ta.get("no_trade")},
+                )
+            if ta.get("baseline_shadow"):
+                append_jsonl(
+                    artifacts / "baseline-shadow-decisions.jsonl",
+                    {
+                        "event": event_type,
+                        "shadow": ta.get("baseline_shadow"),
+                        "authoritative_action": ta.get("action"),
+                        "executes_shadow": False,
+                    },
+                )
 
         important = {
             "order.accepted",

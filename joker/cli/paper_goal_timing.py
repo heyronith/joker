@@ -130,11 +130,15 @@ def resolve_paper_goal_timing(
         )
 
     if objective_deadline > session_close:
+        max_valid_duration_minutes = max(
+            0.0, (session_close - exchange_now).total_seconds() / 60.0
+        )
         raise PaperGoalTimingError(
             "objective window does not fit before regular-session close; "
-            f"deadline={objective_deadline.isoformat()} "
-            f"session_close={session_close.isoformat()} "
-            f"exchange_now={exchange_now.isoformat()}. "
+            f"current exchange time={exchange_now.isoformat()} "
+            f"requested deadline={objective_deadline.isoformat()} "
+            f"regular-session close={session_close.isoformat()} "
+            f"maximum valid duration={max_valid_duration_minutes:.2f} minutes. "
             "Do not silently shorten the objective — choose a shorter duration "
             "or an earlier --target-deadline."
         )

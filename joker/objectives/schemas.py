@@ -293,6 +293,7 @@ class ObjectiveContext(BaseModel):
     working_order_reservation_usd: Decimal = Decimal("0.00")
     filled_position_exposure_usd: Decimal = Decimal("0.00")
     realised_pnl_usd: Decimal
+    unrealised_pnl_usd: Decimal = Decimal("0.00")
     target_profit_usd: Decimal
     required_profit_remaining_usd: Decimal
     progress_to_goal_pct: Decimal
@@ -305,6 +306,8 @@ class ObjectiveContext(BaseModel):
     objective_id: str | None = None
     objective_version: int | None = None
     status: str | None = None
+    policy: str | None = None
+    no_trade_target_hit_estimate: Decimal | None = None
 
     def model_dump_for_hash(self) -> dict[str, Any]:
         return self.model_dump(mode="json")
@@ -504,6 +507,8 @@ def state_to_context(state: SessionObjectiveState) -> ObjectiveContext:
         working_order_reservation_usd=state.working_order_reservation_usd,
         filled_position_exposure_usd=state.filled_position_exposure_usd,
         realised_pnl_usd=state.realised_pnl_usd,
+        unrealised_pnl_usd=getattr(state, "unrealised_pnl_usd", Decimal("0.00"))
+        or Decimal("0.00"),
         target_profit_usd=state.target_profit_usd,
         required_profit_remaining_usd=state.required_profit_remaining_usd,
         progress_to_goal_pct=state.progress_to_goal_pct,
@@ -516,6 +521,7 @@ def state_to_context(state: SessionObjectiveState) -> ObjectiveContext:
         objective_id=str(state.objective_id),
         objective_version=state.version,
         status=state.status,
+        policy=getattr(state, "policy", None),
     )
 
 

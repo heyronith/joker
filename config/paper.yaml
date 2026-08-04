@@ -185,11 +185,14 @@ capital:
 
 objective:
   enabled: true
+  policy: target_attainment
+  shadow_baseline_enabled: true
   require_session_confirmation: true
   require_total_loss_acknowledgement: true
   require_deadline: true
   pause_entries_when_goal_met: true
   stop_new_entries_at_deadline: true
+  # Baseline shadow evidence thresholds (not hard vetoes under target_attainment).
   minimum_win_probability: 0.45
   require_positive_expected_value: true
   default_max_concurrent_positions: 1
@@ -199,8 +202,8 @@ objective:
     minimum_samples_for_numeric_probability: 20
     allow_ordinal_scoring_when_probability_unavailable: true
   sizing:
-    mode: objective_adaptive
-    max_capital_fraction: 0.85
+    mode: target_attainment
+    max_capital_fraction: 1.0
     max_probe_fraction: 0.15
     prohibit_loss_multiplier: true
   historical_outcomes:
@@ -214,6 +217,20 @@ objective:
     require_same_strategy_family: true
   execution:
     maximum_buy_limit_above_ask_pct: 5.0
+  target_attainment:
+    enabled: true
+    allow_full_remaining_capital: true
+    maximum_capital_fraction: 1.0
+    minimum_calibrated_samples: 20
+    probability_estimation:
+      empirical_enabled: true
+      ordinal_fallback_enabled: true
+    quantity_search:
+      evaluate_all_affordable_quantities: true
+    no_trade:
+      model_opportunity_cost: true
+    tie_breaking:
+      use_lower_confidence_bound: true
   exploration:
     enabled: false
     operator_confirmation_required: true

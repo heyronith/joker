@@ -87,6 +87,9 @@ class CognitiveGraphDeps:
     capital_sizer: Any | None = None
     historical_outcome_service: Any | None = None
     historical_outcome_settings: Any | None = None
+    target_attainment_policy: Any | None = None
+    objective_policy: str = "positive_ev_baseline"
+    shadow_baseline_enabled: bool = False
     # Risk kill switch — stronger than objective approval for ENTRY/PROBE/ADD.
     kill_switch: bool = False
     # Shared entry-permission gate (startup reconciliation / truth uncertainty).

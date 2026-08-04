@@ -269,6 +269,11 @@ async def confirm_session_objective(
     table.add_row("Target profit %", f"{float(target):.1f}%")
     table.add_row("Target profit $", f"${float(profit):,.2f}")
     table.add_row("Target ending equity", f"${float(ending):,.2f}")
+    table.add_row("Objective policy", str(obj_settings.policy))
+    table.add_row(
+        "Shadow baseline",
+        "yes" if obj_settings.shadow_baseline_enabled else "no",
+    )
     table.add_row("Deadline (exchange)", deadline.isoformat())
     table.add_row("Time remaining", f"{remaining}s")
     table.add_row("Max concurrent positions", str(int(concurrent)))
@@ -290,8 +295,18 @@ async def confirm_session_objective(
         operator_events=events,
         pause_entries_when_goal_met=bool(obj_settings.pause_entries_when_goal_met),
         stop_new_entries_at_deadline=bool(obj_settings.stop_new_entries_at_deadline),
-        require_positive_expected_value=bool(obj_settings.require_positive_expected_value),
-        minimum_win_probability=float(obj_settings.minimum_win_probability),
+        require_positive_expected_value=(
+            bool(obj_settings.require_positive_expected_value)
+            if not obj_settings.is_target_attainment
+            else False
+        ),
+        minimum_win_probability=(
+            float(obj_settings.minimum_win_probability)
+            if not obj_settings.is_target_attainment
+            else 0.0
+        ),
+        objective_policy=str(obj_settings.policy),
+        shadow_baseline_enabled=bool(obj_settings.shadow_baseline_enabled),
     )
     definition = await service.create_objective(
         session_id=session_id,
@@ -316,9 +331,21 @@ async def confirm_session_objective(
             getattr(obj_settings, "maximum_authorised_contracts", capital.max_contracts_per_trade)
         ),
         min_contracts_per_trade=int(capital.min_contracts_per_trade),
-        aggression_mode=str(capital.aggression_mode),
-        max_kelly_fraction=float(capital.max_kelly_fraction),
-        min_win_probability=float(obj_settings.minimum_win_probability),
+        aggression_mode=(
+            "target_attainment"
+            if obj_settings.is_target_attainment
+            else str(capital.aggression_mode)
+        ),
+        max_kelly_fraction=(
+            1.0
+            if obj_settings.is_target_attainment
+            else float(capital.max_kelly_fraction)
+        ),
+        min_win_probability=(
+            0.0
+            if obj_settings.is_target_attainment
+            else float(obj_settings.minimum_win_probability)
+        ),
         behind_goal_boost=float(capital.behind_goal_boost),
         ahead_goal_dampen=float(capital.ahead_goal_dampen),
     )
@@ -358,6 +385,18 @@ def build_objective_engines(
     obj = app_settings.objective
     capital = app_settings.capital
     hist_settings = obj.historical_outcomes
+    target_mode = obj.is_target_attainment
+    ta = obj.target_attainment
+
+    # Authoritative scorer/sizer: soft EV/win-p under target_attainment.
+    # Baseline thresholds remain available for shadow comparison only.
+    enforce_ev = bool(obj.require_positive_expected_value) and not target_mode
+    enforce_win = float(obj.minimum_win_probability) if not target_mode else 0.0
+    size_frac = (
+        float(ta.maximum_capital_fraction)
+        if target_mode and ta.allow_full_remaining_capital
+        else float(obj.sizing.max_capital_fraction)
+    )
 
     diagnostic_reason: str | None = None
     if episode_repository is not None and evaluation_repository is not None:
@@ -392,33 +431,41 @@ def build_objective_engines(
         cold_start=not historical_service.uses_repository_loaders,
     )
 
+    from joker.objectives.target_attainment import TargetAttainmentPolicy
+
     return ObjectiveEngineBundle(
         feasibility_engine=GoalFeasibilityEngine(
             minimum_samples_for_numeric_probability=int(
                 obj.feasibility.minimum_samples_for_numeric_probability
             ),
+            policy=str(obj.policy),
         ),
         objective_strategy_scorer=ObjectiveStrategyScorer(
-            require_positive_expected_value=bool(obj.require_positive_expected_value),
-            minimum_win_probability=float(obj.minimum_win_probability),
+            require_positive_expected_value=enforce_ev,
+            minimum_win_probability=enforce_win,
             allow_ordinal_when_probability_unavailable=bool(
                 obj.feasibility.allow_ordinal_scoring_when_probability_unavailable
             ),
         ),
         capital_sizer=DeterministicObjectiveSizer(
-            max_capital_fraction=float(obj.sizing.max_capital_fraction),
+            max_capital_fraction=size_frac,
             max_probe_fraction=float(obj.sizing.max_probe_fraction),
             prohibit_loss_multiplier=bool(obj.sizing.prohibit_loss_multiplier),
-            minimum_win_probability=float(obj.minimum_win_probability),
-            require_positive_expected_value=bool(obj.require_positive_expected_value),
+            minimum_win_probability=enforce_win,
+            require_positive_expected_value=enforce_ev,
             maximum_authorised_contracts=int(obj.maximum_authorised_contracts),
             min_contracts=int(capital.min_contracts_per_trade),
-            aggression_mode=str(capital.aggression_mode),
-            max_kelly_fraction=float(capital.max_kelly_fraction),
+            aggression_mode=(
+                "target_attainment" if target_mode else str(capital.aggression_mode)
+            ),
+            max_kelly_fraction=1.0 if target_mode else float(capital.max_kelly_fraction),
             behind_goal_boost=float(capital.behind_goal_boost),
             ahead_goal_dampen=float(capital.ahead_goal_dampen),
         ),
         historical_outcome_service=historical_service,
         historical_outcome_settings=hist_settings,
+        target_attainment_policy=TargetAttainmentPolicy() if target_mode else None,
+        objective_policy=str(obj.policy),
+        shadow_baseline_enabled=bool(obj.shadow_baseline_enabled),
         source_diagnostic=diagnostic,
     )

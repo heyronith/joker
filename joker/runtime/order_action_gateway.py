@@ -428,12 +428,16 @@ class OrderActionGateway:
                         objective_id=obj_state.objective_id,
                     )
                 if estimate is None or not estimate.valid:
-                    return OrderActionResult(
-                        submitted=False,
-                        client_order_id=request.client_order_id,
-                        blocked_reason="objective_estimate_missing_or_invalid",
-                        working_orders=working,
+                    objective_policy_pre = str(
+                        getattr(svc, "objective_policy", "positive_ev_baseline")
                     )
+                    if estimate is None or objective_policy_pre != "target_attainment":
+                        return OrderActionResult(
+                            submitted=False,
+                            client_order_id=request.client_order_id,
+                            blocked_reason="objective_estimate_missing_or_invalid",
+                            working_orders=working,
+                        )
                 if str(estimate.objective_id) != str(obj_state.objective_id):
                     return OrderActionResult(
                         submitted=False,
@@ -452,7 +456,15 @@ class OrderActionGateway:
                     )
                 if estimate.historical_summary_id is not None:
                     summary = svc.get_historical_summary(estimate.historical_summary_id)
-                    if summary is None or not summary.valid_for_ev:
+                    objective_policy = str(
+                        getattr(svc, "objective_policy", "positive_ev_baseline")
+                    )
+                    # Target-attainment may proceed on ordinal/low-sample evidence;
+                    # baseline still requires valid_for_ev historical summaries.
+                    if (
+                        objective_policy != "target_attainment"
+                        and (summary is None or not summary.valid_for_ev)
+                    ):
                         return OrderActionResult(
                             submitted=False,
                             client_order_id=request.client_order_id,
@@ -500,6 +512,11 @@ class OrderActionGateway:
                 require_ev = bool(
                     getattr(svc, "require_positive_expected_value", True)
                 )
+                objective_policy = str(
+                    getattr(svc, "objective_policy", "positive_ev_baseline")
+                )
+                if objective_policy == "target_attainment":
+                    require_ev = False
                 hist_settings = getattr(
                     self._deps, "historical_outcome_settings", None
                 )

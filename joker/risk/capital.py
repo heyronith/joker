@@ -106,8 +106,12 @@ class CapitalBudget:
         Max capital fraction allowed given goal progress and session clock.
 
         Behind goal with time left → boost. Ahead / late day → dampen.
+        ``target_attainment`` mode never applies late-session dampening;
+        urgency emerges from the target-hit probability policy instead.
         """
         base = self.plan.max_kelly_fraction
+        if self.plan.aggression_mode == "target_attainment":
+            return max(0.05, min(1.0, float(base) if base > 0 else 1.0))
         if self.plan.aggression_mode != "goal_adaptive":
             return base
 

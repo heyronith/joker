@@ -38,7 +38,7 @@ class ObjectiveSizingSettings(BaseModel):
     @field_validator("mode")
     @classmethod
     def _mode(cls, value: str) -> str:
-        allowed = {"objective_adaptive", "fixed"}
+        allowed = {"objective_adaptive", "fixed", "target_attainment"}
         if value not in allowed:
             raise ValueError(f"sizing.mode must be one of {sorted(allowed)}")
         return value
@@ -107,18 +107,84 @@ class ObjectiveExecutionSettings(BaseModel):
         return value
 
 
+class TargetAttainmentProbabilitySettings(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    empirical_enabled: bool = True
+    ordinal_fallback_enabled: bool = True
+
+
+class TargetAttainmentQuantitySettings(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    evaluate_all_affordable_quantities: bool = True
+
+
+class TargetAttainmentNoTradeSettings(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    model_opportunity_cost: bool = True
+
+
+class TargetAttainmentTieBreakSettings(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    use_lower_confidence_bound: bool = True
+
+
+class TargetAttainmentSettings(BaseModel):
+    """Maximize P(goal by deadline) under authorized-capital constraints."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = True
+    allow_full_remaining_capital: bool = True
+    maximum_capital_fraction: float = 1.0
+    minimum_calibrated_samples: int = 20
+    probability_estimation: TargetAttainmentProbabilitySettings = Field(
+        default_factory=TargetAttainmentProbabilitySettings
+    )
+    quantity_search: TargetAttainmentQuantitySettings = Field(
+        default_factory=TargetAttainmentQuantitySettings
+    )
+    no_trade: TargetAttainmentNoTradeSettings = Field(
+        default_factory=TargetAttainmentNoTradeSettings
+    )
+    tie_breaking: TargetAttainmentTieBreakSettings = Field(
+        default_factory=TargetAttainmentTieBreakSettings
+    )
+
+    @field_validator("maximum_capital_fraction")
+    @classmethod
+    def _cap(cls, value: float) -> float:
+        if not 0 < value <= 1:
+            raise ValueError("maximum_capital_fraction must be in (0, 1]")
+        return value
+
+    @field_validator("minimum_calibrated_samples")
+    @classmethod
+    def _samples(cls, value: int) -> int:
+        if value < 1:
+            raise ValueError("minimum_calibrated_samples must be >= 1")
+        return value
+
+
 class ObjectiveSettings(BaseModel):
     """Session objective gates — no default capital/target/deadline that silently arms."""
 
     model_config = ConfigDict(extra="forbid")
 
     enabled: bool = False
+    # positive_ev_baseline | target_attainment
+    policy: str = "positive_ev_baseline"
+    shadow_baseline_enabled: bool = False
     require_session_confirmation: bool = True
     require_total_loss_acknowledgement: bool = True
     require_deadline: bool = True
     pause_entries_when_goal_met: bool = True
     stop_new_entries_at_deadline: bool = True
 
+    # Baseline-policy evidence thresholds (hard vetoes only under positive_ev_baseline).
     minimum_win_probability: float = 0.45
     require_positive_expected_value: bool = True
 
@@ -138,7 +204,18 @@ class ObjectiveSettings(BaseModel):
     exploration: ExplorationModeSettings = Field(
         default_factory=ExplorationModeSettings
     )
+    target_attainment: TargetAttainmentSettings = Field(
+        default_factory=TargetAttainmentSettings
+    )
     operator_event_capacity: int = 256
+
+    @field_validator("policy")
+    @classmethod
+    def _policy(cls, value: str) -> str:
+        allowed = {"positive_ev_baseline", "target_attainment"}
+        if value not in allowed:
+            raise ValueError(f"objective.policy must be one of {sorted(allowed)}")
+        return value
 
     @field_validator("minimum_win_probability")
     @classmethod
@@ -153,3 +230,7 @@ class ObjectiveSettings(BaseModel):
         if value < 1:
             raise ValueError("must be >= 1")
         return value
+
+    @property
+    def is_target_attainment(self) -> bool:
+        return self.policy == "target_attainment"

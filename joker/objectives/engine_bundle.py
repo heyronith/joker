@@ -11,6 +11,7 @@ from joker.objectives.feasibility import GoalFeasibilityEngine
 from joker.objectives.historical_outcomes import HistoricalOutcomeService
 from joker.objectives.scoring import ObjectiveStrategyScorer
 from joker.objectives.sizing import DeterministicObjectiveSizer
+from joker.objectives.target_attainment import TargetAttainmentPolicy
 
 
 class HistoricalSourceDiagnostic(BaseModel):
@@ -36,6 +37,9 @@ class ObjectiveEngineBundle(BaseModel):
     capital_sizer: DeterministicObjectiveSizer
     historical_outcome_service: HistoricalOutcomeService
     historical_outcome_settings: HistoricalOutcomeSettings
+    target_attainment_policy: TargetAttainmentPolicy | None = None
+    objective_policy: str = "positive_ev_baseline"
+    shadow_baseline_enabled: bool = False
     source_diagnostic: HistoricalSourceDiagnostic = Field(
         default_factory=HistoricalSourceDiagnostic
     )
@@ -48,4 +52,7 @@ class ObjectiveEngineBundle(BaseModel):
             "capital_sizer": self.capital_sizer,
             "historical_outcome_service": self.historical_outcome_service,
             "historical_outcome_settings": self.historical_outcome_settings,
+            "target_attainment_policy": self.target_attainment_policy,
+            "objective_policy": self.objective_policy,
+            "shadow_baseline_enabled": self.shadow_baseline_enabled,
         }
