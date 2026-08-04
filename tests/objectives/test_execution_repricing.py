@@ -611,6 +611,38 @@ async def test_incremental_add_requires_positive_ev(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_gateway_price_change_triggers_recalculation_when_ranking_invalid(
+    tmp_path, monkeypatch
+) -> None:
+    """Material ask move under target_attainment must not silently resize/submit."""
+    quote = _quote(ask="2.00", bid="1.90", spread="0.05")
+    gateway, svc, est, strategy, runtime, calls, _ = await _gateway_stack(
+        tmp_path, quote=quote, pnl=Decimal("20")
+    )
+    svc.objective_policy = "target_attainment"
+    svc.require_positive_expected_value = False
+    _patch_validate(monkeypatch)
+    est2 = est.model_copy(
+        update={
+            "valid": True,
+            "expected_value_usd": Decimal("20.00"),
+            "quote_inputs": {
+                "premium_per_contract": "1.00",
+                "quantity": 1,
+                "slippage_per_contract": "0.00",
+            },
+        }
+    )
+    svc.save_strategy_estimate(est2)
+    result = await gateway.submit(_entry_request(est2, strategy, limit=2.00))
+    assert calls == [CONTRACT_ID]
+    assert result.submitted is False
+    assert result.blocked_reason is not None
+    assert "target_attainment_recalculation_required" in result.blocked_reason
+    assert runtime.submissions == []
+
+
+@pytest.mark.asyncio
 async def test_historical_ev_restart_reuses_persisted_artifacts(tmp_path) -> None:
     hist, obj_repo, ep_repo, ev_repo, _ = await make_repo_backed_hist_service(tmp_path)
     as_of = datetime.now(timezone.utc)

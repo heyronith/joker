@@ -52,6 +52,8 @@ def _ctx(**overrides: object) -> TargetAttainmentContext:
         "allow_full_remaining_capital": True,
         "maximum_capital_fraction": 1.0,
         "minimum_calibrated_samples": 20,
+        "exchange_session_phase": "regular",
+        "session_similarity_bucket": "midday",
         "session_phase": "regular",
         "market_usable_for_execution": True,
         "option_surface_usable": True,
@@ -342,9 +344,20 @@ def test_low_probability_does_not_block_valid_candidate() -> None:
 
 
 def test_physical_impossibility_blocks_entry() -> None:
-    ctx = _ctx(session_phase="closed")
+    from joker.objectives.session_eligibility import resolve_objective_session_state
+    from joker.time.calendar import MarketCalendar
+    from joker.time.clock import FrozenExchangeClock
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    clock = FrozenExchangeClock(
+        datetime(2026, 8, 4, 20, 0, tzinfo=ZoneInfo("America/New_York")),
+        calendar=MarketCalendar(),
+    )
+    session = resolve_objective_session_state(clock=clock, similarity_bucket="closed")
+    ctx = _ctx(exchange_session_phase="closed", session_phase="closed")
     candidate = _candidate(estimated_useful_upside_usd=Decimal("1000.00"))
-    decision = TargetAttainmentPolicy().decide(ctx, [candidate])
+    decision = TargetAttainmentPolicy().decide(ctx, [candidate], session_state=session)
     assert decision.action == TargetAttainmentAction.BLOCK
     assert decision.feasibility == "physically_impossible"
     assert "market_not_regular" in decision.reason_codes

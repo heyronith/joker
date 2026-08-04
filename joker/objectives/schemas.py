@@ -31,6 +31,9 @@ class SessionObjectiveDefinition(BaseModel):
     pause_entries_when_goal_met: bool = True
     accepted_total_loss_risk: bool
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    # Stamped once at confirmation; never restarted. Duration is durable.
+    objective_confirmed_at_exchange_time: datetime | None = None
+    objective_duration_seconds: int | None = None
     definition_version: int = 1
     armed: bool = False
     first_broker_submission_at: datetime | None = None
@@ -46,7 +49,12 @@ class SessionObjectiveDefinition(BaseModel):
     def _decimal_money(cls, value: object) -> Decimal:
         return _money(value)  # type: ignore[arg-type]
 
-    @field_validator("deadline_exchange_time", "created_at", "first_broker_submission_at")
+    @field_validator(
+        "deadline_exchange_time",
+        "created_at",
+        "first_broker_submission_at",
+        "objective_confirmed_at_exchange_time",
+    )
     @classmethod
     def _tz_aware(cls, value: datetime | None) -> datetime | None:
         if value is None:
@@ -136,6 +144,10 @@ class SessionObjectiveState(BaseModel):
     progress_to_goal_pct: Decimal = Decimal("0.00")
     required_profit_remaining_usd: Decimal
     time_remaining_seconds: int
+    # Durable timing (copied from definition; never rewritten as remaining time).
+    objective_confirmed_at_exchange_time: datetime | None = None
+    objective_duration_seconds: int | None = None
+    elapsed_seconds: int = 0
 
     estimated_success_probability: Decimal | None = None
     feasibility_classification: FeasibilityClassification = "unknown"
@@ -169,7 +181,11 @@ class SessionObjectiveState(BaseModel):
     def _dec(cls, value: object) -> Decimal:
         return _money(value)  # type: ignore[arg-type]
 
-    @field_validator("last_recomputed_at", "deadline_exchange_time")
+    @field_validator(
+        "last_recomputed_at",
+        "deadline_exchange_time",
+        "objective_confirmed_at_exchange_time",
+    )
     @classmethod
     def _aware(cls, value: datetime | None) -> datetime | None:
         if value is None:
@@ -177,6 +193,13 @@ class SessionObjectiveState(BaseModel):
         if value.tzinfo is None:
             raise ValueError("timestamps must be timezone-aware")
         return value
+
+    @property
+    def fraction_remaining(self) -> float | None:
+        duration = self.objective_duration_seconds
+        if duration is None or duration <= 0:
+            return None
+        return max(0.0, min(1.0, float(self.time_remaining_seconds) / float(duration)))
 
     @property
     def total_encumbered_usd(self) -> Decimal:
@@ -298,6 +321,9 @@ class ObjectiveContext(BaseModel):
     required_profit_remaining_usd: Decimal
     progress_to_goal_pct: Decimal
     time_remaining_seconds: int
+    objective_duration_seconds: int | None = None
+    elapsed_seconds: int = 0
+    fraction_remaining: float | None = None
     feasibility_classification: str
     estimated_success_probability: Decimal | None
     stance: str
@@ -513,6 +539,9 @@ def state_to_context(state: SessionObjectiveState) -> ObjectiveContext:
         required_profit_remaining_usd=state.required_profit_remaining_usd,
         progress_to_goal_pct=state.progress_to_goal_pct,
         time_remaining_seconds=state.time_remaining_seconds,
+        objective_duration_seconds=state.objective_duration_seconds,
+        elapsed_seconds=int(state.elapsed_seconds or 0),
+        fraction_remaining=state.fraction_remaining,
         feasibility_classification=state.feasibility_classification,
         estimated_success_probability=state.estimated_success_probability,
         stance=state.current_stance,

@@ -16,6 +16,11 @@ from uuid import UUID, uuid4
 
 from joker.objectives.schemas import SessionObjectiveState
 from joker.objectives.scoring import StrategyScoreInput
+from joker.objectives.session_eligibility import (
+    ObjectiveSessionEligibility,
+    ObjectiveSessionState,
+)
+from joker.time.clock import SessionPhase
 
 ProbabilityEstimateType = Literal[
     "calibrated",
@@ -29,6 +34,21 @@ AttainmentFeasibility = Literal[
     "low_probability",
     "physically_impossible",
 ]
+
+# Typed data-quality findings that imply stale / unusable market truth.
+_STALE_DATA_QUALITY_CODES: frozenset[str] = frozenset(
+    {
+        "stale",
+        "stale_quote",
+        "stale_quotes",
+        "stale_underlying",
+        "stale_option_surface",
+        "quote_stale",
+        "underlying_stale",
+        "surface_stale",
+        "data_stale",
+    }
+)
 
 
 class TargetAttainmentAction(StrEnum):
@@ -84,13 +104,25 @@ class TargetAttainmentContext:
     allow_full_remaining_capital: bool = True
     maximum_capital_fraction: float = 1.0
     minimum_calibrated_samples: int = 20
-    session_phase: str = "regular"
+    # Authoritative exchange phase controls physical eligibility.
+    exchange_session_phase: str | None = "regular"
+    # Similarity bucket is for historical comparison only (open/midday/close).
+    session_similarity_bucket: str | None = None
+    session_phase: str = "regular"  # back-compat alias → exchange phase
+    objective_version: int = 1
     market_usable_for_execution: bool = True
     option_surface_usable: bool = True
     underlying_symbol: str = "SPY"
     spy_last: Decimal | None = None
     data_quality_codes: tuple[str, ...] = ()
     future_opportunity_estimate: Decimal | None = None  # ordinal 0-1 if known
+
+    @property
+    def fraction_remaining(self) -> Decimal:
+        duration = max(int(self.objective_duration_seconds), 1)
+        return (
+            Decimal(max(0, int(self.time_remaining_seconds))) / Decimal(duration)
+        ).quantize(Decimal("0.0001"))
 
     @classmethod
     def from_state(
@@ -104,18 +136,27 @@ class TargetAttainmentContext:
         maximum_capital_fraction: float = 1.0,
         minimum_calibrated_samples: int = 20,
         working_order_count: int = 0,
-        session_phase: str = "regular",
+        exchange_session_phase: str | None = None,
+        session_similarity_bucket: str | None = None,
+        session_phase: str | None = None,
         market_usable_for_execution: bool = True,
         option_surface_usable: bool = True,
         spy_last: Decimal | None = None,
         data_quality_codes: tuple[str, ...] = (),
         future_opportunity_estimate: Decimal | None = None,
     ) -> TargetAttainmentContext:
-        duration = objective_duration_seconds
-        if duration is None:
-            # Approximate from deadline clock when definition duration unknown.
-            duration = max(state.time_remaining_seconds, 1)
-        elapsed = max(0, int(duration) - int(state.time_remaining_seconds))
+        # Prefer durable original duration from objective state — never remaining time.
+        duration = (
+            objective_duration_seconds
+            if objective_duration_seconds is not None
+            else state.objective_duration_seconds
+        )
+        if duration is None or int(duration) <= 0:
+            duration = max(int(state.time_remaining_seconds), 1)
+        elapsed = int(getattr(state, "elapsed_seconds", 0) or 0)
+        if elapsed <= 0:
+            elapsed = max(0, int(duration) - int(state.time_remaining_seconds))
+        phase = exchange_session_phase or session_phase or "regular"
         return cls(
             objective_id=state.objective_id,
             snapshot_id=snapshot_id,
@@ -136,12 +177,69 @@ class TargetAttainmentContext:
             allow_full_remaining_capital=allow_full_remaining_capital,
             maximum_capital_fraction=float(maximum_capital_fraction),
             minimum_calibrated_samples=int(minimum_calibrated_samples),
-            session_phase=session_phase,
+            exchange_session_phase=phase,
+            session_similarity_bucket=session_similarity_bucket,
+            session_phase=str(phase),
+            objective_version=int(state.version),
             market_usable_for_execution=market_usable_for_execution,
             option_surface_usable=option_surface_usable,
             spy_last=spy_last,
             data_quality_codes=data_quality_codes,
             future_opportunity_estimate=future_opportunity_estimate,
+        )
+
+
+@dataclass(frozen=True)
+class TargetAttainmentContractCandidate:
+    """One strategy × executable contract opportunity before quantity expansion."""
+
+    strategy_id: UUID
+    contract_id: str
+    option_type: str
+    strike: Decimal
+    premium_per_contract_usd: Decimal  # execution-reference (ask for long buys)
+    bid: Decimal
+    ask: Decimal
+    mid: Decimal
+    relative_spread: Decimal
+    liquidity_score: float = 1.0
+    estimated_win_probability: Decimal | None = None
+    expected_value_usd: Decimal | None = None
+    estimated_payoff_ratio: Decimal | None = None
+    estimated_useful_upside_usd: Decimal | None = None
+    estimated_resolution_seconds: int | None = None
+    maximum_loss_usd_per_contract: Decimal = Decimal("0")
+    historical_sample_count: int = 0
+    historical_hit_rate: Decimal | None = None
+    evidence_ids: tuple[UUID, ...] = ()
+    direction: str | None = None
+    quote_timestamp: str | None = None
+    assumptions: tuple[str, ...] = ()
+    uncertainty_reasons: tuple[str, ...] = ()
+    calculation_method: str = "unknown"
+
+    def as_candidate(self) -> TargetAttainmentCandidate:
+        return TargetAttainmentCandidate(
+            strategy_id=self.strategy_id,
+            premium_per_contract_usd=self.premium_per_contract_usd,
+            estimated_win_probability=self.estimated_win_probability,
+            expected_value_usd=self.expected_value_usd,
+            estimated_payoff_ratio=self.estimated_payoff_ratio,
+            estimated_useful_upside_usd=self.estimated_useful_upside_usd,
+            estimated_resolution_seconds=self.estimated_resolution_seconds,
+            maximum_loss_usd_per_contract=(
+                self.maximum_loss_usd_per_contract
+                if self.maximum_loss_usd_per_contract > 0
+                else self.premium_per_contract_usd * Decimal("100")
+            ),
+            sample_count=self.historical_sample_count,
+            historical_hit_rate=self.historical_hit_rate,
+            calculation_method=self.calculation_method,
+            evidence_ids=self.evidence_ids,
+            assumptions=self.assumptions,
+            uncertainty_reasons=self.uncertainty_reasons,
+            direction=self.direction,
+            contract_id=self.contract_id,
         )
 
 
@@ -170,11 +268,13 @@ class TargetAttainmentCandidate:
 
 @dataclass
 class QuantityAttainmentEvaluation:
-    """Evaluation of one (candidate, quantity) pair."""
+    """Evaluation of one (strategy, contract, quantity) tuple."""
 
     evaluation_id: UUID = field(default_factory=uuid4)
     strategy_id: UUID | None = None
+    contract_id: str | None = None
     quantity: int = 0
+    evaluation_premium_usd: Decimal = Decimal("0")
     capital_required_usd: Decimal = Decimal("0")
     maximum_loss_usd: Decimal = Decimal("0")
     useful_upside_usd: Decimal = Decimal("0")
@@ -198,7 +298,9 @@ class QuantityAttainmentEvaluation:
         return {
             "evaluation_id": str(self.evaluation_id),
             "strategy_id": str(self.strategy_id) if self.strategy_id else None,
+            "contract_id": self.contract_id,
             "quantity": self.quantity,
+            "evaluation_premium_usd": str(self.evaluation_premium_usd),
             "capital_required_usd": str(self.capital_required_usd),
             "maximum_loss_usd": str(self.maximum_loss_usd),
             "useful_upside_usd": str(self.useful_upside_usd),
@@ -243,17 +345,28 @@ class TargetAttainmentDecision:
     action: TargetAttainmentAction = TargetAttainmentAction.WAIT
     feasibility: AttainmentFeasibility = "low_probability"
     selected_strategy_id: UUID | None = None
+    selected_contract_id: str | None = None
     selected_quantity: int = 0
     selected_capital_usd: Decimal = Decimal("0")
+    selected_evaluation_premium_usd: Decimal | None = None
     selected_p_goal: TargetProbabilityEstimate | None = None
     no_trade_p_goal: TargetProbabilityEstimate | None = None
     probability_delta: Decimal | None = None
+    snapshot_id: UUID | None = None
+    objective_version: int | None = None
+    authoritative: bool = True
     reason_codes: list[str] = field(default_factory=list)
     quantity_evaluations: list[QuantityAttainmentEvaluation] = field(
         default_factory=list
     )
     no_trade: NoTradeAttainmentEvaluation | None = None
     baseline_shadow: dict[str, Any] | None = None
+    exchange_session_phase: str | None = None
+    session_similarity_bucket: str | None = None
+    objective_duration_seconds: int | None = None
+    elapsed_seconds: int | None = None
+    time_remaining_seconds: int | None = None
+    fraction_remaining: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -263,8 +376,14 @@ class TargetAttainmentDecision:
             "selected_strategy_id": (
                 str(self.selected_strategy_id) if self.selected_strategy_id else None
             ),
+            "selected_contract_id": self.selected_contract_id,
             "selected_quantity": self.selected_quantity,
             "selected_capital_usd": str(self.selected_capital_usd),
+            "selected_evaluation_premium_usd": (
+                str(self.selected_evaluation_premium_usd)
+                if self.selected_evaluation_premium_usd is not None
+                else None
+            ),
             "selected_p_goal": (
                 self.selected_p_goal.as_dict() if self.selected_p_goal else None
             ),
@@ -274,10 +393,19 @@ class TargetAttainmentDecision:
             "probability_delta": (
                 str(self.probability_delta) if self.probability_delta is not None else None
             ),
+            "snapshot_id": str(self.snapshot_id) if self.snapshot_id else None,
+            "objective_version": self.objective_version,
+            "authoritative": self.authoritative,
             "reason_codes": list(self.reason_codes),
             "quantity_evaluations": [q.as_dict() for q in self.quantity_evaluations],
             "no_trade": self.no_trade.as_dict() if self.no_trade else None,
             "baseline_shadow": self.baseline_shadow,
+            "exchange_session_phase": self.exchange_session_phase,
+            "session_similarity_bucket": self.session_similarity_bucket,
+            "objective_duration_seconds": self.objective_duration_seconds,
+            "elapsed_seconds": self.elapsed_seconds,
+            "time_remaining_seconds": self.time_remaining_seconds,
+            "fraction_remaining": self.fraction_remaining,
         }
 
 
@@ -289,13 +417,36 @@ def _d(value: Decimal | float | int | str | None, default: str = "0") -> Decimal
 
 def classify_physical_impossibility(
     ctx: TargetAttainmentContext,
+    *,
+    session_state: ObjectiveSessionState | None = None,
 ) -> tuple[bool, list[str]]:
-    """Hard correctness / physical blocks — not low-probability judgements."""
+    """Hard correctness / physical blocks — not low-probability judgements.
+
+    Physical eligibility uses authoritative exchange phase only. Similarity
+    buckets such as open/midday/close never alone block entry.
+    """
     codes: list[str] = []
     if ctx.time_remaining_seconds <= 0:
         codes.append("deadline_passed")
-    if ctx.session_phase not in {"regular", "REGULAR"}:
-        codes.append("market_not_regular")
+
+    if session_state is not None:
+        if session_state.eligibility is ObjectiveSessionEligibility.UNKNOWN:
+            codes.append("exchange_session_truth_unavailable")
+        elif not session_state.entries_permitted:
+            codes.append("market_not_regular")
+            codes.extend(session_state.reason_codes)
+    else:
+        phase = (ctx.exchange_session_phase or ctx.session_phase or "").strip().lower()
+        if phase in {"", "unknown", "none"}:
+            codes.append("exchange_session_truth_unavailable")
+        elif phase != SessionPhase.REGULAR.value:
+            # Similarity buckets are NOT exchange phases — ignore them here.
+            if phase not in {"open", "midday", "close", "regular"}:
+                codes.append("market_not_regular")
+            # If caller passed a similarity bucket as session_phase by mistake,
+            # treat open/midday/close as regular (compat) only when no session_state.
+            # Prefer resolving via ObjectiveSessionState in production wiring.
+
     if not ctx.market_usable_for_execution:
         codes.append("market_truth_unusable")
     if not ctx.option_surface_usable:
@@ -306,7 +457,8 @@ def classify_physical_impossibility(
         codes.append("no_available_capital")
     if ctx.open_position_count >= ctx.max_concurrent_positions:
         codes.append("max_concurrent_positions")
-    if "stale" in {c.lower() for c in ctx.data_quality_codes}:
+    normalized_dq = {str(c).strip().lower() for c in ctx.data_quality_codes}
+    if normalized_dq & _STALE_DATA_QUALITY_CODES:
         codes.append("stale_data_quality")
     return bool(codes), codes
 
@@ -520,8 +672,22 @@ class TargetAttainmentPolicy:
         candidates: list[TargetAttainmentCandidate],
         *,
         baseline_shadow: dict[str, Any] | None = None,
+        session_state: ObjectiveSessionState | None = None,
     ) -> TargetAttainmentDecision:
-        impossible, hard_codes = classify_physical_impossibility(ctx)
+        timing_fields = {
+            "snapshot_id": ctx.snapshot_id,
+            "objective_version": ctx.objective_version,
+            "exchange_session_phase": ctx.exchange_session_phase,
+            "session_similarity_bucket": ctx.session_similarity_bucket,
+            "objective_duration_seconds": ctx.objective_duration_seconds,
+            "elapsed_seconds": ctx.elapsed_seconds,
+            "time_remaining_seconds": ctx.time_remaining_seconds,
+            "fraction_remaining": str(ctx.fraction_remaining),
+            "authoritative": True,
+        }
+        impossible, hard_codes = classify_physical_impossibility(
+            ctx, session_state=session_state
+        )
         if impossible:
             no_trade = NoTradeAttainmentEvaluation(
                 p_goal=TargetProbabilityEstimate(
@@ -539,6 +705,7 @@ class TargetAttainmentPolicy:
                 no_trade=no_trade,
                 no_trade_p_goal=no_trade.p_goal,
                 baseline_shadow=baseline_shadow,
+                **timing_fields,
             )
 
         if ctx.remaining_goal_gap_usd <= 0:
@@ -556,6 +723,7 @@ class TargetAttainmentPolicy:
                     reason_codes=["goal_already_achieved"],
                 ),
                 baseline_shadow=baseline_shadow,
+                **timing_fields,
             )
 
         no_trade_p = estimate_target_hit_probability(
@@ -589,16 +757,17 @@ class TargetAttainmentPolicy:
                 quantity_evals.append(
                     QuantityAttainmentEvaluation(
                         strategy_id=cand.strategy_id,
+                        contract_id=cand.contract_id,
                         quantity=0,
+                        evaluation_premium_usd=_d(cand.premium_per_contract_usd),
                         physically_impossible=True,
                         reason_codes=["no_affordable_quantity"],
                     )
                 )
                 continue
             for q in range(1, max_q + 1):
-                cost = (
-                    _d(cand.premium_per_contract_usd) * Decimal("100") * Decimal(q)
-                ).quantize(Decimal("0.01"))
+                premium = _d(cand.premium_per_contract_usd)
+                cost = (premium * Decimal("100") * Decimal(q)).quantize(Decimal("0.01"))
                 max_loss = (
                     _d(cand.maximum_loss_usd_per_contract) * Decimal(q)
                 ).quantize(Decimal("0.01"))
@@ -638,7 +807,9 @@ class TargetAttainmentPolicy:
                 quantity_evals.append(
                     QuantityAttainmentEvaluation(
                         strategy_id=cand.strategy_id,
+                        contract_id=cand.contract_id,
                         quantity=q,
+                        evaluation_premium_usd=premium,
                         capital_required_usd=cost,
                         maximum_loss_usd=max_loss,
                         useful_upside_usd=upside,
@@ -668,6 +839,7 @@ class TargetAttainmentPolicy:
                 no_trade_p_goal=no_trade_p,
                 selected_p_goal=no_trade_p,
                 baseline_shadow=baseline_shadow,
+                **timing_fields,
             )
 
         # Rank viable evaluations; compare best against no-trade.
@@ -714,12 +886,30 @@ class TargetAttainmentPolicy:
         return TargetAttainmentDecision(
             action=select_action,
             feasibility=feasibility,
-            selected_strategy_id=best.strategy_id if select_action == TargetAttainmentAction.ENTER and best else None,
-            selected_quantity=best.quantity if select_action == TargetAttainmentAction.ENTER and best else 0,
+            selected_strategy_id=(
+                best.strategy_id
+                if select_action == TargetAttainmentAction.ENTER and best
+                else None
+            ),
+            selected_contract_id=(
+                best.contract_id
+                if select_action == TargetAttainmentAction.ENTER and best
+                else None
+            ),
+            selected_quantity=(
+                best.quantity
+                if select_action == TargetAttainmentAction.ENTER and best
+                else 0
+            ),
             selected_capital_usd=(
                 best.capital_required_usd
                 if select_action == TargetAttainmentAction.ENTER and best
                 else Decimal("0")
+            ),
+            selected_evaluation_premium_usd=(
+                best.evaluation_premium_usd
+                if select_action == TargetAttainmentAction.ENTER and best
+                else None
             ),
             selected_p_goal=(
                 best.p_goal
@@ -732,6 +922,7 @@ class TargetAttainmentPolicy:
             quantity_evaluations=quantity_evals,
             no_trade=no_trade_eval,
             baseline_shadow=baseline_shadow,
+            **timing_fields,
         )
 
 

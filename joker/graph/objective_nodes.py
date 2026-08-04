@@ -263,7 +263,7 @@ async def score_strategies_against_objective_node(
     regime_labels: list[str] = []
     volatility_bucket: str | None = None
     liquidity_bucket: str | None = None
-    session_phase = "unknown"
+    similarity_bucket = "unknown"
     wm = state.get("world_model")
     if wm is not None:
         ms = getattr(wm, "market_structure", None)
@@ -287,11 +287,22 @@ async def score_strategies_against_objective_node(
                 liquidity_bucket = "normal"
         temporal = getattr(wm, "temporal_state", None)
         if temporal is not None:
-            session_phase = str(getattr(temporal, "session_phase", "unknown") or "unknown")
-    if session_phase in {"", "unknown"} and deps.clock is not None:
+            similarity_bucket = str(
+                getattr(temporal, "session_phase", "unknown") or "unknown"
+            )
+    # Historical similarity bucket may be open/midday/close; never use it for
+    # physical eligibility. Fall back to clock-derived similarity for history.
+    if similarity_bucket in {"", "unknown"} and deps.clock is not None:
         from joker.objectives.historical_outcomes import session_phase_from_exchange_ts
 
-        session_phase = session_phase_from_exchange_ts(deps.clock.now())
+        similarity_bucket = session_phase_from_exchange_ts(deps.clock.now())
+    session_phase = similarity_bucket  # historical summarizer still expects bucket labels
+    from joker.objectives.session_eligibility import resolve_objective_session_state
+
+    objective_session = resolve_objective_session_state(
+        clock=deps.clock,
+        similarity_bucket=similarity_bucket,
+    )
 
     current_episode_id = state.get("current_episode_id")
     if current_episode_id is not None:
@@ -473,7 +484,11 @@ async def score_strategies_against_objective_node(
     ta_decision_dump: dict[str, Any] | None = None
     ta_no_valid = False
     if policy == "target_attainment" and deps.target_attainment_policy is not None:
+        from joker.objectives.contract_candidates import (
+            build_contract_candidates_for_strategies,
+        )
         from joker.objectives.target_attainment import (
+            TargetAttainmentAction,
             TargetAttainmentContext,
             candidate_from_score_input,
             run_positive_ev_baseline_shadow,
@@ -492,7 +507,6 @@ async def score_strategies_against_objective_node(
         allow_full = True
         max_frac = 1.0
         min_cal = 20
-        max_contracts = 20
         if ta_settings is not None:
             allow_full = bool(getattr(ta_settings, "allow_full_remaining_capital", True))
             max_frac = float(getattr(ta_settings, "maximum_capital_fraction", 1.0))
@@ -502,10 +516,24 @@ async def score_strategies_against_objective_node(
             if deps.capital_sizer is not None
             else 20
         )
-        duration_s = None
-        if getattr(obj_state, "deadline_exchange_time", None) is not None:
-            # Prefer elapsed+remaining when available; otherwise use remaining.
-            duration_s = max(int(obj_state.time_remaining_seconds), 1)
+        # Durable original duration — never substitute remaining time.
+        duration_s = obj_state.objective_duration_seconds
+        exchange_phase = (
+            objective_session.exchange_phase.value
+            if objective_session.exchange_phase is not None
+            else None
+        )
+        dq_codes: list[str] = []
+        if _dq is not None:
+            for finding in getattr(_dq, "findings", ()) or ():
+                code = getattr(finding, "code", None) or getattr(finding, "finding_code", None)
+                if code:
+                    dq_codes.append(str(code))
+            for code in getattr(_dq, "codes", ()) or ():
+                dq_codes.append(str(code))
+        market_usable = True
+        if _dq is not None and hasattr(_dq, "usable_for_execution"):
+            market_usable = bool(getattr(_dq, "usable_for_execution"))
         ctx = TargetAttainmentContext.from_state(
             obj_state,
             snapshot_id=snapshot_id,
@@ -514,17 +542,41 @@ async def score_strategies_against_objective_node(
             allow_full_remaining_capital=allow_full,
             maximum_capital_fraction=max_frac,
             minimum_calibrated_samples=min_cal,
-            session_phase=session_phase,
-            market_usable_for_execution=True,
+            exchange_session_phase=exchange_phase,
+            session_similarity_bucket=similarity_bucket,
+            session_phase=exchange_phase or "unknown",
+            market_usable_for_execution=market_usable,
             option_surface_usable=bool(surface_slice),
+            data_quality_codes=tuple(dq_codes),
         )
-        ta_cands = [
-            candidate_from_score_input(
-                c,
-                premium_per_contract_usd=default_premium,
-            )
-            for c in candidates
-        ]
+        estimates_by_strategy = {
+            str(e.get("strategy_id")): e for e in estimates if e.get("strategy_id")
+        }
+        trading_date = None
+        if deps.clock is not None:
+            trading_date = deps.clock.trading_date()
+        max_quote_age = getattr(deps, "max_quote_age_seconds", 30)
+        contract_cands = build_contract_candidates_for_strategies(
+            strategies=list(state.get("strategies") or []),
+            surface_slice=list(surface_slice or []),
+            trading_date=trading_date,
+            estimates_by_strategy=estimates_by_strategy,
+            max_quote_age_seconds=(
+                float(max_quote_age) if max_quote_age is not None else None
+            ),
+            now=deps.clock.now() if deps.clock is not None else as_of,
+        )
+        if contract_cands:
+            ta_cands = [c.as_candidate() for c in contract_cands]
+        else:
+            # Fail closed to score-input bridge only when strategies lack legs;
+            # still attach strategy-specific premiums when present.
+            ta_cands = []
+            for c in candidates:
+                prem = default_premium
+                ta_cands.append(
+                    candidate_from_score_input(c, premium_per_contract_usd=prem)
+                )
         from dataclasses import replace as dc_replace
 
         for i, summary in enumerate(historical_summaries):
@@ -540,11 +592,12 @@ async def score_strategies_against_objective_node(
                 sample_count=int(summary.get("sample_count") or c0.sample_count),
             )
         decision = deps.target_attainment_policy.decide(
-            ctx, ta_cands, baseline_shadow=baseline_shadow
+            ctx,
+            ta_cands,
+            baseline_shadow=baseline_shadow,
+            session_state=objective_session,
         )
         ta_decision_dump = decision.as_dict()
-        from joker.objectives.target_attainment import TargetAttainmentAction
-
         if decision.action == TargetAttainmentAction.ENTER:
             ta_no_valid = False
             for idx, score in enumerate(scores):
@@ -597,6 +650,7 @@ async def score_strategies_against_objective_node(
         "_historical_sample_count": max_sample_seen,
         "_historical_minimum_required": min_samples,
         "_objective_policy": policy,
+        "_objective_session": objective_session.as_dict(),
         **trace_update(
             append_trace(
                 state,
@@ -607,12 +661,29 @@ async def score_strategies_against_objective_node(
     }
     if ta_decision_dump is not None:
         result["_target_attainment_decision"] = ta_decision_dump
+        result["_target_attainment_action"] = ta_decision_dump.get("action")
         result["_target_attainment_quantity"] = int(
             ta_decision_dump.get("selected_quantity") or 0
         )
         result["_target_attainment_strategy_id"] = ta_decision_dump.get(
             "selected_strategy_id"
         )
+        result["_target_attainment_contract_id"] = ta_decision_dump.get(
+            "selected_contract_id"
+        )
+        result["_target_attainment_objective_version"] = ta_decision_dump.get(
+            "objective_version"
+        )
+        result["_target_attainment_snapshot_id"] = ta_decision_dump.get("snapshot_id")
+        result["_target_attainment_authoritative"] = True
+    else:
+        # Explicitly clear so a reused graph state cannot leak prior authority.
+        result["_target_attainment_authoritative"] = False
+        result["_target_attainment_action"] = None
+        result["_target_attainment_decision"] = None
+        result["_target_attainment_strategy_id"] = None
+        result["_target_attainment_contract_id"] = None
+        result["_target_attainment_quantity"] = None
     return result
 
 
@@ -697,15 +768,11 @@ async def deterministic_sizing_node(
         if px is not None:
             premium = Decimal(str(px))
     ta_qty = state.get("_target_attainment_quantity")
-    ta_sid = state.get("_target_attainment_strategy_id")
     if (
         target_mode
+        and bool(state.get("_target_attainment_authoritative"))
         and ta_qty
         and int(ta_qty) > 0
-        and (
-            ta_sid is None
-            or str(ta_sid) == str(meta.selected_strategy_id)
-        )
     ):
         requested = int(ta_qty)
     is_probe = meta.action == MetaDecisionAction.PROBE
@@ -793,14 +860,26 @@ async def apply_objective_sizing_to_proposal(
     premium = Decimal(str(leg.limit_price or "0.10"))
     requested = int(leg.quantity)
     ta_qty = state.get("_target_attainment_quantity")
-    ta_sid = state.get("_target_attainment_strategy_id")
+    ta_cid = state.get("_target_attainment_contract_id")
     if (
         target_mode
+        and bool(state.get("_target_attainment_authoritative"))
         and ta_qty
         and int(ta_qty) > 0
-        and (ta_sid is None or str(ta_sid) == str(strategy_id))
     ):
         requested = int(ta_qty)
+    if (
+        target_mode
+        and bool(state.get("_target_attainment_authoritative"))
+        and ta_cid
+        and str(leg.contract_id) != str(ta_cid)
+    ):
+        return append_error(
+            state,
+            node_name="apply_objective_sizing",
+            error_code="target_attainment_contract_mismatch",
+            message="proposal contract differs from authoritative target-attainment tuple",
+        )
     is_probe = bool(
         meta is not None and meta.action == MetaDecisionAction.PROBE
     ) or getattr(proposal, "action", None) == "probe"

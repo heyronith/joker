@@ -287,27 +287,44 @@ _PROMPTS: dict[AgentRole, PromptSpec] = {
         prompt_id="decision.meta_decision",
         role=AgentRole.META_DECISION,
         role_mandate=(
-            "Choose among EXECUTE, PROBE, DELAY, REQUEST_MORE_EVIDENCE, SWITCH_STRATEGY, "
-            "or ABANDON by weighing evidence and debate — not majority vote. "
-            "Deterministic target-attainment scoring remains authoritative for quantity "
-            "and whether a candidate improves P(goal by deadline) versus waiting."
+            "Choose among EXECUTE, PROBE, DELAY, REQUEST_MORE_EVIDENCE, "
+            "SWITCH_STRATEGY, or ABANDON by weighing evidence and debate — not "
+            "majority vote. "
+            "When objective.policy is target_attainment, the deterministic "
+            "target-attainment policy is the final selector of ENTER versus WAIT, "
+            "strategy, contract and quantity. Your role is then to examine evidence "
+            "supporting that selection: you may support it, challenge specific "
+            "assumptions, or request more evidence. You may not replace the "
+            "executable tuple directly. A material challenge must trigger a fresh "
+            "target-attainment calculation — not an alternate silent selection."
         ),
         output_schema_name="MetaDecision",
         required_context_schema="decision_context",
-        focus="Route action; do not select contracts or prices.",
+        focus=(
+            "Route action; under target_attainment review only — never silently "
+            "replace the authoritative tuple."
+        ),
         include_target_attainment=True,
     ),
     AgentRole.ENTRY_TACTICIAN: _build_prompt(
         prompt_id="execution.entry_tactician",
         role=AgentRole.ENTRY_TACTICIAN,
         role_mandate=(
-            "Translate an approved strategy into a typed ExecutionProposal: contract, "
-            "quantity, limit, timing, and fill policies. Quantity is advisory; "
-            "deterministic target-attainment / capital sizing is authoritative."
+            "Translate an approved strategy into a typed ExecutionProposal: "
+            "contract, quantity, limit, timing, and fill policies. "
+            "When objective.policy is target_attainment, construct the order for "
+            "the authoritative target-attainment tuple only — do not change "
+            "strategy_id, contract_id, or quantity. You may select a valid limit "
+            "price and timing tactic within execution constraints. Fail closed if "
+            "you cannot produce an order for that authoritative contract and "
+            "quantity; never silently choose another contract."
         ),
         output_schema_name="ExecutionProposal",
         required_context_schema="execution_context",
-        focus="Propose limits only; never treat them as fills.",
+        focus=(
+            "Propose limits only; never treat them as fills; under "
+            "target_attainment never change contract/qty."
+        ),
         include_target_attainment=True,
     ),
     AgentRole.ORDER_MANAGER: _build_prompt(

@@ -84,8 +84,21 @@ class CognitiveGraphState(TypedDict, total=False):
     _no_valid_strategy: bool
     _sizing_decision: dict | None
     _objective_context: dict | None
+    _objective_policy: str | None
+    _objective_session: dict | None
     _block_new_entries: bool
     _meta_decision_override: str | None
+
+    # Target-attainment authority channels (must be declared or LangGraph drops them)
+    _target_attainment_decision: dict | None
+    _target_attainment_action: str | None
+    _target_attainment_strategy_id: str | None
+    _target_attainment_contract_id: str | None
+    _target_attainment_quantity: int | None
+    _target_attainment_objective_version: int | None
+    _target_attainment_snapshot_id: str | None
+    _target_attainment_authoritative: bool
+    _meta_target_review: dict | None
 
     # Position graph channels
     _position_id: str | None

@@ -601,6 +601,47 @@ class OrderActionGateway:
                         ),
                         working_orders=working,
                     )
+                # Target-attainment: material quote change that invalidates the
+                # selected tuple must not silently resize/reselect — recalculate.
+                if (
+                    objective_policy == "target_attainment"
+                    and not repriced.valid
+                    and any(
+                        r.startswith("premium_change")
+                        or "premium_change" in r
+                        or r in {
+                            "quote_stale",
+                            "spread_too_wide",
+                            "premium_unavailable",
+                        }
+                        for r in (repriced.invalidation_reasons or ())
+                    )
+                ):
+                    return OrderActionResult(
+                        submitted=False,
+                        client_order_id=request.client_order_id,
+                        blocked_reason=(
+                            "target_attainment_recalculation_required:"
+                            + ",".join(repriced.invalidation_reasons)
+                        ),
+                        working_orders=working,
+                    )
+                # Selected quantity must remain affordable at current ask.
+                if objective_policy == "target_attainment":
+                    required = (
+                        premium_per * Decimal("100") * Decimal(qty)
+                    ).quantize(Decimal("0.01"))
+                    available = Decimal(str(obj_state.available_capital_usd))
+                    if required > available:
+                        return OrderActionResult(
+                            submitted=False,
+                            client_order_id=request.client_order_id,
+                            blocked_reason=(
+                                "target_attainment_recalculation_required:"
+                                "quantity_unaffordable_after_reprice"
+                            ),
+                            working_orders=working,
+                        )
                 # ADD must use incremental capital only (quantity on the command).
                 if request.action == OrderActionKind.ADD and require_ev:
                     if ev is None or ev <= 0:

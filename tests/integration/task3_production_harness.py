@@ -858,10 +858,10 @@ async def run_closed_trade_round_trip(
         )
     await stack["supervisor"].event_bus.drain(timeout=5.0)
     try:
-        for i in range(240):
+        for i in range(320):
             if len(stack["gateway_entry_ids"]) > entries_before:
                 break
-            if i % 5 == 0:
+            if i % 4 == 0:
                 projection = await supervisor.execution_runtime.project_session()
                 pos = projection.positions.get(CONTRACT_ID)
                 if pos is not None and pos.quantity != 0:

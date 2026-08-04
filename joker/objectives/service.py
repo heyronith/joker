@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
 from uuid import UUID, uuid4
+
+from zoneinfo import ZoneInfo
 
 from joker.objectives.deadline import time_remaining_seconds
 from joker.objectives.events import (
@@ -25,6 +27,30 @@ from joker.objectives.schemas import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _elapsed_seconds(
+    *,
+    confirmed_at: datetime | None,
+    duration_seconds: int | None,
+    time_remaining_seconds: int,
+    now: datetime | None = None,
+    exchange_tz: str = "America/New_York",
+) -> int:
+    """Elapsed wall time since confirmation; never mutates stored duration."""
+    if duration_seconds is not None and duration_seconds >= 0:
+        # Prefer remaining-based elapsed when duration is known (stable under clock skew).
+        return max(0, int(duration_seconds) - max(0, int(time_remaining_seconds)))
+    if confirmed_at is None:
+        return 0
+    tz = ZoneInfo(exchange_tz)
+    current = now or datetime.now(tz)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=tz)
+    conf = confirmed_at
+    if conf.tzinfo is None:
+        conf = conf.replace(tzinfo=tz)
+    return max(0, int((current.astimezone(tz) - conf.astimezone(tz)).total_seconds()))
 
 
 class ObjectiveServiceError(RuntimeError):
@@ -198,7 +224,10 @@ class SessionObjectiveService:
         return pending
 
     async def confirm_objective(
-        self, objective_id: UUID | str | None = None
+        self,
+        objective_id: UUID | str | None = None,
+        *,
+        confirmed_at_exchange_time: datetime | None = None,
     ) -> SessionObjectiveState:
         oid = UUID(str(objective_id or self._objective_id))
         definition = self._repo.get_definition(oid)
@@ -206,6 +235,41 @@ class SessionObjectiveService:
             raise ObjectiveServiceError("objective definition missing")
         if not definition.accepted_total_loss_risk:
             raise ObjectiveServiceError("total-loss acknowledgement required")
+        tz = ZoneInfo(self._exchange_tz)
+        confirmed_at = (
+            definition.objective_confirmed_at_exchange_time
+            or confirmed_at_exchange_time
+            or datetime.now(tz)
+        )
+        if confirmed_at.tzinfo is None:
+            raise ObjectiveServiceError(
+                "objective_confirmed_at_exchange_time must be timezone-aware"
+            )
+        # Preserve original duration across restarts / re-confirm of same definition.
+        duration = definition.objective_duration_seconds
+        if duration is None:
+            duration = int(
+                (
+                    definition.deadline_exchange_time.astimezone(tz)
+                    - confirmed_at.astimezone(tz)
+                ).total_seconds()
+            )
+        if duration <= 0:
+            # Late confirmation (deadline already reached): derive duration from
+            # definition.created_at when it precedes the deadline so restart math
+            # remains defined. Never silently extend the deadline.
+            created = definition.created_at.astimezone(tz)
+            deadline_local = definition.deadline_exchange_time.astimezone(tz)
+            if created < deadline_local:
+                confirmed_at = created
+                duration = int((deadline_local - created).total_seconds())
+            else:
+                confirmed_at = deadline_local - timedelta(seconds=1)
+                duration = 1
+        if duration <= 0:
+            raise ObjectiveServiceError(
+                "objective_duration_seconds must be > 0 at confirmation"
+            )
         armed = SessionObjectiveDefinition(
             objective_id=definition.objective_id,
             session_id=definition.session_id,
@@ -218,18 +282,25 @@ class SessionObjectiveService:
             pause_entries_when_goal_met=definition.pause_entries_when_goal_met,
             accepted_total_loss_risk=True,
             created_at=definition.created_at,
+            objective_confirmed_at_exchange_time=confirmed_at,
+            objective_duration_seconds=int(duration),
             definition_version=definition.definition_version,
             armed=True,
             first_broker_submission_at=definition.first_broker_submission_at,
         )
         self._repo.save_definition(armed)
         self._objective_id = armed.objective_id
-        state = await self.recompute_from_truth(force_status="active")
+        state = await self.recompute_from_truth(force_status="active", now=confirmed_at)
         self._emit(
             ObjectiveOperatorEventType.CONFIRMED,
             objective_id=armed.objective_id,
             session_id=armed.session_id,
-            after={"status": state.status, "version": state.version},
+            after={
+                "status": state.status,
+                "version": state.version,
+                "objective_duration_seconds": armed.objective_duration_seconds,
+                "objective_confirmed_at_exchange_time": confirmed_at.isoformat(),
+            },
         )
         return state
 
@@ -370,6 +441,20 @@ class SessionObjectiveService:
             status = force_status
 
         version = (prev.version + 1) if prev else 1
+        duration = definition.objective_duration_seconds
+        confirmed_at = definition.objective_confirmed_at_exchange_time
+        # Prefer durable definition values; fall back to previous state after restart.
+        if duration is None and prev is not None:
+            duration = prev.objective_duration_seconds
+        if confirmed_at is None and prev is not None:
+            confirmed_at = prev.objective_confirmed_at_exchange_time
+        elapsed = _elapsed_seconds(
+            confirmed_at=confirmed_at,
+            duration_seconds=duration,
+            time_remaining_seconds=remaining_s,
+            now=now,
+            exchange_tz=self._exchange_tz,
+        )
         return SessionObjectiveState(
             objective_id=definition.objective_id,
             session_id=definition.session_id,
@@ -386,6 +471,9 @@ class SessionObjectiveService:
             progress_to_goal_pct=progress,
             required_profit_remaining_usd=remaining_profit,
             time_remaining_seconds=remaining_s,
+            objective_confirmed_at_exchange_time=confirmed_at,
+            objective_duration_seconds=duration,
+            elapsed_seconds=elapsed,
             estimated_success_probability=est_p,
             feasibility_classification=feasibility,  # type: ignore[arg-type]
             current_stance=stance,  # type: ignore[arg-type]
@@ -982,6 +1070,10 @@ class SessionObjectiveService:
                 pause_entries_when_goal_met=definition.pause_entries_when_goal_met,
                 accepted_total_loss_risk=definition.accepted_total_loss_risk,
                 created_at=definition.created_at,
+                objective_confirmed_at_exchange_time=(
+                    definition.objective_confirmed_at_exchange_time
+                ),
+                objective_duration_seconds=definition.objective_duration_seconds,
                 definition_version=definition.definition_version,
                 armed=definition.armed,
                 first_broker_submission_at=datetime.now(timezone.utc),

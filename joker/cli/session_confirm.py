@@ -140,6 +140,7 @@ async def confirm_session_objective(
     target_profit_pct: float | None = None,
     target_deadline: str | None = None,
     deadline_exchange_time: datetime | None = None,
+    confirmed_at_exchange_time: datetime | None = None,
     max_concurrent_positions: int | None = None,
     acknowledge_total_loss: bool = False,
     yes: bool = False,
@@ -317,10 +318,25 @@ async def confirm_session_objective(
         accepted_total_loss_risk=bool(ack),
         pause_entries_when_goal_met=bool(obj_settings.pause_entries_when_goal_met),
     )
-    state = await service.confirm_objective(definition.objective_id)
+    from datetime import timedelta
+    from zoneinfo import ZoneInfo
+
+    confirm_at = confirmed_at_exchange_time
+    if confirm_at is None:
+        confirm_at = datetime.now(ZoneInfo(tz))
+    # Keep a positive original duration; never move the deadline forward.
+    if confirm_at >= deadline:
+        confirm_at = deadline - timedelta(seconds=60)
+        if confirm_at >= deadline:
+            confirm_at = deadline - timedelta(seconds=1)
+    state = await service.confirm_objective(
+        definition.objective_id,
+        confirmed_at_exchange_time=confirm_at,
+    )
     out.print(
         f"[green]Objective confirmed[/green] id={definition.objective_id} "
-        f"status={state.status} version={state.version}"
+        f"status={state.status} version={state.version} "
+        f"duration={state.objective_duration_seconds}s"
     )
 
     plan = CapitalPlan(

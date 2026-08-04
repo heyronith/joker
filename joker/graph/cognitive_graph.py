@@ -241,18 +241,33 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
         context = state.get("_context_package")  # type: ignore[typeddict-item]
         if not isinstance(context, ContextPackage):
             return {}
+        from uuid import uuid4 as _uuid4
+
+        from joker.cognition.schemas import MetaDecision
+
+        ta_authoritative = bool(state.get("_target_attainment_authoritative"))
+        ta_action = str(state.get("_target_attainment_action") or "")
+        ta_strategy = state.get("_target_attainment_strategy_id")
+
         if (
             state.get("_no_valid_strategy")
             or state.get("_meta_decision_override") == "abandon"
             or entry_blocked_by_objective(state)
+            or (ta_authoritative and ta_action in {"wait", "block"})
         ):
-            from uuid import uuid4 as _uuid4
-
-            from joker.cognition.schemas import MetaDecision
-
             snapshot_raw = state.get("snapshot_id") or state.get("latest_known_snapshot_id")
             reason = "no valid objective strategy scores; retaining no-trade"
-            if state.get("_meta_decision_override") == "abandon" or entry_blocked_by_objective(
+            if ta_authoritative and ta_action in {"wait", "block"}:
+                reason = (
+                    f"target_attainment_{ta_action}: "
+                    + ",".join(
+                        (state.get("_target_attainment_decision") or {}).get(
+                            "reason_codes"
+                        )
+                        or [ta_action]
+                    )
+                )
+            elif state.get("_meta_decision_override") == "abandon" or entry_blocked_by_objective(
                 state
             ):
                 reason = "objective gate blocks new entries; abandoning"
@@ -269,6 +284,11 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
             )
             return {
                 "meta_decision": decision,
+                "_meta_target_review": {
+                    "role": "review_only",
+                    "target_action": ta_action or "none",
+                    "overrode_execution": True,
+                },
                 **trace_update(
                     append_trace(
                         state,
@@ -304,10 +324,57 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
             context=context,
             strategies=strategies,
         )
+        meta_review: dict[str, Any] = {
+            "role": "review_only" if ta_authoritative else "selector",
+            "llm_action": decision.action.value,
+            "llm_selected_strategy_id": (
+                str(decision.selected_strategy_id)
+                if decision.selected_strategy_id
+                else None
+            ),
+            "target_action": ta_action or None,
+            "target_strategy_id": str(ta_strategy) if ta_strategy else None,
+        }
+        # Under target-attainment, meta may challenge (request evidence / abandon)
+        # but cannot replace the executable strategy tuple.
+        if ta_authoritative and ta_action == "enter" and ta_strategy:
+            challenge = decision.action in {
+                MetaDecisionAction.REQUEST_MORE_EVIDENCE,
+                MetaDecisionAction.ABANDON,
+            }
+            meta_review["challenge"] = challenge
+            if challenge:
+                meta_review["result"] = "challenge_blocks_entry_pending_recalc"
+                # Persist challenge; do not execute an alternate strategy.
+                decision = decision.model_copy(
+                    update={
+                        "action": MetaDecisionAction.ABANDON,
+                        "selected_strategy_id": None,
+                        "rationale_summary": (
+                            "meta_challenge_of_target_attainment: "
+                            + decision.rationale_summary
+                        ),
+                    }
+                )
+            else:
+                # Force authoritative strategy; ignore LLM strategy substitution.
+                decision = decision.model_copy(
+                    update={
+                        "action": MetaDecisionAction.EXECUTE,
+                        "selected_strategy_id": UUID(str(ta_strategy)),
+                        "rationale_summary": (
+                            "target_attainment_authoritative_tuple; meta_support: "
+                            + decision.rationale_summary
+                        ),
+                    }
+                )
+                meta_review["result"] = "target_tuple_enforced"
+                meta_review["enforced_strategy_id"] = str(ta_strategy)
         if deps.decision_repo is not None:
             await deps.decision_repo.append_meta(decision)
         return {
             "meta_decision": decision,
+            "_meta_target_review": meta_review,
             **trace_update(
                 append_trace(
                     state,
@@ -326,6 +393,15 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
             return "persist_stale"
         if state.get("_no_valid_strategy") or entry_blocked_by_objective(state):
             return "persist_cycle"
+        ta_authoritative = bool(state.get("_target_attainment_authoritative"))
+        ta_action = str(state.get("_target_attainment_action") or "")
+        if ta_authoritative and ta_action in {"wait", "block"}:
+            return "persist_cycle"
+        if ta_authoritative and ta_action == "enter":
+            # Challenges become ABANDON above; only EXECUTE proceeds.
+            if meta.action in {MetaDecisionAction.EXECUTE, MetaDecisionAction.PROBE}:
+                return "entry_tactician"
+            return "persist_cycle"
         action = meta.action
         if action in {MetaDecisionAction.EXECUTE, MetaDecisionAction.PROBE}:
             return "entry_tactician"
@@ -334,6 +410,9 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
         if action == MetaDecisionAction.REQUEST_MORE_EVIDENCE:
             return "persist_evidence_request"
         if action == MetaDecisionAction.SWITCH_STRATEGY:
+            if ta_authoritative:
+                # Strategy switches are not an independent selector under TA.
+                return "persist_cycle"
             switches = int(state.get("strategy_switch_count") or 0)
             if switches >= deps.config.max_strategy_switches:
                 return "persist_cycle"
@@ -393,6 +472,19 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
                 )
             except Exception:
                 pass
+        # Enforce target-attainment strategy identity before tactician runs.
+        if bool(state.get("_target_attainment_authoritative")):
+            ta_sid = state.get("_target_attainment_strategy_id")
+            if ta_sid is not None and str(strategy.strategy_id) != str(ta_sid):
+                return append_error(
+                    state,
+                    node_name="entry_tactician",
+                    error_code="target_attainment_strategy_mismatch",
+                    message=(
+                        "entry tactician refused: strategy differs from "
+                        "authoritative target-attainment selection"
+                    ),
+                )
         proposal = await run_entry_tactician(
             state=state,
             router=deps.router,
@@ -400,6 +492,48 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
             meta_decision=meta,
             strategy=strategy,
         )
+        # Authoritative contract + quantity overwrite — tactician cannot change them.
+        if bool(state.get("_target_attainment_authoritative")):
+            ta_cid = state.get("_target_attainment_contract_id")
+            ta_qty = int(state.get("_target_attainment_quantity") or 0)
+            if not ta_cid or ta_qty < 1:
+                return append_error(
+                    state,
+                    node_name="entry_tactician",
+                    error_code="target_attainment_tuple_incomplete",
+                    message="authoritative target-attainment tuple missing contract/quantity",
+                )
+            if not proposal.legs:
+                return append_error(
+                    state,
+                    node_name="entry_tactician",
+                    error_code="target_attainment_missing_legs",
+                    message="entry tactician produced no legs for authoritative tuple",
+                )
+            new_legs = []
+            for leg in proposal.legs:
+                new_legs.append(
+                    leg.model_copy(
+                        update={
+                            "contract_id": str(ta_cid),
+                            "quantity": ta_qty,
+                        }
+                    )
+                )
+            # Only first leg is authoritative for single-leg 0DTE entries.
+            proposal = proposal.model_copy(
+                update={
+                    "legs": tuple(new_legs),
+                    "strategy_id": UUID(str(state.get("_target_attainment_strategy_id"))),
+                }
+            )
+            if str(proposal.legs[0].contract_id) != str(ta_cid):
+                return append_error(
+                    state,
+                    node_name="entry_tactician",
+                    error_code="target_attainment_contract_mismatch",
+                    message="failed to bind authoritative contract_id on proposal",
+                )
         if deps.decision_repo is not None:
             await deps.decision_repo.append_proposal(proposal)
         return {

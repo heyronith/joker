@@ -427,6 +427,7 @@ def paper_run(
                 target_profit_pct=target_profit_pct,
                 target_deadline=None,
                 deadline_exchange_time=timing.objective_deadline,
+                confirmed_at_exchange_time=timing.exchange_now,
                 max_concurrent_positions=max_concurrent_positions,
                 acknowledge_total_loss=acknowledge_total_loss,
                 yes=yes,
@@ -506,10 +507,12 @@ def paper_run(
     # Ensure target-attainment evidence streams exist even if no cycles emit.
     for name in (
         "target-attainment-context.jsonl",
+        "contract-candidate-evaluations.jsonl",
         "candidate-quantity-evaluations.jsonl",
         "target-probability-estimates.jsonl",
         "no-trade-evaluations.jsonl",
         "baseline-shadow-decisions.jsonl",
+        "meta-target-review.jsonl",
         "urgency-transitions.jsonl",
     ):
         (artifacts / name).touch(exist_ok=True)
@@ -674,6 +677,25 @@ def paper_run(
                         "executes_shadow": False,
                     },
                 )
+            for qev in ta.get("quantity_evaluations") or []:
+                if isinstance(qev, dict) and qev.get("contract_id"):
+                    append_jsonl(
+                        artifacts / "contract-candidate-evaluations.jsonl",
+                        {
+                            "event": event_type,
+                            "strategy_id": qev.get("strategy_id"),
+                            "contract_id": qev.get("contract_id"),
+                            "quantity": qev.get("quantity"),
+                            "evaluation_premium_usd": qev.get("evaluation_premium_usd"),
+                            "selected": qev.get("selected"),
+                        },
+                    )
+        review = payload.get("_meta_target_review") or payload.get("meta_target_review")
+        if review:
+            append_jsonl(
+                artifacts / "meta-target-review.jsonl",
+                {"event": event_type, "review": review},
+            )
 
         important = {
             "order.accepted",
