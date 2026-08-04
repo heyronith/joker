@@ -797,29 +797,34 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
         {"debate": "debate", "meta_decision": "meta_decision"},
     )
 
+    _SIZING_STOP_CODES = frozenset(
+        {
+            "validation_failed",
+            "sizing_rejected",
+            "entries_blocked",
+            "missing_proposal",
+            "estimate_invalid",
+            "target_attainment_recalculation_required",
+            "target_attainment_contract_mismatch",
+            "target_attainment_strategy_mismatch",
+            "target_attainment_tuple_incomplete",
+            "target_attainment_missing_legs",
+        }
+    )
+
     def after_validate_route(state: CognitiveGraphState) -> str:
         if state.get("stale_decision"):
             return "persist_stale"
         errors = state.get("errors") or []
-        if any(
-            e.error_code
-            in {
-                "validation_failed",
-                "sizing_rejected",
-                "entries_blocked",
-                "missing_proposal",
-            }
-            for e in errors
-        ):
+        if any(e.error_code in _SIZING_STOP_CODES for e in errors):
             return "persist_cycle"
         return "submit_execution_command"
 
     def after_apply_sizing(state: CognitiveGraphState) -> str:
         errors = state.get("errors") or []
-        if any(
-            e.error_code in {"sizing_rejected", "entries_blocked", "missing_proposal"}
-            for e in errors
-        ):
+        if any(e.error_code in _SIZING_STOP_CODES for e in errors):
+            return "persist_cycle"
+        if state.get("_block_new_entries"):
             return "persist_cycle"
         return "validate_execution_proposal"
 

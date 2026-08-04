@@ -459,11 +459,11 @@ def test_loss_does_not_apply_martingale_multiplier() -> None:
     assert first.selected_capital_usd == second.selected_capital_usd
 
 
-def test_no_candidates_selects_wait() -> None:
+def test_no_exact_contract_candidate_returns_wait() -> None:
     ctx = _ctx()
     decision = TargetAttainmentPolicy().decide(ctx, [])
     assert decision.action == TargetAttainmentAction.WAIT
-    assert "no_candidates" in decision.reason_codes
+    assert "no_valid_contract_candidates" in decision.reason_codes
 
 
 def test_candidate_exceeding_capital_is_physically_impossible_not_selected() -> None:

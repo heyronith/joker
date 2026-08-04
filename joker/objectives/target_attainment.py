@@ -829,11 +829,11 @@ class TargetAttainmentPolicy:
         viable = [e for e in quantity_evals if not e.physically_impossible]
         if not viable and not candidates:
             no_trade_eval.selected = True
-            no_trade_eval.reason_codes.append("no_candidates")
+            no_trade_eval.reason_codes.append("no_valid_contract_candidates")
             return TargetAttainmentDecision(
                 action=TargetAttainmentAction.WAIT,
                 feasibility="low_probability",
-                reason_codes=["no_candidates"],
+                reason_codes=["no_valid_contract_candidates"],
                 quantity_evaluations=quantity_evals,
                 no_trade=no_trade_eval,
                 no_trade_p_goal=no_trade_p,

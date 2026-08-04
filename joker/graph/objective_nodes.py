@@ -37,6 +37,19 @@ async def load_objective_context(deps: CognitiveGraphDeps) -> dict[str, Any] | N
     return state_to_context(state).model_dump_for_hash()
 
 
+async def refresh_objective_timing_for_cycle(deps: CognitiveGraphDeps) -> Any | None:
+    """Recompute objective elapsed/remaining from the exchange clock for this cycle.
+
+    Must run before feasibility / target-attainment so no-trade opportunity cost
+    decays as the deadline approaches. Returns the refreshed state, or None when
+    objectives are not wired.
+    """
+    if deps.objective_service is None:
+        return None
+    now = deps.clock.now() if deps.clock is not None else None
+    return await deps.objective_service.recompute_from_truth(now=now)
+
+
 def entry_blocked_by_objective(state: CognitiveGraphState) -> bool:
     """True when new ENTRY/PROBE must not proceed."""
     if state.get("_block_new_entries"):
@@ -52,7 +65,11 @@ async def gate_objective_confirmed(
     if deps.objective_service is None:
         return None
     try:
-        obj_state = await deps.objective_service.get_state()
+        # Refresh timing against the current exchange clock before any gate /
+        # feasibility / target-attainment read of remaining time.
+        obj_state = await refresh_objective_timing_for_cycle(deps)
+        if obj_state is None:
+            obj_state = await deps.objective_service.get_state()
     except Exception as exc:
         return {
             "_block_new_entries": True,
@@ -490,7 +507,6 @@ async def score_strategies_against_objective_node(
         from joker.objectives.target_attainment import (
             TargetAttainmentAction,
             TargetAttainmentContext,
-            candidate_from_score_input,
             run_positive_ev_baseline_shadow,
         )
 
@@ -566,37 +582,47 @@ async def score_strategies_against_objective_node(
             ),
             now=deps.clock.now() if deps.clock is not None else as_of,
         )
-        if contract_cands:
-            ta_cands = [c.as_candidate() for c in contract_cands]
-        else:
-            # Fail closed to score-input bridge only when strategies lack legs;
-            # still attach strategy-specific premiums when present.
-            ta_cands = []
-            for c in candidates:
-                prem = default_premium
-                ta_cands.append(
-                    candidate_from_score_input(c, premium_per_contract_usd=prem)
-                )
+        # Exact linked-surface contracts only — never fall back to a generic
+        # first-surface premium without an authoritative contract_id.
+        ta_cands = [c.as_candidate() for c in contract_cands]
         from dataclasses import replace as dc_replace
 
-        for i, summary in enumerate(historical_summaries):
-            if i >= len(ta_cands):
-                break
-            rate = summary.get("hit_rate") or summary.get("win_rate")
-            if rate is None:
+        summaries_by_strategy = {
+            str(s.get("strategy_id")): s
+            for s in historical_summaries
+            if s.get("strategy_id") is not None
+        }
+        for i, c0 in enumerate(ta_cands):
+            summary = summaries_by_strategy.get(str(c0.strategy_id))
+            if summary is None:
                 continue
-            c0 = ta_cands[i]
-            ta_cands[i] = dc_replace(
-                c0,
-                historical_hit_rate=Decimal(str(rate)),
-                sample_count=int(summary.get("sample_count") or c0.sample_count),
-            )
+            rate = summary.get("hit_rate") or summary.get("win_rate")
+            sample_count = int(summary.get("sample_count") or c0.sample_count)
+            updates: dict[str, Any] = {"sample_count": sample_count}
+            if rate is not None:
+                updates["historical_hit_rate"] = Decimal(str(rate))
+            ta_cands[i] = dc_replace(c0, **updates)
         decision = deps.target_attainment_policy.decide(
             ctx,
             ta_cands,
             baseline_shadow=baseline_shadow,
             session_state=objective_session,
         )
+        if (
+            not contract_cands
+            and decision.action != TargetAttainmentAction.BLOCK
+        ):
+            decision = dc_replace(
+                decision,
+                action=TargetAttainmentAction.WAIT,
+                selected_strategy_id=None,
+                selected_contract_id=None,
+                selected_quantity=0,
+                selected_capital_usd=Decimal("0"),
+                selected_probability=None,
+                probability_delta=None,
+                reason_codes=["no_valid_contract_candidates"],
+            )
         ta_decision_dump = decision.as_dict()
         if decision.action == TargetAttainmentAction.ENTER:
             ta_no_valid = False
@@ -768,12 +794,8 @@ async def deterministic_sizing_node(
         if px is not None:
             premium = Decimal(str(px))
     ta_qty = state.get("_target_attainment_quantity")
-    if (
-        target_mode
-        and bool(state.get("_target_attainment_authoritative"))
-        and ta_qty
-        and int(ta_qty) > 0
-    ):
+    ta_authoritative = bool(state.get("_target_attainment_authoritative"))
+    if target_mode and ta_authoritative and ta_qty and int(ta_qty) > 0:
         requested = int(ta_qty)
     is_probe = meta.action == MetaDecisionAction.PROBE
     decision = deps.capital_sizer.size(
@@ -794,6 +816,34 @@ async def deterministic_sizing_node(
             append_trace(state, node_name="deterministic_sizing", status="completed")
         ),
     }
+    if (
+        target_mode
+        and ta_authoritative
+        and requested is not None
+        and int(requested) > 0
+        and (
+            not decision.approved
+            or int(decision.approved_quantity) != int(requested)
+        )
+    ):
+        dump["reason_codes"] = list(dump.get("reason_codes") or []) + [
+            "target_attainment_recalculation_required",
+            "target_quantity_changed",
+        ]
+        update["_sizing_decision"] = dump
+        update["_block_new_entries"] = True
+        update.update(
+            append_error(
+                state,
+                node_name="deterministic_sizing",
+                error_code="target_attainment_recalculation_required",
+                message=(
+                    "target-attainment quantity cannot be silently resized "
+                    f"(selected={requested}, approved={decision.approved_quantity})"
+                ),
+            )
+        )
+        return update
     if not decision.approved:
         update.update(
             append_error(
@@ -861,16 +911,12 @@ async def apply_objective_sizing_to_proposal(
     requested = int(leg.quantity)
     ta_qty = state.get("_target_attainment_quantity")
     ta_cid = state.get("_target_attainment_contract_id")
-    if (
-        target_mode
-        and bool(state.get("_target_attainment_authoritative"))
-        and ta_qty
-        and int(ta_qty) > 0
-    ):
+    ta_authoritative = bool(state.get("_target_attainment_authoritative"))
+    if target_mode and ta_authoritative and ta_qty and int(ta_qty) > 0:
         requested = int(ta_qty)
     if (
         target_mode
-        and bool(state.get("_target_attainment_authoritative"))
+        and ta_authoritative
         and ta_cid
         and str(leg.contract_id) != str(ta_cid)
     ):
@@ -899,6 +945,34 @@ async def apply_objective_sizing_to_proposal(
         ),
         is_probe=is_probe,
     )
+    if (
+        target_mode
+        and ta_authoritative
+        and requested > 0
+        and (
+            not decision.approved
+            or int(decision.approved_quantity) != int(requested)
+        )
+    ):
+        dump = decision.model_dump(mode="json")
+        dump["estimate_id"] = estimate.get("estimate_id")
+        dump["reason_codes"] = list(dump.get("reason_codes") or []) + [
+            "target_attainment_recalculation_required",
+            "target_quantity_changed",
+        ]
+        return {
+            "_sizing_decision": dump,
+            "_block_new_entries": True,
+            **append_error(
+                state,
+                node_name="apply_objective_sizing",
+                error_code="target_attainment_recalculation_required",
+                message=(
+                    "target-attainment quantity cannot be silently resized "
+                    f"(selected={requested}, approved={decision.approved_quantity})"
+                ),
+            ),
+        }
     if not decision.approved or decision.approved_quantity <= 0:
         return {
             "_sizing_decision": decision.model_dump(mode="json"),
@@ -909,7 +983,9 @@ async def apply_objective_sizing_to_proposal(
                 message="deterministic sizer rejected proposal quantity",
             ),
         }
-    qty = int(decision.approved_quantity)
+    # Under target_attainment the approved quantity must equal the selected
+    # quantity; never apply a shrunk/enlarged sizer result.
+    qty = int(requested if (target_mode and ta_authoritative) else decision.approved_quantity)
     new_legs = tuple(leg.model_copy(update={"quantity": qty}) for leg in proposal.legs)
     sized = proposal.model_copy(update={"legs": new_legs})
     dump = decision.model_dump(mode="json")
