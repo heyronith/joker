@@ -465,3 +465,110 @@ def test_no_exact_contract_candidate_returns_wait_from_policy() -> None:
     assert "no_valid_contract_candidates" in decision.reason_codes
     assert decision.selected_contract_id is None
     assert decision.selected_quantity == 0
+
+
+@pytest.mark.asyncio
+async def test_objective_node_no_valid_contract_candidates_waits_without_exception(
+    tmp_path, monkeypatch
+) -> None:
+    """Strategies present but linked surface has no match → WAIT, no TypeError."""
+    from datetime import date
+
+    from joker.graph import objective_nodes as on
+    from joker.objectives.feasibility import GoalFeasibilityEngine
+    from joker.objectives.scoring import ObjectiveStrategyScorer
+
+    start = datetime(2026, 8, 4, 10, 0, tzinfo=ET)
+    clock = FrozenExchangeClock(start, calendar=MarketCalendar())
+    svc = await _armed_svc(tmp_path, clock=clock, minutes=60)
+    snap_id = uuid4()
+    sid = uuid4()
+
+    async def _truth(deps_arg, sid_arg):
+        # Surface has a contract, but it does not match the strategy leg id.
+        surface = (
+            SimpleNamespace(
+                contract_id="OTHER_CONTRACT",
+                symbol="SPY",
+                expiry=date(2026, 8, 4),
+                strike=Decimal("500"),
+                option_type="call",
+                bid=Decimal("1.00"),
+                ask=Decimal("1.10"),
+                quote_age_seconds=1,
+            ),
+        )
+        return (
+            SimpleNamespace(
+                snapshot_id=sid_arg,
+                exchange_time=clock.now(),
+                option_surface_id=uuid4(),
+            ),
+            SimpleNamespace(findings=(), codes=(), usable_for_execution=True),
+            None,
+            surface,
+        )
+
+    monkeypatch.setattr(on, "load_snapshot_truth", _truth)
+    deps = CognitiveGraphDeps(
+        router=_router("no-contract"),
+        config=CognitiveGraphSettings(),
+        session_id="sess",
+        run_id="sess",
+        snapshot_repo=SimpleNamespace(  # type: ignore[arg-type]
+            get_by_id=lambda _sid: SimpleNamespace(
+                snapshot_id=_sid,
+                exchange_time=clock.now(),
+                option_surface_id=uuid4(),
+            )
+        ),
+        objective_service=svc,
+        objective_state_loader=svc.get_state,
+        feasibility_engine=GoalFeasibilityEngine(policy="target_attainment"),
+        objective_strategy_scorer=ObjectiveStrategyScorer(),
+        capital_sizer=DeterministicObjectiveSizer(
+            require_positive_expected_value=False
+        ),
+        target_attainment_policy=TargetAttainmentPolicy(),
+        objective_policy="target_attainment",
+        clock=clock,
+    )
+    from tests.objectives.test_strategy_family_required import _strategy
+
+    strategy = _strategy(family="breakout_continuation")
+    # Point the only leg at a contract_id absent from the linked surface.
+    strategy = strategy.model_copy(
+        update={
+            "strategy_id": sid,
+            "candidate_legs": (
+                strategy.candidate_legs[0].model_copy(
+                    update={"contract_id": "MISSING_FROM_SURFACE"}
+                ),
+            ),
+        }
+    )
+    state = {
+        "strategies": [strategy],
+        "snapshot_id": str(snap_id),
+        "session_id": "sess",
+        "cycle_id": "c-no-contract",
+        "world_model": SimpleNamespace(
+            market_structure=None,
+            volatility_state=None,
+            options_state=None,
+            temporal_state=SimpleNamespace(session_phase="regular"),
+        ),
+        "trace": [],
+        "errors": [],
+    }
+    out = await on.score_strategies_against_objective_node(deps, state)  # type: ignore[arg-type]
+    decision = out.get("_target_attainment_decision") or {}
+    assert out.get("_target_attainment_authoritative") is True
+    assert out.get("_target_attainment_action") == "wait"
+    assert decision.get("action") == "wait"
+    assert "no_valid_contract_candidates" in (decision.get("reason_codes") or [])
+    assert decision.get("selected_contract_id") in {None, ""}
+    assert int(decision.get("selected_quantity") or 0) == 0
+    # No entry tuple for gateway / tactician.
+    assert not out.get("_target_attainment_contract_id")
+    assert int(out.get("_target_attainment_quantity") or 0) == 0

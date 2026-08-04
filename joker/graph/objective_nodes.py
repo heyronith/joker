@@ -619,7 +619,8 @@ async def score_strategies_against_objective_node(
                 selected_contract_id=None,
                 selected_quantity=0,
                 selected_capital_usd=Decimal("0"),
-                selected_probability=None,
+                selected_evaluation_premium_usd=None,
+                selected_p_goal=None,
                 probability_delta=None,
                 reason_codes=["no_valid_contract_candidates"],
             )
