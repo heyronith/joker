@@ -22,16 +22,55 @@ def build_debate_graph(deps: CognitiveGraphDeps):
         selected_ids = set(state.get("selected_strategy_ids") or [])
         if selected_ids:
             strategies = [s for s in strategies if str(s.strategy_id) in selected_ids]
+        from joker.objectives.portfolio_review import (
+            build_portfolio_review_context,
+            portfolio_review_from_debate,
+        )
+
+        full_chain_settings = getattr(deps, "full_chain_optimizer_settings", None)
+        review_limit = int(
+            getattr(full_chain_settings, "top_candidates_for_agent_review", 10)
+            or 10
+        )
+        portfolio_context = build_portfolio_review_context(
+            state=dict(state),
+            limit=review_limit,
+        )
         reviews = []
         for strategy in strategies:
-            panel = await run_debate_panel(strategy, context, deps.router)
+            panel = await run_debate_panel(
+                strategy,
+                context,
+                deps.router,
+                portfolio_review_context=(
+                    portfolio_context.model_dump(mode="json")
+                    if portfolio_context is not None
+                    else None
+                ),
+            )
             reviews.extend(panel)
         if deps.debate_repo is not None:
             session_id = state.get("session_id") or deps.session_id
             for review in reviews:
                 await deps.debate_repo.append(review, session_id=session_id)
+        portfolio_reviews = (
+            [
+                portfolio_review_from_debate(review, portfolio_context).model_dump(
+                    mode="json"
+                )
+                for review in reviews
+            ]
+            if portfolio_context is not None
+            else []
+        )
         return {
             "reviews": reviews,
+            "_portfolio_review_context": (
+                portfolio_context.model_dump(mode="json")
+                if portfolio_context is not None
+                else None
+            ),
+            "_portfolio_debate_reviews": portfolio_reviews,
             **trace_update(
                 append_trace(state, node_name="debate_panel", status="started"),
                 append_trace(

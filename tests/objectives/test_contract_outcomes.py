@@ -61,6 +61,9 @@ def _contract(
         relative_spread=(ask_d - bid_d) / mid,
         quote_timestamp=datetime(2026, 8, 5, 15, 0, tzinfo=timezone.utc),
         quote_age_seconds=Decimal("0"),
+        evaluated_at_exchange_time=datetime(
+            2026, 8, 5, 15, 0, tzinfo=timezone.utc
+        ),
         liquidity_score=0.8,
         delta=Decimal(delta) if delta is not None else None,
         gamma=Decimal(gamma) if gamma is not None else None,

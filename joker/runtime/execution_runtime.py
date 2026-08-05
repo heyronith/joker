@@ -8,7 +8,7 @@ verified PARTIAL_FILL / FINAL_FILL ledger events.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any
@@ -40,6 +40,7 @@ class ExecutionCommand:
     client_order_id: str
     intent: OrderIntent
     broker_account_id: str = "default"
+    provenance: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -169,7 +170,11 @@ class ExecutionRuntime:
             idempotency_key=f"submit-req:{command.client_order_id}",
             session_id=self._session_id,
             price=Decimal(str(intent.limit_price)) if intent.limit_price is not None else None,
-            metadata={"intent_id": intent.intent_id, "order_type": intent.order_type},
+            metadata={
+                "intent_id": intent.intent_id,
+                "order_type": intent.order_type,
+                **dict(command.provenance),
+            },
         )
         await self._ledger.append(requested)
         await self._publish_order_event(EventType.ORDER_SUBMITTED, command.client_order_id, now)

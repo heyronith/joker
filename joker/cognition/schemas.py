@@ -623,10 +623,21 @@ class ExecutionLeg(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     leg_id: UUID = Field(default_factory=uuid4)
+    strategy_id: UUID | None = None
     contract_id: str
     side: Side
     quantity: int
     limit_price: Decimal | None = None
+    evaluation_premium: Decimal | None = None
+    capital_allocation: Decimal | None = None
+    authorized_position_tuple_id: UUID | None = None
+    target_portfolio_decision_id: UUID | None = None
+    selected_portfolio_id: UUID | None = None
+    component_index: int | None = None
+    component_count: int | None = None
+    evaluated_objective_version: int | None = None
+    evaluated_objective_fingerprint: str | None = None
+    original_decision_snapshot_id: UUID | None = None
     sequence_order: int
     max_quote_age_seconds: int
     replacement_policy: str

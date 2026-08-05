@@ -47,6 +47,10 @@ async def _prepare_stack(
     kill_switch: bool = False,
     option_ask: str = "1.20",
     option_bid: str = "1.00",
+    option_quotes: list[dict] | None = None,
+    max_concurrent_positions: int = 1,
+    maximum_authorised_contracts: int = 20,
+    objective_duration: timedelta = timedelta(hours=4),
 ):
     start = datetime(2026, 7, 1, 10, 0, tzinfo=ET)
     clock = FrozenExchangeClock(start, calendar=MarketCalendar())
@@ -83,7 +87,8 @@ async def _prepare_stack(
             received_timestamp=ts,
         )
     await market.ingest_option_quotes(
-        [
+        option_quotes
+        or [
             {
                 "contract_id": CONTRACT_ID,
                 "symbol": "SPY",
@@ -118,16 +123,19 @@ async def _prepare_stack(
     objective_service = SessionObjectiveService(
         obj_repo, require_positive_expected_value=True
     )
-    deadline = datetime.now(tz=ET) + timedelta(hours=4)
+    deadline = start + objective_duration
     definition = await objective_service.create_objective(
         session_id=session_id,
         authorised_capital_usd=500,
         target_profit_pct=10,
         deadline_exchange_time=deadline,
-        max_concurrent_positions=1,
+        max_concurrent_positions=max_concurrent_positions,
         accepted_total_loss_risk=True,
     )
-    await objective_service.confirm_objective(definition.objective_id)
+    await objective_service.confirm_objective(
+        definition.objective_id,
+        confirmed_at_exchange_time=start,
+    )
 
     app = AppSettings()
     app = app.model_copy(
@@ -135,6 +143,7 @@ async def _prepare_stack(
             "objective": app.objective.model_copy(
                 update={
                     "enabled": True,
+                    "maximum_authorised_contracts": maximum_authorised_contracts,
                     "require_positive_expected_value": True,
                     "historical_outcomes": app.objective.historical_outcomes.model_copy(
                         update={
@@ -255,6 +264,7 @@ async def _prepare_stack(
         "original_submit": original_submit,
         "engines": engines,
         "evo": evo,
+        "deps": deps,
     }
 
 

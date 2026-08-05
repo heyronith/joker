@@ -128,6 +128,7 @@ class FullChainContract:
     relative_spread: Decimal
     quote_timestamp: datetime
     quote_age_seconds: Decimal
+    evaluated_at_exchange_time: datetime
     liquidity_score: float
     delta: Decimal | None = None
     gamma: Decimal | None = None
@@ -153,6 +154,8 @@ class FullChainContract:
             "bid": str(self.bid),
             "ask": str(self.ask),
             "relative_spread": str(self.relative_spread),
+            "quote_age_seconds": str(self.quote_age_seconds),
+            "evaluated_at_exchange_time": self.evaluated_at_exchange_time.isoformat(),
             "liquidity_score": self.liquidity_score,
         }
 
@@ -163,6 +166,7 @@ class FullChainUniverse:
     surface_id: UUID
     trading_date: date
     underlying_price: Decimal
+    evaluated_at_exchange_time: datetime
     source_contract_count: int
     eligible_contract_count: int
     contracts: tuple[FullChainContract, ...]
@@ -176,6 +180,7 @@ class FullChainUniverse:
             "surface_id": str(self.surface_id),
             "trading_date": self.trading_date.isoformat(),
             "underlying_price": str(self.underlying_price),
+            "evaluated_at_exchange_time": self.evaluated_at_exchange_time.isoformat(),
             "source_contract_count": self.source_contract_count,
             "eligible_contract_count": self.eligible_contract_count,
             "evaluated_contract_count": len(self.contracts),
@@ -188,6 +193,8 @@ class FullChainUniverse:
 @dataclass(frozen=True)
 class FullChainUniverseSettings:
     maximum_quote_age_seconds: int = 30
+    maximum_surface_age_seconds: int = 30
+    maximum_future_timestamp_seconds: int = 1
     maximum_relative_spread: Decimal = Decimal("0.25")
     maximum_contracts_evaluated: int = 200
     moneyness_buckets: tuple[Decimal, ...] = (
@@ -216,7 +223,8 @@ def build_full_chain_universe(
     *,
     snapshot_id: UUID,
     surface: OptionSurfaceSnapshot,
-    trading_date: date,
+    current_exchange_time: datetime,
+    current_trading_date: date,
     available_capital_usd: Decimal,
     settings: FullChainUniverseSettings | None = None,
 ) -> FullChainUniverse:
@@ -224,16 +232,29 @@ def build_full_chain_universe(
     cfg = settings or FullChainUniverseSettings()
     spot = surface.underlying_price
     reasons: list[str] = []
+    if current_exchange_time.tzinfo is None:
+        reasons.append("current_exchange_time_naive")
     if surface.underlying_symbol.upper() != "SPY":
         reasons.append("wrong_underlying")
+    if surface.trading_date != current_trading_date:
+        reasons.append("surface_trading_date_mismatch")
+    if current_exchange_time.tzinfo is not None:
+        surface_age = Decimal(
+            str((current_exchange_time - surface.exchange_time).total_seconds())
+        )
+        if surface_age < -Decimal(cfg.maximum_future_timestamp_seconds):
+            reasons.append("surface_timestamp_in_future")
+        elif surface_age > Decimal(cfg.maximum_surface_age_seconds):
+            reasons.append("stale_option_surface")
     if spot is None or spot <= 0:
         reasons.append("underlying_price_unavailable")
     if reasons:
         return FullChainUniverse(
             snapshot_id=snapshot_id,
             surface_id=surface.surface_id,
-            trading_date=trading_date,
+            trading_date=current_trading_date,
             underlying_price=spot or Decimal("0"),
+            evaluated_at_exchange_time=current_exchange_time,
             source_contract_count=len(surface.contracts),
             eligible_contract_count=0,
             contracts=(),
@@ -245,7 +266,8 @@ def build_full_chain_universe(
     for row in surface.contracts:
         reason = _validate_row(
             row,
-            trading_date=trading_date,
+            trading_date=current_trading_date,
+            current_exchange_time=current_exchange_time,
             available_capital_usd=available_capital_usd,
             settings=cfg,
         )
@@ -277,6 +299,10 @@ def build_full_chain_universe(
             _distance_bucket(distance_pct, cfg.moneyness_buckets),
             _liquidity_bucket(row.liquidity_score),
         )
+        quote_age = max(
+            Decimal("0"),
+            Decimal(str((current_exchange_time - row.quote_timestamp).total_seconds())),
+        )
         eligible.append(
             FullChainContract(
                 surface_id=surface.surface_id,
@@ -296,7 +322,8 @@ def build_full_chain_universe(
                 mid=mid,
                 relative_spread=spread,
                 quote_timestamp=row.quote_timestamp,
-                quote_age_seconds=Decimal(row.quote_age_ms) / Decimal("1000"),
+                quote_age_seconds=quote_age,
+                evaluated_at_exchange_time=current_exchange_time,
                 liquidity_score=float(row.liquidity_score),
                 delta=row.delta,
                 gamma=row.gamma,
@@ -314,8 +341,9 @@ def build_full_chain_universe(
     return FullChainUniverse(
         snapshot_id=snapshot_id,
         surface_id=surface.surface_id,
-        trading_date=trading_date,
+        trading_date=current_trading_date,
         underlying_price=spot,
+        evaluated_at_exchange_time=current_exchange_time,
         source_contract_count=len(surface.contracts),
         eligible_contract_count=len(eligible),
         contracts=tuple(selected),
@@ -385,6 +413,7 @@ def _validate_row(
     row: OptionContractSnapshot,
     *,
     trading_date: date,
+    current_exchange_time: datetime,
     available_capital_usd: Decimal,
     settings: FullChainUniverseSettings,
 ) -> str | None:
@@ -400,7 +429,14 @@ def _validate_row(
         return "missing_bid_ask"
     if row.bid <= 0 or row.ask <= 0 or row.ask < row.bid:
         return "invalid_bid_ask"
-    if row.quote_age_ms > settings.maximum_quote_age_seconds * 1000:
+    if row.quote_timestamp.tzinfo is None:
+        return "quote_timestamp_naive"
+    quote_age = Decimal(
+        str((current_exchange_time - row.quote_timestamp).total_seconds())
+    )
+    if quote_age < -Decimal(settings.maximum_future_timestamp_seconds):
+        return "quote_timestamp_in_future"
+    if quote_age > Decimal(settings.maximum_quote_age_seconds):
         return "stale_contract"
     mid = row.mid if row.mid is not None else (row.bid + row.ask) / Decimal("2")
     if mid <= 0:

@@ -167,6 +167,28 @@ class CognitiveExecutionProvenanceRegistry:
             return None
         return self._row_to_record(row)
 
+    async def list_by_target_portfolio_decision_id(
+        self, target_portfolio_decision_id: str
+    ) -> list[ExecutionProvenanceRecord]:
+        """Return submitted portfolio components in deterministic component order."""
+        await self._ensure()
+        async with aiosqlite.connect(self._db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                """
+                SELECT * FROM cognitive_execution_provenance
+                WHERE json_extract(
+                    payload_json, '$.target_portfolio_decision_id'
+                ) = ?
+                ORDER BY CAST(
+                    json_extract(payload_json, '$.component_index') AS INTEGER
+                ) ASC
+                """,
+                (str(target_portfolio_decision_id),),
+            )
+            rows = await cur.fetchall()
+        return [self._row_to_record(row) for row in rows]
+
     async def list_by_lifecycle_id(
         self, position_lifecycle_id: str
     ) -> list[ExecutionProvenanceRecord]:

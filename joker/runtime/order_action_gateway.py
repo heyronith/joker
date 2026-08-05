@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from decimal import Decimal
 from enum import StrEnum
@@ -94,6 +94,17 @@ class OrderActionRequest:
     # Factual horizon-start anchor for entry provenance (never a fill event).
     # Prefer decision-completed → execution-proposal → cognitive-cycle trigger.
     causation_event_id: str | None = None
+    target_portfolio_decision_id: str | None = None
+    selected_portfolio_id: str | None = None
+    authorized_position_tuple_id: str | None = None
+    component_index: int | None = None
+    component_count: int | None = None
+    evaluated_objective_version: int | None = None
+    submission_objective_version: int | None = None
+    evaluated_objective_fingerprint: str | None = None
+    submission_objective_fingerprint: str | None = None
+    original_decision_snapshot_id: str | None = None
+    submission_snapshot_id: str | None = None
 
 
 @dataclass
@@ -118,7 +129,11 @@ def working_orders_from_projection(
     """Extract typed working-order truth from a Task 1 ledger projection."""
     if projection is None:
         return ()
-    orders = getattr(projection, "orders", None) or {}
+    orders = (
+        projection.get("orders")
+        if isinstance(projection, dict)
+        else getattr(projection, "orders", None)
+    ) or {}
     order_iter = orders.values() if isinstance(orders, dict) else orders
     out: list[WorkingOrderTruth] = []
     proposal_map = proposal_id_by_client_order or {}
@@ -290,6 +305,36 @@ class OrderActionGateway:
                 working=working,
                 open_positions=open_positions,
             )
+            command = replace(
+                command,
+                provenance={
+                    "target_portfolio_decision_id": (
+                        request.target_portfolio_decision_id
+                    ),
+                    "selected_portfolio_id": request.selected_portfolio_id,
+                    "authorized_position_tuple_id": (
+                        request.authorized_position_tuple_id
+                    ),
+                    "component_index": request.component_index,
+                    "component_count": request.component_count,
+                    "evaluated_objective_version": (
+                        request.evaluated_objective_version
+                    ),
+                    "submission_objective_version": (
+                        request.submission_objective_version
+                    ),
+                    "evaluated_objective_fingerprint": (
+                        request.evaluated_objective_fingerprint
+                    ),
+                    "submission_objective_fingerprint": (
+                        request.submission_objective_fingerprint
+                    ),
+                    "original_decision_snapshot_id": (
+                        request.original_decision_snapshot_id
+                    ),
+                    "submission_snapshot_id": request.submission_snapshot_id,
+                },
+            )
         except CognitiveValidationError as exc:
             msg = str(exc).lower()
             degraded = (
@@ -394,6 +439,18 @@ class OrderActionGateway:
         } and self._deps.objective_service is not None:
             try:
                 obj_state = await self._deps.objective_service.get_state()
+                if request.submission_objective_version is not None and int(
+                    request.submission_objective_version
+                ) != int(obj_state.version):
+                    return OrderActionResult(
+                        submitted=False,
+                        client_order_id=request.client_order_id,
+                        blocked_reason=(
+                            "target_attainment_recalculation_required:"
+                            "submission_objective_version_stale"
+                        ),
+                        working_orders=working,
+                    )
                 if (
                     obj_state.status
                     in {
@@ -755,6 +812,31 @@ class OrderActionGateway:
                         "position_lifecycle_id": lifecycle_id,
                         "originating_entry_client_order_id": originating,
                         "causation_event_id": request.causation_event_id,
+                        "target_portfolio_decision_id": (
+                            request.target_portfolio_decision_id
+                        ),
+                        "selected_portfolio_id": request.selected_portfolio_id,
+                        "authorized_position_tuple_id": (
+                            request.authorized_position_tuple_id
+                        ),
+                        "component_index": request.component_index,
+                        "component_count": request.component_count,
+                        "evaluated_objective_version": (
+                            request.evaluated_objective_version
+                        ),
+                        "submission_objective_version": (
+                            request.submission_objective_version
+                        ),
+                        "evaluated_objective_fingerprint": (
+                            request.evaluated_objective_fingerprint
+                        ),
+                        "submission_objective_fingerprint": (
+                            request.submission_objective_fingerprint
+                        ),
+                        "original_decision_snapshot_id": (
+                            request.original_decision_snapshot_id
+                        ),
+                        "submission_snapshot_id": request.submission_snapshot_id,
                     },
                 )
             )
@@ -823,10 +905,16 @@ class OrderActionGateway:
             raise CognitiveValidationError(
                 f"contract_id {request.contract_id!r} is absent from the option surface"
             )
+        clock = getattr(self._deps, "clock", None)
+        quote_now = (
+            clock.now()
+            if clock is not None and hasattr(clock, "now")
+            else datetime.now(timezone.utc)
+        )
         self._validate_quote_age(
             request.max_quote_age_seconds,
             surface_row,
-            now=datetime.now(timezone.utc),
+            now=quote_now,
         )
 
         if request.quantity <= 0:
@@ -1005,6 +1093,8 @@ class OrderActionGateway:
     ) -> None:
         if max_quote_age_seconds is None:
             return
+        # Prefer persisted exchange-relative age when present. Otherwise compute
+        # age from quote_timestamp against the caller-provided exchange clock.
         if row.quote_age_ms is not None:
             if row.quote_age_ms > max_quote_age_seconds * 1000:
                 raise CognitiveValidationError(
@@ -1012,12 +1102,17 @@ class OrderActionGateway:
                     f"{max_quote_age_seconds}s"
                 )
             return
-        if row.quote_timestamp is not None:
-            age = (now - row.quote_timestamp).total_seconds()
-            if age > max_quote_age_seconds:
-                raise CognitiveValidationError(
-                    f"quote age {age:.1f}s exceeds proposal limit {max_quote_age_seconds}s"
-                )
+        if row.quote_timestamp is None:
+            raise CognitiveValidationError("quote timestamp missing")
+        if row.quote_timestamp.tzinfo is None:
+            raise CognitiveValidationError("quote timestamp must be timezone-aware")
+        age = (now - row.quote_timestamp).total_seconds()
+        if age < -1:
+            raise CognitiveValidationError("quote timestamp is materially in the future")
+        if age > max_quote_age_seconds:
+            raise CognitiveValidationError(
+                f"quote age {age:.1f}s exceeds proposal limit {max_quote_age_seconds}s"
+            )
 
     async def _maybe_live_preview(
         self,

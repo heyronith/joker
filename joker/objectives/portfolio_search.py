@@ -10,12 +10,33 @@ from typing import Any, Sequence
 from uuid import UUID, uuid4
 
 from joker.objectives.contract_outcomes import ContractOutcomeEstimate
+from joker.objectives.shared_scenarios import SharedUnderlyingScenario
 
 
 class PortfolioAction(StrEnum):
     ENTER = "enter"
     WAIT = "wait"
     BLOCK = "block"
+
+
+@dataclass(frozen=True)
+class QuantityScenarioPnl:
+    scenario_id: str
+    shared_scenario_grid_hash: str
+    probability: Decimal
+    underlying_price: Decimal
+    horizon_seconds: int
+    pnl_usd: Decimal
+
+    @property
+    def identity(self) -> tuple[str, str, Decimal, Decimal, int]:
+        return (
+            self.shared_scenario_grid_hash,
+            self.scenario_id,
+            self.underlying_price,
+            self.probability,
+            self.horizon_seconds,
+        )
 
 
 @dataclass(frozen=True)
@@ -42,7 +63,7 @@ class QuantityGridRow:
     physically_feasible: bool
     selected: bool = False
     outcome_estimate_id: UUID | None = None
-    scenario_pnl: tuple[tuple[str, Decimal, Decimal], ...] = ()
+    scenario_pnl: tuple[QuantityScenarioPnl, ...] = ()
     relative_spread: Decimal = Decimal("1")
     liquidity_score: float = 0.0
 
@@ -82,11 +103,18 @@ class QuantityGridRow:
                 else None
             ),
             "estimate_type": self.estimate_type,
+            "relative_spread": str(self.relative_spread),
+            "liquidity_score": self.liquidity_score,
             "reason_codes": list(self.reason_codes),
             "physically_feasible": self.physically_feasible,
             "selected": self.selected,
             "outcome_estimate_id": (
                 str(self.outcome_estimate_id) if self.outcome_estimate_id else None
+            ),
+            "shared_scenario_grid_hash": (
+                self.scenario_pnl[0].shared_scenario_grid_hash
+                if self.scenario_pnl
+                else None
             ),
         }
 
@@ -103,6 +131,10 @@ class AuthorizedPositionTuple:
     snapshot_id: UUID
     objective_version: int
     decision_id: UUID
+    evaluated_objective_fingerprint: str | None = None
+    submission_objective_version: int | None = None
+    submission_objective_fingerprint: str | None = None
+    submission_snapshot_id: UUID | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -115,6 +147,16 @@ class AuthorizedPositionTuple:
             "maximum_loss": str(self.maximum_loss),
             "snapshot_id": str(self.snapshot_id),
             "objective_version": self.objective_version,
+            "evaluated_objective_version": self.objective_version,
+            "evaluated_objective_fingerprint": self.evaluated_objective_fingerprint,
+            "submission_objective_version": self.submission_objective_version,
+            "submission_objective_fingerprint": self.submission_objective_fingerprint,
+            "original_decision_snapshot_id": str(self.snapshot_id),
+            "submission_snapshot_id": (
+                str(self.submission_snapshot_id)
+                if self.submission_snapshot_id is not None
+                else None
+            ),
             "decision_id": str(self.decision_id),
         }
 
@@ -137,6 +179,8 @@ class PortfolioAttainmentEvaluation:
     liquidity_penalty: Decimal
     reason_codes: tuple[str, ...]
     physically_feasible: bool
+    shared_scenario_grid_hash: str | None = None
+    shared_scenarios: tuple[SharedUnderlyingScenario, ...] = ()
     selected: bool = False
 
     def as_dict(self) -> dict[str, Any]:
@@ -175,6 +219,10 @@ class PortfolioAttainmentEvaluation:
             "liquidity_penalty": str(self.liquidity_penalty),
             "reason_codes": list(self.reason_codes),
             "physically_feasible": self.physically_feasible,
+            "shared_scenario_grid_hash": self.shared_scenario_grid_hash,
+            "shared_scenarios": [
+                scenario.as_dict() for scenario in self.shared_scenarios
+            ],
             "selected": self.selected,
         }
 
@@ -194,6 +242,10 @@ class TargetPortfolioDecision:
     reason_codes: tuple[str, ...]
     quantity_grid: tuple[QuantityGridRow, ...]
     portfolio_evaluations: tuple[PortfolioAttainmentEvaluation, ...]
+    evaluated_objective_fingerprint: str | None = None
+    submission_objective_version: int | None = None
+    submission_objective_fingerprint: str | None = None
+    submission_snapshot_id: UUID | None = None
     authoritative: bool = True
 
     def as_dict(self) -> dict[str, Any]:
@@ -223,6 +275,16 @@ class TargetPortfolioDecision:
             ),
             "snapshot_id": str(self.snapshot_id),
             "objective_version": self.objective_version,
+            "evaluated_objective_version": self.objective_version,
+            "evaluated_objective_fingerprint": self.evaluated_objective_fingerprint,
+            "submission_objective_version": self.submission_objective_version,
+            "submission_objective_fingerprint": self.submission_objective_fingerprint,
+            "original_decision_snapshot_id": str(self.snapshot_id),
+            "submission_snapshot_id": (
+                str(self.submission_snapshot_id)
+                if self.submission_snapshot_id is not None
+                else None
+            ),
             "time_remaining_seconds": self.time_remaining_seconds,
             "reason_codes": list(self.reason_codes),
             "quantity_grid": [row.as_dict() for row in self.quantity_grid],
@@ -269,10 +331,13 @@ def expand_quantity_grid(
         for quantity in range(1, max_q + 1):
             capital = (per_contract * Decimal(quantity)).quantize(Decimal("0.01"))
             scenario_pnl = tuple(
-                (
-                    scenario.scenario_id,
-                    scenario.probability,
-                    scenario.pnl_per_contract_usd * Decimal(quantity),
+                QuantityScenarioPnl(
+                    scenario_id=scenario.scenario_id,
+                    shared_scenario_grid_hash=scenario.shared_scenario_grid_hash,
+                    probability=scenario.probability,
+                    underlying_price=scenario.underlying_price,
+                    horizon_seconds=scenario.horizon_seconds,
+                    pnl_usd=scenario.pnl_per_contract_usd * Decimal(quantity),
                 )
                 for scenario in outcome.scenarios
             )
@@ -281,9 +346,9 @@ def expand_quantity_grid(
             if outcome.usable_for_ranking and scenario_pnl:
                 p_goal = sum(
                     (
-                        probability
-                        for _, probability, pnl in scenario_pnl
-                        if pnl >= remaining_goal_gap_usd
+                        scenario.probability
+                        for scenario in scenario_pnl
+                        if scenario.pnl_usd >= remaining_goal_gap_usd
                     ),
                     Decimal("0"),
                 ).quantize(Decimal("0.0001"))
@@ -369,6 +434,7 @@ def search_target_portfolios(
     working_order_count: int,
     max_concurrent_positions: int,
     wait_probability_goal: Decimal | None,
+    evaluated_objective_fingerprint: str | None = None,
     settings: PortfolioSearchSettings | None = None,
 ) -> TargetPortfolioDecision:
     """Bounded deterministic search using shared-scenario portfolio P&L."""
@@ -395,6 +461,7 @@ def search_target_portfolios(
             objective_version=objective_version,
             time_remaining_seconds=time_remaining_seconds,
             wait_probability_goal=wait_probability_goal,
+            evaluated_objective_fingerprint=evaluated_objective_fingerprint,
             quantity_grid=quantity_grid,
             portfolios=(),
             reason="maximum_concurrent_positions_reached",
@@ -406,6 +473,7 @@ def search_target_portfolios(
             objective_version=objective_version,
             time_remaining_seconds=time_remaining_seconds,
             wait_probability_goal=wait_probability_goal,
+            evaluated_objective_fingerprint=evaluated_objective_fingerprint,
             quantity_grid=quantity_grid,
             portfolios=(),
             reason="no_valid_contract_candidates",
@@ -463,6 +531,7 @@ def search_target_portfolios(
             objective_version=objective_version,
             time_remaining_seconds=time_remaining_seconds,
             wait_probability_goal=wait_probability_goal,
+            evaluated_objective_fingerprint=evaluated_objective_fingerprint,
             quantity_grid=quantity_grid,
             portfolios=evaluations,
             reason="no_rankable_portfolio",
@@ -483,6 +552,7 @@ def search_target_portfolios(
             objective_version=objective_version,
             time_remaining_seconds=time_remaining_seconds,
             wait_probability_goal=wait_probability_goal,
+            evaluated_objective_fingerprint=evaluated_objective_fingerprint,
             quantity_grid=quantity_grid,
             portfolios=evaluations,
             reason="wait_has_higher_or_insufficient_probability_improvement",
@@ -504,6 +574,7 @@ def search_target_portfolios(
             snapshot_id=snapshot_id,
             objective_version=objective_version,
             decision_id=decision_id,
+            evaluated_objective_fingerprint=evaluated_objective_fingerprint,
         )
         for row in sorted(selected_rows, key=_row_search_key)
     )
@@ -532,6 +603,7 @@ def search_target_portfolios(
         ),
         quantity_grid=marked_rows,
         portfolio_evaluations=marked_portfolios,
+        evaluated_objective_fingerprint=evaluated_objective_fingerprint,
     )
 
 
@@ -543,41 +615,35 @@ def _evaluate_portfolio(
     wait_probability_goal: Decimal | None,
     cfg: PortfolioSearchSettings,
 ) -> PortfolioAttainmentEvaluation:
-    scenario_ids = sorted(
-        set.intersection(
-            *(set(sid for sid, _, _ in row.scenario_pnl) for row in combo)
-        )
-        if combo
-        else set()
+    reference_scenarios = combo[0].scenario_pnl if combo else ()
+    reference_identity = tuple(
+        scenario.identity for scenario in reference_scenarios
+    )
+    scenarios_compatible = bool(reference_scenarios) and all(
+        tuple(scenario.identity for scenario in row.scenario_pnl)
+        == reference_identity
+        for row in combo
     )
     p_goal: Decimal | None = None
     lower: Decimal | None = None
-    if scenario_ids:
-        aggregate: list[tuple[Decimal, Decimal]] = []
-        for scenario_id in scenario_ids:
-            probabilities: list[Decimal] = []
-            total_pnl = Decimal("0")
-            for row in combo:
-                entry = next(
-                    (item for item in row.scenario_pnl if item[0] == scenario_id),
-                    None,
+    aggregate: list[tuple[Decimal, Decimal]] = []
+    if scenarios_compatible:
+        for index, scenario in enumerate(reference_scenarios):
+            aggregate.append(
+                (
+                    scenario.probability,
+                    sum(
+                        (row.scenario_pnl[index].pnl_usd for row in combo),
+                        Decimal("0"),
+                    ),
                 )
-                if entry is None:
-                    break
-                probabilities.append(entry[1])
-                total_pnl += entry[2]
-            else:
-                # Shared scenario probability: average distributions and normalize;
-                # never multiply contract probabilities as if independent.
-                aggregate.append(
-                    (sum(probabilities, Decimal("0")) / Decimal(len(probabilities)), total_pnl)
-                )
-        total_probability = sum((p for p, _ in aggregate), Decimal("0"))
-        if total_probability > 0:
+            )
+        total_probability = sum((probability for probability, _ in aggregate), Decimal("0"))
+        if total_probability == Decimal("1"):
             p_goal = sum(
                 (
-                    p / total_probability
-                    for p, pnl in aggregate
+                    probability
+                    for probability, pnl in aggregate
                     if pnl >= remaining_goal_gap_usd
                 ),
                 Decimal("0"),
@@ -628,8 +694,36 @@ def _evaluate_portfolio(
         ),
         concentration_penalty=concentration,
         liquidity_penalty=liquidity_penalty,
-        reason_codes=("shared_underlying_scenarios",),
-        physically_feasible=capital <= available_capital_usd,
+        reason_codes=(
+            ("shared_underlying_scenarios",)
+            if scenarios_compatible
+            else ("incompatible_shared_scenario_grid",)
+        ),
+        physically_feasible=(
+            capital <= available_capital_usd
+            and scenarios_compatible
+            and p_goal is not None
+        ),
+        shared_scenario_grid_hash=(
+            reference_scenarios[0].shared_scenario_grid_hash
+            if scenarios_compatible
+            else None
+        ),
+        shared_scenarios=(
+            tuple(
+                SharedUnderlyingScenario(
+                    scenario_id=scenario.scenario_id,
+                    probability=scenario.probability,
+                    underlying_price=scenario.underlying_price,
+                    horizon_seconds=scenario.horizon_seconds,
+                    generation_method="referenced_shared_grid",
+                    assumptions=("portfolio_components_priced_on_identical_spots",),
+                )
+                for scenario in reference_scenarios
+            )
+            if scenarios_compatible
+            else ()
+        ),
     )
 
 
@@ -692,6 +786,7 @@ def _wait_decision(
     objective_version: int,
     time_remaining_seconds: int,
     wait_probability_goal: Decimal | None,
+    evaluated_objective_fingerprint: str | None,
     quantity_grid: Sequence[QuantityGridRow],
     portfolios: Sequence[PortfolioAttainmentEvaluation],
     reason: str,
@@ -710,4 +805,5 @@ def _wait_decision(
         reason_codes=(reason,),
         quantity_grid=tuple(quantity_grid),
         portfolio_evaluations=tuple(portfolios),
+        evaluated_objective_fingerprint=evaluated_objective_fingerprint,
     )

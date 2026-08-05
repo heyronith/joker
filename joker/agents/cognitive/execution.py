@@ -308,12 +308,19 @@ class ExecutionProposalValidator:
                     f"{max_quote_age_seconds}s"
                 )
             return
-        if row.quote_timestamp is not None:
-            age = (now - row.quote_timestamp).total_seconds()
-            if age > max_quote_age_seconds:
-                raise CognitiveValidationError(
-                    f"quote age {age:.1f}s exceeds proposal limit {max_quote_age_seconds}s"
-                )
+        if row.quote_timestamp is None:
+            raise CognitiveValidationError("quote timestamp missing")
+        if row.quote_timestamp.tzinfo is None:
+            raise CognitiveValidationError("quote timestamp must be timezone-aware")
+        age = (now - row.quote_timestamp).total_seconds()
+        if age < -1:
+            raise CognitiveValidationError(
+                "quote timestamp is materially in the future"
+            )
+        if age > max_quote_age_seconds:
+            raise CognitiveValidationError(
+                f"quote age {age:.1f}s exceeds proposal limit {max_quote_age_seconds}s"
+            )
 
 
 class ExecutionCommandCompiler:
@@ -460,6 +467,7 @@ def build_truth_from_deps(
     projection: Any | None = None,
     already_submitted_proposal_ids: Sequence[str] = (),
     trading_mode: str = "PAPER",
+    now: datetime | None = None,
 ) -> AuthoritativeMarketTruth:
     """Assemble authoritative truth from Task 1 repositories / projection."""
     from joker.runtime.order_action_gateway import (
@@ -478,4 +486,5 @@ def build_truth_from_deps(
         open_position_contract_ids=frozenset(open_positions.keys()),
         already_submitted_proposal_ids=frozenset(str(x) for x in already_submitted_proposal_ids),
         trading_mode=trading_mode,
+        now=now,
     )

@@ -303,6 +303,14 @@ class AppSettings(BaseModel):
                 "live_trading_enabled requires mode LIVE_GATED. "
                 "Refusing to enable live trading in paper/shadow mode."
             )
+        if bool(getattr(self.full_chain_optimizer, "enabled", False)) and (
+            self.mode is SafetyMode.LIVE_GATED
+            or str(self.broker.provider).strip().lower() == "webull_live"
+        ):
+            raise ValueError(
+                "full-chain optimizer is paper/replay only and is not approved "
+                "for live-money activation"
+            )
 
 
 class EnvSettings(BaseSettings):

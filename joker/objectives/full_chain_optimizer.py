@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import date, datetime
 from decimal import Decimal
 from typing import Any, Sequence
 from uuid import UUID
@@ -27,6 +28,10 @@ from joker.objectives.portfolio_search import (
     expand_quantity_grid,
     search_target_portfolios,
 )
+from joker.objectives.shared_scenarios import (
+    SharedUnderlyingScenarioGrid,
+    build_shared_underlying_scenario_grid,
+)
 from joker.objectives.target_attainment import (
     TargetAttainmentContext,
     estimate_target_hit_probability,
@@ -37,6 +42,7 @@ from joker.objectives.target_attainment import (
 class FullChainOptimizationResult:
     universe: FullChainUniverse
     selection_specs: tuple[ContractSelectionSpec, ...]
+    shared_scenario_grid: SharedUnderlyingScenarioGrid | None
     contract_outcomes: tuple[ContractOutcomeEstimate, ...]
     decision: TargetPortfolioDecision
 
@@ -70,6 +76,11 @@ class FullChainOptimizationResult:
                 outcome.as_dict(include_scenarios=False)
                 for outcome in self.contract_outcomes
             ],
+            "_shared_underlying_scenario_grid": (
+                self.shared_scenario_grid.as_dict()
+                if self.shared_scenario_grid is not None
+                else None
+            ),
             "_quantity_grid": [
                 row.as_dict() for row in self.decision.quantity_grid
             ],
@@ -92,10 +103,17 @@ def optimize_full_chain(
     ctx: TargetAttainmentContext,
     settings: FullChainOptimizerSettings,
     maximum_authorised_contracts: int,
+    current_exchange_time: datetime,
+    current_trading_date: date,
+    evaluated_objective_fingerprint: str | None = None,
 ) -> FullChainOptimizationResult:
     """Run truth-bound discovery through authoritative WAIT/portfolio selection."""
     universe_settings = FullChainUniverseSettings(
         maximum_quote_age_seconds=settings.maximum_quote_age_seconds,
+        maximum_surface_age_seconds=settings.maximum_surface_age_seconds,
+        maximum_future_timestamp_seconds=(
+            settings.maximum_future_timestamp_seconds
+        ),
         maximum_relative_spread=Decimal(str(settings.maximum_relative_spread)),
         maximum_contracts_evaluated=settings.maximum_contracts_evaluated,
         moneyness_buckets=tuple(
@@ -107,7 +125,8 @@ def optimize_full_chain(
     universe = build_full_chain_universe(
         snapshot_id=ctx.snapshot_id,
         surface=surface,
-        trading_date=surface.trading_date,
+        current_exchange_time=current_exchange_time,
+        current_trading_date=current_trading_date,
         available_capital_usd=ctx.available_capital_usd,
         settings=universe_settings,
     )
@@ -120,6 +139,26 @@ def optimize_full_chain(
         historical_hit_rate=None,
         resolution_seconds=None,
         is_no_trade=True,
+    )
+    common_horizon = min(
+        max(1, int(ctx.time_remaining_seconds)),
+        max(
+            (
+                max(1, int(getattr(strategy, "expected_horizon_seconds", 600) or 600))
+                for strategy in strategies
+            ),
+            default=max(1, int(ctx.time_remaining_seconds)),
+        ),
+    )
+    shared_scenario_grid = (
+        build_shared_underlying_scenario_grid(
+            strategies=strategies,
+            reference_underlying_price=universe.underlying_price,
+            evaluation_time=current_exchange_time,
+            horizon_seconds=common_horizon,
+        )
+        if universe.underlying_price > 0 and universe.contracts
+        else None
     )
 
     specs: list[ContractSelectionSpec] = []
@@ -147,6 +186,7 @@ def optimize_full_chain(
                     remaining_goal_gap_usd=ctx.remaining_goal_gap_usd,
                     time_remaining_seconds=ctx.time_remaining_seconds,
                     evidence_ids=evidence_ids,
+                    shared_scenario_grid=shared_scenario_grid,
                 )
             )
 
@@ -181,11 +221,13 @@ def optimize_full_chain(
             else min(ctx.max_concurrent_positions, 1)
         ),
         wait_probability_goal=wait_estimate.p_goal,
+        evaluated_objective_fingerprint=evaluated_objective_fingerprint,
         settings=search_settings,
     )
     return FullChainOptimizationResult(
         universe=universe,
         selection_specs=tuple(specs),
+        shared_scenario_grid=shared_scenario_grid,
         contract_outcomes=tuple(outcomes),
         decision=decision,
     )

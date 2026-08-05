@@ -552,6 +552,11 @@ async def score_strategies_against_objective_node(
         market_usable = True
         if _dq is not None and hasattr(_dq, "usable_for_execution"):
             market_usable = bool(getattr(_dq, "usable_for_execution"))
+        from joker.runtime.order_action_gateway import working_orders_from_projection
+
+        working_order_count = len(
+            working_orders_from_projection(state.get("_order_projection"))
+        )
         ctx = TargetAttainmentContext.from_state(
             obj_state,
             snapshot_id=snapshot_id,
@@ -566,6 +571,7 @@ async def score_strategies_against_objective_node(
             market_usable_for_execution=market_usable,
             option_surface_usable=bool(surface_slice),
             data_quality_codes=tuple(dq_codes),
+            working_order_count=working_order_count,
         )
         full_chain_settings = getattr(deps, "full_chain_optimizer_settings", None)
         full_chain_enabled = bool(
@@ -575,10 +581,41 @@ async def score_strategies_against_objective_node(
         hard_block, _hard_codes = classify_physical_impossibility(
             ctx, session_state=objective_session
         )
-        if full_chain_enabled and _surface is not None and not hard_block:
+        if (
+            full_chain_enabled
+            and _surface is not None
+            and deps.clock is not None
+            and not hard_block
+        ):
             from joker.objectives.full_chain_optimizer import (
                 optimize_full_chain,
                 portfolio_decision_as_legacy_target_dict,
+            )
+            from joker.objectives.decision_fingerprint import (
+                ObjectiveDecisionFingerprint,
+            )
+
+            permission = getattr(deps, "entry_permission", None)
+            broker_eligible = not bool(getattr(deps, "kill_switch", False))
+            if permission is not None:
+                broker_eligible = broker_eligible and bool(
+                    getattr(permission, "permitted", False)
+                )
+            runtime = getattr(deps, "execution_runtime", None)
+            reconciliation_eligible = (
+                runtime is None
+                or getattr(runtime, "unresolved_reconciliation", None) is None
+            )
+            broker = getattr(runtime, "_broker", None)
+            broker_identity = (
+                type(broker).__qualname__ if broker is not None else "unconfigured"
+            )
+            evaluated_fingerprint = ObjectiveDecisionFingerprint.from_state(
+                obj_state,
+                working_order_count=working_order_count,
+                broker_identity=broker_identity,
+                broker_eligible=broker_eligible,
+                reconciliation_eligible=reconciliation_eligible,
             )
 
             optimized = optimize_full_chain(
@@ -587,6 +624,9 @@ async def score_strategies_against_objective_node(
                 ctx=ctx,
                 settings=full_chain_settings,
                 maximum_authorised_contracts=max_contracts,
+                current_exchange_time=deps.clock.now(),
+                current_trading_date=deps.clock.trading_date(),
+                evaluated_objective_fingerprint=evaluated_fingerprint.canonical_json,
             )
             full_chain_payload = optimized.state_payload()
             ta_decision_dump = portfolio_decision_as_legacy_target_dict(
@@ -764,7 +804,15 @@ def _estimate_for_strategy(
 async def deterministic_sizing_node(
     deps: CognitiveGraphDeps, state: CognitiveGraphState
 ) -> dict[str, Any]:
-    if deps.capital_sizer is None or deps.objective_service is None:
+    target_mode = (
+        str(getattr(deps, "objective_policy", "positive_ev_baseline"))
+        == "target_attainment"
+    )
+    portfolio_decision = state.get("_target_portfolio_decision")
+    if deps.objective_service is None or (
+        deps.capital_sizer is None
+        and not (target_mode and isinstance(portfolio_decision, dict))
+    ):
         return trace_update(
             append_trace(state, node_name="deterministic_sizing", status="skipped")
         )
@@ -786,56 +834,36 @@ async def deterministic_sizing_node(
                 message="objective gate blocks sizing",
             ),
         }
-    proposal = state.get("execution_proposal")
     obj_state = await deps.objective_service.get_state()
     estimate = _estimate_for_strategy(state, meta.selected_strategy_id)
-    target_mode = (
-        str(getattr(deps, "objective_policy", "positive_ev_baseline"))
-        == "target_attainment"
-    )
     authorized_positions = list(state.get("_target_authorized_positions") or [])
-    if target_mode and authorized_positions:
-        if len(proposal.legs) != len(authorized_positions):
-            return {
-                "_block_new_entries": True,
-                **append_error(
-                    state,
-                    node_name="apply_objective_sizing",
-                    error_code="target_attainment_recalculation_required",
-                    message="authorized portfolio component count changed",
-                ),
-            }
-        if any(
-            str(leg.contract_id) != str(position.get("contract_id"))
-            or int(leg.quantity) != int(position.get("quantity") or 0)
-            for leg, position in zip(
-                proposal.legs, authorized_positions, strict=True
-            )
+    if target_mode and isinstance(portfolio_decision, dict):
+        reason: str | None = None
+        if str(portfolio_decision.get("action") or "").lower() != "enter":
+            reason = "authoritative portfolio action is not ENTER"
+        elif not authorized_positions:
+            reason = "authoritative portfolio has no positions"
+        decision_id = str(portfolio_decision.get("decision_id") or "")
+        decision_snapshot = str(portfolio_decision.get("snapshot_id") or "")
+        evaluated_version = int(portfolio_decision.get("objective_version") or 0)
+        if reason is None and (
+            not decision_id or not decision_snapshot or evaluated_version <= 0
         ):
-            return {
-                "_block_new_entries": True,
-                **append_error(
-                    state,
-                    node_name="apply_objective_sizing",
-                    error_code="target_attainment_recalculation_required",
-                    message="authorized portfolio contract or quantity changed",
-                ),
-            }
-        expected_version = int(authorized_positions[0].get("objective_version") or 0)
-        expected_snapshot = str(authorized_positions[0].get("snapshot_id") or "")
-        if (
-            expected_version != int(obj_state.version)
-            or expected_snapshot != str(state.get("snapshot_id") or "")
+            reason = "authoritative portfolio provenance is incomplete"
+        if reason is None and any(
+            str(position.get("decision_id") or "") != decision_id
+            or str(position.get("snapshot_id") or "") != decision_snapshot
+            or int(position.get("objective_version") or 0) != evaluated_version
+            for position in authorized_positions
         ):
-            return {
-                "_block_new_entries": True,
-                **append_error(
-                    state,
-                    node_name="apply_objective_sizing",
-                    error_code="target_attainment_recalculation_required",
-                    message="objective version or snapshot provenance changed",
-                ),
-            }
+            reason = "authorized portfolio provenance is internally inconsistent"
+        if reason is None and decision_snapshot != str(state.get("snapshot_id") or ""):
+            reason = "authorized portfolio snapshot differs from graph snapshot"
+        if reason is None and any(
+            int(position.get("quantity") or 0) <= 0
+            for position in authorized_positions
+        ):
+            reason = "authorized portfolio contains a non-positive quantity"
         total_capital = sum(
             (
                 Decimal(str(position.get("capital_allocation") or "0"))
@@ -843,18 +871,35 @@ async def deterministic_sizing_node(
             ),
             Decimal("0"),
         )
-        if total_capital > Decimal(str(obj_state.available_capital_usd)):
+        if reason is None and (
+            total_capital <= 0
+            or total_capital > Decimal(str(obj_state.available_capital_usd))
+        ):
+            reason = "authorized portfolio does not fit current available capital"
+        from joker.runtime.order_action_gateway import working_orders_from_projection
+
+        working_count = len(
+            working_orders_from_projection(state.get("_order_projection"))
+        )
+        available_slots = max(
+            0,
+            int(obj_state.max_concurrent_positions)
+            - int(obj_state.open_position_count)
+            - working_count,
+        )
+        if reason is None and len(authorized_positions) > available_slots:
+            reason = "authorized portfolio exceeds current available position slots"
+        if reason is not None:
             return {
                 "_block_new_entries": True,
                 **append_error(
                     state,
-                    node_name="apply_objective_sizing",
+                    node_name="deterministic_sizing",
                     error_code="target_attainment_recalculation_required",
-                    message="authorized portfolio no longer fits available capital",
+                    message=reason,
                 ),
             }
         return {
-            "execution_proposal": proposal,
             "_sizing_decision": {
                 "approved": True,
                 "approved_quantity": sum(
@@ -866,7 +911,7 @@ async def deterministic_sizing_node(
             **trace_update(
                 append_trace(
                     state,
-                    node_name="apply_objective_sizing",
+                    node_name="deterministic_sizing",
                     status="completed",
                 )
             ),
@@ -902,12 +947,6 @@ async def deterministic_sizing_node(
     payoff = estimate.get("estimated_payoff_ratio")
     requested = None
     premium = Decimal(str(estimate.get("quote_inputs", {}).get("premium_per_contract") or "0.10"))
-    if proposal is not None and getattr(proposal, "legs", None):
-        leg = proposal.legs[0]
-        requested = int(getattr(leg, "quantity", 1) or 1)
-        px = getattr(leg, "limit_price", None)
-        if px is not None:
-            premium = Decimal(str(px))
     ta_qty = state.get("_target_attainment_quantity")
     ta_authoritative = bool(state.get("_target_attainment_authoritative"))
     if target_mode and ta_authoritative and ta_qty and int(ta_qty) > 0:
@@ -983,7 +1022,15 @@ async def apply_objective_sizing_to_proposal(
             error_code="missing_proposal",
             message="no execution proposal to size",
         )
-    if deps.capital_sizer is None or deps.objective_service is None:
+    target_mode = (
+        str(getattr(deps, "objective_policy", "positive_ev_baseline"))
+        == "target_attainment"
+    )
+    portfolio_decision = state.get("_target_portfolio_decision")
+    if deps.objective_service is None or (
+        deps.capital_sizer is None
+        and not (target_mode and isinstance(portfolio_decision, dict))
+    ):
         return trace_update(
             append_trace(state, node_name="apply_objective_sizing", status="skipped")
         )
@@ -1003,10 +1050,107 @@ async def apply_objective_sizing_to_proposal(
         proposal, "strategy_id", None
     )
     estimate = _estimate_for_strategy(state, strategy_id)
-    target_mode = (
-        str(getattr(deps, "objective_policy", "positive_ev_baseline"))
-        == "target_attainment"
-    )
+    authorized_positions = list(state.get("_target_authorized_positions") or [])
+    if target_mode and isinstance(portfolio_decision, dict):
+        mismatches: list[str] = []
+        if len(proposal.legs) != len(authorized_positions):
+            mismatches.append("component_count_changed")
+        else:
+            selected_portfolio_id = str(
+                portfolio_decision.get("selected_portfolio_id") or ""
+            )
+            for index, (leg, position) in enumerate(
+                zip(proposal.legs, authorized_positions, strict=True)
+            ):
+                if str(leg.strategy_id or "") != str(position.get("strategy_id") or ""):
+                    mismatches.append(f"strategy_changed:{index}")
+                if str(leg.contract_id) != str(position.get("contract_id") or ""):
+                    mismatches.append(f"contract_changed:{index}")
+                if int(leg.quantity) != int(position.get("quantity") or 0):
+                    mismatches.append(f"quantity_changed:{index}")
+                authorized_premium = Decimal(
+                    str(position.get("evaluation_premium") or "0")
+                )
+                if (
+                    leg.limit_price is None
+                    or leg.evaluation_premium is None
+                    or leg.evaluation_premium != authorized_premium
+                    or leg.limit_price != authorized_premium
+                ):
+                    mismatches.append(f"evaluation_provenance_missing:{index}")
+                if leg.capital_allocation is None or leg.capital_allocation != Decimal(
+                    str(position.get("capital_allocation") or "0")
+                ):
+                    mismatches.append(f"capital_allocation_changed:{index}")
+                if str(leg.authorized_position_tuple_id or "") != str(
+                    position.get("position_tuple_id") or ""
+                ):
+                    mismatches.append(f"position_tuple_changed:{index}")
+                if str(leg.target_portfolio_decision_id or "") != str(
+                    position.get("decision_id") or ""
+                ):
+                    mismatches.append(f"decision_provenance_changed:{index}")
+                if str(leg.selected_portfolio_id or "") != selected_portfolio_id:
+                    mismatches.append(f"portfolio_provenance_changed:{index}")
+                if leg.component_index != index or leg.sequence_order != index + 1:
+                    mismatches.append(f"component_order_changed:{index}")
+                if leg.component_count != len(authorized_positions):
+                    mismatches.append(f"component_count_provenance_changed:{index}")
+                if str(leg.original_decision_snapshot_id or "") != str(
+                    position.get("snapshot_id") or ""
+                ):
+                    mismatches.append(f"snapshot_provenance_changed:{index}")
+                if leg.evaluated_objective_version != int(
+                    position.get("objective_version") or 0
+                ):
+                    mismatches.append(f"objective_provenance_changed:{index}")
+        total_capital = sum(
+            (
+                Decimal(str(position.get("capital_allocation") or "0"))
+                for position in authorized_positions
+            ),
+            Decimal("0"),
+        )
+        if total_capital <= 0 or total_capital > Decimal(
+            str(obj_state.available_capital_usd)
+        ):
+            mismatches.append("portfolio_allocation_unavailable")
+        if mismatches:
+            return {
+                "_block_new_entries": True,
+                "_sizing_decision": {
+                    "approved": False,
+                    "reason_codes": [
+                        "target_attainment_recalculation_required",
+                        *mismatches,
+                    ],
+                },
+                **append_error(
+                    state,
+                    node_name="apply_objective_sizing",
+                    error_code="target_attainment_recalculation_required",
+                    message="authorized portfolio proposal changed: "
+                    + ",".join(mismatches),
+                ),
+            }
+        return {
+            "execution_proposal": proposal,
+            "_sizing_decision": {
+                "approved": True,
+                "approved_quantity": sum(
+                    int(position["quantity"]) for position in authorized_positions
+                ),
+                "capital_required_usd": str(total_capital),
+                "reason_codes": ["authoritative_portfolio_exact_allocation"],
+            },
+            **trace_update(
+                append_trace(
+                    state,
+                    node_name="apply_objective_sizing",
+                    status="completed",
+                )
+            ),
+        }
     if estimate is None or (not estimate.get("valid") and not target_mode):
         return append_error(
             state,

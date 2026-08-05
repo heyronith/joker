@@ -177,6 +177,8 @@ class FullChainOptimizerSettings(BaseModel):
     # Disabled by default globally. Paper/replay profiles must opt in.
     enabled: bool = False
     maximum_quote_age_seconds: int = 30
+    maximum_surface_age_seconds: int = 30
+    maximum_future_timestamp_seconds: int = 1
     maximum_relative_spread: float = 0.25
     maximum_contracts_evaluated: int = 200
     moneyness_buckets: tuple[float, ...] = (-2.0, -0.5, 0.5, 2.0)
@@ -195,6 +197,8 @@ class FullChainOptimizerSettings(BaseModel):
 
     @field_validator(
         "maximum_quote_age_seconds",
+        "maximum_surface_age_seconds",
+        "maximum_future_timestamp_seconds",
         "maximum_contracts_evaluated",
         "top_contracts_per_strategy",
         "top_candidates_for_agent_review",

@@ -179,6 +179,7 @@ async def run_debate_panel(
     router: ModelRouter,
     *,
     roles: Sequence[AgentRole] | None = None,
+    portfolio_review_context: dict[str, Any] | None = None,
 ) -> tuple[DebateReview, ...]:
     """Run all debate critics for a strategy hypothesis in parallel."""
     debate_context = debate_context_for_strategy(context, strategy)
@@ -188,6 +189,8 @@ async def run_debate_panel(
         "strategy_id": str(strategy.strategy_id),
         "strategy_name": strategy.name,
     }
+    if portfolio_review_context is not None:
+        extra["portfolio_review_context"] = portfolio_review_context
 
     async def _run_one(agent: CognitiveAgent[DebateReview]) -> DebateReview:
         review = await agent.run(debate_context, router, extra_payload=extra)

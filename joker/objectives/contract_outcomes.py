@@ -7,13 +7,16 @@ fallbacks are labeled in the estimate.
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any, Literal, Sequence
 from uuid import UUID, uuid4
 
 from joker.objectives.full_chain_universe import FullChainContract
+from joker.objectives.shared_scenarios import (
+    SharedUnderlyingScenarioGrid,
+    build_shared_underlying_scenario_grid,
+)
 
 ContractEstimateType = Literal[
     "market_greeks_scenario",
@@ -30,6 +33,8 @@ class ContractScenarioOutcome:
     underlying_price: Decimal
     estimated_option_price: Decimal
     pnl_per_contract_usd: Decimal
+    horizon_seconds: int = 0
+    shared_scenario_grid_hash: str = ""
 
     def as_dict(self) -> dict[str, str]:
         return {
@@ -38,6 +43,8 @@ class ContractScenarioOutcome:
             "underlying_price": str(self.underlying_price),
             "estimated_option_price": str(self.estimated_option_price),
             "pnl_per_contract_usd": str(self.pnl_per_contract_usd),
+            "horizon_seconds": str(self.horizon_seconds),
+            "shared_scenario_grid_hash": self.shared_scenario_grid_hash,
         }
 
 
@@ -76,6 +83,7 @@ class ContractOutcomeEstimate:
     historical_sample_count: int
     scenarios: tuple[ContractScenarioOutcome, ...]
     usable_for_ranking: bool
+    shared_scenario_grid_hash: str | None = None
 
     def as_dict(self, *, include_scenarios: bool = False) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -132,6 +140,7 @@ class ContractOutcomeEstimate:
             "uncertainty_reasons": list(self.uncertainty_reasons),
             "evidence_ids": [str(e) for e in self.evidence_ids],
             "historical_sample_count": self.historical_sample_count,
+            "shared_scenario_grid_hash": self.shared_scenario_grid_hash,
             "usable_for_ranking": self.usable_for_ranking,
         }
         if include_scenarios:
@@ -157,19 +166,31 @@ def estimate_contract_outcome(
     historical_contract_hit_rate: Decimal | None = None,
     historical_sample_count: int = 0,
     evidence_ids: Sequence[UUID] = (),
+    shared_scenario_grid: SharedUnderlyingScenarioGrid | None = None,
 ) -> ContractOutcomeEstimate:
     """Estimate one strategy × contract using shared-underlying scenarios."""
     cfg = settings or ContractOutcomeSettings()
     strategy_id = UUID(str(getattr(strategy, "strategy_id")))
     family = str(getattr(strategy, "strategy_family", None) or "unknown")
-    horizon = min(
+    requested_horizon = min(
         max(1, int(getattr(strategy, "expected_horizon_seconds", 600) or 600)),
         max(0, int(time_remaining_seconds)),
     )
+    scenario_grid = shared_scenario_grid
+    if scenario_grid is None and requested_horizon > 0:
+        scenario_grid = build_shared_underlying_scenario_grid(
+            strategies=(strategy,),
+            reference_underlying_price=contract.underlying_price,
+            evaluation_time=contract.evaluated_at_exchange_time,
+            horizon_seconds=requested_horizon,
+            base_move_pct=cfg.fallback_underlying_move_pct,
+        )
+    horizon = scenario_grid.horizon_seconds if scenario_grid is not None else 0
     assumptions: list[str] = [
         "long_option_max_loss_equals_ask_premium",
         "scenario_probabilities_are_heuristic_not_calibrated",
         "shared_underlying_scenarios_preserve_contract_correlation",
+        "bounded_linear_interpolation_between_shared_scenario_points",
     ]
     uncertainty: list[str] = []
     if horizon <= 0 or contract.underlying_price <= 0 or contract.ask <= 0:
@@ -192,11 +213,9 @@ def estimate_contract_outcome(
         uncertainty.append("missing_greeks_or_implied_volatility")
         assumptions.append("conservative_moneyness_response_fallback")
 
-    scenarios = _build_scenarios(
-        strategy=strategy,
+    scenarios = _price_shared_scenarios(
         contract=contract,
-        horizon_seconds=horizon,
-        settings=cfg,
+        shared_scenario_grid=scenario_grid,
         has_greeks=has_greeks,
     )
     if not scenarios:
@@ -213,18 +232,16 @@ def estimate_contract_outcome(
     required_price = (
         contract.ask + remaining_goal_gap_usd / Decimal("100")
     ).quantize(Decimal("0.0001"))
-    p_required = sum(
-        (
-            s.probability
-            for s in scenarios
-            if s.estimated_option_price >= required_price
-        ),
-        Decimal("0"),
-    ).quantize(Decimal("0.0001"))
-    p_close = sum(
-        (s.probability for s in scenarios if s.pnl_per_contract_usd >= remaining_goal_gap_usd),
-        Decimal("0"),
-    ).quantize(Decimal("0.0001"))
+    p_required = _interpolated_hit_probability(
+        scenarios,
+        threshold=required_price,
+        value=lambda scenario: scenario.estimated_option_price,
+    )
+    p_close = _interpolated_hit_probability(
+        scenarios,
+        threshold=remaining_goal_gap_usd,
+        value=lambda scenario: scenario.pnl_per_contract_usd,
+    )
     expected = sum(
         (s.probability * s.pnl_per_contract_usd for s in scenarios), Decimal("0")
     ).quantize(Decimal("0.01"))
@@ -282,75 +299,29 @@ def estimate_contract_outcome(
         uncertainty_reasons=tuple(uncertainty),
         evidence_ids=tuple(evidence_ids),
         historical_sample_count=max(0, int(historical_sample_count)),
+        shared_scenario_grid_hash=scenario_grid.grid_hash,
         scenarios=scenarios,
         usable_for_ranking=True,
     )
 
 
-def _build_scenarios(
+def _price_shared_scenarios(
     *,
-    strategy: Any,
     contract: FullChainContract,
-    horizon_seconds: int,
-    settings: ContractOutcomeSettings,
+    shared_scenario_grid: SharedUnderlyingScenarioGrid | None,
     has_greeks: bool,
 ) -> tuple[ContractScenarioOutcome, ...]:
-    direction = str(
-        getattr(getattr(strategy, "direction", None), "value", None)
-        or getattr(strategy, "direction", "")
-    ).lower()
-    confidence = Decimal(str(getattr(strategy, "confidence", 0.5) or 0.5))
-    confidence = max(Decimal("0"), min(Decimal("1"), confidence))
-
-    if contract.implied_volatility is not None and contract.implied_volatility > 0:
-        # IV is annualized; clamp a 0DTE horizon estimate to avoid zero-width grids.
-        annual_seconds = Decimal(365 * 24 * 60 * 60)
-        sigma_pct = (
-            contract.implied_volatility
-            * Decimal(str(math.sqrt(float(Decimal(horizon_seconds) / annual_seconds))))
-            * Decimal("100")
-        )
-        base_move_pct = max(Decimal("0.20"), min(Decimal("5.00"), sigma_pct))
-    else:
-        base_move_pct = settings.fallback_underlying_move_pct
-
-    # Symmetric base weights with a bounded thesis tilt. Contract estimates still
-    # vary by their own strike, premium, Greeks and required payoff.
-    z_values = (-2, -1, 0, 1, 2)
-    base_weights = (
-        Decimal("0.08"),
-        Decimal("0.22"),
-        Decimal("0.40"),
-        Decimal("0.22"),
-        Decimal("0.08"),
-    )
-    tilt = (confidence - Decimal("0.5")) * Decimal("0.20")
-    direction_sign = Decimal("1") if direction in {"bullish", "long", "up"} else Decimal("-1")
-    if direction not in {"bullish", "long", "up", "bearish", "short", "down"}:
-        direction_sign = Decimal("0")
-
-    raw_weights: list[Decimal] = []
-    for z, base in zip(z_values, base_weights, strict=True):
-        directional = Decimal(z) * direction_sign
-        adjusted = base * (Decimal("1") + tilt * directional)
-        raw_weights.append(max(settings.minimum_scenario_probability, adjusted))
-    total = sum(raw_weights, Decimal("0"))
-
+    if shared_scenario_grid is None:
+        return ()
     outcomes: list[ContractScenarioOutcome] = []
-    for z, raw in zip(z_values, raw_weights, strict=True):
-        probability = (raw / total).quantize(Decimal("0.000001"))
-        underlying_move = (
-            contract.underlying_price
-            * base_move_pct
-            / Decimal("100")
-            * Decimal(z)
-        )
-        scenario_spot = max(Decimal("0.01"), contract.underlying_price + underlying_move)
+    for scenario in shared_scenario_grid.scenarios:
+        scenario_spot = scenario.underlying_price
+        underlying_move = scenario_spot - contract.underlying_price
         option_price = _scenario_option_price(
             contract=contract,
             scenario_spot=scenario_spot,
             underlying_move=underlying_move,
-            horizon_seconds=horizon_seconds,
+            horizon_seconds=scenario.horizon_seconds,
             has_greeks=has_greeks,
         )
         pnl = ((option_price - contract.ask) * Decimal("100")).quantize(
@@ -358,25 +329,16 @@ def _build_scenarios(
         )
         outcomes.append(
             ContractScenarioOutcome(
-                scenario_id=f"underlying_z_{z:+d}",
-                probability=probability,
+                scenario_id=scenario.scenario_id,
+                probability=scenario.probability,
                 underlying_price=scenario_spot.quantize(Decimal("0.0001")),
                 estimated_option_price=option_price,
                 pnl_per_contract_usd=max(
                     -contract.maximum_loss_usd_per_contract, pnl
                 ),
+                horizon_seconds=scenario.horizon_seconds,
+                shared_scenario_grid_hash=shared_scenario_grid.grid_hash,
             )
-        )
-    # Correct Decimal quantization drift on the central scenario.
-    drift = Decimal("1") - sum((s.probability for s in outcomes), Decimal("0"))
-    if drift:
-        center = outcomes[2]
-        outcomes[2] = ContractScenarioOutcome(
-            scenario_id=center.scenario_id,
-            probability=center.probability + drift,
-            underlying_price=center.underlying_price,
-            estimated_option_price=center.estimated_option_price,
-            pnl_per_contract_usd=center.pnl_per_contract_usd,
         )
     return tuple(outcomes)
 
@@ -435,6 +397,56 @@ def _uncertainty_width(
     )
 
 
+def _interpolated_hit_probability(
+    scenarios: Sequence[ContractScenarioOutcome],
+    *,
+    threshold: Decimal,
+    value: Any,
+) -> Decimal:
+    """P(value >= threshold) via CDF interpolation on the shared scenario grid.
+
+    Softens only the single adjacent pair that straddles the threshold so a
+    coarse common underlying grid does not create false exact ties across
+    contracts with materially different priced outcomes.
+    """
+    if not scenarios:
+        return Decimal("0.0000")
+    buckets: dict[Decimal, Decimal] = {}
+    for scenario in scenarios:
+        level = value(scenario)
+        buckets[level] = buckets.get(level, Decimal("0")) + scenario.probability
+    ordered_levels = sorted(buckets)
+    if threshold <= ordered_levels[0]:
+        return Decimal("1.0000")
+    if threshold > ordered_levels[-1]:
+        return Decimal("0.0000")
+
+    cumulative = Decimal("0")
+    previous_level = ordered_levels[0]
+    previous_cdf = Decimal("0")
+    for level in ordered_levels:
+        cumulative += buckets[level]
+        if level < threshold:
+            previous_level = level
+            previous_cdf = cumulative
+            continue
+        if level == threshold:
+            return (Decimal("1") - cumulative + buckets[level]).quantize(
+                Decimal("0.0001")
+            )
+        span = level - previous_level
+        if span <= 0:
+            return (Decimal("1") - previous_cdf).quantize(Decimal("0.0001"))
+        # Linear CDF between the last point below threshold and the first above.
+        frac = (threshold - previous_level) / span
+        cdf_at_threshold = previous_cdf + frac * (cumulative - previous_cdf)
+        return max(
+            Decimal("0"),
+            min(Decimal("1"), Decimal("1") - cdf_at_threshold),
+        ).quantize(Decimal("0.0001"))
+    return Decimal("0.0000")
+
+
 def _unknown_estimate(
     *,
     strategy_id: UUID,
@@ -479,6 +491,7 @@ def _unknown_estimate(
         uncertainty_reasons=reasons,
         evidence_ids=evidence_ids,
         historical_sample_count=0,
+        shared_scenario_grid_hash=None,
         scenarios=(),
         usable_for_ranking=False,
     )

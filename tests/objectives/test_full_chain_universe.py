@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from uuid import uuid4
 
@@ -36,7 +36,7 @@ def _contract(
         bid=bid_d,
         ask=ask_d,
         mid=mid,
-        quote_timestamp=NOW,
+        quote_timestamp=NOW - timedelta(milliseconds=age_ms),
         quote_age_ms=age_ms,
         relative_spread=(ask_d - bid_d) / mid,
         liquidity_score=0.6,
@@ -63,7 +63,8 @@ def _build(
     return build_full_chain_universe(
         snapshot_id=uuid4(),
         surface=_surface(contracts),
-        trading_date=TRADING_DATE,
+        current_exchange_time=NOW,
+        current_trading_date=TRADING_DATE,
         available_capital_usd=Decimal(budget),
         settings=FullChainUniverseSettings(maximum_contracts_evaluated=maximum),
     )
@@ -153,3 +154,54 @@ def test_two_hundred_dollar_budget_keeps_affordable_premiums() -> None:
         Decimal("1.00"),
     }
     assert universe.exclusion_counts["unaffordable_contract"] == 1
+
+
+def test_exchange_clock_date_rejects_previous_day_surface() -> None:
+    surface = OptionSurfaceSnapshot(
+        surface_id=uuid4(),
+        exchange_time=NOW,
+        trading_date=date(2026, 8, 4),
+        underlying_symbol="SPY",
+        underlying_price=Decimal("500"),
+        contracts=(_contract("500", "call", "1.00"),),
+    )
+    universe = build_full_chain_universe(
+        snapshot_id=uuid4(),
+        surface=surface,
+        current_exchange_time=NOW,
+        current_trading_date=TRADING_DATE,
+        available_capital_usd=Decimal("200"),
+        settings=FullChainUniverseSettings(),
+    )
+    assert universe.contracts == ()
+    assert "surface_trading_date_mismatch" in universe.reason_codes
+
+
+def test_current_clock_rejects_aged_contract_quote() -> None:
+    aged = _contract("500", "call", "0.50", age_ms=45_000)
+    universe = build_full_chain_universe(
+        snapshot_id=uuid4(),
+        surface=_surface([aged]),
+        current_exchange_time=NOW,
+        current_trading_date=TRADING_DATE,
+        available_capital_usd=Decimal("200"),
+        settings=FullChainUniverseSettings(maximum_quote_age_seconds=30),
+    )
+    assert universe.contracts == ()
+    assert universe.exclusion_counts["stale_contract"] == 1
+
+
+def test_future_quote_timestamp_fails_closed() -> None:
+    future = _contract("500", "call", "0.50").model_copy(
+        update={"quote_timestamp": NOW + timedelta(seconds=30)}
+    )
+    universe = build_full_chain_universe(
+        snapshot_id=uuid4(),
+        surface=_surface([future]),
+        current_exchange_time=NOW,
+        current_trading_date=TRADING_DATE,
+        available_capital_usd=Decimal("200"),
+        settings=FullChainUniverseSettings(maximum_future_timestamp_seconds=1),
+    )
+    assert universe.contracts == ()
+    assert universe.exclusion_counts["quote_timestamp_in_future"] == 1

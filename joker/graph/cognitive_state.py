@@ -102,10 +102,15 @@ class CognitiveGraphState(TypedDict, total=False):
     _full_chain_universe: dict | None
     _contract_selection_specs: list | None
     _contract_outcomes: list | None
+    _shared_underlying_scenario_grid: dict | None
     _quantity_grid: list | None
     _portfolio_grid: list | None
     _target_portfolio_decision: dict | None
+    _provisional_target_portfolio_decision: dict | None
     _target_authorized_positions: list | None
+    _portfolio_review_context: dict | None
+    _portfolio_debate_reviews: list | None
+    _portfolio_review_finalization: dict | None
     _execution_command_ids: list[str] | None
 
     # Position graph channels

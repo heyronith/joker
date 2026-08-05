@@ -136,7 +136,24 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
         if deps.projection_loader is not None:
             projection = await deps.projection_loader()
             if projection is not None:
-                order_projection = {"orders": [str(o) for o in getattr(projection, "orders", ())]}
+                raw_orders = getattr(projection, "orders", ()) or ()
+                order_values = (
+                    raw_orders.values()
+                    if isinstance(raw_orders, dict)
+                    else raw_orders
+                )
+                order_projection = {
+                    "orders": [
+                        (
+                            order.model_dump(mode="json")
+                            if hasattr(order, "model_dump")
+                            else dict(vars(order))
+                            if hasattr(order, "__dict__")
+                            else order
+                        )
+                        for order in order_values
+                    ]
+                }
                 position_projection = {
                     "positions": [str(p) for p in getattr(projection, "positions", ())]
                 }
@@ -163,6 +180,7 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
             if record.option_surface_id
             else None,
             "_objective_context": objective_context,
+            "_order_projection": order_projection,
             "latest_known_snapshot_id": str(snapshot_id),
             **trace_update(append_trace(state, node_name="hydrate_context", status="completed")),
         }
@@ -238,6 +256,100 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
             "selected_strategy_ids": selected,
             **trace_update(
                 append_trace(state, node_name="select_debate_candidates", status="completed")
+            ),
+        }
+
+    async def finalize_portfolio_review(
+        state: CognitiveGraphState,
+    ) -> dict[str, Any]:
+        decision = state.get("_target_portfolio_decision")
+        context = state.get("_portfolio_review_context")
+        reviews = list(state.get("_portfolio_debate_reviews") or [])
+        if not isinstance(decision, dict) or not isinstance(context, dict):
+            return trace_update(
+                append_trace(
+                    state,
+                    node_name="finalize_portfolio_review",
+                    status="skipped",
+                )
+            )
+        original = dict(decision)
+        recommendations = {
+            str(review.get("finalizer_recommendation") or "")
+            for review in reviews
+        }
+        if "reoptimize" in recommendations:
+            return {
+                "_provisional_target_portfolio_decision": original,
+                "_portfolio_review_finalization": {
+                    "action": "request_reoptimization",
+                    "preserved_decision_id": decision.get("decision_id"),
+                    "review_ids": [review.get("review_id") for review in reviews],
+                },
+                "_block_new_entries": True,
+                **append_error(
+                    state,
+                    node_name="finalize_portfolio_review",
+                    error_code="target_attainment_recalculation_required",
+                    message="portfolio reviewer requested full reoptimization",
+                ),
+            }
+        if "wait" in recommendations:
+            finalized = {
+                **original,
+                "action": "wait",
+                "authorized_positions": [],
+                "selected_portfolio_id": None,
+                "reason_codes": list(original.get("reason_codes") or [])
+                + ["portfolio_review_forced_wait"],
+            }
+            target_decision = dict(state.get("_target_attainment_decision") or {})
+            target_decision.update(
+                {
+                    "action": "wait",
+                    "selected_strategy_id": None,
+                    "selected_contract_id": None,
+                    "selected_quantity": 0,
+                    "selected_capital_usd": "0",
+                    "reason_codes": list(target_decision.get("reason_codes") or [])
+                    + ["portfolio_review_forced_wait"],
+                }
+            )
+            return {
+                "_provisional_target_portfolio_decision": original,
+                "_target_portfolio_decision": finalized,
+                "_target_authorized_positions": [],
+                "_target_attainment_decision": target_decision,
+                "_target_attainment_action": "wait",
+                "_target_attainment_strategy_id": None,
+                "_target_attainment_contract_id": None,
+                "_target_attainment_quantity": 0,
+                "_portfolio_review_finalization": {
+                    "action": "wait",
+                    "preserved_decision_id": decision.get("decision_id"),
+                    "review_ids": [review.get("review_id") for review in reviews],
+                },
+                **trace_update(
+                    append_trace(
+                        state,
+                        node_name="finalize_portfolio_review",
+                        status="completed",
+                    )
+                ),
+            }
+        return {
+            "_provisional_target_portfolio_decision": original,
+            "_portfolio_review_finalization": {
+                "action": "preserve_exact_tuple",
+                "preserved_decision_id": decision.get("decision_id"),
+                "review_ids": [review.get("review_id") for review in reviews],
+            },
+            **trace_update(
+                append_trace(
+                    state,
+                    node_name="finalize_portfolio_review",
+                    status="completed",
+                )
             ),
         }
 
@@ -519,19 +631,52 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
                 )
             template_leg = proposal.legs[0]
             if authorized_positions:
+                portfolio_decision = dict(
+                    state.get("_target_portfolio_decision") or {}
+                )
+                component_count = len(authorized_positions)
                 new_legs = [
                     template_leg.model_copy(
                         update={
                             "leg_id": uuid4(),
+                            "strategy_id": UUID(str(position["strategy_id"])),
                             "contract_id": str(position["contract_id"]),
                             "quantity": int(position["quantity"]),
                             "limit_price": Decimal(
                                 str(position["evaluation_premium"])
                             ),
-                            "sequence_order": index,
+                            "evaluation_premium": Decimal(
+                                str(position["evaluation_premium"])
+                            ),
+                            "capital_allocation": Decimal(
+                                str(position["capital_allocation"])
+                            ),
+                            "authorized_position_tuple_id": UUID(
+                                str(position["position_tuple_id"])
+                            ),
+                            "target_portfolio_decision_id": UUID(
+                                str(position["decision_id"])
+                            ),
+                            "selected_portfolio_id": (
+                                UUID(str(portfolio_decision["selected_portfolio_id"]))
+                                if portfolio_decision.get("selected_portfolio_id")
+                                else None
+                            ),
+                            "component_index": index,
+                            "component_count": component_count,
+                            "evaluated_objective_version": int(
+                                position["objective_version"]
+                            ),
+                            "evaluated_objective_fingerprint": position.get(
+                                "evaluated_objective_fingerprint"
+                            ),
+                            "original_decision_snapshot_id": UUID(
+                                str(position["snapshot_id"])
+                            ),
+                            "sequence_order": index + 1,
                         }
                     )
-                    for index, position in enumerate(authorized_positions, start=1)
+                    for index, position in enumerate(authorized_positions)
                 ]
             else:
                 new_legs = [
@@ -594,6 +739,11 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
                 option_surface=surface,
                 projection=projection,
                 already_submitted_proposal_ids=tuple(deps.submitted_proposal_ids),
+                now=(
+                    deps.clock.now()
+                    if deps.clock is not None and hasattr(deps.clock, "now")
+                    else None
+                ),
             )
             for leg in proposal.legs:
                 validate_and_compile_proposal(
@@ -638,12 +788,117 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
 
         gateway = ensure_order_action_gateway(deps)
         authorized_positions = list(state.get("_target_authorized_positions") or [])
+        portfolio_decision = dict(state.get("_target_portfolio_decision") or {})
         command_ids: list[str] = []
         result_refs: list[str] = []
+        submitted_by_tuple: dict[str, Any] = {}
+        if (
+            deps.provenance_registry is not None
+            and portfolio_decision.get("decision_id")
+        ):
+            prior_components = (
+                await deps.provenance_registry.list_by_target_portfolio_decision_id(
+                    str(portfolio_decision["decision_id"])
+                )
+            )
+            submitted_by_tuple = {
+                str((record.extra or {}).get("authorized_position_tuple_id")): record
+                for record in prior_components
+                if (record.extra or {}).get("authorized_position_tuple_id")
+            }
+            prior_indexes = sorted(
+                int((record.extra or {}).get("component_index"))
+                for record in prior_components
+                if (record.extra or {}).get("component_index") is not None
+            )
+            if prior_indexes != list(range(len(prior_indexes))):
+                return {
+                    "_block_new_entries": True,
+                    **append_error(
+                        state,
+                        node_name="submit_execution_command",
+                        error_code="target_attainment_recalculation_required",
+                        message="persisted portfolio components are non-contiguous",
+                    ),
+                }
+
+        from joker.objectives.decision_fingerprint import (
+            ObjectiveDecisionFingerprint,
+        )
+        from joker.runtime.order_action_gateway import (
+            working_orders_from_projection,
+        )
+
+        evaluated_fingerprint_raw = portfolio_decision.get(
+            "evaluated_objective_fingerprint"
+        )
+        expected_fingerprint = (
+            ObjectiveDecisionFingerprint.from_json(evaluated_fingerprint_raw)
+            if evaluated_fingerprint_raw
+            else None
+        )
+        if submitted_by_tuple:
+            latest_prior = max(
+                submitted_by_tuple.values(),
+                key=lambda record: int(
+                    (record.extra or {}).get("component_index") or 0
+                ),
+            )
+            post_fingerprint = (latest_prior.extra or {}).get(
+                "post_submission_objective_fingerprint"
+            )
+            if post_fingerprint:
+                expected_fingerprint = ObjectiveDecisionFingerprint.from_json(
+                    post_fingerprint
+                )
+
+        def _current_fingerprint(
+            objective_state: Any,
+            *,
+            working_order_count: int,
+        ) -> ObjectiveDecisionFingerprint:
+            permission = getattr(deps, "entry_permission", None)
+            broker_eligible = not bool(getattr(deps, "kill_switch", False))
+            if permission is not None:
+                broker_eligible = broker_eligible and bool(
+                    getattr(permission, "permitted", False)
+                )
+            runtime = getattr(deps, "execution_runtime", None)
+            reconciliation_eligible = (
+                runtime is None
+                or getattr(runtime, "unresolved_reconciliation", None) is None
+            )
+            broker = getattr(runtime, "_broker", None)
+            broker_identity = (
+                type(broker).__qualname__ if broker is not None else "unconfigured"
+            )
+            return ObjectiveDecisionFingerprint.from_state(
+                objective_state,
+                working_order_count=working_order_count,
+                broker_identity=broker_identity,
+                broker_eligible=broker_eligible,
+                reconciliation_eligible=reconciliation_eligible,
+            )
+
         for index, leg in enumerate(proposal.legs):
             position = (
                 authorized_positions[index]
                 if index < len(authorized_positions)
+                else None
+            )
+            tuple_id = (
+                str(position.get("position_tuple_id") or "")
+                if position is not None
+                else ""
+            )
+            already_submitted = submitted_by_tuple.get(tuple_id)
+            if already_submitted is not None:
+                command_ids.append(already_submitted.client_order_id)
+                result_refs.append(already_submitted.client_order_id)
+                continue
+            projection = (
+                await deps.projection_loader()
+                if deps.projection_loader is not None
                 else None
             )
             if position is not None and deps.objective_service is not None:
@@ -655,15 +910,19 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
                         now=deps.clock.now()
                     )
                 current_objective = await deps.objective_service.get_state()
-                if (
-                    int(current_objective.version)
-                    != int(position.get("objective_version") or 0)
-                    or int(current_objective.time_remaining_seconds) <= 0
-                    or Decimal(
-                        str(current_objective.required_profit_remaining_usd)
+                working_count = len(working_orders_from_projection(projection))
+                submission_fingerprint = _current_fingerprint(
+                    current_objective,
+                    working_order_count=working_count,
+                )
+                material_differences = (
+                    expected_fingerprint.material_differences(
+                        submission_fingerprint
                     )
-                    <= 0
-                ):
+                    if expected_fingerprint is not None
+                    else ("evaluated_objective_fingerprint_missing",)
+                )
+                if material_differences:
                     return {
                         "_block_new_entries": True,
                         "_execution_command_ids": command_ids,
@@ -672,15 +931,15 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
                             node_name="submit_execution_command",
                             error_code="target_attainment_recalculation_required",
                             message=(
-                                "objective truth changed before sequential "
-                                "portfolio component submission"
+                                "material objective truth changed before component: "
+                                + ",".join(material_differences)
                             ),
                         ),
                     }
                 remaining_components = len(authorized_positions) - index
                 projected_positions = (
                     int(current_objective.open_position_count)
-                    + int(getattr(current_objective, "working_order_count", 0) or 0)
+                    + working_count
                     + remaining_components
                 )
                 if projected_positions > int(
@@ -722,6 +981,9 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
                             ),
                         ),
                     }
+            else:
+                current_objective = None
+                submission_fingerprint = None
             child_proposal = proposal.model_copy(
                 update={
                     "proposal_id": uuid5(
@@ -733,18 +995,43 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
                         if position is not None
                         else proposal.strategy_id
                     ),
+                    "snapshot_id": (
+                        proposal.snapshot_id
+                    ),
                     "legs": (leg,),
                 }
             )
             try:
                 # Refresh account/order projection and market truth before every
                 # sequential component. Validation never mutates the tuple.
-                snapshot, data_quality, surface, _slice = await load_snapshot_truth(
-                    deps, str(child_proposal.snapshot_id)
+                if deps.snapshot_repo is None:
+                    raise RuntimeError("latest snapshot repository unavailable")
+                latest_snapshot = await deps.snapshot_repo.get_latest(deps.session_id)
+                if latest_snapshot is None:
+                    raise RuntimeError("latest submission snapshot unavailable")
+                child_proposal = child_proposal.model_copy(
+                    update={"snapshot_id": latest_snapshot.snapshot_id}
                 )
-                projection = None
-                if deps.projection_loader is not None:
-                    projection = await deps.projection_loader()
+                snapshot, data_quality, surface, _slice = await load_snapshot_truth(
+                    deps, str(latest_snapshot.snapshot_id)
+                )
+                exchange_now = None
+                if deps.clock is not None and hasattr(deps.clock, "now"):
+                    exchange_now = deps.clock.now()
+                    if authorized_positions:
+                        if snapshot.trading_date != deps.clock.trading_date():
+                            raise RuntimeError(
+                                "latest snapshot is not from current trading date"
+                            )
+                        if (
+                            surface is None
+                            or surface.trading_date != deps.clock.trading_date()
+                        ):
+                            raise RuntimeError(
+                                "latest option surface is not current trading date"
+                            )
+                elif authorized_positions:
+                    raise RuntimeError("exchange clock unavailable for submission")
                 truth = build_truth_from_deps(
                     snapshot=snapshot,
                     data_quality=data_quality,
@@ -753,6 +1040,7 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
                     already_submitted_proposal_ids=tuple(
                         deps.submitted_proposal_ids
                     ),
+                    now=exchange_now,
                 )
                 provenanced = validate_and_compile_proposal(
                     child_proposal,
@@ -810,6 +1098,46 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
                     provenanced,
                     action=action,
                     causation_event_id=_resolve_entry_causation_event_id(state),
+                )
+                action_request = replace(
+                    action_request,
+                    target_portfolio_decision_id=(
+                        str(leg.target_portfolio_decision_id)
+                        if leg.target_portfolio_decision_id is not None
+                        else None
+                    ),
+                    selected_portfolio_id=(
+                        str(leg.selected_portfolio_id)
+                        if leg.selected_portfolio_id is not None
+                        else None
+                    ),
+                    authorized_position_tuple_id=(
+                        str(leg.authorized_position_tuple_id)
+                        if leg.authorized_position_tuple_id is not None
+                        else None
+                    ),
+                    component_index=index,
+                    component_count=len(proposal.legs),
+                    evaluated_objective_version=leg.evaluated_objective_version,
+                    submission_objective_version=(
+                        int(current_objective.version)
+                        if current_objective is not None
+                        else None
+                    ),
+                    evaluated_objective_fingerprint=(
+                        leg.evaluated_objective_fingerprint
+                    ),
+                    submission_objective_fingerprint=(
+                        submission_fingerprint.canonical_json
+                        if submission_fingerprint is not None
+                        else None
+                    ),
+                    original_decision_snapshot_id=(
+                        str(leg.original_decision_snapshot_id)
+                        if leg.original_decision_snapshot_id is not None
+                        else None
+                    ),
+                    submission_snapshot_id=str(child_proposal.snapshot_id),
                 )
                 sizing = state.get("_sizing_decision") or {}
                 estimate_id = sizing.get("estimate_id")
@@ -882,12 +1210,93 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
                             causation_event_id=_resolve_entry_causation_event_id(
                                 state
                             ),
+                            extra={
+                                "target_portfolio_decision_id": (
+                                    str(leg.target_portfolio_decision_id)
+                                    if leg.target_portfolio_decision_id
+                                    else None
+                                ),
+                                "selected_portfolio_id": (
+                                    str(leg.selected_portfolio_id)
+                                    if leg.selected_portfolio_id
+                                    else None
+                                ),
+                                "authorized_position_tuple_id": tuple_id or None,
+                                "component_index": index,
+                                "component_count": len(proposal.legs),
+                                "evaluated_objective_version": (
+                                    leg.evaluated_objective_version
+                                ),
+                                "submission_objective_version": (
+                                    int(current_objective.version)
+                                    if current_objective is not None
+                                    else None
+                                ),
+                                "evaluated_objective_fingerprint": (
+                                    leg.evaluated_objective_fingerprint
+                                ),
+                                "submission_objective_fingerprint": (
+                                    submission_fingerprint.canonical_json
+                                    if submission_fingerprint is not None
+                                    else None
+                                ),
+                                "original_decision_snapshot_id": (
+                                    str(leg.original_decision_snapshot_id)
+                                    if leg.original_decision_snapshot_id
+                                    else None
+                                ),
+                                "submission_snapshot_id": str(
+                                    child_proposal.snapshot_id
+                                ),
+                            },
                         )
                     )
                 result = await deps.submit_callback(provenanced)
             deps.submitted_proposal_ids.add(str(child_proposal.proposal_id))
             command_ids.append(command_id)
             result_refs.append(str(getattr(result, "order_id", command_id)))
+            if (
+                position is not None
+                and deps.objective_service is not None
+                and deps.clock is not None
+            ):
+                await deps.objective_service.recompute_from_truth(
+                    now=deps.clock.now()
+                )
+                post_objective = await deps.objective_service.get_state()
+                post_projection = (
+                    await deps.projection_loader()
+                    if deps.projection_loader is not None
+                    else projection
+                )
+                post_fingerprint = _current_fingerprint(
+                    post_objective,
+                    working_order_count=len(
+                        working_orders_from_projection(post_projection)
+                    ),
+                )
+                expected_fingerprint = post_fingerprint
+                if deps.provenance_registry is not None:
+                    recorded = (
+                        await deps.provenance_registry.get_by_client_order_id(
+                            command_id
+                        )
+                    )
+                    if recorded is not None:
+                        await deps.provenance_registry.record(
+                            replace(
+                                recorded,
+                                extra={
+                                    **(recorded.extra or {}),
+                                    "post_submission_objective_version": int(
+                                        post_objective.version
+                                    ),
+                                    "post_submission_objective_fingerprint": (
+                                        post_fingerprint.canonical_json
+                                    ),
+                                },
+                            )
+                        )
         return {
             "execution_command_id": command_ids[0] if command_ids else None,
             "_execution_command_ids": command_ids,
@@ -944,6 +1353,7 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
     )
     graph.add_node("select_debate_candidates", select_debate_candidates)
     graph.add_node("debate", debate)
+    graph.add_node("finalize_portfolio_review", finalize_portfolio_review)
     graph.add_node("meta_decision", meta_decision_node)
     graph.add_node("strategy_switch_revision", strategy_switch_revision)
     graph.add_node("deterministic_sizing", deterministic_sizing)
@@ -973,7 +1383,8 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
     graph.add_edge("assess_goal_feasibility", "score_strategies_against_objective")
     graph.add_edge("score_strategies_against_objective", "select_debate_candidates")
     graph.add_edge("select_debate_candidates", "debate")
-    graph.add_edge("debate", "meta_decision")
+    graph.add_edge("debate", "finalize_portfolio_review")
+    graph.add_edge("finalize_portfolio_review", "meta_decision")
     graph.add_conditional_edges(
         "meta_decision",
         route_meta_decision,
@@ -990,7 +1401,10 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
     graph.add_conditional_edges(
         "strategy_switch_revision",
         after_switch_route,
-        {"debate": "debate", "meta_decision": "meta_decision"},
+        {
+            "debate": "debate",
+            "meta_decision": "finalize_portfolio_review",
+        },
     )
 
     _SIZING_STOP_CODES = frozenset(
