@@ -432,7 +432,7 @@ class PatternHypothesis(CycleArtifactBase):
 
 
 class StrategyLegCandidate(BaseModel):
-    """Proposed strategy leg referencing a real contract."""
+    """Backward-compatible, non-authoritative contract hint from an agent."""
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
@@ -451,6 +451,41 @@ class StrategyLegCandidate(BaseModel):
         if value <= 0:
             raise ValueError("quantity must be positive")
         return value
+
+
+class ContractSelectionPreference(BaseModel):
+    """Optional thesis preference; never an executable contract selection."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    option_types: tuple[OptionType, ...] = ()
+    minimum_moneyness_pct: Decimal | None = None
+    maximum_moneyness_pct: Decimal | None = None
+    preferred_delta_min: Decimal | None = None
+    preferred_delta_max: Decimal | None = None
+    maximum_relative_spread: Decimal | None = None
+    maximum_premium_usd: Decimal | None = None
+    minimum_quote_quality: str | None = None
+    rationale: str = ""
+
+    @model_validator(mode="after")
+    def _valid_ranges(self) -> ContractSelectionPreference:
+        if (
+            self.minimum_moneyness_pct is not None
+            and self.maximum_moneyness_pct is not None
+            and self.minimum_moneyness_pct > self.maximum_moneyness_pct
+        ):
+            raise ValueError("minimum_moneyness_pct cannot exceed maximum")
+        if (
+            self.preferred_delta_min is not None
+            and self.preferred_delta_max is not None
+            and self.preferred_delta_min > self.preferred_delta_max
+        ):
+            raise ValueError("preferred_delta_min cannot exceed maximum")
+        for value in (self.preferred_delta_min, self.preferred_delta_max):
+            if value is not None and not Decimal("0") <= value <= Decimal("1"):
+                raise ValueError("preferred delta bounds must be in [0, 1]")
+        return self
 
 
 class EntryPlan(BaseModel):
@@ -507,6 +542,7 @@ class StrategyHypothesis(CycleArtifactBase):
     # Legacy records may omit it; compilers/objective graph fail closed if absent.
     strategy_family: str | None = None
     candidate_legs: tuple[StrategyLegCandidate, ...] = ()
+    contract_selection_preferences: tuple[ContractSelectionPreference, ...] = ()
     entry_plan: EntryPlan
     execution_plan: ExecutionPlan
     exit_plan: ExitPlan

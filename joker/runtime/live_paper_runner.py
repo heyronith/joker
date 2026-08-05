@@ -332,12 +332,8 @@ class LivePaperRunner:
                     "objective.enabled requires a confirmed SessionObjectiveService "
                     "before starting the cognitive graph"
                 )
-            feasibility_engine = None
-            objective_strategy_scorer = None
-            capital_sizer = None
             objective_state_loader = None
-            historical_outcome_service = None
-            historical_outcome_settings = None
+            objective_engine_kwargs: dict[str, Any] = {}
             if objective_service is not None:
                 from joker.cli.session_confirm import build_objective_engines
                 from joker.evolution.repositories import build_evolution_repositories
@@ -362,12 +358,7 @@ class LivePaperRunner:
                     dataset_repository=dataset_repo,
                     objective_repository=obj_repo,
                 )
-                feasibility_engine = engines.feasibility_engine
-                objective_strategy_scorer = engines.objective_strategy_scorer
-                capital_sizer = engines.capital_sizer
-                historical_outcome_service = engines.historical_outcome_service
-                historical_outcome_settings = engines.historical_outcome_settings
-
+                objective_engine_kwargs = engines.as_deps_kwargs()
                 async def _objective_state_loader():
                     return await objective_service.get_state()
 
@@ -394,14 +385,16 @@ class LivePaperRunner:
                 db_path=task1_db,
                 objective_service=objective_service,
                 objective_state_loader=objective_state_loader,
-                feasibility_engine=feasibility_engine,
-                objective_strategy_scorer=objective_strategy_scorer,
-                capital_sizer=capital_sizer,
-                historical_outcome_service=historical_outcome_service,
-                historical_outcome_settings=historical_outcome_settings,
+                target_attainment_settings=getattr(
+                    self.app_settings.objective, "target_attainment", None
+                ),
+                full_chain_optimizer_settings=getattr(
+                    self.app_settings, "full_chain_optimizer", None
+                ),
                 kill_switch=bool(self.app_settings.risk.kill_switch),
                 max_quote_age_seconds=max_quote_age,
                 max_relative_spread=max_spread,
+                **objective_engine_kwargs,
                 **repos,
             )
             if (
@@ -472,6 +465,33 @@ class LivePaperRunner:
             )
             assert cognitive_graph_deps.execution_runtime is not None
             assert cognitive_graph_deps.order_action_gateway is not None
+            graph_event_values = {
+                "graph.cycle.started",
+                "strategy.thesis.generated",
+                "chain.universe.built",
+                "contract.outcome.estimated",
+                "contract.grid.scored",
+                "portfolio.grid.scored",
+                "debate.review.completed",
+                "target.portfolio.selected",
+                "target.wait.selected",
+                "execution.revalidation",
+                "execution.reoptimization_required",
+                "graph.cycle.completed",
+            }
+
+            async def _stream_graph_evidence(event) -> None:
+                event_name = str(event.event_type.value)
+                if event_name in graph_event_values:
+                    self._log(
+                        run_id,
+                        event_name,
+                        dict(event.payload),
+                        on_event=on_event,
+                    )
+
+            assert cognitive_graph_deps.event_bus is not None
+            cognitive_graph_deps.event_bus.subscribe(None, _stream_graph_evidence)
             if objective_service is not None:
                 from joker.runtime.objective_recovery import recover_session_objective
 
@@ -531,6 +551,13 @@ class LivePaperRunner:
                         engines.objective_strategy_scorer
                     )
                     cognitive_graph_deps.capital_sizer = engines.capital_sizer
+                    cognitive_graph_deps.target_attainment_policy = (
+                        engines.target_attainment_policy
+                    )
+                    cognitive_graph_deps.objective_policy = engines.objective_policy
+                    cognitive_graph_deps.shadow_baseline_enabled = (
+                        engines.shadow_baseline_enabled
+                    )
                 cognitive_graph_deps.evolution_runtime = evolution_runtime
                 cognitive_graph_deps.configuration_repo = evo_repos.get(
                     "configurations"

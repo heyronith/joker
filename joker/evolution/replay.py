@@ -293,6 +293,18 @@ class CognitiveReplayService:
             order_action_gateway=gateway,
             cycle_registry=None,
             order_management_action_repo=None,
+            objective_service=base.objective_service,
+            objective_state_loader=base.objective_state_loader,
+            feasibility_engine=base.feasibility_engine,
+            objective_strategy_scorer=base.objective_strategy_scorer,
+            capital_sizer=base.capital_sizer,
+            historical_outcome_service=base.historical_outcome_service,
+            historical_outcome_settings=base.historical_outcome_settings,
+            target_attainment_policy=base.target_attainment_policy,
+            target_attainment_settings=base.target_attainment_settings,
+            full_chain_optimizer_settings=base.full_chain_optimizer_settings,
+            objective_policy=base.objective_policy,
+            shadow_baseline_enabled=base.shadow_baseline_enabled,
         )
 
     async def _save(

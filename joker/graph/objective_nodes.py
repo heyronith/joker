@@ -500,6 +500,7 @@ async def score_strategies_against_objective_node(
     )
     ta_decision_dump: dict[str, Any] | None = None
     ta_no_valid = False
+    full_chain_payload: dict[str, Any] = {}
     if policy == "target_attainment" and deps.target_attainment_policy is not None:
         from joker.objectives.contract_candidates import (
             build_contract_candidates_for_strategies,
@@ -507,6 +508,7 @@ async def score_strategies_against_objective_node(
         from joker.objectives.target_attainment import (
             TargetAttainmentAction,
             TargetAttainmentContext,
+            classify_physical_impossibility,
             run_positive_ev_baseline_shadow,
         )
 
@@ -565,74 +567,103 @@ async def score_strategies_against_objective_node(
             option_surface_usable=bool(surface_slice),
             data_quality_codes=tuple(dq_codes),
         )
-        estimates_by_strategy = {
-            str(e.get("strategy_id")): e for e in estimates if e.get("strategy_id")
-        }
-        trading_date = None
-        if deps.clock is not None:
-            trading_date = deps.clock.trading_date()
-        max_quote_age = getattr(deps, "max_quote_age_seconds", 30)
-        contract_cands = build_contract_candidates_for_strategies(
-            strategies=list(state.get("strategies") or []),
-            surface_slice=list(surface_slice or []),
-            trading_date=trading_date,
-            estimates_by_strategy=estimates_by_strategy,
-            max_quote_age_seconds=(
-                float(max_quote_age) if max_quote_age is not None else None
-            ),
-            now=deps.clock.now() if deps.clock is not None else as_of,
+        full_chain_settings = getattr(deps, "full_chain_optimizer_settings", None)
+        full_chain_enabled = bool(
+            full_chain_settings is not None
+            and getattr(full_chain_settings, "enabled", False)
         )
-        # Exact linked-surface contracts only — never fall back to a generic
-        # first-surface premium without an authoritative contract_id.
-        ta_cands = [c.as_candidate() for c in contract_cands]
-        from dataclasses import replace as dc_replace
-
-        summaries_by_strategy = {
-            str(s.get("strategy_id")): s
-            for s in historical_summaries
-            if s.get("strategy_id") is not None
-        }
-        for i, c0 in enumerate(ta_cands):
-            summary = summaries_by_strategy.get(str(c0.strategy_id))
-            if summary is None:
-                continue
-            rate = summary.get("hit_rate") or summary.get("win_rate")
-            sample_count = int(summary.get("sample_count") or c0.sample_count)
-            updates: dict[str, Any] = {"sample_count": sample_count}
-            if rate is not None:
-                updates["historical_hit_rate"] = Decimal(str(rate))
-            ta_cands[i] = dc_replace(c0, **updates)
-        decision = deps.target_attainment_policy.decide(
-            ctx,
-            ta_cands,
-            baseline_shadow=baseline_shadow,
-            session_state=objective_session,
+        hard_block, _hard_codes = classify_physical_impossibility(
+            ctx, session_state=objective_session
         )
-        if (
-            not contract_cands
-            and decision.action != TargetAttainmentAction.BLOCK
-        ):
-            decision = dc_replace(
-                decision,
-                action=TargetAttainmentAction.WAIT,
-                selected_strategy_id=None,
-                selected_contract_id=None,
-                selected_quantity=0,
-                selected_capital_usd=Decimal("0"),
-                selected_evaluation_premium_usd=None,
-                selected_p_goal=None,
-                probability_delta=None,
-                reason_codes=["no_valid_contract_candidates"],
+        if full_chain_enabled and _surface is not None and not hard_block:
+            from joker.objectives.full_chain_optimizer import (
+                optimize_full_chain,
+                portfolio_decision_as_legacy_target_dict,
             )
-        ta_decision_dump = decision.as_dict()
-        if decision.action == TargetAttainmentAction.ENTER:
+
+            optimized = optimize_full_chain(
+                strategies=list(state.get("strategies") or []),
+                surface=_surface,
+                ctx=ctx,
+                settings=full_chain_settings,
+                maximum_authorised_contracts=max_contracts,
+            )
+            full_chain_payload = optimized.state_payload()
+            ta_decision_dump = portfolio_decision_as_legacy_target_dict(
+                optimized.decision
+            )
+        else:
+            estimates_by_strategy = {
+                str(e.get("strategy_id")): e
+                for e in estimates
+                if e.get("strategy_id")
+            }
+            trading_date = None
+            if deps.clock is not None:
+                trading_date = deps.clock.trading_date()
+            max_quote_age = getattr(deps, "max_quote_age_seconds", 30)
+            contract_cands = build_contract_candidates_for_strategies(
+                strategies=list(state.get("strategies") or []),
+                surface_slice=list(surface_slice or []),
+                trading_date=trading_date,
+                estimates_by_strategy=estimates_by_strategy,
+                max_quote_age_seconds=(
+                    float(max_quote_age) if max_quote_age is not None else None
+                ),
+                now=deps.clock.now() if deps.clock is not None else as_of,
+            )
+            # Exact linked-surface contracts only — never fall back to a generic
+            # first-surface premium without an authoritative contract_id.
+            ta_cands = [c.as_candidate() for c in contract_cands]
+            from dataclasses import replace as dc_replace
+
+            summaries_by_strategy = {
+                str(s.get("strategy_id")): s
+                for s in historical_summaries
+                if s.get("strategy_id") is not None
+            }
+            for i, c0 in enumerate(ta_cands):
+                summary = summaries_by_strategy.get(str(c0.strategy_id))
+                if summary is None:
+                    continue
+                rate = summary.get("hit_rate") or summary.get("win_rate")
+                sample_count = int(summary.get("sample_count") or c0.sample_count)
+                updates: dict[str, Any] = {"sample_count": sample_count}
+                if rate is not None:
+                    updates["historical_hit_rate"] = Decimal(str(rate))
+                ta_cands[i] = dc_replace(c0, **updates)
+            decision = deps.target_attainment_policy.decide(
+                ctx,
+                ta_cands,
+                baseline_shadow=baseline_shadow,
+                session_state=objective_session,
+            )
+            if (
+                not contract_cands
+                and decision.action != TargetAttainmentAction.BLOCK
+            ):
+                decision = dc_replace(
+                    decision,
+                    action=TargetAttainmentAction.WAIT,
+                    selected_strategy_id=None,
+                    selected_contract_id=None,
+                    selected_quantity=0,
+                    selected_capital_usd=Decimal("0"),
+                    selected_evaluation_premium_usd=None,
+                    selected_p_goal=None,
+                    probability_delta=None,
+                    reason_codes=["no_valid_contract_candidates"],
+                )
+            ta_decision_dump = decision.as_dict()
+        if ta_decision_dump.get("action") == TargetAttainmentAction.ENTER.value:
             ta_no_valid = False
             for idx, score in enumerate(scores):
                 if score.is_no_trade:
                     continue
                 if (
-                    decision.selected_strategy_id is not None
-                    and score.strategy_id == decision.selected_strategy_id
+                    ta_decision_dump.get("selected_strategy_id") is not None
+                    and str(score.strategy_id)
+                    == str(ta_decision_dump.get("selected_strategy_id"))
                 ):
                     scores[idx] = score.model_copy(
                         update={
@@ -678,6 +709,7 @@ async def score_strategies_against_objective_node(
         "_historical_minimum_required": min_samples,
         "_objective_policy": policy,
         "_objective_session": objective_session.as_dict(),
+        **full_chain_payload,
         **trace_update(
             append_trace(
                 state,
@@ -711,6 +743,10 @@ async def score_strategies_against_objective_node(
         result["_target_attainment_strategy_id"] = None
         result["_target_attainment_contract_id"] = None
         result["_target_attainment_quantity"] = None
+    if full_chain_payload:
+        from joker.graph.observable_events import publish_optimizer_scoring_events
+
+        await publish_optimizer_scoring_events(deps, {**state, **result})
     return result
 
 
@@ -757,6 +793,84 @@ async def deterministic_sizing_node(
         str(getattr(deps, "objective_policy", "positive_ev_baseline"))
         == "target_attainment"
     )
+    authorized_positions = list(state.get("_target_authorized_positions") or [])
+    if target_mode and authorized_positions:
+        if len(proposal.legs) != len(authorized_positions):
+            return {
+                "_block_new_entries": True,
+                **append_error(
+                    state,
+                    node_name="apply_objective_sizing",
+                    error_code="target_attainment_recalculation_required",
+                    message="authorized portfolio component count changed",
+                ),
+            }
+        if any(
+            str(leg.contract_id) != str(position.get("contract_id"))
+            or int(leg.quantity) != int(position.get("quantity") or 0)
+            for leg, position in zip(
+                proposal.legs, authorized_positions, strict=True
+            )
+        ):
+            return {
+                "_block_new_entries": True,
+                **append_error(
+                    state,
+                    node_name="apply_objective_sizing",
+                    error_code="target_attainment_recalculation_required",
+                    message="authorized portfolio contract or quantity changed",
+                ),
+            }
+        expected_version = int(authorized_positions[0].get("objective_version") or 0)
+        expected_snapshot = str(authorized_positions[0].get("snapshot_id") or "")
+        if (
+            expected_version != int(obj_state.version)
+            or expected_snapshot != str(state.get("snapshot_id") or "")
+        ):
+            return {
+                "_block_new_entries": True,
+                **append_error(
+                    state,
+                    node_name="apply_objective_sizing",
+                    error_code="target_attainment_recalculation_required",
+                    message="objective version or snapshot provenance changed",
+                ),
+            }
+        total_capital = sum(
+            (
+                Decimal(str(position.get("capital_allocation") or "0"))
+                for position in authorized_positions
+            ),
+            Decimal("0"),
+        )
+        if total_capital > Decimal(str(obj_state.available_capital_usd)):
+            return {
+                "_block_new_entries": True,
+                **append_error(
+                    state,
+                    node_name="apply_objective_sizing",
+                    error_code="target_attainment_recalculation_required",
+                    message="authorized portfolio no longer fits available capital",
+                ),
+            }
+        return {
+            "execution_proposal": proposal,
+            "_sizing_decision": {
+                "approved": True,
+                "approved_quantity": sum(
+                    int(position["quantity"]) for position in authorized_positions
+                ),
+                "capital_required_usd": str(total_capital),
+                "reason_codes": ["authoritative_portfolio_exact_allocation"],
+            },
+            **trace_update(
+                append_trace(
+                    state,
+                    node_name="apply_objective_sizing",
+                    status="completed",
+                )
+            ),
+        }
     if estimate is None or (not estimate.get("valid") and not target_mode):
         return {
             "_sizing_decision": {

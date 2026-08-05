@@ -60,7 +60,19 @@ LIVE_CLI_EVENT_TYPES: frozenset[str] = frozenset(
 
 
 def should_stream_event(event_type: str) -> bool:
-    return event_type in LIVE_CLI_EVENT_TYPES or event_type.startswith("proposal.")
+    return (
+        event_type in LIVE_CLI_EVENT_TYPES
+        or event_type.startswith("proposal.")
+        or event_type.startswith("graph.")
+        or event_type.startswith("strategy.thesis.")
+        or event_type.startswith("chain.universe.")
+        or event_type.startswith("contract.")
+        or event_type.startswith("portfolio.")
+        or event_type.startswith("debate.review.")
+        or event_type.startswith("target.")
+        or event_type.startswith("execution.revalidation")
+        or event_type.startswith("execution.reoptimization")
+    )
 
 
 def format_live_event(event_type: str, payload: dict[str, Any] | None = None) -> str:

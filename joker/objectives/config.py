@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class ObjectiveFeasibilitySettings(BaseModel):
@@ -167,6 +167,82 @@ class TargetAttainmentSettings(BaseModel):
         if value < 1:
             raise ValueError("minimum_calibrated_samples must be >= 1")
         return value
+
+
+class FullChainOptimizerSettings(BaseModel):
+    """Deterministic paper/replay full-chain and portfolio optimizer settings."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    # Disabled by default globally. Paper/replay profiles must opt in.
+    enabled: bool = False
+    maximum_quote_age_seconds: int = 30
+    maximum_relative_spread: float = 0.25
+    maximum_contracts_evaluated: int = 200
+    moneyness_buckets: tuple[float, ...] = (-2.0, -0.5, 0.5, 2.0)
+    premium_buckets: tuple[float, ...] = (0.10, 0.20, 0.50, 1.0, 2.0, 5.0)
+    delta_buckets: tuple[float, ...] = (0.10, 0.25, 0.50, 0.75)
+    top_contracts_per_strategy: int = 50
+    top_candidates_for_agent_review: int = 10
+    portfolio_search_enabled: bool = True
+    portfolio_beam_width: int = 50
+    maximum_portfolio_candidates: int = 500
+    allow_duplicate_contracts: bool = False
+    minimum_probability_improvement_over_wait: float = 0.01
+    cli_graph_view: str = "compact"
+    cli_top_contract_rows: int = 10
+    cli_top_portfolio_rows: int = 10
+
+    @field_validator(
+        "maximum_quote_age_seconds",
+        "maximum_contracts_evaluated",
+        "top_contracts_per_strategy",
+        "top_candidates_for_agent_review",
+        "portfolio_beam_width",
+        "maximum_portfolio_candidates",
+        "cli_top_contract_rows",
+        "cli_top_portfolio_rows",
+    )
+    @classmethod
+    def _positive_int(cls, value: int) -> int:
+        if value < 1:
+            raise ValueError("full-chain integer limits must be >= 1")
+        return value
+
+    @field_validator("maximum_relative_spread")
+    @classmethod
+    def _spread(cls, value: float) -> float:
+        if not 0 < value <= 2:
+            raise ValueError("maximum_relative_spread must be in (0, 2]")
+        return value
+
+    @field_validator("minimum_probability_improvement_over_wait")
+    @classmethod
+    def _probability_delta(cls, value: float) -> float:
+        if not 0 <= value <= 1:
+            raise ValueError(
+                "minimum_probability_improvement_over_wait must be in [0, 1]"
+            )
+        return value
+
+    @field_validator("cli_graph_view")
+    @classmethod
+    def _graph_view(cls, value: str) -> str:
+        if value not in {"compact", "verbose", "json"}:
+            raise ValueError("cli_graph_view must be compact, verbose, or json")
+        return value
+
+    @model_validator(mode="after")
+    def _ordered_buckets(self) -> FullChainOptimizerSettings:
+        for name in ("moneyness_buckets", "premium_buckets", "delta_buckets"):
+            values = tuple(getattr(self, name))
+            if not values or any(b <= a for a, b in zip(values, values[1:])):
+                raise ValueError(f"{name} must be non-empty and strictly increasing")
+        if any(value <= 0 for value in self.premium_buckets):
+            raise ValueError("premium_buckets must contain only positive values")
+        if any(not 0 < value <= 1 for value in self.delta_buckets):
+            raise ValueError("delta_buckets must be in (0, 1]")
+        return self
 
 
 class ObjectiveSettings(BaseModel):

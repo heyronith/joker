@@ -90,6 +90,26 @@ cognitive_graph:
     maximum_option_rows_per_request: 80
     maximum_context_characters: 60000
 
+# Paper/replay-only deterministic optimizer. This does not enable live trading.
+full_chain_optimizer:
+  enabled: true
+  maximum_quote_age_seconds: 30
+  maximum_relative_spread: 0.25
+  maximum_contracts_evaluated: 200
+  moneyness_buckets: [-2.0, -0.5, 0.5, 2.0]
+  premium_buckets: [0.10, 0.20, 0.50, 1.0, 2.0, 5.0]
+  delta_buckets: [0.10, 0.25, 0.50, 0.75]
+  top_contracts_per_strategy: 50
+  top_candidates_for_agent_review: 10
+  portfolio_search_enabled: true
+  portfolio_beam_width: 50
+  maximum_portfolio_candidates: 500
+  allow_duplicate_contracts: false
+  minimum_probability_improvement_over_wait: 0.01
+  cli_graph_view: compact
+  cli_top_contract_rows: 10
+  cli_top_portfolio_rows: 10
+
 models:
   # Local-paper cognitive path: Ollama is mandatory unless mock_agents /
   # JOKER_COGNITIVE_USE_FAKE_MODELS explicitly remaps profiles to fake.

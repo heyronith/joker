@@ -236,6 +236,11 @@ def paper_run(
         "--heartbeat-seconds",
         help="How often to print SPY heartbeat lines (decision events print immediately)",
     ),
+    graph_view: Optional[str] = typer.Option(
+        None,
+        "--graph-view",
+        help="Cognitive graph evidence view: compact, verbose, or json",
+    ),
 ) -> None:
     """Run the full live paper loop: monitor → decide → risk → auto order → log."""
     import asyncio
@@ -269,6 +274,22 @@ def paper_run(
         raise typer.Exit(code=1)
 
     result = validate_startup(config_path=config, skip_model_check=skip_model_check)
+    from joker.cli.graph_view import (
+        GRAPH_EVENT_TYPES,
+        GraphView,
+        render_graph_event,
+    )
+
+    configured_graph_view = getattr(
+        getattr(result.app_settings, "full_chain_optimizer", None),
+        "cli_graph_view",
+        "compact",
+    )
+    try:
+        resolved_graph_view = GraphView(graph_view or configured_graph_view)
+    except ValueError:
+        console.print("[red]--graph-view must be compact, verbose, or json[/red]")
+        raise typer.Exit(code=1) from None
     if not skip_preflight:
         from joker.data.webull_capability import capability_usable_for_shadow
 
@@ -563,7 +584,17 @@ def paper_run(
     def on_event(event_type: str, payload: dict) -> None:
         nonlocal latest_graph_action, latest_no_trade_reason
         nonlocal graph_cycles, no_trade_decisions, entry_proposals, entry_approvals
-        line = format_live_event(event_type, payload)
+        if event_type in GRAPH_EVENT_TYPES:
+            optimizer_settings = result.app_settings.full_chain_optimizer
+            line = render_graph_event(
+                event_type,
+                payload,
+                view=resolved_graph_view,
+                top_contract_rows=optimizer_settings.cli_top_contract_rows,
+                top_portfolio_rows=optimizer_settings.cli_top_portfolio_rows,
+            )
+        else:
+            line = format_live_event(event_type, payload)
         latest_graph_action = f"{event_type}"
         if event_type in {
             "agent.decision",
@@ -712,7 +743,9 @@ def paper_run(
             "objective.achieved",
             "objective.missed",
         }
-        if event_type.startswith("order.") or event_type in important:
+        if event_type in GRAPH_EVENT_TYPES:
+            console.print(line, markup=False)
+        elif event_type.startswith("order.") or event_type in important:
             console.print(f"[bold cyan]» {line}[/bold cyan]")
         elif event_type in ("agent.decision",) and payload.get("action") in (
             "propose",

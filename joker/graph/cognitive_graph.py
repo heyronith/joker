@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone
+from decimal import Decimal
 from typing import Any
-from uuid import UUID, uuid4
+from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 from langgraph.graph import END, START, StateGraph
 
@@ -91,6 +92,9 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
                 ),
             }
         gate = await gate_objective_confirmed(deps, state)
+        from joker.graph.observable_events import publish_graph_cycle_started
+
+        await publish_graph_cycle_started(deps, {**state, **(gate or {})})
         return {
             **(gate or {}),
             **trace_update(
@@ -496,6 +500,9 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
         if bool(state.get("_target_attainment_authoritative")):
             ta_cid = state.get("_target_attainment_contract_id")
             ta_qty = int(state.get("_target_attainment_quantity") or 0)
+            authorized_positions = list(
+                state.get("_target_authorized_positions") or []
+            )
             if not ta_cid or ta_qty < 1:
                 return append_error(
                     state,
@@ -510,17 +517,31 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
                     error_code="target_attainment_missing_legs",
                     message="entry tactician produced no legs for authoritative tuple",
                 )
-            new_legs = []
-            for leg in proposal.legs:
-                new_legs.append(
-                    leg.model_copy(
+            template_leg = proposal.legs[0]
+            if authorized_positions:
+                new_legs = [
+                    template_leg.model_copy(
+                        update={
+                            "leg_id": uuid4(),
+                            "contract_id": str(position["contract_id"]),
+                            "quantity": int(position["quantity"]),
+                            "limit_price": Decimal(
+                                str(position["evaluation_premium"])
+                            ),
+                            "sequence_order": index,
+                        }
+                    )
+                    for index, position in enumerate(authorized_positions, start=1)
+                ]
+            else:
+                new_legs = [
+                    template_leg.model_copy(
                         update={
                             "contract_id": str(ta_cid),
                             "quantity": ta_qty,
                         }
                     )
-                )
-            # Only first leg is authoritative for single-leg 0DTE entries.
+                ]
             proposal = proposal.model_copy(
                 update={
                     "legs": tuple(new_legs),
@@ -574,11 +595,14 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
                 projection=projection,
                 already_submitted_proposal_ids=tuple(deps.submitted_proposal_ids),
             )
-            validate_and_compile_proposal(
-                proposal,
-                truth=truth,
-                evidence_ids=tuple(e.evidence_id for e in state.get("evidence") or []),
-            )
+            for leg in proposal.legs:
+                validate_and_compile_proposal(
+                    proposal.model_copy(update={"legs": (leg,)}),
+                    truth=truth,
+                    evidence_ids=tuple(
+                        e.evidence_id for e in state.get("evidence") or []
+                    ),
+                )
         except Exception as exc:
             if "stale" in str(exc).lower():
                 return {"stale_decision": True, **append_error(
@@ -601,32 +625,6 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
             return {}
         if state.get("execution_command_id"):
             return trace_update(append_trace(state, node_name="submit_execution_command", status="skipped"))
-        try:
-            snapshot, data_quality, surface, _slice = await load_snapshot_truth(
-                deps, str(proposal.snapshot_id)
-            )
-            projection = None
-            if deps.projection_loader is not None:
-                projection = await deps.projection_loader()
-            truth = build_truth_from_deps(
-                snapshot=snapshot,
-                data_quality=data_quality,
-                option_surface=surface,
-                projection=projection,
-                already_submitted_proposal_ids=tuple(deps.submitted_proposal_ids),
-            )
-            provenanced = validate_and_compile_proposal(
-                proposal,
-                truth=truth,
-                evidence_ids=tuple(e.evidence_id for e in state.get("evidence") or []),
-            )
-        except Exception as exc:
-            return append_error(
-                state,
-                node_name="submit_execution_command",
-                error_code="submit_validation_failed",
-                message=str(exc),
-            )
         from dataclasses import replace
 
         from joker.runtime.order_action_gateway import (
@@ -634,68 +632,266 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
             ensure_order_action_gateway,
             provenanced_to_action_request,
         )
+        from joker.graph.observable_events import (
+            publish_execution_observable_event,
+        )
 
         gateway = ensure_order_action_gateway(deps)
-        if gateway is not None:
-            action = (
-                OrderActionKind.PROBE
-                if getattr(proposal, "action", None) == "probe"
-                else OrderActionKind.ENTRY
+        authorized_positions = list(state.get("_target_authorized_positions") or [])
+        command_ids: list[str] = []
+        result_refs: list[str] = []
+        for index, leg in enumerate(proposal.legs):
+            position = (
+                authorized_positions[index]
+                if index < len(authorized_positions)
+                else None
             )
-            causation = _resolve_entry_causation_event_id(state)
-            action_request = provenanced_to_action_request(
-                provenanced,
-                action=action,
-                causation_event_id=causation,
-            )
-            sizing = state.get("_sizing_decision") or {}
-            estimate_id = sizing.get("estimate_id")
-            if estimate_id:
-                action_request = replace(action_request, estimate_id=str(estimate_id))
-            gateway_result = await gateway.submit(action_request)
-            if not gateway_result.submitted:
-                return append_error(
-                    state,
-                    node_name="submit_execution_command",
-                    error_code="gateway_blocked",
-                    message=gateway_result.blocked_reason or "order action blocked",
-                )
-            command_id = gateway_result.client_order_id
-            result = gateway_result.broker_order
-        else:
-            if deps.submit_callback is None:
-                return append_error(
-                    state,
-                    node_name="submit_execution_command",
-                    error_code="no_submit_callback",
-                    message="execution submit callback not configured",
-                )
-            command_id = provenanced.command.client_order_id
-            if deps.provenance_registry is not None:
-                from joker.persistence.cognitive_execution_provenance import (
-                    ExecutionProvenanceRecord,
-                )
-                from joker.runtime.execution_runtime import contract_id_for
-
-                await deps.provenance_registry.record(
-                    ExecutionProvenanceRecord(
-                        client_order_id=command_id,
-                        proposal_id=str(provenanced.proposal_id),
-                        decision_id=str(provenanced.decision_id),
-                        strategy_id=str(provenanced.strategy_id),
-                        cycle_id=str(provenanced.cycle_id),
-                        snapshot_id=str(provenanced.snapshot_id),
-                        contract_id=contract_id_for(provenanced.command.intent.contract),
-                        session_id=deps.session_id,
-                        kind="entry",
-                        causation_event_id=_resolve_entry_causation_event_id(state),
+            if position is not None and deps.objective_service is not None:
+                if (
+                    deps.clock is not None
+                    and hasattr(deps.objective_service, "recompute_from_truth")
+                ):
+                    await deps.objective_service.recompute_from_truth(
+                        now=deps.clock.now()
                     )
+                current_objective = await deps.objective_service.get_state()
+                if (
+                    int(current_objective.version)
+                    != int(position.get("objective_version") or 0)
+                    or int(current_objective.time_remaining_seconds) <= 0
+                    or Decimal(
+                        str(current_objective.required_profit_remaining_usd)
+                    )
+                    <= 0
+                ):
+                    return {
+                        "_block_new_entries": True,
+                        "_execution_command_ids": command_ids,
+                        **append_error(
+                            state,
+                            node_name="submit_execution_command",
+                            error_code="target_attainment_recalculation_required",
+                            message=(
+                                "objective truth changed before sequential "
+                                "portfolio component submission"
+                            ),
+                        ),
+                    }
+                remaining_components = len(authorized_positions) - index
+                projected_positions = (
+                    int(current_objective.open_position_count)
+                    + int(getattr(current_objective, "working_order_count", 0) or 0)
+                    + remaining_components
                 )
-            result = await deps.submit_callback(provenanced)
-            deps.submitted_proposal_ids.add(str(proposal.proposal_id))
+                if projected_positions > int(
+                    current_objective.max_concurrent_positions
+                ):
+                    return {
+                        "_block_new_entries": True,
+                        "_execution_command_ids": command_ids,
+                        **append_error(
+                            state,
+                            node_name="submit_execution_command",
+                            error_code="target_attainment_recalculation_required",
+                            message=(
+                                "position limit changed before sequential "
+                                "portfolio component submission"
+                            ),
+                        ),
+                    }
+                remaining_allocation = sum(
+                    (
+                        Decimal(str(item.get("capital_allocation") or "0"))
+                        for item in authorized_positions[index:]
+                    ),
+                    Decimal("0"),
+                )
+                if remaining_allocation > Decimal(
+                    str(current_objective.available_capital_usd)
+                ):
+                    return {
+                        "_block_new_entries": True,
+                        "_execution_command_ids": command_ids,
+                        **append_error(
+                            state,
+                            node_name="submit_execution_command",
+                            error_code="target_attainment_recalculation_required",
+                            message=(
+                                "available capital changed before sequential "
+                                "portfolio component submission"
+                            ),
+                        ),
+                    }
+            child_proposal = proposal.model_copy(
+                update={
+                    "proposal_id": uuid5(
+                        NAMESPACE_URL,
+                        f"{proposal.proposal_id}:portfolio-component:{index}",
+                    ),
+                    "strategy_id": (
+                        UUID(str(position["strategy_id"]))
+                        if position is not None
+                        else proposal.strategy_id
+                    ),
+                    "legs": (leg,),
+                }
+            )
+            try:
+                # Refresh account/order projection and market truth before every
+                # sequential component. Validation never mutates the tuple.
+                snapshot, data_quality, surface, _slice = await load_snapshot_truth(
+                    deps, str(child_proposal.snapshot_id)
+                )
+                projection = None
+                if deps.projection_loader is not None:
+                    projection = await deps.projection_loader()
+                truth = build_truth_from_deps(
+                    snapshot=snapshot,
+                    data_quality=data_quality,
+                    option_surface=surface,
+                    projection=projection,
+                    already_submitted_proposal_ids=tuple(
+                        deps.submitted_proposal_ids
+                    ),
+                )
+                provenanced = validate_and_compile_proposal(
+                    child_proposal,
+                    truth=truth,
+                    evidence_ids=tuple(
+                        e.evidence_id for e in state.get("evidence") or []
+                    ),
+                )
+                await publish_execution_observable_event(
+                    deps,
+                    state,
+                    reoptimization_required=False,
+                    payload={
+                        "component_index": index,
+                        "contract_id": leg.contract_id,
+                        "quantity": leg.quantity,
+                        "quote_revalidation": "passed",
+                        "capital_revalidation": "passed",
+                        "objective_version_revalidation": "passed",
+                        "data_quality_revalidation": "passed",
+                    },
+                )
+            except Exception as exc:
+                await publish_execution_observable_event(
+                    deps,
+                    state,
+                    reoptimization_required=True,
+                    payload={
+                        "component_index": index,
+                        "reason": str(exc),
+                        "submitted_component_count": len(command_ids),
+                    },
+                )
+                return {
+                    "_block_new_entries": bool(command_ids),
+                    "_execution_command_ids": command_ids,
+                    **append_error(
+                        state,
+                        node_name="submit_execution_command",
+                        error_code=(
+                            "target_attainment_recalculation_required"
+                            if command_ids
+                            else "submit_validation_failed"
+                        ),
+                        message=str(exc),
+                    ),
+                }
+            if gateway is not None:
+                action = (
+                    OrderActionKind.PROBE
+                    if getattr(proposal, "action", None) == "probe"
+                    else OrderActionKind.ENTRY
+                )
+                action_request = provenanced_to_action_request(
+                    provenanced,
+                    action=action,
+                    causation_event_id=_resolve_entry_causation_event_id(state),
+                )
+                sizing = state.get("_sizing_decision") or {}
+                estimate_id = sizing.get("estimate_id")
+                if estimate_id:
+                    action_request = replace(
+                        action_request, estimate_id=str(estimate_id)
+                    )
+                gateway_result = await gateway.submit(action_request)
+                if not gateway_result.submitted:
+                    await publish_execution_observable_event(
+                        deps,
+                        state,
+                        reoptimization_required=True,
+                        payload={
+                            "component_index": index,
+                            "reason": (
+                                gateway_result.blocked_reason
+                                or "order action blocked"
+                            ),
+                            "submitted_component_count": len(command_ids),
+                        },
+                    )
+                    return {
+                        "_block_new_entries": bool(command_ids),
+                        "_execution_command_ids": command_ids,
+                        **append_error(
+                            state,
+                            node_name="submit_execution_command",
+                            error_code=(
+                                "target_attainment_recalculation_required"
+                                if command_ids
+                                else "gateway_blocked"
+                            ),
+                            message=(
+                                gateway_result.blocked_reason
+                                or "order action blocked"
+                            ),
+                        ),
+                    }
+                command_id = gateway_result.client_order_id
+                result = gateway_result.broker_order
+            else:
+                if deps.submit_callback is None:
+                    return append_error(
+                        state,
+                        node_name="submit_execution_command",
+                        error_code="no_submit_callback",
+                        message="execution submit callback not configured",
+                    )
+                command_id = provenanced.command.client_order_id
+                if deps.provenance_registry is not None:
+                    from joker.persistence.cognitive_execution_provenance import (
+                        ExecutionProvenanceRecord,
+                    )
+                    from joker.runtime.execution_runtime import contract_id_for
+
+                    await deps.provenance_registry.record(
+                        ExecutionProvenanceRecord(
+                            client_order_id=command_id,
+                            proposal_id=str(provenanced.proposal_id),
+                            decision_id=str(provenanced.decision_id),
+                            strategy_id=str(provenanced.strategy_id),
+                            cycle_id=str(provenanced.cycle_id),
+                            snapshot_id=str(provenanced.snapshot_id),
+                            contract_id=contract_id_for(
+                                provenanced.command.intent.contract
+                            ),
+                            session_id=deps.session_id,
+                            kind="entry",
+                            causation_event_id=_resolve_entry_causation_event_id(
+                                state
+                            ),
+                        )
+                    )
+                result = await deps.submit_callback(provenanced)
+            deps.submitted_proposal_ids.add(str(child_proposal.proposal_id))
+            command_ids.append(command_id)
+            result_refs.append(str(getattr(result, "order_id", command_id)))
         return {
-            "execution_command_id": command_id,
-            "execution_result_ref": str(getattr(result, "order_id", command_id)),
+            "execution_command_id": command_ids[0] if command_ids else None,
+            "_execution_command_ids": command_ids,
+            "execution_result_ref": ",".join(result_refs),
             **trace_update(
                 append_trace(state, node_name="submit_execution_command", status="completed")
             ),
@@ -916,6 +1112,9 @@ async def _publish_cycle_completed(
             },
         )
     )
+    from joker.graph.observable_events import publish_cycle_observable_events
+
+    await publish_cycle_observable_events(deps, state, outcome=outcome)
 
 
 def initial_cycle_state(

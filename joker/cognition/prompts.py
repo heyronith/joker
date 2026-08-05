@@ -165,8 +165,10 @@ _PROMPTS: dict[AgentRole, PromptSpec] = {
         prompt_id="strategy.bullish_inventor",
         role=AgentRole.BULLISH_INVENTOR,
         role_mandate=(
-            "Invent a bullish SPY 0DTE options strategy grounded in the world model, "
-            "using real contract IDs from supplied surface data."
+            "Invent a bullish SPY 0DTE market thesis grounded in the world model. "
+            "Describe the expected underlying path, adverse path, resolution horizon, "
+            "entry, exit, and invalidation conditions. Do not author contract IDs or "
+            "quantity; deterministic linked-surface optimization owns those fields."
         ),
         output_schema_name="StrategyHypothesis",
         required_context_schema="strategy_context",
@@ -182,8 +184,10 @@ _PROMPTS: dict[AgentRole, PromptSpec] = {
         prompt_id="strategy.bearish_inventor",
         role=AgentRole.BEARISH_INVENTOR,
         role_mandate=(
-            "Invent a bearish SPY 0DTE options strategy grounded in the world model, "
-            "using real contract IDs from supplied surface data."
+            "Invent a bearish SPY 0DTE market thesis grounded in the world model. "
+            "Describe the expected underlying path, adverse path, resolution horizon, "
+            "entry, exit, and invalidation conditions. Do not author contract IDs or "
+            "quantity; deterministic linked-surface optimization owns those fields."
         ),
         output_schema_name="StrategyHypothesis",
         required_context_schema="strategy_context",
@@ -291,8 +295,8 @@ _PROMPTS: dict[AgentRole, PromptSpec] = {
             "SWITCH_STRATEGY, or ABANDON by weighing evidence and debate — not "
             "majority vote. "
             "When objective.policy is target_attainment, the deterministic "
-            "target-attainment policy is the final selector of ENTER versus WAIT, "
-            "strategy, contract and quantity. Your role is then to examine evidence "
+            "target-attainment policy is the final selector of ENTER versus WAIT and "
+            "the complete authorized position portfolio. Your role is then to examine evidence "
             "supporting that selection: you may support it, challenge specific "
             "assumptions, or request more evidence. You may not replace the "
             "executable tuple directly. A material challenge must trigger a fresh "
@@ -310,11 +314,11 @@ _PROMPTS: dict[AgentRole, PromptSpec] = {
         prompt_id="execution.entry_tactician",
         role=AgentRole.ENTRY_TACTICIAN,
         role_mandate=(
-            "Translate an approved strategy into a typed ExecutionProposal: "
-            "contract, quantity, limit, timing, and fill policies. "
-            "When objective.policy is target_attainment, construct the order for "
-            "the authoritative target-attainment tuple only — do not change "
-            "strategy_id, contract_id, or quantity. You may select a valid limit "
+            "Translate an approved strategy into a typed ExecutionProposal with limit, "
+            "timing, and fill policies. When objective.policy is target_attainment, "
+            "construct orders for the complete authorized position portfolio only — "
+            "do not change strategy_id, contract_id, quantity, position count, or "
+            "capital allocation. You may select a valid limit "
             "price and timing tactic within execution constraints. Fail closed if "
             "you cannot produce an order for that authoritative contract and "
             "quantity; never silently choose another contract."

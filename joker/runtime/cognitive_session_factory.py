@@ -212,17 +212,19 @@ async def prepare_agentic_trading_session(
         db_path=task1_db,
         objective_service=objective_service,
         objective_state_loader=_objective_state_loader,
-        feasibility_engine=engines.feasibility_engine,
-        objective_strategy_scorer=engines.objective_strategy_scorer,
-        capital_sizer=engines.capital_sizer,
-        historical_outcome_service=engines.historical_outcome_service,
-        historical_outcome_settings=engines.historical_outcome_settings,
+        target_attainment_settings=getattr(
+            app_settings.objective, "target_attainment", None
+        ),
+        full_chain_optimizer_settings=getattr(
+            app_settings, "full_chain_optimizer", None
+        ),
         objective_execution_settings=getattr(app_settings.objective, "execution", None),
         kill_switch=bool(app_settings.risk.kill_switch),
         entry_permission=entry_permission or EntryPermissionState(),
         max_quote_age_seconds=max_quote_age,
         max_relative_spread=max_spread,
         configuration_repo=evo_repos.get("configurations"),
+        **engines.as_deps_kwargs(),
         **repos,
     )
     deps.require_objective_dependencies()

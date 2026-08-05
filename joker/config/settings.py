@@ -196,6 +196,12 @@ def _default_objective_settings() -> Any:
     return ObjectiveSettings()
 
 
+def _default_full_chain_optimizer_settings() -> Any:
+    from joker.objectives.config import FullChainOptimizerSettings
+
+    return FullChainOptimizerSettings()
+
+
 class AppSettings(BaseModel):
     """Merged application settings from YAML config and environment."""
 
@@ -221,6 +227,9 @@ class AppSettings(BaseModel):
     models: Any = Field(default_factory=_default_models_config)
     evolution: Any = Field(default_factory=_default_evolution_settings)
     objective: Any = Field(default_factory=_default_objective_settings)
+    full_chain_optimizer: Any = Field(
+        default_factory=_default_full_chain_optimizer_settings
+    )
 
     @field_validator("models", mode="before")
     @classmethod
@@ -261,6 +270,19 @@ class AppSettings(BaseModel):
             return value
         if isinstance(value, dict):
             return ObjectiveSettings.model_validate(value)
+        return value
+
+    @field_validator("full_chain_optimizer", mode="before")
+    @classmethod
+    def _parse_full_chain_optimizer(cls, value: Any) -> Any:
+        from joker.objectives.config import FullChainOptimizerSettings
+
+        if value is None:
+            return FullChainOptimizerSettings()
+        if isinstance(value, FullChainOptimizerSettings):
+            return value
+        if isinstance(value, dict):
+            return FullChainOptimizerSettings.model_validate(value)
         return value
 
     @field_validator("mode", mode="before")

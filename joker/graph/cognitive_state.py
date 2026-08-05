@@ -99,6 +99,14 @@ class CognitiveGraphState(TypedDict, total=False):
     _target_attainment_snapshot_id: str | None
     _target_attainment_authoritative: bool
     _meta_target_review: dict | None
+    _full_chain_universe: dict | None
+    _contract_selection_specs: list | None
+    _contract_outcomes: list | None
+    _quantity_grid: list | None
+    _portfolio_grid: list | None
+    _target_portfolio_decision: dict | None
+    _target_authorized_positions: list | None
+    _execution_command_ids: list[str] | None
 
     # Position graph channels
     _position_id: str | None
