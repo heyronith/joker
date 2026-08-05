@@ -114,6 +114,9 @@ class CognitiveGraphState(TypedDict, total=False):
     _portfolio_review_finalization: dict | None
     _execution_command_ids: list[str] | None
     _portfolio_execution_state: list | None
+    _portfolio_reoptimization_request_id: str | None
+    _reoptimization_excluded_contract_ids: list[str] | None
+    _reoptimization_existing_positions: list[dict] | None
 
     # Position graph channels
     _position_id: str | None

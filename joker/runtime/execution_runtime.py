@@ -118,6 +118,14 @@ class ExecutionRuntime:
         return dict(self._client_to_broker)
 
     @property
+    def broker_account_id(self) -> str:
+        return self._broker_account_id
+
+    @property
+    def session_id(self) -> str:
+        return self._session_id
+
+    @property
     def unresolved_reconciliation(self) -> UnresolvedReconciliation | None:
         return self._unresolved
 

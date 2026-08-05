@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import json
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any
@@ -80,15 +81,11 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
                     state,
                     node_name="validate_trigger",
                     error_code="entry_permission_blocked",
-                    message=(
-                        "entries blocked: " + (", ".join(reasons) or "reconciliation")
-                    ),
+                    message=("entries blocked: " + (", ".join(reasons) or "reconciliation")),
                     recoverable=True,
                 ),
                 **trace_update(
-                    append_trace(
-                        state, node_name="validate_trigger", status="completed"
-                    )
+                    append_trace(state, node_name="validate_trigger", status="completed")
                 ),
             }
         gate = await gate_objective_confirmed(deps, state)
@@ -97,9 +94,7 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
         await publish_graph_cycle_started(deps, {**state, **(gate or {})})
         return {
             **(gate or {}),
-            **trace_update(
-                append_trace(state, node_name="validate_trigger", status="completed")
-            ),
+            **trace_update(append_trace(state, node_name="validate_trigger", status="completed")),
         }
 
     def after_validate_trigger(state: CognitiveGraphState) -> str:
@@ -137,11 +132,7 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
             projection = await deps.projection_loader()
             if projection is not None:
                 raw_orders = getattr(projection, "orders", ()) or ()
-                order_values = (
-                    raw_orders.values()
-                    if isinstance(raw_orders, dict)
-                    else raw_orders
-                )
+                order_values = raw_orders.values() if isinstance(raw_orders, dict) else raw_orders
                 order_projection = {
                     "orders": [
                         (
@@ -274,10 +265,7 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
                 )
             )
         original = dict(decision)
-        recommendations = {
-            str(review.get("finalizer_recommendation") or "")
-            for review in reviews
-        }
+        recommendations = {str(review.get("finalizer_recommendation") or "") for review in reviews}
         if "reoptimize" in recommendations:
             return {
                 "_provisional_target_portfolio_decision": original,
@@ -298,6 +286,7 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
             from joker.objectives.portfolio_review import (
                 normalize_reviewer_forced_wait,
             )
+
             finalized, target_decision, audit = normalize_reviewer_forced_wait(
                 portfolio_decision=original,
                 legacy_decision=state.get("_target_attainment_decision"),
@@ -370,14 +359,9 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
             snapshot_raw = state.get("snapshot_id") or state.get("latest_known_snapshot_id")
             reason = "no valid objective strategy scores; retaining no-trade"
             if ta_authoritative and ta_action in {"wait", "block"}:
-                reason = (
-                    f"target_attainment_{ta_action}: "
-                    + ",".join(
-                        (state.get("_target_attainment_decision") or {}).get(
-                            "reason_codes"
-                        )
-                        or [ta_action]
-                    )
+                reason = f"target_attainment_{ta_action}: " + ",".join(
+                    (state.get("_target_attainment_decision") or {}).get("reason_codes")
+                    or [ta_action]
                 )
             elif state.get("_meta_decision_override") == "abandon" or entry_blocked_by_objective(
                 state
@@ -440,9 +424,7 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
             "role": "review_only" if ta_authoritative else "selector",
             "llm_action": decision.action.value,
             "llm_selected_strategy_id": (
-                str(decision.selected_strategy_id)
-                if decision.selected_strategy_id
-                else None
+                str(decision.selected_strategy_id) if decision.selected_strategy_id else None
             ),
             "target_action": ta_action or None,
             "target_strategy_id": str(ta_strategy) if ta_strategy else None,
@@ -463,8 +445,7 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
                         "action": MetaDecisionAction.ABANDON,
                         "selected_strategy_id": None,
                         "rationale_summary": (
-                            "meta_challenge_of_target_attainment: "
-                            + decision.rationale_summary
+                            "meta_challenge_of_target_attainment: " + decision.rationale_summary
                         ),
                     }
                 )
@@ -608,9 +589,7 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
         if bool(state.get("_target_attainment_authoritative")):
             ta_cid = state.get("_target_attainment_contract_id")
             ta_qty = int(state.get("_target_attainment_quantity") or 0)
-            authorized_positions = list(
-                state.get("_target_authorized_positions") or []
-            )
+            authorized_positions = list(state.get("_target_authorized_positions") or [])
             if not ta_cid or ta_qty < 1:
                 return append_error(
                     state,
@@ -627,9 +606,7 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
                 )
             template_leg = proposal.legs[0]
             if authorized_positions:
-                portfolio_decision = dict(
-                    state.get("_target_portfolio_decision") or {}
-                )
+                portfolio_decision = dict(state.get("_target_portfolio_decision") or {})
                 component_count = len(authorized_positions)
                 new_legs = [
                     template_leg.model_copy(
@@ -638,21 +615,13 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
                             "strategy_id": UUID(str(position["strategy_id"])),
                             "contract_id": str(position["contract_id"]),
                             "quantity": int(position["quantity"]),
-                            "limit_price": Decimal(
-                                str(position["evaluation_premium"])
-                            ),
-                            "evaluation_premium": Decimal(
-                                str(position["evaluation_premium"])
-                            ),
-                            "capital_allocation": Decimal(
-                                str(position["capital_allocation"])
-                            ),
+                            "limit_price": Decimal(str(position["evaluation_premium"])),
+                            "evaluation_premium": Decimal(str(position["evaluation_premium"])),
+                            "capital_allocation": Decimal(str(position["capital_allocation"])),
                             "authorized_position_tuple_id": UUID(
                                 str(position["position_tuple_id"])
                             ),
-                            "target_portfolio_decision_id": UUID(
-                                str(position["decision_id"])
-                            ),
+                            "target_portfolio_decision_id": UUID(str(position["decision_id"])),
                             "selected_portfolio_id": (
                                 UUID(str(portfolio_decision["selected_portfolio_id"]))
                                 if portfolio_decision.get("selected_portfolio_id")
@@ -660,33 +629,21 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
                             ),
                             "component_index": index,
                             "component_count": component_count,
-                            "evaluated_objective_version": int(
-                                position["objective_version"]
-                            ),
+                            "evaluated_objective_version": int(position["objective_version"]),
                             "evaluated_objective_fingerprint": position.get(
                                 "evaluated_objective_fingerprint"
                             ),
-                            "original_decision_snapshot_id": UUID(
-                                str(position["snapshot_id"])
-                            ),
+                            "original_decision_snapshot_id": UUID(str(position["snapshot_id"])),
                             "evaluated_at_exchange_time": (
-                                datetime.fromisoformat(
-                                    str(position["evaluated_at_exchange_time"])
-                                )
+                                datetime.fromisoformat(str(position["evaluated_at_exchange_time"]))
                                 if position.get("evaluated_at_exchange_time")
                                 else None
                             ),
                             "decision_valid_until_exchange_time": (
                                 datetime.fromisoformat(
-                                    str(
-                                        position[
-                                            "decision_valid_until_exchange_time"
-                                        ]
-                                    )
+                                    str(position["decision_valid_until_exchange_time"])
                                 )
-                                if position.get(
-                                    "decision_valid_until_exchange_time"
-                                )
+                                if position.get("decision_valid_until_exchange_time")
                                 else None
                             ),
                             "maximum_decision_age_seconds": position.get(
@@ -771,32 +728,37 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
                 validate_and_compile_proposal(
                     proposal.model_copy(update={"legs": (leg,)}),
                     truth=truth,
-                    evidence_ids=tuple(
-                        e.evidence_id for e in state.get("evidence") or []
-                    ),
+                    evidence_ids=tuple(e.evidence_id for e in state.get("evidence") or []),
                 )
         except Exception as exc:
             if "stale" in str(exc).lower():
-                return {"stale_decision": True, **append_error(
-                    state,
-                    node_name="validate_execution_proposal",
-                    error_code="stale_proposal",
-                    message=str(exc),
-                )}
+                return {
+                    "stale_decision": True,
+                    **append_error(
+                        state,
+                        node_name="validate_execution_proposal",
+                        error_code="stale_proposal",
+                        message=str(exc),
+                    ),
+                }
             return append_error(
                 state,
                 node_name="validate_execution_proposal",
                 error_code="validation_failed",
                 message=str(exc),
             )
-        return trace_update(append_trace(state, node_name="validate_execution_proposal", status="completed"))
+        return trace_update(
+            append_trace(state, node_name="validate_execution_proposal", status="completed")
+        )
 
     async def submit_execution_command(state: CognitiveGraphState) -> dict[str, Any]:
         proposal = state.get("execution_proposal")
         if proposal is None:
             return {}
         if state.get("execution_command_id"):
-            return trace_update(append_trace(state, node_name="submit_execution_command", status="skipped"))
+            return trace_update(
+                append_trace(state, node_name="submit_execution_command", status="skipped")
+            )
         from dataclasses import replace
 
         from joker.runtime.order_action_gateway import (
@@ -815,15 +777,14 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
         result_refs: list[str] = []
         submitted_by_tuple: dict[str, Any] = {}
         portfolio_execution_repo = None
+        portfolio_owner = None
         if authorized_positions:
             if deps.provenance_registry is None and deps.db_path is not None:
                 from joker.persistence.cognitive_execution_provenance import (
                     CognitiveExecutionProvenanceRegistry,
                 )
 
-                deps.provenance_registry = CognitiveExecutionProvenanceRegistry(
-                    deps.db_path
-                )
+                deps.provenance_registry = CognitiveExecutionProvenanceRegistry(deps.db_path)
                 await deps.provenance_registry.initialize()
             if deps.provenance_registry is None:
                 return append_error(
@@ -832,17 +793,46 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
                     error_code="portfolio_execution_store_unavailable",
                     message="durable portfolio execution store unavailable",
                 )
-            portfolio_execution_repo = (
-                deps.provenance_registry.portfolio_executions
+            portfolio_execution_repo = deps.provenance_registry.portfolio_executions
+            from joker.persistence.cognitive_execution_provenance import (
+                PortfolioExecutionOwner,
             )
-        if (
-            deps.provenance_registry is not None
-            and portfolio_decision.get("decision_id")
-        ):
-            prior_components = (
-                await deps.provenance_registry.list_by_target_portfolio_decision_id(
-                    str(portfolio_decision["decision_id"])
+
+            runtime_session = (
+                deps.execution_runtime.session_id
+                if deps.execution_runtime is not None
+                else deps.session_id
+            )
+            broker_account_id = (
+                deps.execution_runtime.broker_account_id
+                if deps.execution_runtime is not None
+                else "default"
+            )
+            if runtime_session != deps.session_id or (
+                state.get("session_id") and str(state["session_id"]) != deps.session_id
+            ):
+                return append_error(
+                    state,
+                    node_name="submit_execution_command",
+                    error_code="portfolio_execution_owner_mismatch",
+                    message="graph and execution runtime session ownership differ",
                 )
+            if deps.clock is None:
+                return append_error(
+                    state,
+                    node_name="submit_execution_command",
+                    error_code="portfolio_execution_owner_unavailable",
+                    message="exchange clock required for portfolio ownership",
+                )
+            portfolio_owner = PortfolioExecutionOwner(
+                session_id=deps.session_id,
+                run_id=deps.run_id,
+                broker_account_id=broker_account_id,
+                trading_date=deps.clock.trading_date().isoformat(),
+            )
+        if deps.provenance_registry is not None and portfolio_decision.get("decision_id"):
+            prior_components = await deps.provenance_registry.list_by_target_portfolio_decision_id(
+                str(portfolio_decision["decision_id"])
             )
             submitted_by_tuple = {
                 str((record.extra or {}).get("authorized_position_tuple_id")): record
@@ -872,9 +862,7 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
                 stable_portfolio_client_order_id,
             )
 
-            evaluated_timestamp = portfolio_decision.get(
-                "evaluated_at_exchange_time"
-            )
+            evaluated_timestamp = portfolio_decision.get("evaluated_at_exchange_time")
             if not evaluated_timestamp:
                 return append_error(
                     state,
@@ -893,9 +881,11 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
                     )
                 )
                 record = PortfolioExecutionComponentRecord(
-                    target_portfolio_decision_id=str(
-                        portfolio_decision["decision_id"]
-                    ),
+                    session_id=portfolio_owner.session_id,
+                    run_id=portfolio_owner.run_id,
+                    broker_account_id=portfolio_owner.broker_account_id,
+                    trading_date=portfolio_owner.trading_date,
+                    target_portfolio_decision_id=str(portfolio_decision["decision_id"]),
                     selected_portfolio_id=(
                         str(portfolio_decision["selected_portfolio_id"])
                         if portfolio_decision.get("selected_portfolio_id")
@@ -907,18 +897,14 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
                     strategy_id=str(position["strategy_id"]),
                     contract_id=str(position["contract_id"]),
                     authorized_quantity=int(position["quantity"]),
-                    capital_allocation=Decimal(
-                        str(position["capital_allocation"])
-                    ),
+                    capital_allocation=Decimal(str(position["capital_allocation"])),
                     client_order_id=client_order_id,
                     status=PortfolioComponentStatus.AUTHORIZED,
                     submitted_quantity=0,
                     filled_quantity=0,
                     remaining_quantity=int(position["quantity"]),
                     original_decision_snapshot_id=str(position["snapshot_id"]),
-                    evaluated_objective_version=int(
-                        position["objective_version"]
-                    ),
+                    evaluated_objective_version=int(position["objective_version"]),
                     evaluated_timestamp=str(evaluated_timestamp),
                     extra={
                         "portfolio_decision": portfolio_decision,
@@ -930,25 +916,24 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
                 if legacy is not None and stored.status == PortfolioComponentStatus.AUTHORIZED:
                     await portfolio_execution_repo.transition(
                         tuple_id,
+                        owner=portfolio_owner,
                         status=PortfolioComponentStatus.SUBMITTED,
                         submitted_quantity=int(position["quantity"]),
                         latest_validation_snapshot_id=legacy.snapshot_id,
                         submission_objective_version=(
                             int((legacy.extra or {}).get("submission_objective_version"))
-                            if (legacy.extra or {}).get("submission_objective_version")
-                            is not None
+                            if (legacy.extra or {}).get("submission_objective_version") is not None
                             else None
                         ),
                         extra_update={"legacy_provenance_recovered": True},
                     )
 
-        async def _mark_remaining_reoptimization(
-            start_index: int, reason: str
-        ) -> None:
+        async def _mark_remaining_reoptimization(start_index: int, reason: str) -> None:
             if portfolio_execution_repo is None:
                 return
             records = await portfolio_execution_repo.list_by_decision(
-                str(portfolio_decision.get("decision_id") or "")
+                str(portfolio_decision.get("decision_id") or ""),
+                owner=portfolio_owner,
             )
             for record in records:
                 if record.component_index < start_index:
@@ -960,9 +945,114 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
                     continue
                 await portfolio_execution_repo.transition(
                     record.authorized_position_tuple_id,
+                    owner=portfolio_owner,
                     status=PortfolioComponentStatus.REOPTIMIZATION_REQUIRED,
                     failure_reoptimization_reason=reason,
                 )
+            if deps.provenance_registry is None:
+                return
+            records = await portfolio_execution_repo.list_by_decision(
+                str(portfolio_decision.get("decision_id") or ""),
+                owner=portfolio_owner,
+            )
+            remaining = tuple(
+                record.authorized_position_tuple_id
+                for record in records
+                if record.status == PortfolioComponentStatus.REOPTIMIZATION_REQUIRED
+            )
+            if not remaining or portfolio_owner is None:
+                return
+            from joker.persistence.cognitive_execution_provenance import (
+                PortfolioReoptimizationRequestRecord,
+                stable_reoptimization_request_id,
+            )
+
+            objective = (
+                await deps.objective_service.get_state()
+                if deps.objective_service is not None
+                else None
+            )
+            objective_payload = (
+                objective.as_dict()
+                if objective is not None and hasattr(objective, "as_dict")
+                else objective.model_dump(mode="json")
+                if objective is not None and hasattr(objective, "model_dump")
+                else dict(vars(objective))
+                if objective is not None and hasattr(objective, "__dict__")
+                else {}
+            )
+            projection = (
+                await deps.projection_loader() if deps.projection_loader is not None else None
+            )
+            raw_positions = (
+                projection.get("positions", {})
+                if isinstance(projection, dict)
+                else getattr(projection, "positions", {})
+                if projection is not None
+                else {}
+            )
+            position_values = (
+                raw_positions.values() if isinstance(raw_positions, dict) else raw_positions
+            )
+            open_positions = tuple(
+                json.loads(
+                    json.dumps(
+                        position.model_dump(mode="json")
+                        if hasattr(position, "model_dump")
+                        else dict(vars(position))
+                        if hasattr(position, "__dict__")
+                        else position,
+                        default=str,
+                    )
+                )
+                for position in position_values
+            )
+            latest_snapshot = (
+                await deps.snapshot_repo.get_latest(deps.session_id)
+                if deps.snapshot_repo is not None
+                else None
+            )
+            latest_snapshot_id = str(
+                getattr(latest_snapshot, "snapshot_id", None) or state.get("snapshot_id") or ""
+            )
+            request_id = stable_reoptimization_request_id(
+                session_id=portfolio_owner.session_id,
+                run_id=portfolio_owner.run_id,
+                broker_account_id=portfolio_owner.broker_account_id,
+                trading_date=portfolio_owner.trading_date,
+                original_portfolio_decision_id=str(portfolio_decision.get("decision_id") or ""),
+                remaining_authorized_tuple_ids=remaining,
+            )
+            await deps.provenance_registry.portfolio_reoptimizations.enqueue(
+                PortfolioReoptimizationRequestRecord(
+                    request_id=request_id,
+                    session_id=portfolio_owner.session_id,
+                    run_id=portfolio_owner.run_id,
+                    broker_account_id=portfolio_owner.broker_account_id,
+                    trading_date=portfolio_owner.trading_date,
+                    original_portfolio_decision_id=str(portfolio_decision.get("decision_id") or ""),
+                    already_filled_tuple_ids=tuple(
+                        record.authorized_position_tuple_id
+                        for record in records
+                        if record.status == PortfolioComponentStatus.FILLED
+                    ),
+                    open_positions=open_positions,
+                    remaining_authorized_tuple_ids=remaining,
+                    reason_codes=(reason,),
+                    latest_objective_state=json.loads(json.dumps(objective_payload, default=str)),
+                    latest_objective_version=int(getattr(objective, "version", 0) or 0),
+                    latest_snapshot_id=latest_snapshot_id,
+                    created_exchange_time=(
+                        deps.clock.now().isoformat()
+                        if deps.clock is not None
+                        else datetime.now(timezone.utc).isoformat()
+                    ),
+                    extra={
+                        "original_authorized_positions": authorized_positions,
+                        "source_cycle_id": state.get("cycle_id"),
+                    },
+                )
+            )
 
         from joker.objectives.decision_fingerprint import (
             ObjectiveDecisionFingerprint,
@@ -972,28 +1062,12 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
             working_orders_from_projection,
         )
 
-        evaluated_fingerprint_raw = portfolio_decision.get(
-            "evaluated_objective_fingerprint"
-        )
+        evaluated_fingerprint_raw = portfolio_decision.get("evaluated_objective_fingerprint")
         expected_fingerprint = (
             ObjectiveDecisionFingerprint.from_json(evaluated_fingerprint_raw)
             if evaluated_fingerprint_raw
             else None
         )
-        if submitted_by_tuple:
-            latest_prior = max(
-                submitted_by_tuple.values(),
-                key=lambda record: int(
-                    (record.extra or {}).get("component_index") or 0
-                ),
-            )
-            post_fingerprint = (latest_prior.extra or {}).get(
-                "post_submission_objective_fingerprint"
-            )
-            if post_fingerprint:
-                expected_fingerprint = ObjectiveDecisionFingerprint.from_json(
-                    post_fingerprint
-                )
 
         def _current_fingerprint(
             objective_state: Any,
@@ -1003,18 +1077,13 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
             permission = getattr(deps, "entry_permission", None)
             broker_eligible = not bool(getattr(deps, "kill_switch", False))
             if permission is not None:
-                broker_eligible = broker_eligible and bool(
-                    getattr(permission, "permitted", False)
-                )
+                broker_eligible = broker_eligible and bool(getattr(permission, "permitted", False))
             runtime = getattr(deps, "execution_runtime", None)
             reconciliation_eligible = (
-                runtime is None
-                or getattr(runtime, "unresolved_reconciliation", None) is None
+                runtime is None or getattr(runtime, "unresolved_reconciliation", None) is None
             )
             broker = getattr(runtime, "_broker", None)
-            broker_identity = (
-                type(broker).__qualname__ if broker is not None else "unconfigured"
-            )
+            broker_identity = type(broker).__qualname__ if broker is not None else "unconfigured"
             return ObjectiveDecisionFingerprint.from_state(
                 objective_state,
                 working_order_count=working_order_count,
@@ -1023,23 +1092,85 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
                 reconciliation_eligible=reconciliation_eligible,
             )
 
-        authorized_fill_transition = False
+        async def _persist_filled_continuation(
+            component: Any,
+            *,
+            filled_quantity: int,
+            broker_order_id: str | None = None,
+        ) -> Any:
+            if filled_quantity != component.authorized_quantity:
+                raise ValueError("filled component quantity is not fully reconciled")
+            if deps.objective_service is None or deps.clock is None or deps.snapshot_repo is None:
+                raise RuntimeError("post-fill continuation truth is unavailable")
+            await deps.objective_service.recompute_from_truth(now=deps.clock.now())
+            post_objective = await deps.objective_service.get_state()
+            post_projection = (
+                await deps.projection_loader() if deps.projection_loader is not None else None
+            )
+            post_fingerprint = _current_fingerprint(
+                post_objective,
+                working_order_count=len(working_orders_from_projection(post_projection)),
+            )
+            latest_snapshot = await deps.snapshot_repo.get_latest(deps.session_id)
+            if latest_snapshot is None:
+                raise RuntimeError("post-fill snapshot is unavailable")
+            exchange_time = deps.clock.now().isoformat()
+            return await portfolio_execution_repo.transition(
+                component.authorized_position_tuple_id,
+                owner=portfolio_owner,
+                status=PortfolioComponentStatus.FILLED,
+                broker_order_id=broker_order_id,
+                submitted_quantity=component.authorized_quantity,
+                filled_quantity=filled_quantity,
+                last_reconciliation_timestamp=exchange_time,
+                post_fill_objective_version=int(post_objective.version),
+                post_fill_objective_fingerprint=post_fingerprint.canonical_json,
+                post_fill_snapshot_id=str(latest_snapshot.snapshot_id),
+                post_fill_exchange_time=exchange_time,
+                reconciled_filled_quantity=filled_quantity,
+                continuation_ready=True,
+                extra_update={
+                    "post_fill_objective_version": int(post_objective.version),
+                    "post_fill_objective_fingerprint": (post_fingerprint.canonical_json),
+                    "post_fill_snapshot_id": str(latest_snapshot.snapshot_id),
+                    "post_fill_exchange_time": exchange_time,
+                    "reconciled_filled_quantity": filled_quantity,
+                    "continuation_ready": True,
+                },
+            )
+
+        if portfolio_execution_repo is not None:
+            persisted = await portfolio_execution_repo.list_by_decision(
+                str(portfolio_decision.get("decision_id") or ""),
+                owner=portfolio_owner,
+            )
+            for component in persisted:
+                if component.status != PortfolioComponentStatus.FILLED:
+                    break
+                if not component.continuation_ready:
+                    await _mark_remaining_reoptimization(
+                        component.component_index + 1,
+                        "filled_component_missing_post_fill_checkpoint",
+                    )
+                    return {
+                        "_block_new_entries": True,
+                        **append_error(
+                            state,
+                            node_name="submit_execution_command",
+                            error_code="post_fill_continuation_checkpoint_missing",
+                            message="filled component lacks durable continuation truth",
+                        ),
+                    }
+                expected_fingerprint = ObjectiveDecisionFingerprint.from_json(
+                    component.post_fill_objective_fingerprint
+                )
+
         for index, leg in enumerate(proposal.legs):
             timing_evidence = None
-            position = (
-                authorized_positions[index]
-                if index < len(authorized_positions)
-                else None
-            )
-            tuple_id = (
-                str(position.get("position_tuple_id") or "")
-                if position is not None
-                else ""
-            )
+            position = authorized_positions[index] if index < len(authorized_positions) else None
+            tuple_id = str(position.get("position_tuple_id") or "") if position is not None else ""
             projection = (
-                await deps.projection_loader()
-                if deps.projection_loader is not None
-                else None
+                await deps.projection_loader() if deps.projection_loader is not None else None
             )
             component_record = (
                 await portfolio_execution_repo.get(tuple_id)
@@ -1047,6 +1178,16 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
                 else None
             )
             if component_record is not None:
+                if portfolio_owner is None or not portfolio_owner.matches(component_record):
+                    return {
+                        "_block_new_entries": True,
+                        **append_error(
+                            state,
+                            node_name="submit_execution_command",
+                            error_code="portfolio_execution_owner_mismatch",
+                            message="persisted component owner does not match runtime",
+                        ),
+                    }
                 order = None
                 orders = (
                     projection.get("orders")
@@ -1066,24 +1207,16 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
                         None,
                     )
                 if order is not None:
-                    prior_component_status = component_record.status
                     raw_status = (
                         order.get("status")
                         if isinstance(order, dict)
                         else getattr(order, "status", "")
                     )
-                    status_value = str(
-                        getattr(raw_status, "value", raw_status) or ""
-                    ).lower()
+                    status_value = str(getattr(raw_status, "value", raw_status) or "").lower()
                     filled_quantity = int(
-                        (
-                            order.get("filled_qty")
-                            or order.get("filled_quantity")
-                            or 0
-                        )
+                        (order.get("filled_qty") or order.get("filled_quantity") or 0)
                         if isinstance(order, dict)
-                        else getattr(order, "filled_qty", 0)
-                        or getattr(order, "filled_quantity", 0)
+                        else getattr(order, "filled_qty", 0) or getattr(order, "filled_quantity", 0)
                     )
                     status_map = {
                         "submitted": PortfolioComponentStatus.SUBMITTED,
@@ -1091,36 +1224,44 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
                         "open": PortfolioComponentStatus.WORKING,
                         "pending": PortfolioComponentStatus.WORKING,
                         "working": PortfolioComponentStatus.WORKING,
-                        "partially_filled": (
-                            PortfolioComponentStatus.PARTIALLY_FILLED
-                        ),
+                        "partially_filled": (PortfolioComponentStatus.PARTIALLY_FILLED),
                         "filled": PortfolioComponentStatus.FILLED,
                         "rejected": PortfolioComponentStatus.REJECTED,
                         "cancelled": PortfolioComponentStatus.CANCELLED,
                     }
                     mapped_status = status_map.get(status_value)
-                    if mapped_status is not None:
-                        component_record = await portfolio_execution_repo.transition(
-                            tuple_id,
-                            status=mapped_status,
-                            submitted_quantity=component_record.authorized_quantity,
-                            filled_quantity=filled_quantity,
-                            last_reconciliation_timestamp=(
-                                deps.clock.now().isoformat()
-                                if deps.clock is not None
-                                else datetime.now(timezone.utc).isoformat()
-                            ),
-                        )
-                        if (
-                            mapped_status == PortfolioComponentStatus.FILLED
-                            and prior_component_status
-                            in {
-                                PortfolioComponentStatus.SUBMITTED,
-                                PortfolioComponentStatus.WORKING,
-                                PortfolioComponentStatus.PARTIALLY_FILLED,
-                            }
-                        ):
-                            authorized_fill_transition = True
+                    terminal_statuses = {
+                        PortfolioComponentStatus.FILLED,
+                        PortfolioComponentStatus.REJECTED,
+                        PortfolioComponentStatus.CANCELLED,
+                        PortfolioComponentStatus.REOPTIMIZATION_REQUIRED,
+                    }
+                    if (
+                        mapped_status is not None
+                        and component_record.status not in terminal_statuses
+                    ):
+                        if mapped_status == PortfolioComponentStatus.FILLED:
+                            component_record = await _persist_filled_continuation(
+                                component_record,
+                                filled_quantity=filled_quantity,
+                                broker_order_id=component_record.broker_order_id,
+                            )
+                            expected_fingerprint = ObjectiveDecisionFingerprint.from_json(
+                                component_record.post_fill_objective_fingerprint
+                            )
+                        else:
+                            component_record = await portfolio_execution_repo.transition(
+                                tuple_id,
+                                owner=portfolio_owner,
+                                status=mapped_status,
+                                submitted_quantity=(component_record.authorized_quantity),
+                                filled_quantity=filled_quantity,
+                                last_reconciliation_timestamp=(
+                                    deps.clock.now().isoformat()
+                                    if deps.clock is not None
+                                    else datetime.now(timezone.utc).isoformat()
+                                ),
+                            )
                 if component_record.status in {
                     PortfolioComponentStatus.SUBMITTED,
                     PortfolioComponentStatus.WORKING,
@@ -1128,15 +1269,13 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
                 }:
                     command_ids.append(component_record.client_order_id)
                     result_refs.append(
-                        component_record.broker_order_id
-                        or component_record.client_order_id
+                        component_record.broker_order_id or component_record.client_order_id
                     )
                     break
                 if component_record.status == PortfolioComponentStatus.FILLED:
                     command_ids.append(component_record.client_order_id)
                     result_refs.append(
-                        component_record.broker_order_id
-                        or component_record.client_order_id
+                        component_record.broker_order_id or component_record.client_order_id
                     )
                     continue
                 if component_record.status in {
@@ -1150,25 +1289,20 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
                     }:
                         await _mark_remaining_reoptimization(
                             index + 1,
-                            "prior_component_"
-                            + component_record.status.value.lower(),
+                            "prior_component_" + component_record.status.value.lower(),
                         )
                     break
             if position is not None and deps.objective_service is not None:
-                if (
-                    deps.clock is not None
-                    and hasattr(deps.objective_service, "recompute_from_truth")
+                if deps.clock is not None and hasattr(
+                    deps.objective_service, "recompute_from_truth"
                 ):
-                    await deps.objective_service.recompute_from_truth(
-                        now=deps.clock.now()
-                    )
+                    await deps.objective_service.recompute_from_truth(now=deps.clock.now())
                 current_objective = await deps.objective_service.get_state()
                 objective_gate_reasons: list[str] = []
                 if (
                     deps.clock is not None
                     and current_objective.deadline_exchange_time is not None
-                    and deps.clock.now()
-                    >= current_objective.deadline_exchange_time
+                    and deps.clock.now() >= current_objective.deadline_exchange_time
                 ):
                     objective_gate_reasons.append("objective_deadline_reached")
                 if (
@@ -1190,10 +1324,7 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
                             state,
                             node_name="submit_execution_command",
                             error_code="target_attainment_recalculation_required",
-                            message=(
-                                "objective gate changed before component: "
-                                + reason
-                            ),
+                            message=("objective gate changed before component: " + reason),
                         ),
                     }
                 if deps.clock is None or not hasattr(deps.clock, "now"):
@@ -1208,19 +1339,15 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
                         ),
                     }
                 submission_exchange_time = deps.clock.now()
-                evaluated_at_raw = (
-                    position.get("evaluated_at_exchange_time")
-                    or portfolio_decision.get("evaluated_at_exchange_time")
-                )
-                maximum_age_raw = (
-                    position.get("maximum_decision_age_seconds")
-                    or portfolio_decision.get("maximum_decision_age_seconds")
-                )
+                evaluated_at_raw = position.get(
+                    "evaluated_at_exchange_time"
+                ) or portfolio_decision.get("evaluated_at_exchange_time")
+                maximum_age_raw = position.get(
+                    "maximum_decision_age_seconds"
+                ) or portfolio_decision.get("maximum_decision_age_seconds")
                 required_horizon = int(
                     position.get("required_resolution_horizon_seconds")
-                    or portfolio_decision.get(
-                        "required_resolution_horizon_seconds"
-                    )
+                    or portfolio_decision.get("required_resolution_horizon_seconds")
                     or 0
                 )
                 if (
@@ -1301,39 +1428,18 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
                             state,
                             node_name="submit_execution_command",
                             error_code="target_attainment_recalculation_required",
-                            message=(
-                                "execution eligibility changed before component: "
-                                + reason
-                            ),
+                            message=("execution eligibility changed before component: " + reason),
                         ),
                     }
                 material_differences = (
-                    expected_fingerprint.material_differences(
-                        submission_fingerprint
-                    )
+                    expected_fingerprint.material_differences(submission_fingerprint)
                     if expected_fingerprint is not None
                     else ("evaluated_objective_fingerprint_missing",)
                 )
-                if authorized_fill_transition:
-                    expected_fill_fields = {
-                        "reserved_capital_usd",
-                        "working_order_reservation_usd",
-                        "filled_position_exposure_usd",
-                        "open_position_count",
-                        "working_order_count",
-                    }
-                    material_differences = tuple(
-                        field
-                        for field in material_differences
-                        if field not in expected_fill_fields
-                    )
-                    expected_fingerprint = submission_fingerprint
-                    authorized_fill_transition = False
                 if material_differences:
                     await _mark_remaining_reoptimization(
                         index,
-                        "material_objective_truth_changed:"
-                        + ",".join(material_differences),
+                        "material_objective_truth_changed:" + ",".join(material_differences),
                     )
                     return {
                         "_block_new_entries": True,
@@ -1354,9 +1460,7 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
                     + working_count
                     + remaining_components
                 )
-                if projected_positions > int(
-                    current_objective.max_concurrent_positions
-                ):
+                if projected_positions > int(current_objective.max_concurrent_positions):
                     await _mark_remaining_reoptimization(
                         index, "maximum_concurrent_positions_changed"
                     )
@@ -1380,12 +1484,8 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
                     ),
                     Decimal("0"),
                 )
-                if remaining_allocation > Decimal(
-                    str(current_objective.available_capital_usd)
-                ):
-                    await _mark_remaining_reoptimization(
-                        index, "available_capital_changed"
-                    )
+                if remaining_allocation > Decimal(str(current_objective.available_capital_usd)):
+                    await _mark_remaining_reoptimization(index, "available_capital_changed")
                     return {
                         "_block_new_entries": True,
                         "_execution_command_ids": command_ids,
@@ -1413,9 +1513,7 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
                         if position is not None
                         else proposal.strategy_id
                     ),
-                    "snapshot_id": (
-                        proposal.snapshot_id
-                    ),
+                    "snapshot_id": (proposal.snapshot_id),
                     "legs": (leg,),
                 }
             )
@@ -1438,16 +1536,9 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
                     exchange_now = deps.clock.now()
                     if authorized_positions:
                         if snapshot.trading_date != deps.clock.trading_date():
-                            raise RuntimeError(
-                                "latest snapshot is not from current trading date"
-                            )
-                        if (
-                            surface is None
-                            or surface.trading_date != deps.clock.trading_date()
-                        ):
-                            raise RuntimeError(
-                                "latest option surface is not current trading date"
-                            )
+                            raise RuntimeError("latest snapshot is not from current trading date")
+                        if surface is None or surface.trading_date != deps.clock.trading_date():
+                            raise RuntimeError("latest option surface is not current trading date")
                 elif authorized_positions:
                     raise RuntimeError("exchange clock unavailable for submission")
                 truth = build_truth_from_deps(
@@ -1455,30 +1546,23 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
                     data_quality=data_quality,
                     option_surface=surface,
                     projection=projection,
-                    already_submitted_proposal_ids=tuple(
-                        deps.submitted_proposal_ids
-                    ),
+                    already_submitted_proposal_ids=tuple(deps.submitted_proposal_ids),
                     now=exchange_now,
                 )
                 provenanced = validate_and_compile_proposal(
                     child_proposal,
                     truth=truth,
-                    evidence_ids=tuple(
-                        e.evidence_id for e in state.get("evidence") or []
-                    ),
+                    evidence_ids=tuple(e.evidence_id for e in state.get("evidence") or []),
                     client_order_id=(
-                        component_record.client_order_id
-                        if component_record is not None
-                        else None
+                        component_record.client_order_id if component_record is not None else None
                     ),
                 )
                 if component_record is not None:
                     component_record = await portfolio_execution_repo.transition(
                         tuple_id,
+                        owner=portfolio_owner,
                         status=PortfolioComponentStatus.READY,
-                        latest_validation_snapshot_id=str(
-                            child_proposal.snapshot_id
-                        ),
+                        latest_validation_snapshot_id=str(child_proposal.snapshot_id),
                         submission_objective_version=(
                             int(current_objective.version)
                             if current_objective is not None
@@ -1490,14 +1574,8 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
                             else datetime.now(timezone.utc).isoformat()
                         ),
                         extra_update={
-                            **(
-                                timing_evidence.as_dict()
-                                if timing_evidence is not None
-                                else {}
-                            ),
-                            "latest_validation_snapshot_id": str(
-                                child_proposal.snapshot_id
-                            ),
+                            **(timing_evidence.as_dict() if timing_evidence is not None else {}),
+                            "latest_validation_snapshot_id": str(child_proposal.snapshot_id),
                         },
                     )
                 await publish_execution_observable_event(
@@ -1512,11 +1590,7 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
                         "capital_revalidation": "passed",
                         "objective_version_revalidation": "passed",
                         "data_quality_revalidation": "passed",
-                        **(
-                            timing_evidence.as_dict()
-                            if timing_evidence is not None
-                            else {}
-                        ),
+                        **(timing_evidence.as_dict() if timing_evidence is not None else {}),
                     },
                 )
             except Exception as exc:
@@ -1558,6 +1632,14 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
                 )
                 action_request = replace(
                     action_request,
+                    session_id=(portfolio_owner.session_id if portfolio_owner else None),
+                    run_id=(portfolio_owner.run_id if portfolio_owner else None),
+                    broker_account_id=(
+                        portfolio_owner.broker_account_id
+                        if portfolio_owner
+                        else action_request.broker_account_id
+                    ),
+                    trading_date=(portfolio_owner.trading_date if portfolio_owner else None),
                     target_portfolio_decision_id=(
                         str(leg.target_portfolio_decision_id)
                         if leg.target_portfolio_decision_id is not None
@@ -1577,13 +1659,9 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
                     component_count=len(proposal.legs),
                     evaluated_objective_version=leg.evaluated_objective_version,
                     submission_objective_version=(
-                        int(current_objective.version)
-                        if current_objective is not None
-                        else None
+                        int(current_objective.version) if current_objective is not None else None
                     ),
-                    evaluated_objective_fingerprint=(
-                        leg.evaluated_objective_fingerprint
-                    ),
+                    evaluated_objective_fingerprint=(leg.evaluated_objective_fingerprint),
                     submission_objective_fingerprint=(
                         submission_fingerprint.canonical_json
                         if submission_fingerprint is not None
@@ -1626,31 +1704,25 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
                         else None
                     ),
                     evaluation_premium=(
-                        str(leg.evaluation_premium)
-                        if leg.evaluation_premium is not None
-                        else None
+                        str(leg.evaluation_premium) if leg.evaluation_premium is not None else None
                     ),
                     capital_allocation=(
-                        str(leg.capital_allocation)
-                        if leg.capital_allocation is not None
-                        else None
+                        str(leg.capital_allocation) if leg.capital_allocation is not None else None
                     ),
                 )
                 sizing = state.get("_sizing_decision") or {}
                 estimate_id = sizing.get("estimate_id")
                 if estimate_id:
-                    action_request = replace(
-                        action_request, estimate_id=str(estimate_id)
-                    )
+                    action_request = replace(action_request, estimate_id=str(estimate_id))
                 gateway_result = await gateway.submit(action_request)
                 if not gateway_result.submitted:
                     if component_record is not None:
                         component_record = await portfolio_execution_repo.transition(
                             tuple_id,
+                            owner=portfolio_owner,
                             status=PortfolioComponentStatus.REOPTIMIZATION_REQUIRED,
                             failure_reoptimization_reason=(
-                                gateway_result.blocked_reason
-                                or "order_action_blocked"
+                                gateway_result.blocked_reason or "order_action_blocked"
                             ),
                         )
                     await _mark_remaining_reoptimization(
@@ -1663,10 +1735,7 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
                         reoptimization_required=True,
                         payload={
                             "component_index": index,
-                            "reason": (
-                                gateway_result.blocked_reason
-                                or "order action blocked"
-                            ),
+                            "reason": (gateway_result.blocked_reason or "order action blocked"),
                             "submitted_component_count": len(command_ids),
                         },
                     )
@@ -1681,10 +1750,7 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
                                 if command_ids
                                 else "gateway_blocked"
                             ),
-                            message=(
-                                gateway_result.blocked_reason
-                                or "order action blocked"
-                            ),
+                            message=(gateway_result.blocked_reason or "order action blocked"),
                         ),
                     }
                 command_id = gateway_result.client_order_id
@@ -1712,15 +1778,27 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
                             strategy_id=str(provenanced.strategy_id),
                             cycle_id=str(provenanced.cycle_id),
                             snapshot_id=str(provenanced.snapshot_id),
-                            contract_id=contract_id_for(
-                                provenanced.command.intent.contract
-                            ),
+                            contract_id=contract_id_for(provenanced.command.intent.contract),
                             session_id=deps.session_id,
                             kind="entry",
-                            causation_event_id=_resolve_entry_causation_event_id(
-                                state
-                            ),
+                            causation_event_id=_resolve_entry_causation_event_id(state),
                             extra={
+                                "session_id": (
+                                    portfolio_owner.session_id
+                                    if portfolio_owner
+                                    else deps.session_id
+                                ),
+                                "run_id": (
+                                    portfolio_owner.run_id if portfolio_owner else deps.run_id
+                                ),
+                                "broker_account_id": (
+                                    portfolio_owner.broker_account_id
+                                    if portfolio_owner
+                                    else "default"
+                                ),
+                                "trading_date": (
+                                    portfolio_owner.trading_date if portfolio_owner else None
+                                ),
                                 "target_portfolio_decision_id": (
                                     str(leg.target_portfolio_decision_id)
                                     if leg.target_portfolio_decision_id
@@ -1734,9 +1812,7 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
                                 "authorized_position_tuple_id": tuple_id or None,
                                 "component_index": index,
                                 "component_count": len(proposal.legs),
-                                "evaluated_objective_version": (
-                                    leg.evaluated_objective_version
-                                ),
+                                "evaluated_objective_version": (leg.evaluated_objective_version),
                                 "submission_objective_version": (
                                     int(current_objective.version)
                                     if current_objective is not None
@@ -1755,22 +1831,16 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
                                     if leg.original_decision_snapshot_id
                                     else None
                                 ),
-                                "submission_snapshot_id": str(
-                                    child_proposal.snapshot_id
-                                ),
+                                "submission_snapshot_id": str(child_proposal.snapshot_id),
                                 **(
-                                    timing_evidence.as_dict()
-                                    if timing_evidence is not None
-                                    else {}
+                                    timing_evidence.as_dict() if timing_evidence is not None else {}
                                 ),
                             },
                         )
                     )
                 result = await deps.submit_callback(provenanced)
             if component_record is not None:
-                broker_status = str(
-                    getattr(result, "status", "submitted") or "submitted"
-                ).lower()
+                broker_status = str(getattr(result, "status", "submitted") or "submitted").lower()
                 broker_status_map = {
                     "accepted": PortfolioComponentStatus.WORKING,
                     "open": PortfolioComponentStatus.WORKING,
@@ -1786,25 +1856,32 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
                 )
                 filled_quantity = int(
                     getattr(result, "filled_quantity", 0)
-                    or (
-                        leg.quantity
-                        if durable_status == PortfolioComponentStatus.FILLED
-                        else 0
+                    or (leg.quantity if durable_status == PortfolioComponentStatus.FILLED else 0)
+                )
+                result_broker_order_id = str(getattr(result, "order_id", "") or "") or None
+                if durable_status == PortfolioComponentStatus.FILLED:
+                    component_record = await _persist_filled_continuation(
+                        component_record,
+                        filled_quantity=filled_quantity,
+                        broker_order_id=result_broker_order_id,
                     )
-                )
-                component_record = await portfolio_execution_repo.transition(
-                    tuple_id,
-                    status=durable_status,
-                    broker_order_id=str(getattr(result, "order_id", "") or "")
-                    or None,
-                    submitted_quantity=leg.quantity,
-                    filled_quantity=filled_quantity,
-                    last_reconciliation_timestamp=(
-                        deps.clock.now().isoformat()
-                        if deps.clock is not None
-                        else datetime.now(timezone.utc).isoformat()
-                    ),
-                )
+                    expected_fingerprint = ObjectiveDecisionFingerprint.from_json(
+                        component_record.post_fill_objective_fingerprint
+                    )
+                else:
+                    component_record = await portfolio_execution_repo.transition(
+                        tuple_id,
+                        owner=portfolio_owner,
+                        status=durable_status,
+                        broker_order_id=result_broker_order_id,
+                        submitted_quantity=leg.quantity,
+                        filled_quantity=filled_quantity,
+                        last_reconciliation_timestamp=(
+                            deps.clock.now().isoformat()
+                            if deps.clock is not None
+                            else datetime.now(timezone.utc).isoformat()
+                        ),
+                    )
                 if component_record.status in {
                     PortfolioComponentStatus.REJECTED,
                     PortfolioComponentStatus.CANCELLED,
@@ -1821,9 +1898,7 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
                 and deps.objective_service is not None
                 and deps.clock is not None
             ):
-                await deps.objective_service.recompute_from_truth(
-                    now=deps.clock.now()
-                )
+                await deps.objective_service.recompute_from_truth(now=deps.clock.now())
                 post_objective = await deps.objective_service.get_state()
                 post_projection = (
                     await deps.projection_loader()
@@ -1832,17 +1907,15 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
                 )
                 post_fingerprint = _current_fingerprint(
                     post_objective,
-                    working_order_count=len(
-                        working_orders_from_projection(post_projection)
-                    ),
+                    working_order_count=len(working_orders_from_projection(post_projection)),
                 )
-                expected_fingerprint = post_fingerprint
+                if (
+                    component_record is None
+                    or component_record.status != PortfolioComponentStatus.FILLED
+                ):
+                    expected_fingerprint = post_fingerprint
                 if deps.provenance_registry is not None:
-                    recorded = (
-                        await deps.provenance_registry.get_by_client_order_id(
-                            command_id
-                        )
-                    )
+                    recorded = await deps.provenance_registry.get_by_client_order_id(command_id)
                     if recorded is not None:
                         await deps.provenance_registry.record(
                             replace(
@@ -1870,11 +1943,11 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
             [
                 record.as_dict()
                 for record in await portfolio_execution_repo.list_by_decision(
-                    str(portfolio_decision.get("decision_id") or "")
+                    str(portfolio_decision.get("decision_id") or ""),
+                    owner=portfolio_owner,
                 )
             ]
-            if portfolio_execution_repo is not None
-            and portfolio_decision.get("decision_id")
+            if portfolio_execution_repo is not None and portfolio_decision.get("decision_id")
             else []
         )
         return {
@@ -1894,7 +1967,9 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
 
     async def persist_pending_cycle(state: CognitiveGraphState) -> dict[str, Any]:
         await _publish_cycle_completed(deps, state, outcome="delayed")
-        return trace_update(append_trace(state, node_name="persist_pending_cycle", status="completed"))
+        return trace_update(
+            append_trace(state, node_name="persist_pending_cycle", status="completed")
+        )
 
     async def persist_evidence_request(state: CognitiveGraphState) -> dict[str, Any]:
         meta = state.get("meta_decision")
@@ -1930,9 +2005,7 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
     graph.add_node("discovery", discovery)
     graph.add_node("strategy", strategy_graph)
     graph.add_node("assess_goal_feasibility", assess_goal_feasibility)
-    graph.add_node(
-        "score_strategies_against_objective", score_strategies_against_objective
-    )
+    graph.add_node("score_strategies_against_objective", score_strategies_against_objective)
     graph.add_node("select_debate_candidates", select_debate_candidates)
     graph.add_node("debate", debate)
     graph.add_node("finalize_portfolio_review", finalize_portfolio_review)

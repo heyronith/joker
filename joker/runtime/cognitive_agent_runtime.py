@@ -164,9 +164,7 @@ class CognitiveAgentRuntime:
                 CognitiveExecutionProvenanceRegistry,
             )
 
-            provenance = CognitiveExecutionProvenanceRegistry(
-                self._deps.db_path
-            )
+            provenance = CognitiveExecutionProvenanceRegistry(self._deps.db_path)
             await provenance.initialize()
             self._deps.provenance_registry = provenance
         if self._deps.cycle_registry is None and self._deps.db_path is not None:
@@ -179,18 +177,13 @@ class CognitiveAgentRuntime:
             )
             await registry.initialize()
             self._deps.cycle_registry = registry
-        if (
-            self._deps.order_management_action_repo is None
-            and self._deps.db_path is not None
-        ):
+        if self._deps.order_management_action_repo is None and self._deps.db_path is not None:
             from joker.persistence.order_management_actions import (
                 OrderManagementActionRepository,
             )
 
             om_repo = OrderManagementActionRepository(
-                Path(self._deps.db_path).with_name(
-                    Path(self._deps.db_path).stem + "_om_actions.db"
-                )
+                Path(self._deps.db_path).with_name(Path(self._deps.db_path).stem + "_om_actions.db")
             )
             await om_repo.initialize()
             self._deps.order_management_action_repo = om_repo
@@ -202,6 +195,7 @@ class CognitiveAgentRuntime:
         try:
             await self._resume_unfinished_cycles()
             await self._resume_pending_portfolio_executions()
+            await self._resume_pending_portfolio_reoptimizations()
         except Exception as exc:  # noqa: BLE001
             logger.exception("cognitive_cycle_recovery_failed", exc_info=exc)
             self._status = "degraded"
@@ -220,12 +214,20 @@ class CognitiveAgentRuntime:
     async def _resume_pending_portfolio_executions(self) -> None:
         """Reconcile durable component state and resume only the next eligible leg."""
         registry = self._deps.provenance_registry
-        if registry is None or self._decision_graph is None:
+        if registry is None or self._decision_graph is None or self._deps.clock is None:
             return
-        records = await registry.portfolio_executions.list_resumable()
-        decision_ids = sorted(
-            {record.target_portfolio_decision_id for record in records}
+        broker_account_id = (
+            self._deps.execution_runtime.broker_account_id
+            if self._deps.execution_runtime is not None
+            else "default"
         )
+        records = await registry.portfolio_executions.list_resumable(
+            session_id=self._session_id,
+            run_id=self._run_id,
+            broker_account_id=broker_account_id,
+            trading_date=self._deps.clock.trading_date().isoformat(),
+        )
+        decision_ids = sorted({record.target_portfolio_decision_id for record in records})
         for decision_id in decision_ids:
             await self._resume_portfolio_decision(decision_id)
 
@@ -233,12 +235,26 @@ class CognitiveAgentRuntime:
         registry = self._deps.provenance_registry
         if registry is None or self._decision_graph is None:
             return
-        records = await registry.portfolio_executions.list_by_decision(decision_id)
-        if not records:
-            return
         from joker.persistence.cognitive_execution_provenance import (
             PortfolioComponentStatus,
+            PortfolioExecutionOwner,
         )
+
+        if self._deps.clock is None:
+            return
+        owner = PortfolioExecutionOwner(
+            session_id=self._session_id,
+            run_id=self._run_id,
+            broker_account_id=(
+                self._deps.execution_runtime.broker_account_id
+                if self._deps.execution_runtime is not None
+                else "default"
+            ),
+            trading_date=self._deps.clock.trading_date().isoformat(),
+        )
+        records = await registry.portfolio_executions.list_by_decision(decision_id, owner=owner)
+        if not records:
+            return
 
         execution_runtime = self._deps.execution_runtime
         if execution_runtime is not None:
@@ -250,9 +266,7 @@ class CognitiveAgentRuntime:
                 }:
                     continue
                 try:
-                    await execution_runtime.poll_order_status(
-                        record.client_order_id
-                    )
+                    await execution_runtime.poll_order_status(record.client_order_id)
                 except Exception as exc:  # noqa: BLE001
                     # Fail closed: without reconciled broker truth, no later
                     # authorized component may advance on restart.
@@ -302,16 +316,59 @@ class CognitiveAgentRuntime:
 
     async def _resume_portfolio_for_order(self, client_order_id: str) -> None:
         registry = self._deps.provenance_registry
-        if registry is None:
+        if registry is None or self._deps.clock is None:
             return
+        from joker.persistence.cognitive_execution_provenance import (
+            PortfolioExecutionOwner,
+        )
+
+        broker_account_id = (
+            self._deps.execution_runtime.broker_account_id
+            if self._deps.execution_runtime is not None
+            else "default"
+        )
+        owner = PortfolioExecutionOwner(
+            session_id=self._session_id,
+            run_id=self._run_id,
+            broker_account_id=broker_account_id,
+            trading_date=self._deps.clock.trading_date().isoformat(),
+        )
         component = await registry.portfolio_executions.get_by_client_order_id(
-            client_order_id
+            client_order_id, owner=owner
         )
         if component is None:
             return
-        await self._resume_portfolio_decision(
-            component.target_portfolio_decision_id
+        await self._resume_portfolio_decision(component.target_portfolio_decision_id)
+
+    async def _resume_pending_portfolio_reoptimizations(self) -> None:
+        """Run durable continuation optimization even while positions are open."""
+        registry = self._deps.provenance_registry
+        if registry is None or self._decision_graph is None or self._deps.clock is None:
+            return
+        broker_account_id = (
+            self._deps.execution_runtime.broker_account_id
+            if self._deps.execution_runtime is not None
+            else "default"
         )
+        requests = await registry.portfolio_reoptimizations.list_pending(
+            session_id=self._session_id,
+            run_id=self._run_id,
+            broker_account_id=broker_account_id,
+            trading_date=self._deps.clock.trading_date().isoformat(),
+        )
+        for request in requests:
+            event = make_event(
+                EventType.MARKET_SNAPSHOT_CREATED,
+                session_id=self._session_id,
+                source="portfolio_reoptimization",
+                exchange_timestamp=self._deps.clock.now(),
+                payload={
+                    "snapshot_id": request.latest_snapshot_id,
+                    "portfolio_reoptimization_request_id": request.request_id,
+                    "cycle_id": f"portfolio-reoptimization-{request.request_id}",
+                },
+            )
+            await self._invoke_decision_graph(event)
 
     async def _resume_unfinished_cycles(self) -> None:
         registry = self._deps.cycle_registry
@@ -323,9 +380,7 @@ class CognitiveAgentRuntime:
         resumable = await registry.list_resumable(self._session_id)
         for record in resumable:
             graph = (
-                self._decision_graph
-                if record.graph_kind == "decision"
-                else self._position_graph
+                self._decision_graph if record.graph_kind == "decision" else self._position_graph
             )
             if graph is None:
                 continue
@@ -542,23 +597,17 @@ class CognitiveAgentRuntime:
         priority = self._event_priority(event)
         kind = self._classify(event)
         self._sequence += 1
-        work = _QueuedWork(
-            priority=priority, sequence=self._sequence, event=event, kind=kind
-        )
+        work = _QueuedWork(priority=priority, sequence=self._sequence, event=event, kind=kind)
         if kind in {"position", "order"}:
             await self._position_queue.put(work)
         else:
             await self._decision_queue.put(work)
-        self._counters.queued_events = (
-            self._decision_queue.qsize() + self._position_queue.qsize()
-        )
+        self._counters.queued_events = self._decision_queue.qsize() + self._position_queue.qsize()
 
     async def _enqueue_snapshot_work(self, event: DomainEvent) -> None:
         """Route snapshots using authoritative ledger projection, not event metadata."""
         snapshot_id = str(
-            event.payload.get("snapshot_id")
-            or event.payload.get("market_snapshot_id")
-            or ""
+            event.payload.get("snapshot_id") or event.payload.get("market_snapshot_id") or ""
         )
         open_positions = await self._open_position_contract_ids()
         working_entry = await self._has_working_entry_order()
@@ -590,15 +639,8 @@ class CognitiveAgentRuntime:
                     )
                 )
         # New-entry only when flat, no working entry, and not suppressed (shadow).
-        if (
-            not open_positions
-            and not working_entry
-            and not self._suppress_new_entry_snapshots
-        ):
-            if (
-                self._config.market_snapshot_coalescing
-                and self._new_entry_in_flight
-            ):
+        if not open_positions and not working_entry and not self._suppress_new_entry_snapshots:
+            if self._config.market_snapshot_coalescing and self._new_entry_in_flight:
                 self._pending_new_entry_snapshot = snapshot_id or self._pending_new_entry_snapshot
             else:
                 self._sequence += 1
@@ -610,9 +652,7 @@ class CognitiveAgentRuntime:
                         kind="decision",
                     )
                 )
-        self._counters.queued_events = (
-            self._decision_queue.qsize() + self._position_queue.qsize()
-        )
+        self._counters.queued_events = self._decision_queue.qsize() + self._position_queue.qsize()
 
     async def _has_working_entry_order(self) -> bool:
         if self._deps.projection_loader is None:
@@ -640,8 +680,10 @@ class CognitiveAgentRuntime:
             return []
         positions = getattr(projection, "positions", None) or {}
         open_ids: list[str] = []
-        items = positions.items() if isinstance(positions, dict) else (
-            (getattr(p, "contract_id", None), p) for p in positions
+        items = (
+            positions.items()
+            if isinstance(positions, dict)
+            else ((getattr(p, "contract_id", None), p) for p in positions)
         )
         for key, pos in items:
             qty = getattr(pos, "quantity", None)
@@ -772,9 +814,7 @@ class CognitiveAgentRuntime:
     async def _run_decision_work(self, event: DomainEvent) -> None:
         if self._new_entry_in_flight:
             snapshot_id = str(
-                event.payload.get("snapshot_id")
-                or event.payload.get("market_snapshot_id")
-                or ""
+                event.payload.get("snapshot_id") or event.payload.get("market_snapshot_id") or ""
             )
             self._pending_new_entry_snapshot = snapshot_id or self._pending_new_entry_snapshot
             return
@@ -796,6 +836,36 @@ class CognitiveAgentRuntime:
 
     async def _invoke_decision_graph(self, event: DomainEvent) -> None:
         assert self._decision_graph is not None
+        reoptimization_request = None
+        reoptimization_request_id = str(
+            event.payload.get("portfolio_reoptimization_request_id") or ""
+        )
+        if reoptimization_request_id:
+            registry = self._deps.provenance_registry
+            if registry is None:
+                return
+            reoptimization_request = await registry.portfolio_reoptimizations.get(
+                reoptimization_request_id
+            )
+            if reoptimization_request is None or self._deps.clock is None:
+                return
+            broker_account_id = (
+                self._deps.execution_runtime.broker_account_id
+                if self._deps.execution_runtime is not None
+                else "default"
+            )
+            if (
+                reoptimization_request.session_id != self._session_id
+                or reoptimization_request.run_id != self._run_id
+                or reoptimization_request.broker_account_id != broker_account_id
+                or reoptimization_request.trading_date
+                != self._deps.clock.trading_date().isoformat()
+            ):
+                logger.warning(
+                    "portfolio_reoptimization_owner_mismatch",
+                    extra={"request_id": reoptimization_request_id},
+                )
+                return
         if await self._has_working_entry_order():
             logger.info(
                 "decision_cycle_skipped_working_entry",
@@ -803,9 +873,7 @@ class CognitiveAgentRuntime:
             )
             return
         snapshot_id = str(
-            event.payload.get("snapshot_id")
-            or event.payload.get("market_snapshot_id")
-            or ""
+            event.payload.get("snapshot_id") or event.payload.get("market_snapshot_id") or ""
         )
         if not snapshot_id:
             return
@@ -836,6 +904,44 @@ class CognitiveAgentRuntime:
             trigger_event_type=event.event_type.value,
             snapshot_id=snapshot_id,
         )
+        if reoptimization_request is not None:
+            from joker.persistence.cognitive_execution_provenance import (
+                PortfolioReoptimizationStatus,
+            )
+
+            if reoptimization_request.status == PortfolioReoptimizationStatus.PENDING:
+                reoptimization_request = await (
+                    self._deps.provenance_registry.portfolio_reoptimizations.transition(
+                        reoptimization_request.request_id,
+                        status=PortfolioReoptimizationStatus.RUNNING,
+                        expected_state_version=reoptimization_request.state_version,
+                    )
+                )
+            persisted_contract_ids = {
+                str(position.get("contract_id") or position.get("symbol") or "")
+                for position in reoptimization_request.open_positions
+                if (position.get("contract_id") or position.get("symbol"))
+            }
+            current_open_contract_ids = set(await self._open_position_contract_ids())
+            excluded_contract_ids = sorted(
+                persisted_contract_ids | current_open_contract_ids
+            )
+            if (
+                self._deps.objective_service is not None
+                and hasattr(self._deps.objective_service, "recompute_from_truth")
+            ):
+                await self._deps.objective_service.recompute_from_truth(
+                    now=self._deps.clock.now()
+                )
+            state.update(
+                {
+                    "_portfolio_reoptimization_request_id": (reoptimization_request.request_id),
+                    "_reoptimization_excluded_contract_ids": excluded_contract_ids,
+                    "_reoptimization_existing_positions": list(
+                        reoptimization_request.open_positions
+                    ),
+                }
+            )
         if self._deps.event_bus is not None:
             await self._deps.event_bus.publish(
                 make_event(
@@ -870,6 +976,24 @@ class CognitiveAgentRuntime:
                     self._decision_graph.ainvoke(state, config=config),
                     timeout=float(self._config.max_cycle_seconds),
                 )
+            if reoptimization_request is not None:
+                from joker.persistence.cognitive_execution_provenance import (
+                    PortfolioReoptimizationStatus,
+                )
+
+                replacement = dict(result_state.get("_target_portfolio_decision") or {})
+                replacement_id = str(replacement.get("decision_id") or "")
+                if (
+                    not replacement_id
+                    or replacement_id == reoptimization_request.original_portfolio_decision_id
+                ):
+                    raise RuntimeError("continuation optimization did not create a new decision")
+                await self._deps.provenance_registry.portfolio_reoptimizations.transition(
+                    reoptimization_request.request_id,
+                    status=PortfolioReoptimizationStatus.COMPLETED,
+                    replacement_decision_id=replacement_id,
+                    replacement_action=str(replacement.get("action") or "WAIT"),
+                )
             self._counters.last_success_at = datetime.now(timezone.utc)
             self._status = "healthy"
             if self._deps.cycle_registry is not None:
@@ -901,6 +1025,15 @@ class CognitiveAgentRuntime:
                 recoverable=True,
             )
             self._status = "degraded"
+            if reoptimization_request is not None:
+                from joker.persistence.cognitive_execution_provenance import (
+                    PortfolioReoptimizationStatus,
+                )
+
+                await self._deps.provenance_registry.portfolio_reoptimizations.transition(
+                    reoptimization_request.request_id,
+                    status=PortfolioReoptimizationStatus.FAILED,
+                )
         except Exception as exc:
             self._counters.last_error = CognitiveError(
                 error_code="cycle_failed",
@@ -908,10 +1041,24 @@ class CognitiveAgentRuntime:
                 recoverable=True,
             )
             self._status = "degraded"
+            if reoptimization_request is not None:
+                from joker.persistence.cognitive_execution_provenance import (
+                    PortfolioReoptimizationStatus,
+                )
 
-    async def _resolve_provenance(
-        self, event: DomainEvent
-    ) -> dict[str, Any]:
+                latest_request = await self._deps.provenance_registry.portfolio_reoptimizations.get(
+                    reoptimization_request.request_id
+                )
+                if latest_request is not None and latest_request.status in {
+                    PortfolioReoptimizationStatus.PENDING,
+                    PortfolioReoptimizationStatus.RUNNING,
+                }:
+                    await self._deps.provenance_registry.portfolio_reoptimizations.transition(
+                        reoptimization_request.request_id,
+                        status=PortfolioReoptimizationStatus.FAILED,
+                    )
+
+    async def _resolve_provenance(self, event: DomainEvent) -> dict[str, Any]:
         """Resolve cognitive metadata from registry using Task 1 event fields."""
         payload = dict(event.payload)
         client_order_id = str(payload.get("client_order_id") or "")
@@ -983,11 +1130,7 @@ class CognitiveAgentRuntime:
                 extra={"event_type": event.event_type.value},
             )
             return
-        snapshot_id = str(
-            resolved.get("snapshot_id")
-            or resolved.get("market_snapshot_id")
-            or ""
-        )
+        snapshot_id = str(resolved.get("snapshot_id") or resolved.get("market_snapshot_id") or "")
         if not snapshot_id:
             logger.info(
                 "position_work_skipped_missing_snapshot",
@@ -1001,11 +1144,9 @@ class CognitiveAgentRuntime:
             self._session_id,
             str(event.event_id),
         )
-        parent_entry_cycle_id = str(
-            resolved.get("parent_entry_cycle_id")
-            or resolved.get("cycle_id")
-            or ""
-        ) or None
+        parent_entry_cycle_id = (
+            str(resolved.get("parent_entry_cycle_id") or resolved.get("cycle_id") or "") or None
+        )
         from joker.graph.langgraph_checkpointer import cognitive_thread_id
         from joker.persistence.cognitive_cycle_registry import CognitiveCycleRecord
 
@@ -1024,9 +1165,7 @@ class CognitiveAgentRuntime:
                     checkpoint_thread_id=thread_id,
                     parent_entry_cycle_id=parent_entry_cycle_id,
                     original_strategy_id=str(
-                        resolved.get("original_strategy_id")
-                        or resolved.get("strategy_id")
-                        or ""
+                        resolved.get("original_strategy_id") or resolved.get("strategy_id") or ""
                     )
                     or None,
                     original_proposal_id=str(resolved.get("proposal_id") or "") or None,
@@ -1058,9 +1197,7 @@ class CognitiveAgentRuntime:
         applied = None
         if self._evolution_runtime is not None:
             contract = str(resolved.get("contract_id") or position_id)
-            origin = self._evolution_runtime.originating_configuration_for_contract(
-                contract
-            )
+            origin = self._evolution_runtime.originating_configuration_for_contract(contract)
             if origin is None and parent_entry_cycle_id:
                 origin = self._evolution_runtime.get_pinned(parent_entry_cycle_id)
             if origin is not None:
@@ -1103,8 +1240,7 @@ class CognitiveAgentRuntime:
                             or ""
                         )
                         or None,
-                        original_proposal_id=str(resolved.get("proposal_id") or "")
-                        or None,
+                        original_proposal_id=str(resolved.get("proposal_id") or "") or None,
                         payload={
                             "configuration_version_id": (
                                 str(applied.configuration_version_id)
@@ -1126,11 +1262,7 @@ class CognitiveAgentRuntime:
         if not client_order_id:
             return
         await self._sync_objective_reservation(event, client_order_id=client_order_id)
-        snapshot_id = str(
-            resolved.get("snapshot_id")
-            or resolved.get("market_snapshot_id")
-            or ""
-        )
+        snapshot_id = str(resolved.get("snapshot_id") or resolved.get("market_snapshot_id") or "")
         order_projection: dict[str, Any] = {
             "client_order_id": client_order_id,
             "event_type": event.event_type.value,
@@ -1138,17 +1270,13 @@ class CognitiveAgentRuntime:
         }
         if self._deps.execution_runtime is not None:
             try:
-                sync = await self._deps.execution_runtime.poll_order_status(
-                    client_order_id
-                )
+                sync = await self._deps.execution_runtime.poll_order_status(client_order_id)
                 if sync is not None:
                     contract = getattr(sync, "contract", None)
                     contract_payload = None
                     if contract is not None:
                         dump = getattr(contract, "model_dump", None)
-                        contract_payload = (
-                            dump(mode="json") if callable(dump) else str(contract)
-                        )
+                        contract_payload = dump(mode="json") if callable(dump) else str(contract)
                     order_projection.update(
                         {
                             "status": sync.status,
@@ -1166,6 +1294,7 @@ class CognitiveAgentRuntime:
                 logger.warning("order_projection_hydrate_failed", extra={"error": str(exc)})
 
         await self._resume_portfolio_for_order(client_order_id)
+        await self._resume_pending_portfolio_reoptimizations()
 
         context: ContextPackage | None = None
         if snapshot_id and self._deps.snapshot_repo is not None:
@@ -1191,9 +1320,7 @@ class CognitiveAgentRuntime:
                     data_quality=data_quality,
                     option_surface_slice=surface_slice,
                     order_projection={
-                        k: v
-                        for k, v in order_projection.items()
-                        if not str(k).startswith("_")
+                        k: v for k, v in order_projection.items() if not str(k).startswith("_")
                     },
                     objective_context=objective_context,
                 )
@@ -1211,15 +1338,11 @@ class CognitiveAgentRuntime:
         applied = None
         if self._evolution_runtime is not None:
             contract = str(
-                resolved.get("contract_id")
-                or (order_projection or {}).get("contract_id")
-                or ""
+                resolved.get("contract_id") or (order_projection or {}).get("contract_id") or ""
             )
             origin = None
             if contract:
-                origin = self._evolution_runtime.originating_configuration_for_contract(
-                    contract
-                )
+                origin = self._evolution_runtime.originating_configuration_for_contract(contract)
             parent_cycle = str(resolved.get("cycle_id") or "")
             if origin is None and parent_cycle:
                 origin = self._evolution_runtime.get_pinned(parent_cycle)
@@ -1350,8 +1473,7 @@ class CognitiveAgentRuntime:
             qty = int(
                 decision.new_quantity
                 if decision.new_quantity is not None
-                else projection.get("quantity")
-                or 1
+                else projection.get("quantity") or 1
             )
             if action == "reduce_quantity":
                 open_qty = int(projection.get("quantity") or qty)

@@ -91,6 +91,9 @@ class OrderActionRequest:
     degraded_exit_reason: str | None = None
     evidence_ids: tuple[str, ...] = ()
     broker_account_id: str = "default"
+    session_id: str | None = None
+    run_id: str | None = None
+    trading_date: str | None = None
     # Factual horizon-start anchor for entry provenance (never a fill event).
     # Prefer decision-completed → execution-proposal → cognitive-cycle trigger.
     causation_event_id: str | None = None
@@ -154,9 +157,7 @@ def working_orders_from_projection(
             requested = int(order.submitted_qty)
             filled = int(order.filled_qty)
         elif isinstance(order, dict):
-            status = str(
-                getattr(order.get("status"), "value", None) or order.get("status") or ""
-            )
+            status = str(getattr(order.get("status"), "value", None) or order.get("status") or "")
             client_id = str(order.get("client_order_id") or "")
             contract_id = str(order.get("contract_id") or "")
             side = str(order.get("side") or "")
@@ -171,8 +172,12 @@ def working_orders_from_projection(
             client_id = str(getattr(order, "client_order_id", "") or "")
             contract_id = str(getattr(order, "contract_id", "") or "")
             side = str(getattr(order, "side", "") or "")
-            requested = int(getattr(order, "submitted_qty", 0) or getattr(order, "quantity", 0) or 0)
-            filled = int(getattr(order, "filled_qty", 0) or getattr(order, "filled_quantity", 0) or 0)
+            requested = int(
+                getattr(order, "submitted_qty", 0) or getattr(order, "quantity", 0) or 0
+            )
+            filled = int(
+                getattr(order, "filled_qty", 0) or getattr(order, "filled_quantity", 0) or 0
+            )
         if status not in _WORKING_STATUSES:
             continue
         if not client_id:
@@ -289,9 +294,7 @@ class OrderActionGateway:
             return OrderActionResult(
                 submitted=False,
                 client_order_id=request.client_order_id,
-                blocked_reason=(
-                    "entry_permission_blocked: " + (",".join(reasons) or "blocked")
-                ),
+                blocked_reason=("entry_permission_blocked: " + (",".join(reasons) or "blocked")),
                 working_orders={},
             )
 
@@ -316,40 +319,26 @@ class OrderActionGateway:
             command = replace(
                 command,
                 provenance={
-                    "target_portfolio_decision_id": (
-                        request.target_portfolio_decision_id
-                    ),
+                    "session_id": request.session_id,
+                    "run_id": request.run_id,
+                    "broker_account_id": request.broker_account_id,
+                    "trading_date": request.trading_date,
+                    "target_portfolio_decision_id": (request.target_portfolio_decision_id),
                     "selected_portfolio_id": request.selected_portfolio_id,
-                    "authorized_position_tuple_id": (
-                        request.authorized_position_tuple_id
-                    ),
+                    "authorized_position_tuple_id": (request.authorized_position_tuple_id),
                     "component_index": request.component_index,
                     "component_count": request.component_count,
-                    "evaluated_objective_version": (
-                        request.evaluated_objective_version
-                    ),
-                    "submission_objective_version": (
-                        request.submission_objective_version
-                    ),
-                    "evaluated_objective_fingerprint": (
-                        request.evaluated_objective_fingerprint
-                    ),
-                    "submission_objective_fingerprint": (
-                        request.submission_objective_fingerprint
-                    ),
-                    "original_decision_snapshot_id": (
-                        request.original_decision_snapshot_id
-                    ),
+                    "evaluated_objective_version": (request.evaluated_objective_version),
+                    "submission_objective_version": (request.submission_objective_version),
+                    "evaluated_objective_fingerprint": (request.evaluated_objective_fingerprint),
+                    "submission_objective_fingerprint": (request.submission_objective_fingerprint),
+                    "original_decision_snapshot_id": (request.original_decision_snapshot_id),
                     "submission_snapshot_id": request.submission_snapshot_id,
-                    "evaluated_at_exchange_time": (
-                        request.evaluated_at_exchange_time
-                    ),
+                    "evaluated_at_exchange_time": (request.evaluated_at_exchange_time),
                     "decision_valid_until_exchange_time": (
                         request.decision_valid_until_exchange_time
                     ),
-                    "maximum_decision_age_seconds": (
-                        request.maximum_decision_age_seconds
-                    ),
+                    "maximum_decision_age_seconds": (request.maximum_decision_age_seconds),
                     "submission_exchange_time": request.submission_exchange_time,
                     "decision_age_seconds": request.decision_age_seconds,
                     "required_resolution_horizon_seconds": (
@@ -456,11 +445,15 @@ class OrderActionGateway:
 
         # Objective capital reservation before ENTRY/PROBE/ADD
         reserved = False
-        if request.action in {
-            OrderActionKind.ENTRY,
-            OrderActionKind.PROBE,
-            OrderActionKind.ADD,
-        } and self._deps.objective_service is not None:
+        if (
+            request.action
+            in {
+                OrderActionKind.ENTRY,
+                OrderActionKind.PROBE,
+                OrderActionKind.ADD,
+            }
+            and self._deps.objective_service is not None
+        ):
             try:
                 obj_state = await self._deps.objective_service.get_state()
                 if request.submission_objective_version is not None and int(
@@ -526,9 +519,7 @@ class OrderActionGateway:
                         blocked_reason="objective_estimate_wrong_objective",
                         working_orders=working,
                     )
-                if request.strategy_id and str(estimate.strategy_id) != str(
-                    request.strategy_id
-                ):
+                if request.strategy_id and str(estimate.strategy_id) != str(request.strategy_id):
                     return OrderActionResult(
                         submitted=False,
                         client_order_id=request.client_order_id,
@@ -537,14 +528,11 @@ class OrderActionGateway:
                     )
                 if estimate.historical_summary_id is not None:
                     summary = svc.get_historical_summary(estimate.historical_summary_id)
-                    objective_policy = str(
-                        getattr(svc, "objective_policy", "positive_ev_baseline")
-                    )
+                    objective_policy = str(getattr(svc, "objective_policy", "positive_ev_baseline"))
                     # Target-attainment may proceed on ordinal/low-sample evidence;
                     # baseline still requires valid_for_ev historical summaries.
-                    if (
-                        objective_policy != "target_attainment"
-                        and (summary is None or not summary.valid_for_ev)
+                    if objective_policy != "target_attainment" and (
+                        summary is None or not summary.valid_for_ev
                     ):
                         return OrderActionResult(
                             submitted=False,
@@ -553,9 +541,7 @@ class OrderActionGateway:
                             working_orders=working,
                         )
                 # Authoritative Task-1 quote — never treat proposed limit as quote truth.
-                quote_loader = getattr(
-                    self._deps, "current_option_quote_loader", None
-                )
+                quote_loader = getattr(self._deps, "current_option_quote_loader", None)
                 if quote_loader is None:
                     return OrderActionResult(
                         submitted=False,
@@ -576,8 +562,7 @@ class OrderActionGateway:
                         submitted=False,
                         client_order_id=request.client_order_id,
                         blocked_reason=(
-                            "current_quote_unusable:"
-                            + ",".join(current_quote.invalidation_reasons)
+                            "current_quote_unusable:" + ",".join(current_quote.invalidation_reasons)
                         ),
                         working_orders=working,
                     )
@@ -590,12 +575,8 @@ class OrderActionGateway:
 
                 ask_premium = execution_premium_from_quote(current_quote)
                 qty = int(command.intent.quantity)
-                require_ev = bool(
-                    getattr(svc, "require_positive_expected_value", True)
-                )
-                objective_policy = str(
-                    getattr(svc, "objective_policy", "positive_ev_baseline")
-                )
+                require_ev = bool(getattr(svc, "require_positive_expected_value", True))
+                objective_policy = str(getattr(svc, "objective_policy", "positive_ev_baseline"))
                 if objective_policy == "target_attainment":
                     require_ev = False
                     # A full-chain portfolio can select multiple contracts for
@@ -607,25 +588,17 @@ class OrderActionGateway:
                             update={
                                 "quote_inputs": {
                                     **(estimate.quote_inputs or {}),
-                                    "premium_per_contract": str(
-                                        request.evaluation_premium
-                                    ),
+                                    "premium_per_contract": str(request.evaluation_premium),
                                     "quantity": int(command.intent.quantity),
                                 }
                             }
                         )
-                hist_settings = getattr(
-                    self._deps, "historical_outcome_settings", None
-                )
+                hist_settings = getattr(self._deps, "historical_outcome_settings", None)
                 max_change = Decimal("25")
                 if hist_settings is not None:
-                    max_change = Decimal(
-                        str(hist_settings.max_premium_change_pct_for_repricing)
-                    )
+                    max_change = Decimal(str(hist_settings.max_premium_change_pct_for_repricing))
                 max_age = int(getattr(self._deps, "max_quote_age_seconds", 30) or 30)
-                max_spread = float(
-                    getattr(self._deps, "max_relative_spread", 0.25) or 0.25
-                )
+                max_spread = float(getattr(self._deps, "max_relative_spread", 0.25) or 0.25)
                 max_limit_above_ask_pct = Decimal("5.0")
                 exec_settings = getattr(self._deps, "objective_execution_settings", None)
                 if exec_settings is not None:
@@ -648,9 +621,7 @@ class OrderActionGateway:
                 if side == "buy" and proposed_limit is not None:
                     limit_dec = Decimal(str(proposed_limit))
                     ceiling = (
-                        ask_premium
-                        * (Decimal("100") + max_limit_above_ask_pct)
-                        / Decimal("100")
+                        ask_premium * (Decimal("100") + max_limit_above_ask_pct) / Decimal("100")
                     ).quantize(Decimal("0.0001"))
                     if limit_dec > ceiling:
                         return OrderActionResult(
@@ -667,9 +638,7 @@ class OrderActionGateway:
                     # Submit the same validated price used for EV and reservation.
                     command = dc_replace(
                         command,
-                        intent=command.intent.model_copy(
-                            update={"limit_price": float(worst_case)}
-                        ),
+                        intent=command.intent.model_copy(update={"limit_price": float(worst_case)}),
                     )
                 elif side == "buy":
                     worst_case = ask_premium
@@ -706,7 +675,8 @@ class OrderActionGateway:
                     and any(
                         r.startswith("premium_change")
                         or "premium_change" in r
-                        or r in {
+                        or r
+                        in {
                             "quote_stale",
                             "spread_too_wide",
                             "premium_unavailable",
@@ -725,9 +695,9 @@ class OrderActionGateway:
                     )
                 # Selected quantity must remain affordable at current ask.
                 if objective_policy == "target_attainment":
-                    required = (
-                        premium_per * Decimal("100") * Decimal(qty)
-                    ).quantize(Decimal("0.01"))
+                    required = (premium_per * Decimal("100") * Decimal(qty)).quantize(
+                        Decimal("0.01")
+                    )
                     available = Decimal(str(obj_state.available_capital_usd))
                     if required > available:
                         return OrderActionResult(
@@ -816,14 +786,10 @@ class OrderActionGateway:
                     contract_id=request.contract_id,
                 )
             elif parent:
-                prior = await self._deps.provenance_registry.get_by_client_order_id(
-                    parent
-                )
+                prior = await self._deps.provenance_registry.get_by_client_order_id(parent)
                 if prior is not None:
                     lifecycle_id = lifecycle_id or prior.position_lifecycle_id
-                    originating = (
-                        originating or prior.originating_entry_client_order_id
-                    )
+                    originating = originating or prior.originating_entry_client_order_id
             if lifecycle_id is None and request.contract_id:
                 prior = await self._deps.provenance_registry.get_latest_by_contract_id(
                     request.contract_id
@@ -848,47 +814,35 @@ class OrderActionGateway:
                     parent_client_order_id=parent,
                     causation_event_id=request.causation_event_id,
                     extra={
+                        "session_id": request.session_id or self._deps.session_id,
+                        "run_id": request.run_id or self._deps.run_id,
+                        "broker_account_id": request.broker_account_id,
+                        "trading_date": request.trading_date,
                         "replace_of": request.replace_of_client_order_id,
                         "position_lifecycle_id": lifecycle_id,
                         "originating_entry_client_order_id": originating,
                         "causation_event_id": request.causation_event_id,
-                        "target_portfolio_decision_id": (
-                            request.target_portfolio_decision_id
-                        ),
+                        "target_portfolio_decision_id": (request.target_portfolio_decision_id),
                         "selected_portfolio_id": request.selected_portfolio_id,
-                        "authorized_position_tuple_id": (
-                            request.authorized_position_tuple_id
-                        ),
+                        "authorized_position_tuple_id": (request.authorized_position_tuple_id),
                         "component_index": request.component_index,
                         "component_count": request.component_count,
-                        "evaluated_objective_version": (
-                            request.evaluated_objective_version
-                        ),
-                        "submission_objective_version": (
-                            request.submission_objective_version
-                        ),
+                        "evaluated_objective_version": (request.evaluated_objective_version),
+                        "submission_objective_version": (request.submission_objective_version),
                         "evaluated_objective_fingerprint": (
                             request.evaluated_objective_fingerprint
                         ),
                         "submission_objective_fingerprint": (
                             request.submission_objective_fingerprint
                         ),
-                        "original_decision_snapshot_id": (
-                            request.original_decision_snapshot_id
-                        ),
+                        "original_decision_snapshot_id": (request.original_decision_snapshot_id),
                         "submission_snapshot_id": request.submission_snapshot_id,
-                        "evaluated_at_exchange_time": (
-                            request.evaluated_at_exchange_time
-                        ),
+                        "evaluated_at_exchange_time": (request.evaluated_at_exchange_time),
                         "decision_valid_until_exchange_time": (
                             request.decision_valid_until_exchange_time
                         ),
-                        "maximum_decision_age_seconds": (
-                            request.maximum_decision_age_seconds
-                        ),
-                        "submission_exchange_time": (
-                            request.submission_exchange_time
-                        ),
+                        "maximum_decision_age_seconds": (request.maximum_decision_age_seconds),
+                        "submission_exchange_time": (request.submission_exchange_time),
                         "decision_age_seconds": request.decision_age_seconds,
                         "required_resolution_horizon_seconds": (
                             request.required_resolution_horizon_seconds
@@ -942,9 +896,7 @@ class OrderActionGateway:
                 "option surface id does not match snapshot.option_surface_id"
             )
 
-        contract = parse_contract_id(
-            request.contract_id, trading_date=snapshot.trading_date
-        )
+        contract = parse_contract_id(request.contract_id, trading_date=snapshot.trading_date)
         if contract.symbol != "SPY":
             raise CognitiveValidationError("only SPY contracts are supported")
         if contract.expiration != snapshot.trading_date:
@@ -985,18 +937,17 @@ class OrderActionGateway:
                 raise CognitiveValidationError(
                     "conflicting working entry order exists; no additional entry"
                 )
-            if request.proposal_id and str(request.proposal_id) in self._deps.submitted_proposal_ids:
+            if (
+                request.proposal_id
+                and str(request.proposal_id) in self._deps.submitted_proposal_ids
+            ):
                 raise CognitiveValidationError("proposal/decision has already been submitted")
             if request.proposal_id and any(
                 o.proposal_id == str(request.proposal_id) for o in working
             ):
-                raise CognitiveValidationError(
-                    "conflicting active order exists for proposal"
-                )
+                raise CognitiveValidationError("conflicting active order exists for proposal")
             if request.contract_id in open_positions and action == OrderActionKind.ENTRY:
-                raise CognitiveValidationError(
-                    "conflicting active position exists for contract"
-                )
+                raise CognitiveValidationError("conflicting active position exists for contract")
             if request.side != "buy":
                 raise CognitiveValidationError("entry/probe requires buy side")
 
@@ -1008,9 +959,7 @@ class OrderActionGateway:
             if has_working_entry_order(
                 [o for o in working if o.contract_id == request.contract_id]
             ):
-                raise CognitiveValidationError(
-                    "conflicting working order exists for ADD contract"
-                )
+                raise CognitiveValidationError("conflicting working order exists for ADD contract")
 
         if action in {OrderActionKind.REDUCE, OrderActionKind.EXIT}:
             pos = open_positions.get(request.contract_id)
@@ -1039,19 +988,13 @@ class OrderActionGateway:
                 raise CognitiveValidationError("replace requires replace_of_client_order_id")
             match = next((o for o in working if o.client_order_id == prior), None)
             if match is None:
-                raise CognitiveValidationError(
-                    "original order is not cancellable / not working"
-                )
+                raise CognitiveValidationError("original order is not cancellable / not working")
             if match.remaining_quantity <= 0:
                 raise CognitiveValidationError("no remaining quantity to replace")
             if match.contract_id != request.contract_id:
-                raise CognitiveValidationError(
-                    "replacement contract must match original lifecycle"
-                )
+                raise CognitiveValidationError("replacement contract must match original lifecycle")
             if match.side != request.side:
-                raise CognitiveValidationError(
-                    "replacement side must match original lifecycle"
-                )
+                raise CognitiveValidationError("replacement side must match original lifecycle")
             if request.quantity > match.remaining_quantity:
                 raise CognitiveValidationError(
                     "replacement quantity exceeds remaining authoritative quantity"
@@ -1095,9 +1038,7 @@ class OrderActionGateway:
     ) -> ExecutionCommand:
         pos = open_positions.get(request.contract_id)
         if pos is None:
-            raise CognitiveValidationError(
-                "degraded exit blocked: no authoritative open position"
-            )
+            raise CognitiveValidationError("degraded exit blocked: no authoritative open position")
         open_qty = int(
             getattr(pos, "quantity", None)
             or (pos.get("quantity") if isinstance(pos, dict) else 0)
@@ -1106,9 +1047,7 @@ class OrderActionGateway:
         qty = min(request.quantity, open_qty)
         if qty <= 0:
             raise CognitiveValidationError("degraded exit blocked: zero open quantity")
-        contract = parse_contract_id(
-            request.contract_id, trading_date=snapshot.trading_date
-        )
+        contract = parse_contract_id(request.contract_id, trading_date=snapshot.trading_date)
         intent = OrderIntent(
             intent_id=request.client_order_id,
             candidate_id=request.decision_id or request.client_order_id,
@@ -1298,10 +1237,7 @@ class OrderActionGateway:
             return OrderActionResult(
                 submitted=False,
                 client_order_id=command.client_order_id,
-                blocked_reason=(
-                    f"broker_preview_rejected: "
-                    f"{preview.rejection_code or 'rejected'}"
-                ),
+                blocked_reason=(f"broker_preview_rejected: {preview.rejection_code or 'rejected'}"),
             )
         return None
 
@@ -1347,11 +1283,16 @@ def _resolve_gateway_position_intent(
             )
         except Exception:
             continue
-    action_name = "entry" if action in {
-        OrderActionKind.ENTRY,
-        OrderActionKind.PROBE,
-        OrderActionKind.ADD,
-    } else "exit"
+    action_name = (
+        "entry"
+        if action
+        in {
+            OrderActionKind.ENTRY,
+            OrderActionKind.PROBE,
+            OrderActionKind.ADD,
+        }
+        else "exit"
+    )
     try:
         return resolve_position_intent(
             action=action_name,
@@ -1394,6 +1335,5 @@ def provenanced_to_action_request(
         cycle_id=provenanced.cycle_id,
         evidence_ids=provenanced.evidence_ids,
         broker_account_id=cmd.broker_account_id,
-        causation_event_id=causation_event_id
-        or getattr(provenanced, "causation_event_id", None),
+        causation_event_id=causation_event_id or getattr(provenanced, "causation_event_id", None),
     )

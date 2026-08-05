@@ -170,7 +170,11 @@ def apply_task1_migrations(db_path: str | Path) -> Path:
     from joker.persistence.session_pnl_baseline import (
         apply_session_pnl_baseline_migration,
     )
+    from joker.persistence.cognitive_execution_provenance import (
+        apply_portfolio_execution_migration,
+    )
 
     apply_broker_submission_journal_migration(path)
     apply_session_pnl_baseline_migration(path)
+    apply_portfolio_execution_migration(path)
     return path
