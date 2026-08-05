@@ -638,6 +638,10 @@ class ExecutionLeg(BaseModel):
     evaluated_objective_version: int | None = None
     evaluated_objective_fingerprint: str | None = None
     original_decision_snapshot_id: UUID | None = None
+    evaluated_at_exchange_time: datetime | None = None
+    decision_valid_until_exchange_time: datetime | None = None
+    maximum_decision_age_seconds: int | None = None
+    required_resolution_horizon_seconds: int | None = None
     sequence_order: int
     max_quote_age_seconds: int
     replacement_policy: str
@@ -648,6 +652,29 @@ class ExecutionLeg(BaseModel):
     def _positive_qty(cls, value: int) -> int:
         if value <= 0:
             raise ValueError("quantity must be positive")
+        return value
+
+    @field_validator(
+        "evaluated_at_exchange_time", "decision_valid_until_exchange_time"
+    )
+    @classmethod
+    def _aware_decision_times(cls, value: datetime | None) -> datetime | None:
+        return _require_tz_aware(value) if value is not None else None
+
+    @field_validator("maximum_decision_age_seconds")
+    @classmethod
+    def _positive_decision_age(cls, value: int | None) -> int | None:
+        if value is not None and value < 1:
+            raise ValueError("maximum_decision_age_seconds must be >= 1")
+        return value
+
+    @field_validator("required_resolution_horizon_seconds")
+    @classmethod
+    def _nonnegative_resolution_horizon(cls, value: int | None) -> int | None:
+        if value is not None and value < 0:
+            raise ValueError(
+                "required_resolution_horizon_seconds must be >= 0"
+            )
         return value
 
 

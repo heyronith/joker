@@ -9,6 +9,96 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field
 
 
+def normalize_reviewer_forced_wait(
+    *,
+    portfolio_decision: dict[str, Any],
+    legacy_decision: dict[str, Any] | None,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    """Remove every executable authority channel from a reviewer-forced WAIT.
+
+    The rejected provisional decision is retained only inside an explicitly
+    non-authoritative audit envelope. Returned decision dictionaries are safe
+    to checkpoint and publish without exposing the rejected tuple as selected.
+    """
+    original = dict(portfolio_decision)
+    wait_probability = original.get("wait_probability_goal")
+    quantity_grid = [
+        {**dict(row), "selected": False}
+        for row in original.get("quantity_grid") or []
+    ]
+    portfolio_grid = [
+        {**dict(row), "selected": False}
+        for row in original.get("portfolio_evaluations") or []
+    ]
+    finalized = {
+        **original,
+        "action": "wait",
+        "authoritative": True,
+        "authorized_positions": [],
+        "selected_portfolio_id": None,
+        "selected_strategy_id": None,
+        "selected_contract_id": None,
+        "selected_quantity": 0,
+        "selected_evaluation_premium": None,
+        "selected_evaluation_premium_usd": None,
+        "selected_capital": "0",
+        "selected_capital_usd": "0",
+        "position_tuple_ids": [],
+        "execution_proposal_authority": None,
+        "sizing_authority": None,
+        "selected_probability_goal": wait_probability,
+        "probability_delta": "0",
+        "quantity_grid": quantity_grid,
+        "portfolio_evaluations": portfolio_grid,
+        "reason_codes": list(original.get("reason_codes") or [])
+        + ["portfolio_review_forced_wait"],
+    }
+
+    legacy = dict(legacy_decision or {})
+    no_trade_probability = legacy.get("no_trade_p_goal")
+    if no_trade_probability is None:
+        no_trade_probability = wait_probability
+    legacy.update(
+        {
+            "action": "wait",
+            "authoritative": True,
+            "authorized_positions": [],
+            "selected_portfolio_id": None,
+            "selected_strategy_id": None,
+            "selected_contract_id": None,
+            "selected_quantity": 0,
+            "selected_capital": "0",
+            "selected_capital_usd": "0",
+            "selected_evaluation_premium": None,
+            "selected_evaluation_premium_usd": None,
+            "position_tuple_ids": [],
+            "execution_proposal_authority": None,
+            "sizing_authority": None,
+            "selected_p_goal": no_trade_probability,
+            "selected_probability_goal": no_trade_probability,
+            "wait_probability_goal": no_trade_probability,
+            "probability_delta": "0",
+            "quantity_evaluations": [
+                {**dict(row), "selected": False}
+                for row in legacy.get("quantity_evaluations") or []
+            ],
+            "portfolio_evaluations": [
+                {**dict(row), "selected": False}
+                for row in legacy.get("portfolio_evaluations") or []
+            ],
+            "reason_codes": list(legacy.get("reason_codes") or [])
+            + ["portfolio_review_forced_wait"],
+        }
+    )
+    audit = {
+        "audit_only": True,
+        "authoritative": False,
+        "rejection_reason": "portfolio_review_forced_wait",
+        "rejected_decision": original,
+    }
+    return finalized, legacy, audit
+
+
 class ContractCandidateReviewSummary(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 

@@ -439,6 +439,7 @@ def validate_and_compile_proposal(
     truth: AuthoritativeMarketTruth | None = None,
     config: ExecutionValidationConfig | None = None,
     trading_date: date | None = None,
+    client_order_id: str | None = None,
 ) -> ProvenancedExecutionCommand:
     """Validate proposal and compile to Task 1 ExecutionCommand."""
     validator = ExecutionProposalValidator(config)
@@ -455,6 +456,7 @@ def validate_and_compile_proposal(
     return ExecutionCommandCompiler(broker_account_id=broker_account_id).compile(
         proposal,
         evidence_ids=evidence_ids,
+        client_order_id=client_order_id,
         trading_date=resolved_date,
     )
 

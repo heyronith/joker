@@ -107,11 +107,13 @@ class CognitiveGraphState(TypedDict, total=False):
     _portfolio_grid: list | None
     _target_portfolio_decision: dict | None
     _provisional_target_portfolio_decision: dict | None
+    _portfolio_review_rejected_decision_audit: dict | None
     _target_authorized_positions: list | None
     _portfolio_review_context: dict | None
     _portfolio_debate_reviews: list | None
     _portfolio_review_finalization: dict | None
     _execution_command_ids: list[str] | None
+    _portfolio_execution_state: list | None
 
     # Position graph channels
     _position_id: str | None

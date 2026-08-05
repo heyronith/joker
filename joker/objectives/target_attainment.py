@@ -9,6 +9,7 @@ implements martingale. Never bypasses execution correctness constraints.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime
 from decimal import Decimal
 from enum import StrEnum
 from typing import Any, Literal
@@ -116,6 +117,7 @@ class TargetAttainmentContext:
     spy_last: Decimal | None = None
     data_quality_codes: tuple[str, ...] = ()
     future_opportunity_estimate: Decimal | None = None  # ordinal 0-1 if known
+    deadline_exchange_time: datetime | None = None
 
     @property
     def fraction_remaining(self) -> Decimal:
@@ -186,6 +188,7 @@ class TargetAttainmentContext:
             spy_last=spy_last,
             data_quality_codes=data_quality_codes,
             future_opportunity_estimate=future_opportunity_estimate,
+            deadline_exchange_time=state.deadline_exchange_time,
         )
 
 

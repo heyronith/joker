@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from decimal import Decimal
 from enum import StrEnum
 from itertools import combinations
@@ -135,6 +136,10 @@ class AuthorizedPositionTuple:
     submission_objective_version: int | None = None
     submission_objective_fingerprint: str | None = None
     submission_snapshot_id: UUID | None = None
+    evaluated_at_exchange_time: datetime | None = None
+    decision_valid_until_exchange_time: datetime | None = None
+    maximum_decision_age_seconds: int | None = None
+    required_resolution_horizon_seconds: int | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -158,6 +163,20 @@ class AuthorizedPositionTuple:
                 else None
             ),
             "decision_id": str(self.decision_id),
+            "evaluated_at_exchange_time": (
+                self.evaluated_at_exchange_time.isoformat()
+                if self.evaluated_at_exchange_time is not None
+                else None
+            ),
+            "decision_valid_until_exchange_time": (
+                self.decision_valid_until_exchange_time.isoformat()
+                if self.decision_valid_until_exchange_time is not None
+                else None
+            ),
+            "maximum_decision_age_seconds": self.maximum_decision_age_seconds,
+            "required_resolution_horizon_seconds": (
+                self.required_resolution_horizon_seconds
+            ),
         }
 
 
@@ -247,6 +266,12 @@ class TargetPortfolioDecision:
     submission_objective_fingerprint: str | None = None
     submission_snapshot_id: UUID | None = None
     authoritative: bool = True
+    evaluated_at_exchange_time: datetime | None = None
+    decision_valid_until_exchange_time: datetime | None = None
+    maximum_decision_age_seconds: int | None = None
+    required_resolution_horizon_seconds: int | None = None
+    submission_exchange_time: datetime | None = None
+    decision_age_seconds: Decimal | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -292,6 +317,30 @@ class TargetPortfolioDecision:
                 portfolio.as_dict() for portfolio in self.portfolio_evaluations
             ],
             "authoritative": self.authoritative,
+            "evaluated_at_exchange_time": (
+                self.evaluated_at_exchange_time.isoformat()
+                if self.evaluated_at_exchange_time is not None
+                else None
+            ),
+            "decision_valid_until_exchange_time": (
+                self.decision_valid_until_exchange_time.isoformat()
+                if self.decision_valid_until_exchange_time is not None
+                else None
+            ),
+            "maximum_decision_age_seconds": self.maximum_decision_age_seconds,
+            "required_resolution_horizon_seconds": (
+                self.required_resolution_horizon_seconds
+            ),
+            "submission_exchange_time": (
+                self.submission_exchange_time.isoformat()
+                if self.submission_exchange_time is not None
+                else None
+            ),
+            "decision_age_seconds": (
+                str(self.decision_age_seconds)
+                if self.decision_age_seconds is not None
+                else None
+            ),
         }
 
 
@@ -435,10 +484,38 @@ def search_target_portfolios(
     max_concurrent_positions: int,
     wait_probability_goal: Decimal | None,
     evaluated_objective_fingerprint: str | None = None,
+    evaluated_at_exchange_time: datetime | None = None,
+    deadline_exchange_time: datetime | None = None,
+    maximum_decision_age_seconds: int | None = None,
     settings: PortfolioSearchSettings | None = None,
 ) -> TargetPortfolioDecision:
     """Bounded deterministic search using shared-scenario portfolio P&L."""
     cfg = settings or PortfolioSearchSettings()
+    if (
+        maximum_decision_age_seconds is not None
+        and maximum_decision_age_seconds < 1
+    ):
+        raise ValueError("maximum_decision_age_seconds must be >= 1")
+    if (
+        evaluated_at_exchange_time is not None
+        and evaluated_at_exchange_time.tzinfo is None
+    ):
+        raise ValueError("evaluated_at_exchange_time must be timezone-aware")
+    if (
+        deadline_exchange_time is not None
+        and deadline_exchange_time.tzinfo is None
+    ):
+        raise ValueError("deadline_exchange_time must be timezone-aware")
+    validity_deadline = None
+    if (
+        evaluated_at_exchange_time is not None
+        and maximum_decision_age_seconds is not None
+    ):
+        validity_deadline = evaluated_at_exchange_time + timedelta(
+            seconds=maximum_decision_age_seconds
+        )
+        if deadline_exchange_time is not None:
+            validity_deadline = min(validity_deadline, deadline_exchange_time)
     decision_id = uuid4()
     slots = max(
         0,
@@ -462,6 +539,9 @@ def search_target_portfolios(
             time_remaining_seconds=time_remaining_seconds,
             wait_probability_goal=wait_probability_goal,
             evaluated_objective_fingerprint=evaluated_objective_fingerprint,
+            evaluated_at_exchange_time=evaluated_at_exchange_time,
+            decision_valid_until_exchange_time=validity_deadline,
+            maximum_decision_age_seconds=maximum_decision_age_seconds,
             quantity_grid=quantity_grid,
             portfolios=(),
             reason="maximum_concurrent_positions_reached",
@@ -474,6 +554,9 @@ def search_target_portfolios(
             time_remaining_seconds=time_remaining_seconds,
             wait_probability_goal=wait_probability_goal,
             evaluated_objective_fingerprint=evaluated_objective_fingerprint,
+            evaluated_at_exchange_time=evaluated_at_exchange_time,
+            decision_valid_until_exchange_time=validity_deadline,
+            maximum_decision_age_seconds=maximum_decision_age_seconds,
             quantity_grid=quantity_grid,
             portfolios=(),
             reason="no_valid_contract_candidates",
@@ -532,6 +615,9 @@ def search_target_portfolios(
             time_remaining_seconds=time_remaining_seconds,
             wait_probability_goal=wait_probability_goal,
             evaluated_objective_fingerprint=evaluated_objective_fingerprint,
+            evaluated_at_exchange_time=evaluated_at_exchange_time,
+            decision_valid_until_exchange_time=validity_deadline,
+            maximum_decision_age_seconds=maximum_decision_age_seconds,
             quantity_grid=quantity_grid,
             portfolios=evaluations,
             reason="no_rankable_portfolio",
@@ -553,6 +639,9 @@ def search_target_portfolios(
             time_remaining_seconds=time_remaining_seconds,
             wait_probability_goal=wait_probability_goal,
             evaluated_objective_fingerprint=evaluated_objective_fingerprint,
+            evaluated_at_exchange_time=evaluated_at_exchange_time,
+            decision_valid_until_exchange_time=validity_deadline,
+            maximum_decision_age_seconds=maximum_decision_age_seconds,
             quantity_grid=quantity_grid,
             portfolios=evaluations,
             reason="wait_has_higher_or_insufficient_probability_improvement",
@@ -575,6 +664,10 @@ def search_target_portfolios(
             objective_version=objective_version,
             decision_id=decision_id,
             evaluated_objective_fingerprint=evaluated_objective_fingerprint,
+            evaluated_at_exchange_time=evaluated_at_exchange_time,
+            decision_valid_until_exchange_time=validity_deadline,
+            maximum_decision_age_seconds=maximum_decision_age_seconds,
+            required_resolution_horizon_seconds=best.maximum_resolution_seconds,
         )
         for row in sorted(selected_rows, key=_row_search_key)
     )
@@ -604,6 +697,10 @@ def search_target_portfolios(
         quantity_grid=marked_rows,
         portfolio_evaluations=marked_portfolios,
         evaluated_objective_fingerprint=evaluated_objective_fingerprint,
+        evaluated_at_exchange_time=evaluated_at_exchange_time,
+        decision_valid_until_exchange_time=validity_deadline,
+        maximum_decision_age_seconds=maximum_decision_age_seconds,
+        required_resolution_horizon_seconds=best.maximum_resolution_seconds,
     )
 
 
@@ -790,6 +887,9 @@ def _wait_decision(
     quantity_grid: Sequence[QuantityGridRow],
     portfolios: Sequence[PortfolioAttainmentEvaluation],
     reason: str,
+    evaluated_at_exchange_time: datetime | None = None,
+    decision_valid_until_exchange_time: datetime | None = None,
+    maximum_decision_age_seconds: int | None = None,
 ) -> TargetPortfolioDecision:
     return TargetPortfolioDecision(
         decision_id=decision_id,
@@ -806,4 +906,8 @@ def _wait_decision(
         quantity_grid=tuple(quantity_grid),
         portfolio_evaluations=tuple(portfolios),
         evaluated_objective_fingerprint=evaluated_objective_fingerprint,
+        evaluated_at_exchange_time=evaluated_at_exchange_time,
+        decision_valid_until_exchange_time=decision_valid_until_exchange_time,
+        maximum_decision_age_seconds=maximum_decision_age_seconds,
+        required_resolution_horizon_seconds=0,
     )

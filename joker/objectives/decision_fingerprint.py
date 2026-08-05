@@ -5,10 +5,97 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
 from joker.objectives.schemas import SessionObjectiveState
+
+
+@dataclass(frozen=True)
+class DecisionTimingEvidence:
+    """Submission-time age/deadline/horizon result using exchange time only."""
+
+    evaluated_at_exchange_time: datetime
+    decision_valid_until_exchange_time: datetime
+    maximum_decision_age_seconds: int
+    submission_exchange_time: datetime
+    decision_age_seconds: Decimal
+    required_resolution_horizon_seconds: int
+    remaining_deadline_seconds: Decimal
+    reason_codes: tuple[str, ...] = ()
+
+    @property
+    def valid(self) -> bool:
+        return not self.reason_codes
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "evaluated_at_exchange_time": self.evaluated_at_exchange_time.isoformat(),
+            "decision_valid_until_exchange_time": (
+                self.decision_valid_until_exchange_time.isoformat()
+            ),
+            "maximum_decision_age_seconds": self.maximum_decision_age_seconds,
+            "submission_exchange_time": self.submission_exchange_time.isoformat(),
+            "decision_age_seconds": str(self.decision_age_seconds),
+            "required_resolution_horizon_seconds": (
+                self.required_resolution_horizon_seconds
+            ),
+            "remaining_deadline_seconds": str(self.remaining_deadline_seconds),
+            "decision_timing_reason_codes": list(self.reason_codes),
+        }
+
+
+def validate_decision_submission_timing(
+    *,
+    evaluated_at_exchange_time: datetime,
+    maximum_decision_age_seconds: int,
+    submission_exchange_time: datetime,
+    deadline_exchange_time: datetime,
+    required_resolution_horizon_seconds: int,
+) -> DecisionTimingEvidence:
+    """Validate explicit decision age without treating clock decay as truth drift."""
+    for name, value in (
+        ("evaluated_at_exchange_time", evaluated_at_exchange_time),
+        ("submission_exchange_time", submission_exchange_time),
+        ("deadline_exchange_time", deadline_exchange_time),
+    ):
+        if value.tzinfo is None:
+            raise ValueError(f"{name} must be timezone-aware")
+    if maximum_decision_age_seconds < 1:
+        raise ValueError("maximum_decision_age_seconds must be >= 1")
+    if required_resolution_horizon_seconds < 0:
+        raise ValueError("required_resolution_horizon_seconds must be >= 0")
+
+    age = Decimal(
+        str((submission_exchange_time - evaluated_at_exchange_time).total_seconds())
+    )
+    remaining = Decimal(
+        str((deadline_exchange_time - submission_exchange_time).total_seconds())
+    )
+    age_deadline = evaluated_at_exchange_time + timedelta(
+        seconds=maximum_decision_age_seconds
+    )
+    valid_until = min(age_deadline, deadline_exchange_time)
+    reasons: list[str] = []
+    if age < 0:
+        reasons.append("submission_precedes_evaluation")
+    if age > Decimal(maximum_decision_age_seconds):
+        reasons.append("decision_age_exceeded")
+    if submission_exchange_time >= deadline_exchange_time:
+        reasons.append("objective_deadline_reached")
+    if remaining < Decimal(required_resolution_horizon_seconds):
+        reasons.append("resolution_horizon_no_longer_fits")
+    return DecisionTimingEvidence(
+        evaluated_at_exchange_time=evaluated_at_exchange_time,
+        decision_valid_until_exchange_time=valid_until,
+        maximum_decision_age_seconds=maximum_decision_age_seconds,
+        submission_exchange_time=submission_exchange_time,
+        decision_age_seconds=age,
+        required_resolution_horizon_seconds=required_resolution_horizon_seconds,
+        remaining_deadline_seconds=remaining,
+        reason_codes=tuple(reasons),
+    )
 
 
 @dataclass(frozen=True)
@@ -141,14 +228,23 @@ class ObjectiveDecisionFingerprint:
         *,
         maximum_time_decay_seconds: int = 1,
     ) -> tuple[str, ...]:
+        """Return changed material truth fields.
+
+        ``time_remaining_seconds`` is retained in the serialized evidence for
+        backward-compatible audit reads, but ordinary clock decay is not a
+        material truth mutation. Submission freshness is enforced explicitly
+        from exchange timestamps, maximum decision age, the deadline, and the
+        selected portfolio's required resolution horizon.
+
+        ``maximum_time_decay_seconds`` remains accepted for callers reading old
+        checkpoints; it no longer changes comparison semantics.
+        """
+        del maximum_time_decay_seconds
         differences: list[str] = []
         left = self.as_dict()
         right = other.as_dict()
         for field_name in left:
             if field_name == "time_remaining_seconds":
-                decay = self.time_remaining_seconds - other.time_remaining_seconds
-                if decay < 0 or decay > maximum_time_decay_seconds:
-                    differences.append(field_name)
                 continue
             if left[field_name] != right[field_name]:
                 differences.append(field_name)

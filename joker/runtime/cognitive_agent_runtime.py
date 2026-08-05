@@ -159,6 +159,16 @@ class CognitiveAgentRuntime:
         from joker.runtime.order_action_gateway import ensure_order_action_gateway
 
         ensure_order_action_gateway(self._deps)
+        if self._deps.provenance_registry is None and self._deps.db_path is not None:
+            from joker.persistence.cognitive_execution_provenance import (
+                CognitiveExecutionProvenanceRegistry,
+            )
+
+            provenance = CognitiveExecutionProvenanceRegistry(
+                self._deps.db_path
+            )
+            await provenance.initialize()
+            self._deps.provenance_registry = provenance
         if self._deps.cycle_registry is None and self._deps.db_path is not None:
             from joker.persistence.cognitive_cycle_registry import CognitiveCycleRegistry
 
@@ -191,6 +201,7 @@ class CognitiveAgentRuntime:
         # Resume unfinished cycles before accepting new events.
         try:
             await self._resume_unfinished_cycles()
+            await self._resume_pending_portfolio_executions()
         except Exception as exc:  # noqa: BLE001
             logger.exception("cognitive_cycle_recovery_failed", exc_info=exc)
             self._status = "degraded"
@@ -204,6 +215,102 @@ class CognitiveAgentRuntime:
         )
         self._position_worker = asyncio.create_task(
             self._position_worker_loop(), name="cognitive-position-worker"
+        )
+
+    async def _resume_pending_portfolio_executions(self) -> None:
+        """Reconcile durable component state and resume only the next eligible leg."""
+        registry = self._deps.provenance_registry
+        if registry is None or self._decision_graph is None:
+            return
+        records = await registry.portfolio_executions.list_resumable()
+        decision_ids = sorted(
+            {record.target_portfolio_decision_id for record in records}
+        )
+        for decision_id in decision_ids:
+            await self._resume_portfolio_decision(decision_id)
+
+    async def _resume_portfolio_decision(self, decision_id: str) -> None:
+        registry = self._deps.provenance_registry
+        if registry is None or self._decision_graph is None:
+            return
+        records = await registry.portfolio_executions.list_by_decision(decision_id)
+        if not records:
+            return
+        from joker.persistence.cognitive_execution_provenance import (
+            PortfolioComponentStatus,
+        )
+
+        execution_runtime = self._deps.execution_runtime
+        if execution_runtime is not None:
+            for record in records:
+                if record.status not in {
+                    PortfolioComponentStatus.SUBMITTED,
+                    PortfolioComponentStatus.WORKING,
+                    PortfolioComponentStatus.PARTIALLY_FILLED,
+                }:
+                    continue
+                try:
+                    await execution_runtime.poll_order_status(
+                        record.client_order_id
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    # Fail closed: without reconciled broker truth, no later
+                    # authorized component may advance on restart.
+                    logger.warning(
+                        "portfolio_resume_reconciliation_failed",
+                        extra={
+                            "target_portfolio_decision_id": decision_id,
+                            "client_order_id": record.client_order_id,
+                            "error": str(exc),
+                        },
+                    )
+                    return
+        payload = dict(records[0].extra or {})
+        proposal_raw = payload.get("execution_proposal")
+        portfolio_decision = payload.get("portfolio_decision")
+        authorized_positions = payload.get("authorized_positions")
+        if (
+            not isinstance(proposal_raw, dict)
+            or not isinstance(portfolio_decision, dict)
+            or not isinstance(authorized_positions, list)
+        ):
+            logger.warning(
+                "portfolio_resume_payload_incomplete",
+                extra={"target_portfolio_decision_id": decision_id},
+            )
+            return
+        from joker.cognition.schemas import ExecutionProposal
+
+        proposal = ExecutionProposal.model_validate(proposal_raw)
+        resume_state: dict[str, Any] = {
+            "session_id": self._session_id,
+            "run_id": self._run_id,
+            "cycle_id": proposal.cycle_id,
+            "snapshot_id": str(proposal.snapshot_id),
+            "execution_proposal": proposal,
+            "execution_command_id": None,
+            "_execution_command_ids": None,
+            "_target_portfolio_decision": portfolio_decision,
+            "_target_authorized_positions": authorized_positions,
+            "evidence": [],
+            "errors": [],
+            "node_trace": [],
+            "_block_new_entries": False,
+        }
+        submit_node = self._decision_graph.nodes["submit_execution_command"]
+        await submit_node.ainvoke(resume_state)
+
+    async def _resume_portfolio_for_order(self, client_order_id: str) -> None:
+        registry = self._deps.provenance_registry
+        if registry is None:
+            return
+        component = await registry.portfolio_executions.get_by_client_order_id(
+            client_order_id
+        )
+        if component is None:
+            return
+        await self._resume_portfolio_decision(
+            component.target_portfolio_decision_id
         )
 
     async def _resume_unfinished_cycles(self) -> None:
@@ -1057,6 +1164,8 @@ class CognitiveAgentRuntime:
                     )
             except Exception as exc:  # noqa: BLE001
                 logger.warning("order_projection_hydrate_failed", extra={"error": str(exc)})
+
+        await self._resume_portfolio_for_order(client_order_id)
 
         context: ContextPackage | None = None
         if snapshot_id and self._deps.snapshot_repo is not None:

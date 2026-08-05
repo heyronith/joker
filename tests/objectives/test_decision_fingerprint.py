@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
-from joker.objectives.decision_fingerprint import ObjectiveDecisionFingerprint
+from joker.objectives.decision_fingerprint import (
+    ObjectiveDecisionFingerprint,
+    validate_decision_submission_timing,
+)
 from joker.objectives.schemas import SessionObjectiveState
 
 ET = ZoneInfo("America/New_York")
@@ -63,6 +66,65 @@ def test_unchanged_truth_refresh_allows_first_component_submission() -> None:
     )
     assert evaluated.material_differences(refreshed) == ()
     assert evaluated.material_differences(refreshed_decay) == ()
+
+
+def test_five_second_clock_decay_is_not_a_material_truth_change() -> None:
+    state = _state(time_remaining_seconds=1800)
+    evaluated = _fp(state)
+    current = _fp(state.model_copy(update={"time_remaining_seconds": 1795}))
+    assert evaluated.material_differences(current) == ()
+
+
+def test_decision_age_at_limit_allows_submission() -> None:
+    evaluated = datetime(2026, 8, 5, 10, 0, tzinfo=ET)
+    timing = validate_decision_submission_timing(
+        evaluated_at_exchange_time=evaluated,
+        maximum_decision_age_seconds=60,
+        submission_exchange_time=evaluated + timedelta(seconds=60),
+        deadline_exchange_time=evaluated + timedelta(minutes=10),
+        required_resolution_horizon_seconds=300,
+    )
+    assert timing.valid
+    assert timing.decision_age_seconds == Decimal("60.0")
+
+
+def test_decision_age_above_limit_requires_reoptimization() -> None:
+    evaluated = datetime(2026, 8, 5, 10, 0, tzinfo=ET)
+    timing = validate_decision_submission_timing(
+        evaluated_at_exchange_time=evaluated,
+        maximum_decision_age_seconds=60,
+        submission_exchange_time=evaluated + timedelta(seconds=60, microseconds=1),
+        deadline_exchange_time=evaluated + timedelta(minutes=10),
+        required_resolution_horizon_seconds=300,
+    )
+    assert not timing.valid
+    assert "decision_age_exceeded" in timing.reason_codes
+
+
+def test_deadline_crossed_during_debate_blocks_submission() -> None:
+    evaluated = datetime(2026, 8, 5, 10, 0, tzinfo=ET)
+    timing = validate_decision_submission_timing(
+        evaluated_at_exchange_time=evaluated,
+        maximum_decision_age_seconds=60,
+        submission_exchange_time=evaluated + timedelta(seconds=30),
+        deadline_exchange_time=evaluated + timedelta(seconds=30),
+        required_resolution_horizon_seconds=0,
+    )
+    assert not timing.valid
+    assert "objective_deadline_reached" in timing.reason_codes
+
+
+def test_remaining_resolution_horizon_no_longer_fits() -> None:
+    evaluated = datetime(2026, 8, 5, 10, 0, tzinfo=ET)
+    timing = validate_decision_submission_timing(
+        evaluated_at_exchange_time=evaluated,
+        maximum_decision_age_seconds=60,
+        submission_exchange_time=evaluated + timedelta(seconds=10),
+        deadline_exchange_time=evaluated + timedelta(seconds=39),
+        required_resolution_horizon_seconds=30,
+    )
+    assert not timing.valid
+    assert "resolution_horizon_no_longer_fits" in timing.reason_codes
 
 
 def test_unchanged_truth_refresh_uses_current_reservation_version() -> None:

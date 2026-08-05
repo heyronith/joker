@@ -74,6 +74,9 @@ async def publish_optimizer_scoring_events(
             timestamp=timestamp,
         )
     contracts = _rank_contract_rows(state)
+    for row in contracts:
+        row["provisional_selected"] = bool(row.get("selected"))
+        row["selected"] = False
     if contracts or universe is not None:
         review_limit = int(
             getattr(
@@ -102,6 +105,9 @@ async def publish_optimizer_scoring_events(
             timestamp=timestamp,
         )
     portfolios = _rank_portfolios(state)
+    for row in portfolios:
+        row["provisional_selected"] = bool(row.get("selected"))
+        row["selected"] = False
     if portfolios or state.get("_target_portfolio_decision") is not None:
         portfolio_limit = int(
             getattr(
@@ -189,6 +195,36 @@ async def publish_cycle_observable_events(
                 "reason_codes": portfolio_decision.get("reason_codes") or [],
                 "objective_version": portfolio_decision.get("objective_version"),
                 "snapshot_id": portfolio_decision.get("snapshot_id"),
+                "selected_portfolio_id": portfolio_decision.get(
+                    "selected_portfolio_id"
+                ),
+                "selected_strategy_id": portfolio_decision.get(
+                    "selected_strategy_id"
+                ),
+                "selected_contract_id": portfolio_decision.get(
+                    "selected_contract_id"
+                ),
+                "selected_quantity": portfolio_decision.get(
+                    "selected_quantity", 0
+                ),
+                "selected_capital": portfolio_decision.get(
+                    "selected_capital", "0"
+                ),
+                "evaluated_at_exchange_time": portfolio_decision.get(
+                    "evaluated_at_exchange_time"
+                ),
+                "decision_valid_until_exchange_time": portfolio_decision.get(
+                    "decision_valid_until_exchange_time"
+                ),
+                "maximum_decision_age_seconds": portfolio_decision.get(
+                    "maximum_decision_age_seconds"
+                ),
+                "submission_exchange_time": portfolio_decision.get(
+                    "submission_exchange_time"
+                ),
+                "decision_age_seconds": portfolio_decision.get(
+                    "decision_age_seconds"
+                ),
             },
             **{
                 key: portfolio_decision.get(key)

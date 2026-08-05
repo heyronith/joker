@@ -176,6 +176,9 @@ class FullChainOptimizerSettings(BaseModel):
 
     # Disabled by default globally. Paper/replay profiles must opt in.
     enabled: bool = False
+    # Conservative paper/replay freshness window. It permits normal model-backed
+    # graph latency while remaining below the default 90-second cycle timeout.
+    maximum_decision_age_seconds: int = 60
     maximum_quote_age_seconds: int = 30
     maximum_surface_age_seconds: int = 30
     maximum_future_timestamp_seconds: int = 1
@@ -197,6 +200,7 @@ class FullChainOptimizerSettings(BaseModel):
 
     @field_validator(
         "maximum_quote_age_seconds",
+        "maximum_decision_age_seconds",
         "maximum_surface_age_seconds",
         "maximum_future_timestamp_seconds",
         "maximum_contracts_evaluated",

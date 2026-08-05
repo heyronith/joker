@@ -105,6 +105,14 @@ class OrderActionRequest:
     submission_objective_fingerprint: str | None = None
     original_decision_snapshot_id: str | None = None
     submission_snapshot_id: str | None = None
+    evaluated_at_exchange_time: str | None = None
+    decision_valid_until_exchange_time: str | None = None
+    maximum_decision_age_seconds: int | None = None
+    submission_exchange_time: str | None = None
+    decision_age_seconds: str | None = None
+    required_resolution_horizon_seconds: int | None = None
+    evaluation_premium: str | None = None
+    capital_allocation: str | None = None
 
 
 @dataclass
@@ -333,6 +341,22 @@ class OrderActionGateway:
                         request.original_decision_snapshot_id
                     ),
                     "submission_snapshot_id": request.submission_snapshot_id,
+                    "evaluated_at_exchange_time": (
+                        request.evaluated_at_exchange_time
+                    ),
+                    "decision_valid_until_exchange_time": (
+                        request.decision_valid_until_exchange_time
+                    ),
+                    "maximum_decision_age_seconds": (
+                        request.maximum_decision_age_seconds
+                    ),
+                    "submission_exchange_time": request.submission_exchange_time,
+                    "decision_age_seconds": request.decision_age_seconds,
+                    "required_resolution_horizon_seconds": (
+                        request.required_resolution_horizon_seconds
+                    ),
+                    "evaluation_premium": request.evaluation_premium,
+                    "capital_allocation": request.capital_allocation,
                 },
             )
         except CognitiveValidationError as exc:
@@ -574,6 +598,22 @@ class OrderActionGateway:
                 )
                 if objective_policy == "target_attainment":
                     require_ev = False
+                    # A full-chain portfolio can select multiple contracts for
+                    # one strategy thesis. Reprice each component against its
+                    # immutable authorized tuple premium, never against an
+                    # unrelated strategy-level contract premium.
+                    if request.evaluation_premium is not None:
+                        estimate = estimate.model_copy(
+                            update={
+                                "quote_inputs": {
+                                    **(estimate.quote_inputs or {}),
+                                    "premium_per_contract": str(
+                                        request.evaluation_premium
+                                    ),
+                                    "quantity": int(command.intent.quantity),
+                                }
+                            }
+                        )
                 hist_settings = getattr(
                     self._deps, "historical_outcome_settings", None
                 )
@@ -837,6 +877,22 @@ class OrderActionGateway:
                             request.original_decision_snapshot_id
                         ),
                         "submission_snapshot_id": request.submission_snapshot_id,
+                        "evaluated_at_exchange_time": (
+                            request.evaluated_at_exchange_time
+                        ),
+                        "decision_valid_until_exchange_time": (
+                            request.decision_valid_until_exchange_time
+                        ),
+                        "maximum_decision_age_seconds": (
+                            request.maximum_decision_age_seconds
+                        ),
+                        "submission_exchange_time": (
+                            request.submission_exchange_time
+                        ),
+                        "decision_age_seconds": request.decision_age_seconds,
+                        "required_resolution_horizon_seconds": (
+                            request.required_resolution_horizon_seconds
+                        ),
                     },
                 )
             )

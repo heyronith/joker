@@ -7,6 +7,7 @@ from uuid import UUID, uuid4
 
 import pytest
 
+from joker.broker.interface import PaperBroker
 from joker.graph.cognitive_graph import build_cognitive_graph
 from joker.graph.cognitive_state import CognitiveGraphState
 from joker.market.option_surface import OptionContractSnapshot, OptionSurfaceSnapshot
@@ -29,6 +30,55 @@ from tests.integration.test_goal_driven_full_graph import (
     _prepare_stack,
     _teardown_stack,
 )
+
+
+class ControllablePaperBroker(PaperBroker):
+    """Webull-paper-like deterministic broker with controllable order outcomes."""
+
+    def __init__(self, submission_statuses: list[str]) -> None:
+        super().__init__(slippage_pct=2.0)
+        self.submission_statuses = list(submission_statuses)
+        self.external_submission_count = 0
+
+    def submit_order(self, intent):
+        self.external_submission_count += 1
+        order = super().submit_order(intent)
+        status = self.submission_statuses.pop(0) if self.submission_statuses else "open"
+        if status == "filled":
+            self._apply_fill(order, float(intent.limit_price or 1.0))
+        elif status == "partially_filled":
+            order.status = "partially_filled"
+            order.filled_quantity = max(1, order.quantity // 2)
+            order.remaining_quantity = order.quantity - order.filled_quantity
+            order.average_fill_price = float(intent.limit_price or 1.0)
+        elif status in {
+            "accepted",
+            "rejected",
+            "cancelled",
+            "pending",
+            "open",
+        }:
+            order.status = status
+        else:
+            raise ValueError(f"unsupported controllable broker status: {status}")
+        return order
+
+    def fill_order(self, order_id: str) -> None:
+        order = self._orders[order_id]
+        order.status = "open"
+        order.filled_quantity = 0
+        order.remaining_quantity = order.quantity
+        self._apply_fill(order, float(order.limit_price or 1.0))
+
+    def partially_fill_order(self, order_id: str, quantity: int = 1) -> None:
+        order = self._orders[order_id]
+        order.status = "partially_filled"
+        order.filled_quantity = min(quantity, order.quantity)
+        order.remaining_quantity = order.quantity - order.filled_quantity
+        order.average_fill_price = float(order.limit_price or 1.0)
+
+    def all_orders(self):
+        return list(self._orders.values())
 
 TRADING_DATE = date(2026, 8, 5)
 NOW = datetime(2026, 8, 5, 15, 0, tzinfo=timezone.utc)
@@ -291,6 +341,9 @@ def _force_two_component_optimize(
 
     def _wrapped(**kwargs):
         result = real_optimize(**kwargs)
+        maximum_age_seconds = int(
+            kwargs["settings"].maximum_decision_age_seconds
+        )
         strategies = list(kwargs.get("strategies") or [])
         strategy_id = (
             UUID(str(strategies[0].strategy_id)) if strategies else uuid4()
@@ -316,6 +369,13 @@ def _force_two_component_optimize(
                 objective_version=kwargs["ctx"].objective_version,
                 decision_id=decision_id,
                 evaluated_objective_fingerprint=fingerprint,
+                evaluated_at_exchange_time=kwargs["current_exchange_time"],
+                decision_valid_until_exchange_time=(
+                    kwargs["current_exchange_time"]
+                    + timedelta(seconds=maximum_age_seconds)
+                ),
+                maximum_decision_age_seconds=maximum_age_seconds,
+                required_resolution_horizon_seconds=30,
             ),
             AuthorizedPositionTuple(
                 position_tuple_id=uuid4(),
@@ -333,6 +393,13 @@ def _force_two_component_optimize(
                 objective_version=kwargs["ctx"].objective_version,
                 decision_id=decision_id,
                 evaluated_objective_fingerprint=fingerprint,
+                evaluated_at_exchange_time=kwargs["current_exchange_time"],
+                decision_valid_until_exchange_time=(
+                    kwargs["current_exchange_time"]
+                    + timedelta(seconds=maximum_age_seconds)
+                ),
+                maximum_decision_age_seconds=maximum_age_seconds,
+                required_resolution_horizon_seconds=30,
             ),
         )
         decision = TargetPortfolioDecision(
@@ -350,6 +417,13 @@ def _force_two_component_optimize(
             quantity_grid=result.decision.quantity_grid,
             portfolio_evaluations=result.decision.portfolio_evaluations,
             evaluated_objective_fingerprint=fingerprint,
+            evaluated_at_exchange_time=kwargs["current_exchange_time"],
+            decision_valid_until_exchange_time=(
+                kwargs["current_exchange_time"]
+                + timedelta(seconds=maximum_age_seconds)
+            ),
+            maximum_decision_age_seconds=maximum_age_seconds,
+            required_resolution_horizon_seconds=30,
         )
         return FullChainOptimizationResult(
             universe=result.universe,
@@ -362,7 +436,15 @@ def _force_two_component_optimize(
     monkeypatch.setattr(fco_mod, "optimize_full_chain", _wrapped)
 
 
-async def _two_contract_stack(tmp_path, monkeypatch):
+async def _two_contract_stack(
+    tmp_path,
+    monkeypatch,
+    *,
+    broker=None,
+    qty_a: int = 1,
+    qty_b: int = 3,
+    objective_duration: timedelta = timedelta(minutes=4),
+):
     from zoneinfo import ZoneInfo
 
     from joker.persistence.cognitive_execution_provenance import (
@@ -375,7 +457,7 @@ async def _two_contract_stack(tmp_path, monkeypatch):
         tmp_path,
         pnl=Decimal("15"),
         n=20,
-        objective_duration=timedelta(minutes=4),
+        objective_duration=objective_duration,
         max_concurrent_positions=2,
         option_quotes=[
             {
@@ -399,12 +481,18 @@ async def _two_contract_stack(tmp_path, monkeypatch):
                 "quote_timestamp": quote_ts,
             },
         ],
+        broker=broker,
     )
     _enable_full_chain(stack["deps"])
-    _force_two_component_optimize(monkeypatch, qty_a=1, qty_b=3)
+    _force_two_component_optimize(monkeypatch, qty_a=qty_a, qty_b=qty_b)
     provenance = CognitiveExecutionProvenanceRegistry(stack["deps"].db_path)
     await provenance.initialize()
     stack["deps"].provenance_registry = provenance
+
+    async def _projection_loader():
+        return await stack["deps"].execution_runtime.project_session()
+
+    stack["deps"].projection_loader = _projection_loader
     tracked_requests: list = []
     gateway = stack["gateway"]
     # Chain through the prepare_stack tracking wrapper (gateway.submit).
@@ -421,57 +509,52 @@ async def _two_contract_stack(tmp_path, monkeypatch):
     return stack
 
 
-async def _seed_first_component_provenance(stack, result) -> str:
-    """Persist component-0 as already submitted for restart simulation."""
-    from joker.objectives.decision_fingerprint import ObjectiveDecisionFingerprint
-    from joker.persistence.cognitive_execution_provenance import (
-        ExecutionProvenanceRecord,
-    )
-    from joker.runtime.order_action_gateway import working_orders_from_projection
+def _advance_exchange_clock_during_debate(
+    stack, *, seconds: int, after_advance=None
+) -> None:
+    """Advance exchange time after optimization but before final review."""
+    original = stack["deps"].router.route_and_complete
+    advanced = False
 
-    positions = result.get("_target_authorized_positions") or []
-    decision = result.get("_target_portfolio_decision") or {}
-    decision_id = str(decision["decision_id"])
-    first = positions[0]
-    proposal = result["execution_proposal"]
-    objective = await stack["objective_service"].get_state()
-    projection = (
-        await stack["deps"].projection_loader()
-        if stack["deps"].projection_loader is not None
-        else None
+    async def _wrapped(request, output_type, **kwargs):
+        nonlocal advanced
+        if not advanced and str(request.role) in {
+            "strategy_advocate",
+            "falsifier",
+            "historical_critic",
+            "execution_critic",
+            "alternative_explanation",
+        }:
+            advanced = True
+            stack["clock"].set_now(
+                stack["clock"].now() + timedelta(seconds=seconds)
+            )
+            if after_advance is not None:
+                after_advance()
+        return await original(request, output_type, **kwargs)
+
+    stack["deps"].router.route_and_complete = _wrapped
+
+
+async def _restart_portfolio_runtime(stack):
+    """Rebuild the durable registry and graph without starting worker tasks."""
+    from joker.persistence.cognitive_execution_provenance import (
+        CognitiveExecutionProvenanceRegistry,
     )
-    fingerprint = ObjectiveDecisionFingerprint.from_state(
-        objective,
-        working_order_count=len(working_orders_from_projection(projection)),
-        broker_identity="PaperBroker",
-        broker_eligible=True,
-        reconciliation_eligible=True,
+    from joker.runtime.cognitive_agent_runtime import CognitiveAgentRuntime
+
+    registry = CognitiveExecutionProvenanceRegistry(stack["deps"].db_path)
+    await registry.initialize()
+    stack["deps"].provenance_registry = registry
+    runtime = CognitiveAgentRuntime(
+        session_id=stack["deps"].session_id,
+        run_id=stack["deps"].run_id,
+        router=stack["deps"].router,
+        config=stack["deps"].config,
+        graph_deps=stack["deps"],
     )
-    client_order_id = f"seeded-{first['position_tuple_id']}"
-    await stack["deps"].provenance_registry.record(
-        ExecutionProvenanceRecord(
-            client_order_id=client_order_id,
-            proposal_id=str(proposal.proposal_id),
-            decision_id=str(proposal.decision_id),
-            strategy_id=str(first["strategy_id"]),
-            cycle_id=str(result.get("cycle_id") or "cycle-hist-ev"),
-            snapshot_id=str(first["snapshot_id"]),
-            contract_id=str(first["contract_id"]),
-            session_id=stack["deps"].session_id,
-            kind="entry",
-            extra={
-                "target_portfolio_decision_id": decision_id,
-                "selected_portfolio_id": str(decision.get("selected_portfolio_id")),
-                "authorized_position_tuple_id": str(first["position_tuple_id"]),
-                "component_index": 0,
-                "component_count": 2,
-                "evaluated_objective_version": int(first["objective_version"]),
-                "post_submission_objective_fingerprint": fingerprint.canonical_json,
-                "post_submission_objective_version": int(objective.version),
-            },
-        )
-    )
-    return client_order_id
+    runtime._decision_graph = build_cognitive_graph(stack["deps"])
+    return runtime, registry
 
 
 @pytest.mark.asyncio
@@ -528,13 +611,33 @@ async def test_target_decision_and_position_tuple_ids_reach_submission_provenanc
                         ),
                         "component_index": request.component_index,
                         "component_count": request.component_count,
+                        "evaluated_at_exchange_time": (
+                            request.evaluated_at_exchange_time
+                        ),
+                        "decision_valid_until_exchange_time": (
+                            request.decision_valid_until_exchange_time
+                        ),
+                        "maximum_decision_age_seconds": (
+                            request.maximum_decision_age_seconds
+                        ),
+                        "submission_exchange_time": (
+                            request.submission_exchange_time
+                        ),
+                        "decision_age_seconds": request.decision_age_seconds,
+                        "required_resolution_horizon_seconds": (
+                            request.required_resolution_horizon_seconds
+                        ),
                     },
                 )
             )
             return OrderActionResult(
                 submitted=True,
                 client_order_id=request.client_order_id,
-                broker_order=SimpleNamespace(order_id=request.client_order_id),
+                broker_order=SimpleNamespace(
+                    order_id=request.client_order_id,
+                    status="filled",
+                    filled_quantity=request.quantity,
+                ),
                 working_orders={},
             )
 
@@ -558,6 +661,10 @@ async def test_target_decision_and_position_tuple_ids_reach_submission_provenanc
             assert request.selected_portfolio_id == str(
                 decision["selected_portfolio_id"]
             )
+            assert request.evaluated_at_exchange_time
+            assert request.submission_exchange_time
+            assert request.maximum_decision_age_seconds == 60
+            assert request.decision_age_seconds is not None
         recorded = await stack[
             "deps"
         ].provenance_registry.list_by_target_portfolio_decision_id(decision_id)
@@ -566,6 +673,17 @@ async def test_target_decision_and_position_tuple_ids_reach_submission_provenanc
             str((row.extra or {}).get("authorized_position_tuple_id"))
             for row in recorded
         } == {str(p["position_tuple_id"]) for p in positions}
+        assert all(
+            (row.extra or {}).get("submission_exchange_time")
+            for row in recorded
+        )
+        durable = await stack[
+            "deps"
+        ].provenance_registry.portfolio_executions.list_by_decision(decision_id)
+        assert len(durable) == 2
+        assert all(row.latest_validation_snapshot_id for row in durable)
+        assert all(row.last_validation_timestamp for row in durable)
+        assert all(row.last_reconciliation_timestamp for row in durable)
     finally:
         await _teardown_stack(stack)
 
@@ -574,60 +692,30 @@ async def test_target_decision_and_position_tuple_ids_reach_submission_provenanc
 async def test_restart_after_first_component_does_not_duplicate_or_skip(
     tmp_path, monkeypatch
 ) -> None:
-    stack = await _two_contract_stack(tmp_path, monkeypatch)
+    broker = ControllablePaperBroker(["open", "filled"])
+    stack = await _two_contract_stack(tmp_path, monkeypatch, broker=broker)
     try:
-        from joker.runtime.order_action_gateway import OrderActionResult
-
-        # First pass: build authoritative two-component proposal without submitting.
-        async def _block_all(request):
-            return OrderActionResult(
-                submitted=False,
-                client_order_id=request.client_order_id,
-                blocked_reason="defer_submission_for_restart_test",
-                working_orders={},
-            )
-
-        stack["gateway"].submit = _block_all  # type: ignore[method-assign]
         result = await stack["graph"].ainvoke(
             stack["state"], config=stack["config"]
         )
-        positions = result.get("_target_authorized_positions") or []
         decision = result.get("_target_portfolio_decision") or {}
-        assert len(positions) == 2
         decision_id = str(decision["decision_id"])
-        seeded_id = await _seed_first_component_provenance(stack, result)
+        first_client_id = stack["tracked_requests"][0].client_order_id
+        runtime, registry = await _restart_portfolio_runtime(stack)
 
-        resume_calls: list = []
+        await runtime._resume_portfolio_decision(decision_id)
+        await runtime._resume_portfolio_decision(decision_id)
 
-        async def _approve_remaining(request):
-            resume_calls.append(request)
-            return OrderActionResult(
-                submitted=True,
-                client_order_id=request.client_order_id,
-                broker_order=SimpleNamespace(order_id=request.client_order_id),
-                working_orders={},
-            )
-
-        stack["gateway"].submit = _approve_remaining  # type: ignore[method-assign]
-        submit_node = stack["graph"].nodes["submit_execution_command"]
-        resume_state: CognitiveGraphState = {
-            **result,
-            "execution_command_id": None,
-            "_execution_command_ids": None,
-            "errors": [],
-            "_block_new_entries": False,
-        }
-        resumed = await submit_node.ainvoke(resume_state)
-        command_ids = list(resumed.get("_execution_command_ids") or [])
-        assert command_ids[0] == seeded_id
-        assert len(resume_calls) == 1
-        assert resume_calls[0].component_index == 1
-        assert resume_calls[0].authorized_position_tuple_id == str(
-            positions[1]["position_tuple_id"]
+        records = await registry.portfolio_executions.list_by_decision(
+            decision_id
         )
-        assert resume_calls[0].target_portfolio_decision_id == decision_id
-        assert len(command_ids) == 2
-        assert command_ids[1] == resume_calls[0].client_order_id
+        assert broker.external_submission_count == 1
+        assert [record.status.value for record in records] == [
+            "WORKING",
+            "AUTHORIZED",
+        ]
+        assert records[0].client_order_id == first_client_id
+        assert records[1].client_order_id != first_client_id
     finally:
         await _teardown_stack(stack)
 
@@ -636,24 +724,15 @@ async def test_restart_after_first_component_does_not_duplicate_or_skip(
 async def test_remaining_components_revalidate_after_restart(
     tmp_path, monkeypatch
 ) -> None:
-    stack = await _two_contract_stack(tmp_path, monkeypatch)
+    broker = ControllablePaperBroker(["open", "filled"])
+    stack = await _two_contract_stack(tmp_path, monkeypatch, broker=broker)
     try:
-        from joker.runtime.order_action_gateway import OrderActionResult
-
-        async def _block_all(request):
-            return OrderActionResult(
-                submitted=False,
-                client_order_id=request.client_order_id,
-                blocked_reason="defer_submission_for_restart_test",
-                working_orders={},
-            )
-
-        stack["gateway"].submit = _block_all  # type: ignore[method-assign]
         result = await stack["graph"].ainvoke(
             stack["state"], config=stack["config"]
         )
-        assert len(result.get("_target_authorized_positions") or []) == 2
-        await _seed_first_component_provenance(stack, result)
+        decision_id = str(result["_target_portfolio_decision"]["decision_id"])
+        first_order = broker.list_open_orders()[0]
+        broker.fill_order(first_order.order_id)
 
         svc = stack["objective_service"]
         original_get = svc.get_state
@@ -665,33 +744,494 @@ async def test_remaining_components_revalidate_after_restart(
             )
 
         svc.get_state = _tight_capital  # type: ignore[method-assign]
-        remaining_calls: list = []
+        runtime, registry = await _restart_portfolio_runtime(stack)
+        await runtime._resume_portfolio_decision(decision_id)
 
-        async def _should_not_submit(request):
-            remaining_calls.append(request)
-            return OrderActionResult(
-                submitted=True,
-                client_order_id=request.client_order_id,
-                broker_order=SimpleNamespace(order_id=request.client_order_id),
-                working_orders={},
+        records = await registry.portfolio_executions.list_by_decision(
+            decision_id
+        )
+        assert broker.external_submission_count == 1
+        assert [record.status.value for record in records] == [
+            "FILLED",
+            "REOPTIMIZATION_REQUIRED",
+        ]
+        assert "available_capital" in str(
+            records[1].failure_reoptimization_reason
+        )
+    finally:
+        await _teardown_stack(stack)
+
+
+@pytest.mark.asyncio
+async def test_restart_after_filled_first_component_submits_second_once(
+    tmp_path, monkeypatch
+) -> None:
+    broker = ControllablePaperBroker(["open", "filled"])
+    stack = await _two_contract_stack(tmp_path, monkeypatch, broker=broker)
+    try:
+        result = await stack["graph"].ainvoke(
+            stack["state"], config=stack["config"]
+        )
+        decision_id = str(result["_target_portfolio_decision"]["decision_id"])
+        positions = result["_target_authorized_positions"]
+        first_order = broker.list_open_orders()[0]
+        broker.fill_order(first_order.order_id)
+
+        runtime, registry = await _restart_portfolio_runtime(stack)
+        await runtime._resume_portfolio_decision(decision_id)
+        await runtime._resume_portfolio_decision(decision_id)
+
+        records = await registry.portfolio_executions.list_by_decision(
+            decision_id
+        )
+        assert broker.external_submission_count == 2
+        assert [record.status.value for record in records] == ["FILLED", "FILLED"]
+        assert [record.contract_id for record in records] == [
+            position["contract_id"] for position in positions
+        ]
+        assert [record.authorized_quantity for record in records] == [
+            int(position["quantity"]) for position in positions
+        ]
+        assert [record.component_index for record in records] == [0, 1]
+        assert len({record.client_order_id for record in records}) == 2
+    finally:
+        await _teardown_stack(stack)
+
+
+@pytest.mark.asyncio
+async def test_compiled_graph_five_second_latency_allows_valid_submission(
+    tmp_path, monkeypatch
+) -> None:
+    broker = ControllablePaperBroker(["filled", "filled"])
+    stack = await _two_contract_stack(
+        tmp_path,
+        monkeypatch,
+        broker=broker,
+        objective_duration=timedelta(minutes=10),
+    )
+    try:
+        _advance_exchange_clock_during_debate(stack, seconds=5)
+        result = await stack["graph"].ainvoke(
+            stack["state"], config=stack["config"]
+        )
+        decision = result["_target_portfolio_decision"]
+        assert broker.external_submission_count == 2
+        assert Decimal(str(decision["decision_age_seconds"])) == Decimal("5.0")
+        assert decision["decision_timing_reason_codes"] == []
+    finally:
+        await _teardown_stack(stack)
+
+
+@pytest.mark.asyncio
+async def test_compiled_graph_real_clock_latency_does_not_fail_on_time_decay_only(
+    tmp_path, monkeypatch
+) -> None:
+    broker = ControllablePaperBroker(["filled", "filled"])
+    stack = await _two_contract_stack(
+        tmp_path,
+        monkeypatch,
+        broker=broker,
+        objective_duration=timedelta(minutes=10),
+    )
+    try:
+        # The injected exchange clock progresses between the optimizer and the
+        # submission node; the fingerprint's time_remaining field therefore
+        # decays exactly as it does during a real model-backed graph cycle.
+        _advance_exchange_clock_during_debate(stack, seconds=7)
+        result = await stack["graph"].ainvoke(
+            stack["state"], config=stack["config"]
+        )
+        assert broker.external_submission_count == 2
+        assert not any(
+            "time_remaining_seconds" in error.message
+            for error in result.get("errors") or []
+        )
+    finally:
+        await _teardown_stack(stack)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("advance_seconds", "expected_submissions", "reason"),
+    [
+        (5, 2, None),
+        (6, 0, "decision_age_exceeded"),
+    ],
+)
+async def test_compiled_graph_decision_age_boundary(
+    tmp_path,
+    monkeypatch,
+    advance_seconds: int,
+    expected_submissions: int,
+    reason: str | None,
+) -> None:
+    broker = ControllablePaperBroker(["filled", "filled"])
+    stack = await _two_contract_stack(
+        tmp_path,
+        monkeypatch,
+        broker=broker,
+        objective_duration=timedelta(minutes=10),
+    )
+    try:
+        stack["deps"].full_chain_optimizer_settings = (
+            stack["deps"].full_chain_optimizer_settings.model_copy(
+                update={"maximum_decision_age_seconds": 5}
+            )
+        )
+        _advance_exchange_clock_during_debate(
+            stack, seconds=advance_seconds
+        )
+        result = await stack["graph"].ainvoke(
+            stack["state"], config=stack["config"]
+        )
+        assert broker.external_submission_count == expected_submissions
+        messages = " ".join(
+            error.message for error in result.get("errors") or []
+        )
+        if reason is None:
+            assert "decision_age_exceeded" not in messages
+        else:
+            assert reason in messages
+    finally:
+        await _teardown_stack(stack)
+
+
+@pytest.mark.asyncio
+async def test_compiled_graph_deadline_crossed_during_debate_blocks_submission(
+    tmp_path, monkeypatch
+) -> None:
+    broker = ControllablePaperBroker(["filled", "filled"])
+    stack = await _two_contract_stack(tmp_path, monkeypatch, broker=broker)
+    try:
+        stack["deps"].full_chain_optimizer_settings = (
+            stack["deps"].full_chain_optimizer_settings.model_copy(
+                update={"maximum_decision_age_seconds": 120}
+            )
+        )
+        _advance_exchange_clock_during_debate(stack, seconds=60)
+        result = await stack["graph"].ainvoke(
+            stack["state"], config=stack["config"]
+        )
+        assert broker.external_submission_count == 0
+        assert any(
+            "objective_deadline_reached" in error.message
+            for error in result.get("errors") or []
+        )
+    finally:
+        await _teardown_stack(stack)
+
+
+@pytest.mark.asyncio
+async def test_remaining_resolution_horizon_no_longer_fits_requires_reoptimization(
+    tmp_path, monkeypatch
+) -> None:
+    broker = ControllablePaperBroker(["filled", "filled"])
+    stack = await _two_contract_stack(tmp_path, monkeypatch, broker=broker)
+    try:
+        _advance_exchange_clock_during_debate(stack, seconds=30)
+        result = await stack["graph"].ainvoke(
+            stack["state"], config=stack["config"]
+        )
+        assert broker.external_submission_count == 0
+        assert any(
+            "resolution_horizon_no_longer_fits" in error.message
+            for error in result.get("errors") or []
+        )
+    finally:
+        await _teardown_stack(stack)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("truth_change", ["target_reached", "capital"])
+async def test_material_truth_change_during_debate_requires_reoptimization(
+    tmp_path, monkeypatch, truth_change: str
+) -> None:
+    broker = ControllablePaperBroker(["filled", "filled"])
+    stack = await _two_contract_stack(
+        tmp_path,
+        monkeypatch,
+        broker=broker,
+        objective_duration=timedelta(minutes=10),
+    )
+    try:
+        changed = False
+        service = stack["objective_service"]
+        original_get_state = service.get_state
+
+        async def _changed_state():
+            state = await original_get_state()
+            if not changed:
+                return state
+            if truth_change == "target_reached":
+                return state.model_copy(
+                    update={
+                        "status": "target_reached",
+                        "required_profit_remaining_usd": Decimal("0"),
+                        "realised_pnl_usd": state.target_profit_usd,
+                    }
+                )
+            return state.model_copy(
+                update={"available_capital_usd": Decimal("1.00")}
             )
 
-        stack["gateway"].submit = _should_not_submit  # type: ignore[method-assign]
-        submit_node = stack["graph"].nodes["submit_execution_command"]
-        resume_state: CognitiveGraphState = {
-            **result,
-            "execution_command_id": None,
-            "_execution_command_ids": None,
-            "errors": [],
-            "_block_new_entries": False,
-        }
-        resumed = await submit_node.ainvoke(resume_state)
-        assert resumed.get("_block_new_entries") is True
-        assert remaining_calls == []
+        service.get_state = _changed_state  # type: ignore[method-assign]
+
+        def _change_truth() -> None:
+            nonlocal changed
+            changed = True
+
+        _advance_exchange_clock_during_debate(
+            stack, seconds=5, after_advance=_change_truth
+        )
+        result = await stack["graph"].ainvoke(
+            stack["state"], config=stack["config"]
+        )
+        assert broker.external_submission_count == 0
+        expected = (
+            "target_already_reached"
+            if truth_change == "target_reached"
+            else "available capital"
+        )
         assert any(
-            getattr(error, "error_code", None)
-            == "target_attainment_recalculation_required"
-            for error in (resumed.get("errors") or [])
+            expected in error.message for error in result.get("errors") or []
+        ), [
+            (error.error_code, error.message)
+            for error in result.get("errors") or []
+        ]
+    finally:
+        await _teardown_stack(stack)
+
+
+@pytest.mark.asyncio
+async def test_review_forced_wait_clears_authority_events_and_checkpoint(
+    tmp_path, monkeypatch
+) -> None:
+    from joker.cli.graph_view import render_graph_event
+    from joker.events.schemas import EventType
+    from joker.objectives import portfolio_review as portfolio_review_mod
+
+    broker = ControllablePaperBroker(["filled", "filled"])
+    stack = await _two_contract_stack(
+        tmp_path,
+        monkeypatch,
+        broker=broker,
+        objective_duration=timedelta(minutes=10),
+    )
+    captured = []
+
+    class _CaptureBus:
+        async def publish(self, event):
+            captured.append(event)
+            return True
+
+    original_review = portfolio_review_mod.portfolio_review_from_debate
+
+    def _force_wait(review, context):
+        return original_review(review, context).model_copy(
+            update={"finalizer_recommendation": "wait"}
+        )
+
+    monkeypatch.setattr(
+        portfolio_review_mod, "portfolio_review_from_debate", _force_wait
+    )
+    stack["deps"].event_bus = _CaptureBus()
+    stack["graph"] = build_cognitive_graph(stack["deps"])
+    try:
+        result = await stack["graph"].ainvoke(
+            stack["state"], config=stack["config"]
+        )
+        decision = result["_target_portfolio_decision"]
+        legacy = result["_target_attainment_decision"]
+        assert decision["action"] == "wait"
+        assert decision["authorized_positions"] == []
+        assert decision["selected_portfolio_id"] is None
+        assert decision["selected_strategy_id"] is None
+        assert decision["selected_contract_id"] is None
+        assert decision["selected_quantity"] == 0
+        assert Decimal(str(decision["selected_capital"])) == 0
+        assert decision["selected_probability_goal"] == decision[
+            "wait_probability_goal"
+        ]
+        assert Decimal(str(decision["probability_delta"])) == 0
+        assert legacy["selected_strategy_id"] is None
+        assert legacy["selected_contract_id"] is None
+        assert legacy["selected_quantity"] == 0
+        assert result["_target_authorized_positions"] == []
+        assert result["_sizing_decision"] is None
+        assert result["execution_proposal"] is None
+        assert result["execution_command_id"] is None
+        assert broker.external_submission_count == 0
+
+        audit = result["_portfolio_review_rejected_decision_audit"]
+        assert audit["audit_only"] is True
+        assert audit["authoritative"] is False
+
+        restored = await stack["graph"].aget_state(stack["config"])
+        restored_values = restored.values
+        assert restored_values["_target_authorized_positions"] == []
+        assert restored_values["execution_proposal"] is None
+        submit_node = stack["graph"].nodes["submit_execution_command"]
+        await submit_node.ainvoke(restored_values)
+        assert broker.external_submission_count == 0
+
+        wait_event = next(
+            event
+            for event in captured
+            if event.event_type == EventType.TARGET_WAIT_SELECTED
+        )
+        wait_payload = wait_event.payload
+        assert wait_payload["decision"]["authorized_positions"] == []
+        assert wait_payload["decision"]["selected_portfolio_id"] is None
+        assert wait_payload["decision"]["selected_quantity"] == 0
+        assert Decimal(str(wait_payload["probability_delta"])) == 0
+
+        scored_events = [
+            event
+            for event in captured
+            if event.event_type
+            in {EventType.CONTRACT_GRID_SCORED, EventType.PORTFOLIO_GRID_SCORED}
+        ]
+        assert scored_events
+        for event in scored_events:
+            rows = event.payload.get("contracts") or event.payload.get(
+                "portfolios"
+            ) or []
+            assert all(row.get("selected") is False for row in rows)
+
+        verbose = render_graph_event(
+            wait_event.event_type.value, wait_payload, view="verbose"
+        )
+        rendered_json = render_graph_event(
+            wait_event.event_type.value, wait_payload, view="json"
+        )
+        assert "selected=True" not in verbose
+        assert '"selected": true' not in rendered_json.lower()
+    finally:
+        await _teardown_stack(stack)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("working_status", ["accepted", "open", "pending"])
+async def test_pending_first_component_queues_remaining_components_with_real_gateway(
+    tmp_path, monkeypatch, working_status
+) -> None:
+    broker = ControllablePaperBroker([working_status, "filled"])
+    stack = await _two_contract_stack(tmp_path, monkeypatch, broker=broker)
+    try:
+        result = await stack["graph"].ainvoke(
+            stack["state"], config=stack["config"]
+        )
+        positions = result.get("_target_authorized_positions") or []
+        execution_state = result.get("_portfolio_execution_state") or []
+        assert broker.external_submission_count == 1
+        assert len(stack["tracked_requests"]) == 1
+        assert [row["status"] for row in execution_state] == [
+            "WORKING",
+            "AUTHORIZED",
+        ]
+        assert [row["contract_id"] for row in execution_state] == [
+            position["contract_id"] for position in positions
+        ]
+        assert [row["authorized_quantity"] for row in execution_state] == [
+            position["quantity"] for position in positions
+        ]
+        assert not any(
+            error.error_code in {"gateway_blocked", "submit_validation_failed"}
+            for error in result.get("errors") or []
+        )
+        assert len(broker.all_orders()) == 1
+        assert broker.all_orders()[0].status == working_status
+    finally:
+        await _teardown_stack(stack)
+
+
+@pytest.mark.asyncio
+async def test_partial_fill_preserves_remaining_component_without_second_entry(
+    tmp_path, monkeypatch
+) -> None:
+    broker = ControllablePaperBroker(["partially_filled", "filled"])
+    stack = await _two_contract_stack(
+        tmp_path, monkeypatch, broker=broker, qty_a=2
+    )
+    try:
+        result = await stack["graph"].ainvoke(
+            stack["state"], config=stack["config"]
+        )
+        execution_state = result.get("_portfolio_execution_state") or []
+        assert broker.external_submission_count == 1
+        assert [row["status"] for row in execution_state] == [
+            "PARTIALLY_FILLED",
+            "AUTHORIZED",
+        ]
+        assert execution_state[0]["remaining_quantity"] > 0
+        assert execution_state[1]["submitted_quantity"] == 0
+
+        first_order = broker.all_orders()[0]
+        first_client_id = stack["tracked_requests"][0].client_order_id
+        broker.fill_order(first_order.order_id)
+        await stack["deps"].execution_runtime.poll_order_status(first_client_id)
+        runtime, registry = await _restart_portfolio_runtime(stack)
+        await runtime._resume_portfolio_for_order(first_client_id)
+        records = await registry.portfolio_executions.list_by_decision(
+            str(result["_target_portfolio_decision"]["decision_id"])
+        )
+        assert broker.external_submission_count == 2
+        assert [record.status.value for record in records] == ["FILLED", "FILLED"]
+    finally:
+        await _teardown_stack(stack)
+
+
+@pytest.mark.asyncio
+async def test_fill_event_resumes_next_component_once_with_stable_identity(
+    tmp_path, monkeypatch
+) -> None:
+    broker = ControllablePaperBroker(["open", "filled"])
+    stack = await _two_contract_stack(tmp_path, monkeypatch, broker=broker)
+    try:
+        result = await stack["graph"].ainvoke(
+            stack["state"], config=stack["config"]
+        )
+        first_order = broker.list_open_orders()[0]
+        first_client_id = stack["tracked_requests"][0].client_order_id
+        broker.fill_order(first_order.order_id)
+        await stack["deps"].execution_runtime.poll_order_status(first_client_id)
+        runtime, registry = await _restart_portfolio_runtime(stack)
+        await runtime._resume_portfolio_for_order(first_client_id)
+        decision_id = str(result["_target_portfolio_decision"]["decision_id"])
+        execution_state = await registry.portfolio_executions.list_by_decision(
+            decision_id
+        )
+        assert broker.external_submission_count == 2
+        assert [row.status.value for row in execution_state] == ["FILLED", "FILLED"]
+        assert len({row.client_order_id for row in execution_state}) == 2
+
+        await runtime._resume_portfolio_for_order(first_client_id)
+        assert broker.external_submission_count == 2
+        replayed = await registry.portfolio_executions.list_by_decision(
+            decision_id
+        )
+        assert replayed[1].client_order_id == execution_state[1].client_order_id
+    finally:
+        await _teardown_stack(stack)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("terminal_status", ["rejected", "cancelled"])
+async def test_terminal_first_component_prevents_later_components(
+    tmp_path, monkeypatch, terminal_status
+) -> None:
+    broker = ControllablePaperBroker([terminal_status, "filled"])
+    stack = await _two_contract_stack(tmp_path, monkeypatch, broker=broker)
+    try:
+        result = await stack["graph"].ainvoke(
+            stack["state"], config=stack["config"]
+        )
+        execution_state = result.get("_portfolio_execution_state") or []
+        assert broker.external_submission_count == 1
+        assert execution_state[0]["status"] == terminal_status.upper()
+        assert execution_state[1]["status"] == "REOPTIMIZATION_REQUIRED"
+        assert execution_state[1]["failure_reoptimization_reason"] == (
+            f"prior_component_{terminal_status}"
         )
     finally:
         await _teardown_stack(stack)

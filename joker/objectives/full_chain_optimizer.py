@@ -222,6 +222,9 @@ def optimize_full_chain(
         ),
         wait_probability_goal=wait_estimate.p_goal,
         evaluated_objective_fingerprint=evaluated_objective_fingerprint,
+        evaluated_at_exchange_time=current_exchange_time,
+        deadline_exchange_time=ctx.deadline_exchange_time,
+        maximum_decision_age_seconds=settings.maximum_decision_age_seconds,
         settings=search_settings,
     )
     return FullChainOptimizationResult(
@@ -307,4 +310,18 @@ def portfolio_decision_as_legacy_target_dict(
             position.as_dict() for position in decision.authorized_positions
         ],
         "time_remaining_seconds": decision.time_remaining_seconds,
+        "evaluated_at_exchange_time": (
+            decision.evaluated_at_exchange_time.isoformat()
+            if decision.evaluated_at_exchange_time is not None
+            else None
+        ),
+        "decision_valid_until_exchange_time": (
+            decision.decision_valid_until_exchange_time.isoformat()
+            if decision.decision_valid_until_exchange_time is not None
+            else None
+        ),
+        "maximum_decision_age_seconds": decision.maximum_decision_age_seconds,
+        "required_resolution_horizon_seconds": (
+            decision.required_resolution_horizon_seconds
+        ),
     }

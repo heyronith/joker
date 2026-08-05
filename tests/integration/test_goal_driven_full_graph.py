@@ -51,13 +51,14 @@ async def _prepare_stack(
     max_concurrent_positions: int = 1,
     maximum_authorised_contracts: int = 20,
     objective_duration: timedelta = timedelta(hours=4),
+    broker: PaperBroker | None = None,
 ):
     start = datetime(2026, 7, 1, 10, 0, tzinfo=ET)
     clock = FrozenExchangeClock(start, calendar=MarketCalendar())
     db = tmp_path / "joker.db"
     session_id = "sess-hist-ev"
     cycle_id = "cycle-hist-ev"
-    broker = PaperBroker(slippage_pct=0)
+    broker = broker or PaperBroker(slippage_pct=0)
     supervisor = SessionSupervisor(
         broker=broker,
         clock=clock,

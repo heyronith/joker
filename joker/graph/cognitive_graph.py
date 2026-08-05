@@ -295,28 +295,16 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
                 ),
             }
         if "wait" in recommendations:
-            finalized = {
-                **original,
-                "action": "wait",
-                "authorized_positions": [],
-                "selected_portfolio_id": None,
-                "reason_codes": list(original.get("reason_codes") or [])
-                + ["portfolio_review_forced_wait"],
-            }
-            target_decision = dict(state.get("_target_attainment_decision") or {})
-            target_decision.update(
-                {
-                    "action": "wait",
-                    "selected_strategy_id": None,
-                    "selected_contract_id": None,
-                    "selected_quantity": 0,
-                    "selected_capital_usd": "0",
-                    "reason_codes": list(target_decision.get("reason_codes") or [])
-                    + ["portfolio_review_forced_wait"],
-                }
+            from joker.objectives.portfolio_review import (
+                normalize_reviewer_forced_wait,
+            )
+            finalized, target_decision, audit = normalize_reviewer_forced_wait(
+                portfolio_decision=original,
+                legacy_decision=state.get("_target_attainment_decision"),
             )
             return {
-                "_provisional_target_portfolio_decision": original,
+                "_provisional_target_portfolio_decision": audit,
+                "_portfolio_review_rejected_decision_audit": audit,
                 "_target_portfolio_decision": finalized,
                 "_target_authorized_positions": [],
                 "_target_attainment_decision": target_decision,
@@ -324,6 +312,14 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
                 "_target_attainment_strategy_id": None,
                 "_target_attainment_contract_id": None,
                 "_target_attainment_quantity": 0,
+                "_target_attainment_authoritative": True,
+                "_quantity_grid": finalized.get("quantity_grid") or [],
+                "_portfolio_grid": finalized.get("portfolio_evaluations") or [],
+                "_sizing_decision": None,
+                "execution_proposal": None,
+                "execution_command_id": None,
+                "_execution_command_ids": [],
+                "execution_result_ref": None,
                 "_portfolio_review_finalization": {
                     "action": "wait",
                     "preserved_decision_id": decision.get("decision_id"),
@@ -673,6 +669,32 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
                             "original_decision_snapshot_id": UUID(
                                 str(position["snapshot_id"])
                             ),
+                            "evaluated_at_exchange_time": (
+                                datetime.fromisoformat(
+                                    str(position["evaluated_at_exchange_time"])
+                                )
+                                if position.get("evaluated_at_exchange_time")
+                                else None
+                            ),
+                            "decision_valid_until_exchange_time": (
+                                datetime.fromisoformat(
+                                    str(
+                                        position[
+                                            "decision_valid_until_exchange_time"
+                                        ]
+                                    )
+                                )
+                                if position.get(
+                                    "decision_valid_until_exchange_time"
+                                )
+                                else None
+                            ),
+                            "maximum_decision_age_seconds": position.get(
+                                "maximum_decision_age_seconds"
+                            ),
+                            "required_resolution_horizon_seconds": position.get(
+                                "required_resolution_horizon_seconds"
+                            ),
                             "sequence_order": index + 1,
                         }
                     )
@@ -792,6 +814,27 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
         command_ids: list[str] = []
         result_refs: list[str] = []
         submitted_by_tuple: dict[str, Any] = {}
+        portfolio_execution_repo = None
+        if authorized_positions:
+            if deps.provenance_registry is None and deps.db_path is not None:
+                from joker.persistence.cognitive_execution_provenance import (
+                    CognitiveExecutionProvenanceRegistry,
+                )
+
+                deps.provenance_registry = CognitiveExecutionProvenanceRegistry(
+                    deps.db_path
+                )
+                await deps.provenance_registry.initialize()
+            if deps.provenance_registry is None:
+                return append_error(
+                    state,
+                    node_name="submit_execution_command",
+                    error_code="portfolio_execution_store_unavailable",
+                    message="durable portfolio execution store unavailable",
+                )
+            portfolio_execution_repo = (
+                deps.provenance_registry.portfolio_executions
+            )
         if (
             deps.provenance_registry is not None
             and portfolio_decision.get("decision_id")
@@ -822,8 +865,108 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
                     ),
                 }
 
+        if authorized_positions and portfolio_execution_repo is not None:
+            from joker.persistence.cognitive_execution_provenance import (
+                PortfolioComponentStatus,
+                PortfolioExecutionComponentRecord,
+                stable_portfolio_client_order_id,
+            )
+
+            evaluated_timestamp = portfolio_decision.get(
+                "evaluated_at_exchange_time"
+            )
+            if not evaluated_timestamp:
+                return append_error(
+                    state,
+                    node_name="submit_execution_command",
+                    error_code="target_attainment_recalculation_required",
+                    message="portfolio evaluation timestamp is missing",
+                )
+            for component_index, position in enumerate(authorized_positions):
+                tuple_id = str(position["position_tuple_id"])
+                legacy = submitted_by_tuple.get(tuple_id)
+                client_order_id = (
+                    legacy.client_order_id
+                    if legacy is not None
+                    else stable_portfolio_client_order_id(
+                        str(portfolio_decision["decision_id"]), tuple_id
+                    )
+                )
+                record = PortfolioExecutionComponentRecord(
+                    target_portfolio_decision_id=str(
+                        portfolio_decision["decision_id"]
+                    ),
+                    selected_portfolio_id=(
+                        str(portfolio_decision["selected_portfolio_id"])
+                        if portfolio_decision.get("selected_portfolio_id")
+                        else None
+                    ),
+                    authorized_position_tuple_id=tuple_id,
+                    component_index=component_index,
+                    component_count=len(authorized_positions),
+                    strategy_id=str(position["strategy_id"]),
+                    contract_id=str(position["contract_id"]),
+                    authorized_quantity=int(position["quantity"]),
+                    capital_allocation=Decimal(
+                        str(position["capital_allocation"])
+                    ),
+                    client_order_id=client_order_id,
+                    status=PortfolioComponentStatus.AUTHORIZED,
+                    submitted_quantity=0,
+                    filled_quantity=0,
+                    remaining_quantity=int(position["quantity"]),
+                    original_decision_snapshot_id=str(position["snapshot_id"]),
+                    evaluated_objective_version=int(
+                        position["objective_version"]
+                    ),
+                    evaluated_timestamp=str(evaluated_timestamp),
+                    extra={
+                        "portfolio_decision": portfolio_decision,
+                        "authorized_positions": authorized_positions,
+                        "execution_proposal": proposal.model_dump(mode="json"),
+                    },
+                )
+                stored = await portfolio_execution_repo.authorize(record)
+                if legacy is not None and stored.status == PortfolioComponentStatus.AUTHORIZED:
+                    await portfolio_execution_repo.transition(
+                        tuple_id,
+                        status=PortfolioComponentStatus.SUBMITTED,
+                        submitted_quantity=int(position["quantity"]),
+                        latest_validation_snapshot_id=legacy.snapshot_id,
+                        submission_objective_version=(
+                            int((legacy.extra or {}).get("submission_objective_version"))
+                            if (legacy.extra or {}).get("submission_objective_version")
+                            is not None
+                            else None
+                        ),
+                        extra_update={"legacy_provenance_recovered": True},
+                    )
+
+        async def _mark_remaining_reoptimization(
+            start_index: int, reason: str
+        ) -> None:
+            if portfolio_execution_repo is None:
+                return
+            records = await portfolio_execution_repo.list_by_decision(
+                str(portfolio_decision.get("decision_id") or "")
+            )
+            for record in records:
+                if record.component_index < start_index:
+                    continue
+                if record.status not in {
+                    PortfolioComponentStatus.AUTHORIZED,
+                    PortfolioComponentStatus.READY,
+                }:
+                    continue
+                await portfolio_execution_repo.transition(
+                    record.authorized_position_tuple_id,
+                    status=PortfolioComponentStatus.REOPTIMIZATION_REQUIRED,
+                    failure_reoptimization_reason=reason,
+                )
+
         from joker.objectives.decision_fingerprint import (
             ObjectiveDecisionFingerprint,
+            validate_decision_submission_timing,
         )
         from joker.runtime.order_action_gateway import (
             working_orders_from_projection,
@@ -880,7 +1023,9 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
                 reconciliation_eligible=reconciliation_eligible,
             )
 
+        authorized_fill_transition = False
         for index, leg in enumerate(proposal.legs):
+            timing_evidence = None
             position = (
                 authorized_positions[index]
                 if index < len(authorized_positions)
@@ -891,16 +1036,124 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
                 if position is not None
                 else ""
             )
-            already_submitted = submitted_by_tuple.get(tuple_id)
-            if already_submitted is not None:
-                command_ids.append(already_submitted.client_order_id)
-                result_refs.append(already_submitted.client_order_id)
-                continue
             projection = (
                 await deps.projection_loader()
                 if deps.projection_loader is not None
                 else None
             )
+            component_record = (
+                await portfolio_execution_repo.get(tuple_id)
+                if portfolio_execution_repo is not None and tuple_id
+                else None
+            )
+            if component_record is not None:
+                order = None
+                orders = (
+                    projection.get("orders")
+                    if isinstance(projection, dict)
+                    else getattr(projection, "orders", None)
+                ) or {}
+                if isinstance(orders, dict):
+                    order = orders.get(component_record.client_order_id)
+                else:
+                    order = next(
+                        (
+                            item
+                            for item in orders
+                            if str(getattr(item, "client_order_id", ""))
+                            == component_record.client_order_id
+                        ),
+                        None,
+                    )
+                if order is not None:
+                    prior_component_status = component_record.status
+                    raw_status = (
+                        order.get("status")
+                        if isinstance(order, dict)
+                        else getattr(order, "status", "")
+                    )
+                    status_value = str(
+                        getattr(raw_status, "value", raw_status) or ""
+                    ).lower()
+                    filled_quantity = int(
+                        (
+                            order.get("filled_qty")
+                            or order.get("filled_quantity")
+                            or 0
+                        )
+                        if isinstance(order, dict)
+                        else getattr(order, "filled_qty", 0)
+                        or getattr(order, "filled_quantity", 0)
+                    )
+                    status_map = {
+                        "submitted": PortfolioComponentStatus.SUBMITTED,
+                        "accepted": PortfolioComponentStatus.WORKING,
+                        "open": PortfolioComponentStatus.WORKING,
+                        "pending": PortfolioComponentStatus.WORKING,
+                        "working": PortfolioComponentStatus.WORKING,
+                        "partially_filled": (
+                            PortfolioComponentStatus.PARTIALLY_FILLED
+                        ),
+                        "filled": PortfolioComponentStatus.FILLED,
+                        "rejected": PortfolioComponentStatus.REJECTED,
+                        "cancelled": PortfolioComponentStatus.CANCELLED,
+                    }
+                    mapped_status = status_map.get(status_value)
+                    if mapped_status is not None:
+                        component_record = await portfolio_execution_repo.transition(
+                            tuple_id,
+                            status=mapped_status,
+                            submitted_quantity=component_record.authorized_quantity,
+                            filled_quantity=filled_quantity,
+                            last_reconciliation_timestamp=(
+                                deps.clock.now().isoformat()
+                                if deps.clock is not None
+                                else datetime.now(timezone.utc).isoformat()
+                            ),
+                        )
+                        if (
+                            mapped_status == PortfolioComponentStatus.FILLED
+                            and prior_component_status
+                            in {
+                                PortfolioComponentStatus.SUBMITTED,
+                                PortfolioComponentStatus.WORKING,
+                                PortfolioComponentStatus.PARTIALLY_FILLED,
+                            }
+                        ):
+                            authorized_fill_transition = True
+                if component_record.status in {
+                    PortfolioComponentStatus.SUBMITTED,
+                    PortfolioComponentStatus.WORKING,
+                    PortfolioComponentStatus.PARTIALLY_FILLED,
+                }:
+                    command_ids.append(component_record.client_order_id)
+                    result_refs.append(
+                        component_record.broker_order_id
+                        or component_record.client_order_id
+                    )
+                    break
+                if component_record.status == PortfolioComponentStatus.FILLED:
+                    command_ids.append(component_record.client_order_id)
+                    result_refs.append(
+                        component_record.broker_order_id
+                        or component_record.client_order_id
+                    )
+                    continue
+                if component_record.status in {
+                    PortfolioComponentStatus.REJECTED,
+                    PortfolioComponentStatus.CANCELLED,
+                    PortfolioComponentStatus.REOPTIMIZATION_REQUIRED,
+                }:
+                    if component_record.status in {
+                        PortfolioComponentStatus.REJECTED,
+                        PortfolioComponentStatus.CANCELLED,
+                    }:
+                        await _mark_remaining_reoptimization(
+                            index + 1,
+                            "prior_component_"
+                            + component_record.status.value.lower(),
+                        )
+                    break
             if position is not None and deps.objective_service is not None:
                 if (
                     deps.clock is not None
@@ -910,11 +1163,150 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
                         now=deps.clock.now()
                     )
                 current_objective = await deps.objective_service.get_state()
+                objective_gate_reasons: list[str] = []
+                if (
+                    deps.clock is not None
+                    and current_objective.deadline_exchange_time is not None
+                    and deps.clock.now()
+                    >= current_objective.deadline_exchange_time
+                ):
+                    objective_gate_reasons.append("objective_deadline_reached")
+                if (
+                    current_objective.status == "target_reached"
+                    or current_objective.required_profit_remaining_usd <= 0
+                ):
+                    objective_gate_reasons.append("target_already_reached")
+                if current_objective.entries_paused:
+                    objective_gate_reasons.append("entries_paused")
+                if current_objective.truth_degraded:
+                    objective_gate_reasons.append("truth_degraded")
+                if objective_gate_reasons:
+                    reason = ",".join(objective_gate_reasons)
+                    await _mark_remaining_reoptimization(index, reason)
+                    return {
+                        "_block_new_entries": True,
+                        "_execution_command_ids": command_ids,
+                        **append_error(
+                            state,
+                            node_name="submit_execution_command",
+                            error_code="target_attainment_recalculation_required",
+                            message=(
+                                "objective gate changed before component: "
+                                + reason
+                            ),
+                        ),
+                    }
+                if deps.clock is None or not hasattr(deps.clock, "now"):
+                    return {
+                        "_block_new_entries": True,
+                        "_execution_command_ids": command_ids,
+                        **append_error(
+                            state,
+                            node_name="submit_execution_command",
+                            error_code="target_attainment_recalculation_required",
+                            message="exchange clock unavailable for decision-age validation",
+                        ),
+                    }
+                submission_exchange_time = deps.clock.now()
+                evaluated_at_raw = (
+                    position.get("evaluated_at_exchange_time")
+                    or portfolio_decision.get("evaluated_at_exchange_time")
+                )
+                maximum_age_raw = (
+                    position.get("maximum_decision_age_seconds")
+                    or portfolio_decision.get("maximum_decision_age_seconds")
+                )
+                required_horizon = int(
+                    position.get("required_resolution_horizon_seconds")
+                    or portfolio_decision.get(
+                        "required_resolution_horizon_seconds"
+                    )
+                    or 0
+                )
+                if (
+                    not evaluated_at_raw
+                    or maximum_age_raw is None
+                    or current_objective.deadline_exchange_time is None
+                ):
+                    await _mark_remaining_reoptimization(
+                        index, "decision_timing_provenance_incomplete"
+                    )
+                    return {
+                        "_block_new_entries": True,
+                        "_execution_command_ids": command_ids,
+                        **append_error(
+                            state,
+                            node_name="submit_execution_command",
+                            error_code="target_attainment_recalculation_required",
+                            message="decision timing provenance is incomplete",
+                        ),
+                    }
+                evaluated_at = (
+                    evaluated_at_raw
+                    if isinstance(evaluated_at_raw, datetime)
+                    else datetime.fromisoformat(str(evaluated_at_raw))
+                )
+                timing_evidence = validate_decision_submission_timing(
+                    evaluated_at_exchange_time=evaluated_at,
+                    maximum_decision_age_seconds=int(maximum_age_raw),
+                    submission_exchange_time=submission_exchange_time,
+                    deadline_exchange_time=current_objective.deadline_exchange_time,
+                    required_resolution_horizon_seconds=required_horizon,
+                )
+                portfolio_decision.update(timing_evidence.as_dict())
+                if not timing_evidence.valid:
+                    await _mark_remaining_reoptimization(
+                        index, ",".join(timing_evidence.reason_codes)
+                    )
+                    await publish_execution_observable_event(
+                        deps,
+                        state,
+                        reoptimization_required=True,
+                        payload={
+                            "component_index": index,
+                            **timing_evidence.as_dict(),
+                        },
+                    )
+                    return {
+                        "_block_new_entries": True,
+                        "_execution_command_ids": command_ids,
+                        "_target_portfolio_decision": portfolio_decision,
+                        **append_error(
+                            state,
+                            node_name="submit_execution_command",
+                            error_code="target_attainment_recalculation_required",
+                            message=(
+                                "decision timing invalid before component: "
+                                + ",".join(timing_evidence.reason_codes)
+                            ),
+                        ),
+                    }
                 working_count = len(working_orders_from_projection(projection))
                 submission_fingerprint = _current_fingerprint(
                     current_objective,
                     working_order_count=working_count,
                 )
+                eligibility_reasons: list[str] = []
+                if not submission_fingerprint.broker_eligible:
+                    eligibility_reasons.append("broker_ineligible")
+                if not submission_fingerprint.reconciliation_eligible:
+                    eligibility_reasons.append("reconciliation_ineligible")
+                if eligibility_reasons:
+                    reason = ",".join(eligibility_reasons)
+                    await _mark_remaining_reoptimization(index, reason)
+                    return {
+                        "_block_new_entries": True,
+                        "_execution_command_ids": command_ids,
+                        **append_error(
+                            state,
+                            node_name="submit_execution_command",
+                            error_code="target_attainment_recalculation_required",
+                            message=(
+                                "execution eligibility changed before component: "
+                                + reason
+                            ),
+                        ),
+                    }
                 material_differences = (
                     expected_fingerprint.material_differences(
                         submission_fingerprint
@@ -922,7 +1314,27 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
                     if expected_fingerprint is not None
                     else ("evaluated_objective_fingerprint_missing",)
                 )
+                if authorized_fill_transition:
+                    expected_fill_fields = {
+                        "reserved_capital_usd",
+                        "working_order_reservation_usd",
+                        "filled_position_exposure_usd",
+                        "open_position_count",
+                        "working_order_count",
+                    }
+                    material_differences = tuple(
+                        field
+                        for field in material_differences
+                        if field not in expected_fill_fields
+                    )
+                    expected_fingerprint = submission_fingerprint
+                    authorized_fill_transition = False
                 if material_differences:
+                    await _mark_remaining_reoptimization(
+                        index,
+                        "material_objective_truth_changed:"
+                        + ",".join(material_differences),
+                    )
                     return {
                         "_block_new_entries": True,
                         "_execution_command_ids": command_ids,
@@ -945,6 +1357,9 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
                 if projected_positions > int(
                     current_objective.max_concurrent_positions
                 ):
+                    await _mark_remaining_reoptimization(
+                        index, "maximum_concurrent_positions_changed"
+                    )
                     return {
                         "_block_new_entries": True,
                         "_execution_command_ids": command_ids,
@@ -968,6 +1383,9 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
                 if remaining_allocation > Decimal(
                     str(current_objective.available_capital_usd)
                 ):
+                    await _mark_remaining_reoptimization(
+                        index, "available_capital_changed"
+                    )
                     return {
                         "_block_new_entries": True,
                         "_execution_command_ids": command_ids,
@@ -1048,7 +1466,40 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
                     evidence_ids=tuple(
                         e.evidence_id for e in state.get("evidence") or []
                     ),
+                    client_order_id=(
+                        component_record.client_order_id
+                        if component_record is not None
+                        else None
+                    ),
                 )
+                if component_record is not None:
+                    component_record = await portfolio_execution_repo.transition(
+                        tuple_id,
+                        status=PortfolioComponentStatus.READY,
+                        latest_validation_snapshot_id=str(
+                            child_proposal.snapshot_id
+                        ),
+                        submission_objective_version=(
+                            int(current_objective.version)
+                            if current_objective is not None
+                            else None
+                        ),
+                        last_validation_timestamp=(
+                            timing_evidence.submission_exchange_time.isoformat()
+                            if timing_evidence is not None
+                            else datetime.now(timezone.utc).isoformat()
+                        ),
+                        extra_update={
+                            **(
+                                timing_evidence.as_dict()
+                                if timing_evidence is not None
+                                else {}
+                            ),
+                            "latest_validation_snapshot_id": str(
+                                child_proposal.snapshot_id
+                            ),
+                        },
+                    )
                 await publish_execution_observable_event(
                     deps,
                     state,
@@ -1061,9 +1512,15 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
                         "capital_revalidation": "passed",
                         "objective_version_revalidation": "passed",
                         "data_quality_revalidation": "passed",
+                        **(
+                            timing_evidence.as_dict()
+                            if timing_evidence is not None
+                            else {}
+                        ),
                     },
                 )
             except Exception as exc:
+                await _mark_remaining_reoptimization(index, str(exc))
                 await publish_execution_observable_event(
                     deps,
                     state,
@@ -1138,6 +1595,46 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
                         else None
                     ),
                     submission_snapshot_id=str(child_proposal.snapshot_id),
+                    evaluated_at_exchange_time=(
+                        timing_evidence.evaluated_at_exchange_time.isoformat()
+                        if timing_evidence is not None
+                        else None
+                    ),
+                    decision_valid_until_exchange_time=(
+                        timing_evidence.decision_valid_until_exchange_time.isoformat()
+                        if timing_evidence is not None
+                        else None
+                    ),
+                    maximum_decision_age_seconds=(
+                        timing_evidence.maximum_decision_age_seconds
+                        if timing_evidence is not None
+                        else None
+                    ),
+                    submission_exchange_time=(
+                        timing_evidence.submission_exchange_time.isoformat()
+                        if timing_evidence is not None
+                        else None
+                    ),
+                    decision_age_seconds=(
+                        str(timing_evidence.decision_age_seconds)
+                        if timing_evidence is not None
+                        else None
+                    ),
+                    required_resolution_horizon_seconds=(
+                        timing_evidence.required_resolution_horizon_seconds
+                        if timing_evidence is not None
+                        else None
+                    ),
+                    evaluation_premium=(
+                        str(leg.evaluation_premium)
+                        if leg.evaluation_premium is not None
+                        else None
+                    ),
+                    capital_allocation=(
+                        str(leg.capital_allocation)
+                        if leg.capital_allocation is not None
+                        else None
+                    ),
                 )
                 sizing = state.get("_sizing_decision") or {}
                 estimate_id = sizing.get("estimate_id")
@@ -1147,6 +1644,19 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
                     )
                 gateway_result = await gateway.submit(action_request)
                 if not gateway_result.submitted:
+                    if component_record is not None:
+                        component_record = await portfolio_execution_repo.transition(
+                            tuple_id,
+                            status=PortfolioComponentStatus.REOPTIMIZATION_REQUIRED,
+                            failure_reoptimization_reason=(
+                                gateway_result.blocked_reason
+                                or "order_action_blocked"
+                            ),
+                        )
+                    await _mark_remaining_reoptimization(
+                        index + 1,
+                        gateway_result.blocked_reason or "order_action_blocked",
+                    )
                     await publish_execution_observable_event(
                         deps,
                         state,
@@ -1248,10 +1758,61 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
                                 "submission_snapshot_id": str(
                                     child_proposal.snapshot_id
                                 ),
+                                **(
+                                    timing_evidence.as_dict()
+                                    if timing_evidence is not None
+                                    else {}
+                                ),
                             },
                         )
                     )
                 result = await deps.submit_callback(provenanced)
+            if component_record is not None:
+                broker_status = str(
+                    getattr(result, "status", "submitted") or "submitted"
+                ).lower()
+                broker_status_map = {
+                    "accepted": PortfolioComponentStatus.WORKING,
+                    "open": PortfolioComponentStatus.WORKING,
+                    "pending": PortfolioComponentStatus.WORKING,
+                    "working": PortfolioComponentStatus.WORKING,
+                    "partially_filled": PortfolioComponentStatus.PARTIALLY_FILLED,
+                    "filled": PortfolioComponentStatus.FILLED,
+                    "rejected": PortfolioComponentStatus.REJECTED,
+                    "cancelled": PortfolioComponentStatus.CANCELLED,
+                }
+                durable_status = broker_status_map.get(
+                    broker_status, PortfolioComponentStatus.SUBMITTED
+                )
+                filled_quantity = int(
+                    getattr(result, "filled_quantity", 0)
+                    or (
+                        leg.quantity
+                        if durable_status == PortfolioComponentStatus.FILLED
+                        else 0
+                    )
+                )
+                component_record = await portfolio_execution_repo.transition(
+                    tuple_id,
+                    status=durable_status,
+                    broker_order_id=str(getattr(result, "order_id", "") or "")
+                    or None,
+                    submitted_quantity=leg.quantity,
+                    filled_quantity=filled_quantity,
+                    last_reconciliation_timestamp=(
+                        deps.clock.now().isoformat()
+                        if deps.clock is not None
+                        else datetime.now(timezone.utc).isoformat()
+                    ),
+                )
+                if component_record.status in {
+                    PortfolioComponentStatus.REJECTED,
+                    PortfolioComponentStatus.CANCELLED,
+                }:
+                    await _mark_remaining_reoptimization(
+                        index + 1,
+                        "prior_component_" + component_record.status.value.lower(),
+                    )
             deps.submitted_proposal_ids.add(str(child_proposal.proposal_id))
             command_ids.append(command_id)
             result_refs.append(str(getattr(result, "order_id", command_id)))
@@ -1297,10 +1858,31 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
                                 },
                             )
                         )
+            if component_record is not None and component_record.status in {
+                PortfolioComponentStatus.SUBMITTED,
+                PortfolioComponentStatus.WORKING,
+                PortfolioComponentStatus.PARTIALLY_FILLED,
+                PortfolioComponentStatus.REJECTED,
+                PortfolioComponentStatus.CANCELLED,
+            }:
+                break
+        execution_state = (
+            [
+                record.as_dict()
+                for record in await portfolio_execution_repo.list_by_decision(
+                    str(portfolio_decision.get("decision_id") or "")
+                )
+            ]
+            if portfolio_execution_repo is not None
+            and portfolio_decision.get("decision_id")
+            else []
+        )
         return {
             "execution_command_id": command_ids[0] if command_ids else None,
             "_execution_command_ids": command_ids,
             "execution_result_ref": ",".join(result_refs),
+            "_target_portfolio_decision": portfolio_decision,
+            "_portfolio_execution_state": execution_state,
             **trace_update(
                 append_trace(state, node_name="submit_execution_command", status="completed")
             ),

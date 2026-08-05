@@ -4,7 +4,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from joker.config.loader import load_app_settings
+from joker.objectives.config import FullChainOptimizerSettings
 
 
 def test_paper_all_tasks_loads_objective_section() -> None:
@@ -30,3 +33,9 @@ def test_paper_yaml_loads_target_attainment_policy() -> None:
     assert app.objective.policy == "target_attainment"
     assert app.objective.shadow_baseline_enabled is True
     assert app.objective.is_target_attainment is True
+
+
+def test_full_chain_decision_age_default_and_validation() -> None:
+    assert FullChainOptimizerSettings().maximum_decision_age_seconds == 60
+    with pytest.raises(ValueError, match="full-chain integer limits"):
+        FullChainOptimizerSettings(maximum_decision_age_seconds=0)

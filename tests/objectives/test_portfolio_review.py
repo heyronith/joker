@@ -13,6 +13,7 @@ from joker.graph.cognitive_graph import build_cognitive_graph
 from joker.objectives.config import FullChainOptimizerSettings
 from joker.objectives.portfolio_review import (
     build_portfolio_review_context,
+    normalize_reviewer_forced_wait,
     portfolio_review_from_debate,
 )
 from joker.objectives.target_attainment import TargetAttainmentPolicy
@@ -171,6 +172,85 @@ def test_portfolio_reviewer_can_force_wait_or_reoptimization() -> None:
     )
     assert wait_review.finalizer_recommendation == "wait"
     assert reopt_review.finalizer_recommendation == "reoptimize"
+
+
+def test_reviewer_forced_wait_normalizes_typed_and_legacy_authority() -> None:
+    decision_id = str(uuid4())
+    strategy_id = str(uuid4())
+    contract_id = "SPY:2026-08-05:500:call"
+    tuple_id = str(uuid4())
+    portfolio = {
+        "decision_id": decision_id,
+        "action": "enter",
+        "authorized_positions": [
+            {
+                "position_tuple_id": tuple_id,
+                "strategy_id": strategy_id,
+                "contract_id": contract_id,
+                "quantity": 2,
+            }
+        ],
+        "selected_portfolio_id": str(uuid4()),
+        "selected_strategy_id": strategy_id,
+        "selected_contract_id": contract_id,
+        "selected_quantity": 2,
+        "selected_evaluation_premium": "1.20",
+        "selected_capital": "240.00",
+        "position_tuple_ids": [tuple_id],
+        "execution_proposal_authority": {"tuple_id": tuple_id},
+        "sizing_authority": {"quantity": 2},
+        "selected_probability_goal": "0.61",
+        "wait_probability_goal": "0.12",
+        "probability_delta": "0.49",
+        "quantity_grid": [{"contract_id": contract_id, "selected": True}],
+        "portfolio_evaluations": [
+            {"portfolio_id": str(uuid4()), "selected": True}
+        ],
+    }
+    legacy = {
+        "action": "enter",
+        "selected_strategy_id": strategy_id,
+        "selected_contract_id": contract_id,
+        "selected_quantity": 2,
+        "selected_capital": "240.00",
+        "selected_evaluation_premium": "1.20",
+        "selected_p_goal": "0.61",
+        "no_trade_p_goal": "0.12",
+        "probability_delta": "0.49",
+        "quantity_evaluations": [{"selected": True}],
+        "portfolio_evaluations": [{"selected": True}],
+    }
+
+    finalized, normalized_legacy, audit = normalize_reviewer_forced_wait(
+        portfolio_decision=portfolio,
+        legacy_decision=legacy,
+    )
+
+    for normalized in (finalized, normalized_legacy):
+        assert normalized["action"] == "wait"
+        assert normalized["authorized_positions"] == []
+        assert normalized["selected_portfolio_id"] is None
+        assert normalized["selected_strategy_id"] is None
+        assert normalized["selected_contract_id"] is None
+        assert normalized["selected_quantity"] == 0
+        assert Decimal(str(normalized["selected_capital"])) == 0
+        assert Decimal(str(normalized["probability_delta"])) == 0
+        assert normalized["execution_proposal_authority"] is None
+        assert normalized["sizing_authority"] is None
+        assert normalized["position_tuple_ids"] == []
+    assert finalized["selected_probability_goal"] == "0.12"
+    assert normalized_legacy["selected_p_goal"] == "0.12"
+    assert normalized_legacy["selected_probability_goal"] == "0.12"
+    assert normalized_legacy["wait_probability_goal"] == "0.12"
+    assert all(not row["selected"] for row in finalized["quantity_grid"])
+    assert all(
+        not row["selected"] for row in finalized["portfolio_evaluations"]
+    )
+    assert audit["audit_only"] is True
+    assert audit["authoritative"] is False
+    assert audit["rejected_decision"]["authorized_positions"][0][
+        "position_tuple_id"
+    ] == tuple_id
 
 
 @pytest.mark.asyncio
