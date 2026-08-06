@@ -19,6 +19,7 @@ from joker.time.calendar import MarketCalendar
 from joker.time.clock import SessionPhase, SystemExchangeClock
 
 DEFAULT_OBJECTIVE_DURATION_MINUTES = 60.0
+DEFAULT_RECONCILIATION_RECOVERY_MINUTES = 30.0
 # Allow exits to finish after the objective window without extending the goal.
 DEFAULT_SHUTDOWN_GRACE_SECONDS = 120.0
 
@@ -191,3 +192,55 @@ def format_timing_banner(timing: PaperGoalTiming) -> dict[str, Any]:
         "objective_source": timing.objective_source,
         "shutdown_grace_seconds": timing.shutdown_grace_seconds,
     }
+
+
+def resolve_reconciliation_only_timing(
+    *,
+    original_deadline: datetime,
+    duration_minutes: float | None,
+    calendar: MarketCalendar | None = None,
+    now: datetime | None = None,
+    require_regular_session: bool = True,
+    default_runtime_minutes: float = DEFAULT_RECONCILIATION_RECOVERY_MINUTES,
+    shutdown_grace_seconds: float = DEFAULT_SHUTDOWN_GRACE_SECONDS,
+) -> PaperGoalTiming:
+    """Build a bounded recovery window without inventing a new entry deadline."""
+    cal = calendar or MarketCalendar()
+    clock = SystemExchangeClock(calendar=cal)
+    exchange_now = now or clock.now()
+    if exchange_now.tzinfo is None or original_deadline.tzinfo is None:
+        raise PaperGoalTimingError("recovery timing requires timezone-aware datetimes")
+    phase = clock.session_phase(exchange_now)
+    if require_regular_session and phase is not SessionPhase.REGULAR:
+        raise PaperGoalTimingError(
+            f"paper goal test requires regular market session "
+            f"(phase={phase.value}, exchange_now={exchange_now.isoformat()})"
+        )
+    trading_date = cal.current_or_next_session(exchange_now)
+    session_close = cal.session_close(trading_date)
+    remaining_session_minutes = max(
+        0.0, (session_close - exchange_now).total_seconds() / 60.0
+    )
+    runtime_duration_minutes = (
+        float(duration_minutes)
+        if duration_minutes is not None
+        else min(float(default_runtime_minutes), remaining_session_minutes)
+    )
+    if runtime_duration_minutes <= 0:
+        raise PaperGoalTimingError("reconciliation-only recovery runtime must be > 0")
+    if runtime_duration_minutes - remaining_session_minutes > 1e-9:
+        raise PaperGoalTimingError(
+            "reconciliation-only recovery runtime must fit before regular-session close "
+            f"(runtime_minutes={runtime_duration_minutes}, "
+            f"remaining_session_minutes={remaining_session_minutes:.2f})"
+        )
+    return PaperGoalTiming(
+        exchange_now=exchange_now,
+        objective_deadline=original_deadline,
+        objective_duration_minutes=0.0,
+        runtime_duration_minutes=runtime_duration_minutes,
+        session_close=session_close,
+        remaining_session_seconds=max(0, int((session_close - exchange_now).total_seconds())),
+        objective_source="reconciliation_only",
+        shutdown_grace_seconds=float(shutdown_grace_seconds),
+    )

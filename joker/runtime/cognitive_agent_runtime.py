@@ -6,6 +6,7 @@ import asyncio
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from decimal import Decimal
 from enum import IntEnum
 from pathlib import Path
 from typing import Any
@@ -123,6 +124,7 @@ class CognitiveAgentRuntime:
         # When True, market snapshots still drive open-position management but do
         # not enqueue new-entry decision cycles (shadow evidence collection).
         self._suppress_new_entry_snapshots = False
+        self._reconciliation_only_recovery = False
         self._counters = _RuntimeCounters()
         self._status: str = "healthy"
         self._received_events: list[DomainEvent] = []
@@ -147,6 +149,12 @@ class CognitiveAgentRuntime:
         self._suppress_new_entry_snapshots = bool(suppressed)
         if suppressed:
             self._pending_new_entry_snapshot = None
+
+    def enable_reconciliation_only_recovery(self, enabled: bool = True) -> None:
+        """Fail closed after terminal objectives: reconcile only, never enter anew."""
+        self._reconciliation_only_recovery = bool(enabled)
+        if enabled:
+            self.suppress_new_entry_snapshots(True)
 
     def bind_evolution_runtime(self, evolution_runtime: Any) -> None:
         """Inject Task 3 runtime before workers start (supported public API)."""
@@ -317,7 +325,8 @@ class CognitiveAgentRuntime:
             "evidence": [],
             "errors": [],
             "node_trace": [],
-            "_block_new_entries": False,
+            "_block_new_entries": bool(self._reconciliation_only_recovery),
+            "_reconciliation_only_recovery": bool(self._reconciliation_only_recovery),
         }
         submit_node = self._decision_graph.nodes["submit_execution_command"]
         await submit_node.ainvoke(resume_state)
@@ -347,6 +356,8 @@ class CognitiveAgentRuntime:
 
     async def _resume_pending_portfolio_reoptimizations(self) -> None:
         """Run durable continuation optimization even while positions are open."""
+        if self._reconciliation_only_recovery:
+            return
         registry = self._deps.provenance_registry
         if registry is None or self._decision_graph is None or self._deps.clock is None:
             return
@@ -668,10 +679,20 @@ class CognitiveAgentRuntime:
                 or component.authorized_quantity != int(position.get("quantity") or 0)
                 or component.original_decision_snapshot_id != latest_snapshot_id
                 or component.evaluated_objective_version != evaluated_objective_version
-                or component.client_order_id
-                != stable_portfolio_client_order_id(
-                    replacement_id, component.authorized_position_tuple_id
-                )
+            ):
+                return False, "replacement_component_authority_invalid", replacement_id, action
+            if component.strategy_id != str(position.get("strategy_id") or ""):
+                return False, "replacement_strategy_mismatch", replacement_id, action
+            if component.selected_portfolio_id != str(
+                replacement_raw.get("selected_portfolio_id") or ""
+            ):
+                return False, "replacement_portfolio_id_mismatch", replacement_id, action
+            if component.capital_allocation != Decimal(
+                str(position.get("capital_allocation") or "0")
+            ):
+                return False, "replacement_capital_allocation_mismatch", replacement_id, action
+            if component.client_order_id != stable_portfolio_client_order_id(
+                replacement_id, component.authorized_position_tuple_id
             ):
                 return False, "replacement_component_authority_invalid", replacement_id, action
             if component.status == PortfolioComponentStatus.FILLED:
@@ -681,7 +702,15 @@ class CognitiveAgentRuntime:
                     component.filled_quantity != component.authorized_quantity
                     or not component.broker_order_id
                     or component.submission_objective_version is None
+                    or component.submission_objective_version
+                    < component.evaluated_objective_version
                     or component.latest_validation_snapshot_id != latest_snapshot_id
+                    or not component.continuation_ready
+                    or component.post_fill_objective_version is None
+                    or not component.post_fill_objective_fingerprint
+                    or component.post_fill_snapshot_id != latest_snapshot_id
+                    or not component.post_fill_exchange_time
+                    or component.reconciled_filled_quantity != component.authorized_quantity
                 ):
                     return False, "replacement_submission_provenance_invalid", replacement_id, action
                 continue
@@ -1228,11 +1257,11 @@ class CognitiveAgentRuntime:
                 )
                 if not valid:
                     raise RuntimeError(reason)
-                await self._deps.provenance_registry.portfolio_reoptimizations.transition(
-                    reoptimization_request.request_id,
-                    status=PortfolioReoptimizationStatus.COMPLETED,
-                    replacement_decision_id=replacement_id,
-                    replacement_action=replacement_action,
+                await self._deps.provenance_registry.portfolio_reoptimizations.complete_attempt(
+                    attempt=reoptimization_request,
+                    completed_at=self._deps.clock.now().isoformat(),
+                    replacement_decision_id=str(replacement_id),
+                    replacement_action=str(replacement_action),
                 )
             self._counters.last_success_at = datetime.now(timezone.utc)
             self._status = "healthy"
@@ -1270,9 +1299,9 @@ class CognitiveAgentRuntime:
                     PortfolioReoptimizationStatus,
                 )
 
-                await self._deps.provenance_registry.portfolio_reoptimizations.transition(
-                    reoptimization_request.request_id,
-                    status=PortfolioReoptimizationStatus.FAILED,
+                await self._deps.provenance_registry.portfolio_reoptimizations.fail_attempt(
+                    attempt=reoptimization_request,
+                    failed_at=self._deps.clock.now().isoformat(),
                     failure_reason="reoptimization_cycle_timeout",
                 )
         except Exception as exc:
@@ -1294,9 +1323,9 @@ class CognitiveAgentRuntime:
                     PortfolioReoptimizationStatus.PENDING,
                     PortfolioReoptimizationStatus.RUNNING,
                 }:
-                    await self._deps.provenance_registry.portfolio_reoptimizations.transition(
-                        reoptimization_request.request_id,
-                        status=PortfolioReoptimizationStatus.FAILED,
+                    await self._deps.provenance_registry.portfolio_reoptimizations.fail_attempt(
+                        attempt=reoptimization_request,
+                        failed_at=self._deps.clock.now().isoformat(),
                         failure_reason=str(exc),
                     )
 

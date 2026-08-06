@@ -79,6 +79,7 @@ class LivePaperRunConfig:
     cognitive_session_id_override: str | None = None
     # Exchange-aware objective deadline (blocks new entries via objective service).
     objective_deadline_exchange: datetime | None = None
+    reconciliation_only_recovery: bool = False
     # Extra wall-clock seconds after duration to finish agent-managed exits only.
     # Default 0 so existing short paper tests are not extended; CLI goal-test sets 120.
     shutdown_grace_seconds: float = 0.0
@@ -418,6 +419,8 @@ class LivePaperRunner:
                 registry=registry,
                 checkpointer_path=task1_db.with_name(task1_db.stem + "_cognitive_ckpt.db"),
             )
+            if config.reconciliation_only_recovery:
+                injected_agent_runtime.enable_reconciliation_only_recovery(True)
             # Startup details are logged after the session log() helper is defined.
             _cognitive_startup_payload = {
                 "mock_session": startup.mock_session,
@@ -1015,7 +1018,20 @@ class LivePaperRunner:
                 max_decision_calls = int(
                     getattr(agent_cfg, "max_decision_calls_per_session", 40) or 40
                 )
-                objective_entries_blocked = False
+                objective_entries_blocked = bool(config.reconciliation_only_recovery)
+                if config.reconciliation_only_recovery:
+                    log(
+                        "objective.reconciliation_only_started",
+                        {
+                            "new_entries_blocked": True,
+                            "runtime_seconds": float(config.duration_seconds),
+                            "original_objective_deadline": (
+                                config.objective_deadline_exchange.isoformat()
+                                if config.objective_deadline_exchange is not None
+                                else None
+                            ),
+                        },
+                    )
 
                 while _time.monotonic() < deadline:
                     now_mono = _time.monotonic()

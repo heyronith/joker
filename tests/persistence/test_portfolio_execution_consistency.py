@@ -10,6 +10,7 @@ import pytest
 
 from joker.config.settings import EnvSettings
 from joker.persistence.cognitive_execution_provenance import (
+    PortfolioComponentResolutionStatus,
     PortfolioComponentStatus,
     PortfolioAttemptLeaseActive,
     PortfolioExecutionComponentRecord,
@@ -683,11 +684,10 @@ async def test_unresolved_component_and_failed_request_block_until_resolution(tm
         current_run_id="run-a",
         attempt_exchange_time=NOW,
     )
-    failed = await requests.transition(
-        request.request_id,
-        status=PortfolioReoptimizationStatus.FAILED,
+    failed = await requests.fail_attempt(
+        attempt=running,
+        failed_at=NOW,
         failure_reason="manual_review_required",
-        expected_state_version=running.state_version,
     )
     assert failed.resolution_status == PortfolioReoptimizationResolutionStatus.UNRESOLVED
     assert await requests.has_unresolved(
@@ -786,14 +786,19 @@ async def test_terminal_reoptimization_cannot_be_reclaimed(
         current_run_id="run-one",
         attempt_exchange_time=NOW,
     )
-    await repo.transition(
-        request.request_id,
-        status=terminal_status,
-        replacement_decision_id=("decision-new" if terminal_status.value == "COMPLETED" else None),
-        replacement_action=("WAIT" if terminal_status.value == "COMPLETED" else None),
-        failure_reason=("manual resolution required" if terminal_status.value == "FAILED" else None),
-        expected_state_version=running.state_version,
-    )
+    if terminal_status == PortfolioReoptimizationStatus.COMPLETED:
+        await repo.complete_attempt(
+            attempt=running,
+            completed_at=NOW,
+            replacement_decision_id="decision-new",
+            replacement_action="WAIT",
+        )
+    else:
+        await repo.fail_attempt(
+            attempt=running,
+            failed_at=NOW,
+            failure_reason="manual resolution required",
+        )
     with pytest.raises(ValueError, match="terminal"):
         await repo.begin_attempt(
             request.request_id,
@@ -801,3 +806,289 @@ async def test_terminal_reoptimization_cannot_be_reclaimed(
             current_run_id="run-two",
             attempt_exchange_time=(datetime.fromisoformat(NOW) + timedelta(minutes=10)).isoformat(),
         )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("replacement_action", ["WAIT", "ENTER"])
+async def test_successful_reoptimization_resolves_old_pending_components(
+    tmp_path, replacement_action
+) -> None:
+    db = tmp_path / "state.db"
+    components = PortfolioExecutionRepository(db)
+    requests = PortfolioReoptimizationRepository(db)
+    await components.authorize(_record("tuple-b"))
+    await components.transition(
+        "tuple-b",
+        owner=_owner(),
+        status=PortfolioComponentStatus.REOPTIMIZATION_REQUIRED,
+    )
+    request = await requests.enqueue(_reoptimization_request(origin_run_id="run-a"))
+    running = await requests.begin_attempt(
+        request.request_id,
+        owner=_owner(),
+        current_run_id="run-a",
+        attempt_exchange_time=NOW,
+    )
+    completed = await requests.complete_attempt(
+        attempt=running,
+        completed_at=NOW,
+        replacement_decision_id=f"decision-{replacement_action.lower()}",
+        replacement_action=replacement_action,
+    )
+    component = await components.get("tuple-b")
+    assert completed.status == PortfolioReoptimizationStatus.COMPLETED
+    assert component is not None
+    assert component.status == PortfolioComponentStatus.REOPTIMIZATION_REQUIRED
+    assert component.resolution_status == PortfolioComponentResolutionStatus.SUPERSEDED
+    assert component.superseded_by_reoptimization_request_id == request.request_id
+    assert component.superseded_by_decision_id == f"decision-{replacement_action.lower()}"
+    assert not await components.has_unresolved(
+        session_id="session-a",
+        broker_account_identity="paper-a",
+        trading_date="2026-08-05",
+    )
+
+
+@pytest.mark.asyncio
+async def test_resolve_failed_request_also_resolves_associated_components(tmp_path) -> None:
+    db = tmp_path / "state.db"
+    components = PortfolioExecutionRepository(db)
+    requests = PortfolioReoptimizationRepository(db)
+    await components.authorize(_record("tuple-b"))
+    await components.transition(
+        "tuple-b",
+        owner=_owner(),
+        status=PortfolioComponentStatus.REOPTIMIZATION_REQUIRED,
+    )
+    request = await requests.enqueue(_reoptimization_request(origin_run_id="run-a"))
+    running = await requests.begin_attempt(
+        request.request_id,
+        owner=_owner(),
+        current_run_id="run-a",
+        attempt_exchange_time=NOW,
+    )
+    await requests.fail_attempt(
+        attempt=running,
+        failed_at=NOW,
+        failure_reason="manual_review_required",
+    )
+    await requests.resolve_failed(
+        request.request_id,
+        resolved_at=NOW,
+        resolved_by="operator:test",
+        resolution_reason="reconciled",
+    )
+    component = await components.get("tuple-b")
+    assert component is not None
+    assert component.resolution_status == PortfolioComponentResolutionStatus.OPERATOR_RESOLVED
+    assert component.resolved_by == "operator:test"
+    assert not await components.has_unresolved(
+        session_id="session-a",
+        broker_account_identity="paper-a",
+        trading_date="2026-08-05",
+    )
+
+
+@pytest.mark.asyncio
+async def test_retry_failed_request_keeps_components_unresolved(tmp_path) -> None:
+    db = tmp_path / "state.db"
+    components = PortfolioExecutionRepository(db)
+    requests = PortfolioReoptimizationRepository(db)
+    await components.authorize(_record("tuple-b"))
+    await components.transition(
+        "tuple-b",
+        owner=_owner(),
+        status=PortfolioComponentStatus.REOPTIMIZATION_REQUIRED,
+    )
+    request = await requests.enqueue(_reoptimization_request(origin_run_id="run-a"))
+    running = await requests.begin_attempt(
+        request.request_id,
+        owner=_owner(),
+        current_run_id="run-a",
+        attempt_exchange_time=NOW,
+    )
+    await requests.fail_attempt(
+        attempt=running,
+        failed_at=NOW,
+        failure_reason="manual_review_required",
+    )
+    await requests.retry_failed(
+        request.request_id,
+        requested_at=NOW,
+        requested_by="operator:test",
+        resolution_reason="retry",
+    )
+    component = await components.get("tuple-b")
+    assert component is not None
+    assert component.resolution_status == PortfolioComponentResolutionStatus.UNRESOLVED
+    assert await components.has_unresolved(
+        session_id="session-a",
+        broker_account_identity="paper-a",
+        trading_date="2026-08-05",
+    )
+
+
+@pytest.mark.asyncio
+async def test_resolved_duplicate_component_rows_release_owner_gate(tmp_path) -> None:
+    db_path = tmp_path / "duplicates.db"
+    apply_portfolio_execution_migration(db_path)
+    with sqlite3.connect(db_path) as db:
+        db.execute("DROP INDEX idx_portfolio_component_order")
+        base = _record("tuple-a", component_index=0, component_count=2)
+        columns = [row[1] for row in db.execute("PRAGMA table_info(portfolio_execution_components)")]
+        values = {
+            "session_id": base.session_id,
+            "run_id": base.origin_run_id,
+            "origin_run_id": base.origin_run_id,
+            "broker_account_id": base.broker_account_id,
+            "trading_date": base.trading_date,
+            "target_portfolio_decision_id": base.target_portfolio_decision_id,
+            "selected_portfolio_id": base.selected_portfolio_id,
+            "component_index": 0,
+            "component_count": 2,
+            "strategy_id": "strategy",
+            "contract_id": "contract",
+            "authorized_quantity": 1,
+            "capital_allocation": "100",
+            "status": "AUTHORIZED",
+            "submitted_quantity": 0,
+            "filled_quantity": 0,
+            "remaining_quantity": 1,
+            "original_decision_snapshot_id": "snapshot",
+            "evaluated_objective_version": 1,
+            "evaluated_timestamp": NOW,
+            "continuation_ready": 0,
+            "state_version": 0,
+            "component_order_conflicted": 0,
+            "created_at": NOW,
+            "updated_at": NOW,
+            "payload_json": "{}",
+        }
+        for suffix in ("a", "b"):
+            row = dict(values)
+            row["authorized_position_tuple_id"] = f"tuple-{suffix}"
+            row["client_order_id"] = f"client-{suffix}"
+            used = [column for column in columns if column in row]
+            db.execute(
+                f"INSERT INTO portfolio_execution_components ({','.join(used)}) "
+                f"VALUES ({','.join('?' for _ in used)})",
+                tuple(row[column] for column in used),
+            )
+        db.commit()
+    apply_portfolio_execution_migration(db_path)
+    components = PortfolioExecutionRepository(db_path)
+    assert await components.has_unresolved(
+        session_id="session-a",
+        broker_account_identity="paper-a",
+        trading_date="2026-08-05",
+    )
+    await components.resolve_stale_components(
+        ("tuple-a", "tuple-b"),
+        owner=_owner(),
+        resolution_status=PortfolioComponentResolutionStatus.OPERATOR_RESOLVED,
+        resolved_at=NOW,
+        resolved_by="operator:test",
+        resolution_reason="duplicate rows reconciled",
+    )
+    assert not await components.has_unresolved(
+        session_id="session-a",
+        broker_account_identity="paper-a",
+        trading_date="2026-08-05",
+    )
+
+
+@pytest.mark.asyncio
+async def test_old_superseded_tuple_can_never_be_reactivated(tmp_path) -> None:
+    db = tmp_path / "state.db"
+    components = PortfolioExecutionRepository(db)
+    requests = PortfolioReoptimizationRepository(db)
+    await components.authorize(_record("tuple-b"))
+    await components.transition(
+        "tuple-b",
+        owner=_owner(),
+        status=PortfolioComponentStatus.REOPTIMIZATION_REQUIRED,
+    )
+    request = await requests.enqueue(_reoptimization_request(origin_run_id="run-a"))
+    running = await requests.begin_attempt(
+        request.request_id,
+        owner=_owner(),
+        current_run_id="run-a",
+        attempt_exchange_time=NOW,
+    )
+    await requests.complete_attempt(
+        attempt=running,
+        completed_at=NOW,
+        replacement_decision_id="decision-new",
+        replacement_action="ENTER",
+    )
+    with pytest.raises(ValueError, match="invalid portfolio component transition"):
+        await components.transition(
+            "tuple-b",
+            owner=_owner(),
+            status=PortfolioComponentStatus.WORKING,
+            submitted_quantity=1,
+        )
+
+
+@pytest.mark.asyncio
+async def test_takeover_increments_attempt_generation(tmp_path) -> None:
+    repo = PortfolioReoptimizationRepository(tmp_path / "state.db")
+    request = await repo.enqueue(_reoptimization_request(origin_run_id="origin"))
+    first = await repo.begin_attempt(
+        request.request_id,
+        owner=_owner(),
+        current_run_id="run-one",
+        attempt_exchange_time=NOW,
+        lease_seconds=1,
+    )
+    takeover = await repo.begin_attempt(
+        request.request_id,
+        owner=_owner(),
+        current_run_id="run-two",
+        attempt_exchange_time=(datetime.fromisoformat(NOW) + timedelta(seconds=2)).isoformat(),
+        lease_seconds=1,
+    )
+    assert takeover.attempt_generation == first.attempt_generation + 1
+    assert takeover.attempt_token != first.attempt_token
+
+
+@pytest.mark.asyncio
+async def test_stale_owner_cannot_complete_or_fail_after_lease_takeover(tmp_path) -> None:
+    db = tmp_path / "state.db"
+    repo_a = PortfolioReoptimizationRepository(db)
+    repo_b = PortfolioReoptimizationRepository(db)
+    request = await repo_a.enqueue(_reoptimization_request(origin_run_id="origin"))
+    first = await repo_a.begin_attempt(
+        request.request_id,
+        owner=_owner(),
+        current_run_id="run-one",
+        attempt_exchange_time=NOW,
+        lease_seconds=1,
+    )
+    second = await repo_b.begin_attempt(
+        request.request_id,
+        owner=_owner(),
+        current_run_id="run-two",
+        attempt_exchange_time=(datetime.fromisoformat(NOW) + timedelta(seconds=2)).isoformat(),
+        lease_seconds=1,
+    )
+    with pytest.raises(PortfolioTransitionConflict, match="fencing race"):
+        await repo_a.complete_attempt(
+            attempt=first,
+            completed_at=(datetime.fromisoformat(NOW) + timedelta(seconds=3)).isoformat(),
+            replacement_decision_id="decision-new",
+            replacement_action="WAIT",
+        )
+    with pytest.raises(PortfolioTransitionConflict, match="fencing race"):
+        await repo_a.fail_attempt(
+            attempt=first,
+            failed_at=(datetime.fromisoformat(NOW) + timedelta(seconds=3)).isoformat(),
+            failure_reason="stale-timeout",
+        )
+    completed = await repo_b.complete_attempt(
+        attempt=second,
+        completed_at=(datetime.fromisoformat(NOW) + timedelta(seconds=4)).isoformat(),
+        replacement_decision_id="decision-new",
+        replacement_action="WAIT",
+    )
+    assert completed.status == PortfolioReoptimizationStatus.COMPLETED

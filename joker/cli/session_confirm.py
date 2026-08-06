@@ -43,6 +43,7 @@ def validate_objective_session_action(
     *,
     has_definition: bool,
     latest_status: str | None,
+    unresolved_work: bool = False,
 ) -> str:
     """Resolve explicit new/resume intent and reject ambiguous ownership."""
     action = requested.strip().lower()
@@ -55,6 +56,15 @@ def validate_objective_session_action(
         raise ValueError(
             "unfinished objective exists; use --objective-session resume or reconcile it"
         )
+    if action == "resume" and unfinished:
+        return action
+    if (
+        action == "resume"
+        and has_definition
+        and latest_status in TERMINAL_OBJECTIVE_STATUSES
+        and unresolved_work
+    ):
+        return "reconciliation_only"
     if action == "resume" and not unfinished:
         raise ValueError(
             "no unfinished objective exists; use --objective-session new"

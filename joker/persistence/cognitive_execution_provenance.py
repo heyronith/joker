@@ -10,7 +10,7 @@ from decimal import Decimal
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
-from uuid import NAMESPACE_URL, uuid5
+from uuid import NAMESPACE_URL, uuid4, uuid5
 
 import aiosqlite
 
@@ -80,6 +80,12 @@ CREATE TABLE IF NOT EXISTS portfolio_execution_components (
     continuation_ready INTEGER NOT NULL DEFAULT 0,
     state_version INTEGER NOT NULL DEFAULT 0,
     component_order_conflicted INTEGER NOT NULL DEFAULT 0,
+    resolution_status TEXT NOT NULL DEFAULT 'UNRESOLVED',
+    resolved_at TEXT,
+    resolved_by TEXT,
+    resolution_reason TEXT,
+    superseded_by_reoptimization_request_id TEXT,
+    superseded_by_decision_id TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     payload_json TEXT NOT NULL DEFAULT '{}'
@@ -116,6 +122,8 @@ CREATE TABLE IF NOT EXISTS portfolio_reoptimization_requests (
     attempt_started_at TEXT,
     attempt_lease_expires_at TEXT,
     attempt_heartbeat_at TEXT,
+    attempt_generation INTEGER NOT NULL DEFAULT 0,
+    attempt_token TEXT,
     resolution_status TEXT NOT NULL DEFAULT 'UNRESOLVED',
     resolved_at TEXT,
     resolved_by TEXT,
@@ -149,6 +157,12 @@ _PORTFOLIO_COMPONENT_MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (
     ("continuation_ready", "INTEGER NOT NULL DEFAULT 0"),
     ("state_version", "INTEGER NOT NULL DEFAULT 0"),
     ("component_order_conflicted", "INTEGER NOT NULL DEFAULT 0"),
+    ("resolution_status", "TEXT NOT NULL DEFAULT 'UNRESOLVED'"),
+    ("resolved_at", "TEXT"),
+    ("resolved_by", "TEXT"),
+    ("resolution_reason", "TEXT"),
+    ("superseded_by_reoptimization_request_id", "TEXT"),
+    ("superseded_by_decision_id", "TEXT"),
 )
 
 _PORTFOLIO_REOPTIMIZATION_MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (
@@ -164,6 +178,8 @@ _PORTFOLIO_REOPTIMIZATION_MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (
     ("attempt_started_at", "TEXT"),
     ("attempt_lease_expires_at", "TEXT"),
     ("attempt_heartbeat_at", "TEXT"),
+    ("attempt_generation", "INTEGER NOT NULL DEFAULT 0"),
+    ("attempt_token", "TEXT"),
     ("resolution_status", "TEXT NOT NULL DEFAULT 'UNRESOLVED'"),
     ("resolved_at", "TEXT"),
     ("resolved_by", "TEXT"),
@@ -344,6 +360,12 @@ class PortfolioComponentStatus(StrEnum):
     REOPTIMIZATION_REQUIRED = "REOPTIMIZATION_REQUIRED"
 
 
+class PortfolioComponentResolutionStatus(StrEnum):
+    UNRESOLVED = "UNRESOLVED"
+    SUPERSEDED = "SUPERSEDED"
+    OPERATOR_RESOLVED = "OPERATOR_RESOLVED"
+
+
 class PortfolioTransitionConflict(RuntimeError):
     """A stale component writer lost the compare-and-swap race."""
 
@@ -439,6 +461,62 @@ _COMPONENT_TRANSITIONS: dict[PortfolioComponentStatus, frozenset[PortfolioCompon
 }
 
 
+async def _resolve_component_obligations(
+    db: aiosqlite.Connection,
+    *,
+    owner: PortfolioExecutionOwner,
+    tuple_ids: tuple[str, ...],
+    resolution_status: PortfolioComponentResolutionStatus,
+    resolved_at: str,
+    resolved_by: str,
+    resolution_reason: str,
+    superseded_by_reoptimization_request_id: str | None = None,
+    superseded_by_decision_id: str | None = None,
+) -> None:
+    if not tuple_ids:
+        return
+    if resolution_status == PortfolioComponentResolutionStatus.SUPERSEDED and (
+        not superseded_by_reoptimization_request_id or not superseded_by_decision_id
+    ):
+        raise ValueError("superseded components require replacement provenance")
+    placeholders = ", ".join("?" for _ in tuple_ids)
+    params: list[Any] = [
+        resolution_status.value,
+        resolved_at,
+        resolved_by,
+        resolution_reason,
+        superseded_by_reoptimization_request_id,
+        superseded_by_decision_id,
+        resolved_at,
+        owner.session_id,
+        owner.broker_account_identity,
+        owner.trading_date,
+        *tuple_ids,
+    ]
+    await db.execute(
+        f"""
+        UPDATE portfolio_execution_components
+        SET resolution_status = ?,
+            resolved_at = ?,
+            resolved_by = ?,
+            resolution_reason = ?,
+            superseded_by_reoptimization_request_id = COALESCE(
+                ?, superseded_by_reoptimization_request_id
+            ),
+            superseded_by_decision_id = COALESCE(?, superseded_by_decision_id),
+            state_version = state_version + 1,
+            updated_at = ?
+        WHERE session_id = ?
+          AND broker_account_id = ?
+          AND trading_date = ?
+          AND authorized_position_tuple_id IN ({placeholders})
+          AND status = 'REOPTIMIZATION_REQUIRED'
+          AND COALESCE(resolution_status, 'UNRESOLVED') = 'UNRESOLVED'
+        """,
+        params,
+    )
+
+
 def stable_portfolio_client_order_id(
     target_portfolio_decision_id: str,
     authorized_position_tuple_id: str,
@@ -490,6 +568,14 @@ class PortfolioExecutionComponentRecord:
     continuation_ready: bool = False
     state_version: int = 0
     component_order_conflicted: bool = False
+    resolution_status: PortfolioComponentResolutionStatus = (
+        PortfolioComponentResolutionStatus.UNRESOLVED
+    )
+    resolved_at: str | None = None
+    resolved_by: str | None = None
+    resolution_reason: str | None = None
+    superseded_by_reoptimization_request_id: str | None = None
+    superseded_by_decision_id: str | None = None
     created_at: str | None = None
     updated_at: str | None = None
     extra: dict[str, Any] | None = None
@@ -518,6 +604,8 @@ class PortfolioExecutionComponentRecord:
             raise ValueError("state_version must be non-negative")
         if self.resume_count < 0:
             raise ValueError("resume_count must be non-negative")
+        if self.resolved_at and datetime.fromisoformat(self.resolved_at).tzinfo is None:
+            raise ValueError("resolved_at must be timezone-aware")
         if self.status == PortfolioComponentStatus.FILLED and (
             self.filled_quantity != self.authorized_quantity
         ):
@@ -540,6 +628,14 @@ class PortfolioExecutionComponentRecord:
                 raise ValueError("continuation checkpoint is incomplete")
             if self.reconciled_filled_quantity != self.authorized_quantity:
                 raise ValueError("continuation checkpoint quantity is not authoritative")
+        if self.resolution_status != PortfolioComponentResolutionStatus.UNRESOLVED:
+            if not all((self.resolved_at, self.resolved_by, self.resolution_reason)):
+                raise ValueError("resolved component requires full resolution provenance")
+        if self.resolution_status == PortfolioComponentResolutionStatus.SUPERSEDED and (
+            not self.superseded_by_reoptimization_request_id
+            or not self.superseded_by_decision_id
+        ):
+            raise ValueError("superseded component requires replacement provenance")
 
     @property
     def has_scoped_owner(self) -> bool:
@@ -607,9 +703,11 @@ class PortfolioExecutionRepository:
                     post_fill_objective_version,
                     post_fill_objective_fingerprint, post_fill_snapshot_id,
                     post_fill_exchange_time, reconciled_filled_quantity,
-                    continuation_ready, state_version,
+                    continuation_ready, state_version, component_order_conflicted,
+                    resolution_status, resolved_at, resolved_by, resolution_reason,
+                    superseded_by_reoptimization_request_id, superseded_by_decision_id,
                     created_at, updated_at, payload_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     record.session_id,
@@ -650,6 +748,13 @@ class PortfolioExecutionRepository:
                     record.reconciled_filled_quantity,
                     int(record.continuation_ready),
                     record.state_version,
+                    int(record.component_order_conflicted),
+                    record.resolution_status.value,
+                    record.resolved_at,
+                    record.resolved_by,
+                    record.resolution_reason,
+                    record.superseded_by_reoptimization_request_id,
+                    record.superseded_by_decision_id,
                     now,
                     record.updated_at or now,
                     json.dumps(record.extra or {}, sort_keys=True),
@@ -682,6 +787,7 @@ class PortfolioExecutionRepository:
             "original_decision_snapshot_id",
             "evaluated_objective_version",
             "evaluated_timestamp",
+            "component_order_conflicted",
         )
         if any(getattr(stored, name) != getattr(record, name) for name in immutable):
             raise ValueError("authorized portfolio component conflicts with durable authority")
@@ -756,6 +862,12 @@ class PortfolioExecutionRepository:
         post_fill_exchange_time: str | None = None,
         reconciled_filled_quantity: int | None = None,
         continuation_ready: bool | None = None,
+        resolution_status: PortfolioComponentResolutionStatus | None = None,
+        resolved_at: str | None = None,
+        resolved_by: str | None = None,
+        resolution_reason: str | None = None,
+        superseded_by_reoptimization_request_id: str | None = None,
+        superseded_by_decision_id: str | None = None,
         expected_state_version: int | None = None,
         expected_status: PortfolioComponentStatus | None = None,
         extra_update: dict[str, Any] | None = None,
@@ -816,12 +928,42 @@ class PortfolioExecutionRepository:
             if reconciled_filled_quantity is not None
             else existing.reconciled_filled_quantity,
         )
+        resolved_status = (
+            existing.resolution_status
+            if resolution_status is None
+            else PortfolioComponentResolutionStatus(resolution_status)
+        )
+        resolved_at_value = resolved_at if resolved_at is not None else existing.resolved_at
+        resolved_by_value = resolved_by if resolved_by is not None else existing.resolved_by
+        resolved_reason_value = (
+            resolution_reason
+            if resolution_reason is not None
+            else existing.resolution_reason
+        )
+        superseded_request_id = (
+            superseded_by_reoptimization_request_id
+            if superseded_by_reoptimization_request_id is not None
+            else existing.superseded_by_reoptimization_request_id
+        )
+        superseded_decision_id = (
+            superseded_by_decision_id
+            if superseded_by_decision_id is not None
+            else existing.superseded_by_decision_id
+        )
         if continuation and (
             status != PortfolioComponentStatus.FILLED
             or any(value is None or value == "" for value in continuation_fields)
             or int(continuation_fields[4]) != existing.authorized_quantity
         ):
             raise ValueError("post-fill continuation checkpoint is incomplete")
+        if resolved_status != PortfolioComponentResolutionStatus.UNRESOLVED:
+            if not all((resolved_at_value, resolved_by_value, resolved_reason_value)):
+                raise ValueError("component resolution requires full provenance")
+            if (
+                resolved_status == PortfolioComponentResolutionStatus.SUPERSEDED
+                and (not superseded_request_id or not superseded_decision_id)
+            ):
+                raise ValueError("superseded component requires replacement provenance")
         desired = (
             status,
             broker_order_id or existing.broker_order_id,
@@ -834,6 +976,12 @@ class PortfolioExecutionRepository:
             failure_reoptimization_reason or existing.failure_reoptimization_reason,
             continuation_fields,
             continuation,
+            resolved_status,
+            resolved_at_value,
+            resolved_by_value,
+            resolved_reason_value,
+            superseded_request_id,
+            superseded_decision_id,
             extra,
         )
         current = (
@@ -854,6 +1002,12 @@ class PortfolioExecutionRepository:
                 existing.reconciled_filled_quantity,
             ),
             existing.continuation_ready,
+            existing.resolution_status,
+            existing.resolved_at,
+            existing.resolved_by,
+            existing.resolution_reason,
+            existing.superseded_by_reoptimization_request_id,
+            existing.superseded_by_decision_id,
             dict(existing.extra or {}),
         )
         if desired == current:
@@ -875,6 +1029,14 @@ class PortfolioExecutionRepository:
                     post_fill_snapshot_id = COALESCE(?, post_fill_snapshot_id),
                     post_fill_exchange_time = COALESCE(?, post_fill_exchange_time),
                     reconciled_filled_quantity = COALESCE(?, reconciled_filled_quantity),
+                    resolution_status = COALESCE(?, resolution_status),
+                    resolved_at = COALESCE(?, resolved_at),
+                    resolved_by = COALESCE(?, resolved_by),
+                    resolution_reason = COALESCE(?, resolution_reason),
+                    superseded_by_reoptimization_request_id = COALESCE(
+                        ?, superseded_by_reoptimization_request_id
+                    ),
+                    superseded_by_decision_id = COALESCE(?, superseded_by_decision_id),
                     continuation_ready = ?, state_version = state_version + 1,
                     updated_at = ?, payload_json = ?
                 WHERE authorized_position_tuple_id = ?
@@ -896,6 +1058,12 @@ class PortfolioExecutionRepository:
                     post_fill_snapshot_id,
                     post_fill_exchange_time,
                     reconciled_filled_quantity,
+                    resolved_status.value if resolution_status is not None else None,
+                    resolved_at,
+                    resolved_by,
+                    resolution_reason,
+                    superseded_by_reoptimization_request_id,
+                    superseded_by_decision_id,
                     int(continuation),
                     now,
                     json.dumps(extra, sort_keys=True),
@@ -912,6 +1080,47 @@ class PortfolioExecutionRepository:
         stored = await self.get(authorized_position_tuple_id)
         assert stored is not None
         return stored
+
+    async def resolve_stale_components(
+        self,
+        tuple_ids: tuple[str, ...],
+        *,
+        owner: PortfolioExecutionOwner,
+        resolution_status: PortfolioComponentResolutionStatus,
+        resolved_at: str,
+        resolved_by: str,
+        resolution_reason: str,
+        superseded_by_reoptimization_request_id: str | None = None,
+        superseded_by_decision_id: str | None = None,
+    ) -> list[PortfolioExecutionComponentRecord]:
+        await self._ensure()
+        if not tuple_ids:
+            return []
+        parsed = datetime.fromisoformat(resolved_at)
+        if parsed.tzinfo is None:
+            raise ValueError("resolved_at must be timezone-aware")
+        if resolution_status == PortfolioComponentResolutionStatus.SUPERSEDED and (
+            not superseded_by_reoptimization_request_id or not superseded_by_decision_id
+        ):
+            raise ValueError("superseded components require replacement provenance")
+        async with aiosqlite.connect(self._db_path) as db:
+            await _resolve_component_obligations(
+                db,
+                owner=owner,
+                tuple_ids=tuple_ids,
+                resolution_status=resolution_status,
+                resolved_at=resolved_at,
+                resolved_by=resolved_by,
+                resolution_reason=resolution_reason,
+                superseded_by_reoptimization_request_id=superseded_by_reoptimization_request_id,
+                superseded_by_decision_id=superseded_by_decision_id,
+            )
+            await db.commit()
+        return [
+            await self.get(tuple_id)
+            for tuple_id in tuple_ids
+            if await self.get(tuple_id) is not None
+        ]
 
     async def get(
         self, authorized_position_tuple_id: str
@@ -1031,20 +1240,24 @@ class PortfolioExecutionRepository:
     ) -> bool:
         """Return whether this stable owner retains executable or stale authority."""
         await self._ensure()
-        placeholders = ", ".join("?" for _ in _UNRESOLVED_COMPONENT_STATUSES)
         async with aiosqlite.connect(self._db_path) as db:
             row = await (
                 await db.execute(
                     f"""SELECT 1 FROM portfolio_execution_components
                         WHERE session_id = ? AND broker_account_id = ?
                           AND trading_date = ?
-                          AND status IN ({placeholders})
+                          AND (
+                            status IN ('AUTHORIZED', 'READY', 'SUBMITTED', 'WORKING', 'PARTIALLY_FILLED')
+                            OR (
+                                status = 'REOPTIMIZATION_REQUIRED'
+                                AND COALESCE(resolution_status, 'UNRESOLVED') = 'UNRESOLVED'
+                            )
+                          )
                         LIMIT 1""",
                     (
                         session_id,
                         broker_account_identity,
                         trading_date,
-                        *_UNRESOLVED_COMPONENT_STATUSES,
                     ),
                 )
             ).fetchone()
@@ -1103,6 +1316,16 @@ class PortfolioExecutionRepository:
             continuation_ready=bool(row["continuation_ready"]),
             state_version=int(row["state_version"]),
             component_order_conflicted=bool(row["component_order_conflicted"]),
+            resolution_status=PortfolioComponentResolutionStatus(
+                row["resolution_status"] or "UNRESOLVED"
+            ),
+            resolved_at=row["resolved_at"],
+            resolved_by=row["resolved_by"],
+            resolution_reason=row["resolution_reason"],
+            superseded_by_reoptimization_request_id=(
+                row["superseded_by_reoptimization_request_id"]
+            ),
+            superseded_by_decision_id=row["superseded_by_decision_id"],
             created_at=row["created_at"],
             updated_at=row["updated_at"],
             extra=json.loads(row["payload_json"] or "{}"),
@@ -1152,6 +1375,8 @@ class PortfolioReoptimizationRequestRecord:
     attempt_started_at: str | None = None
     attempt_lease_expires_at: str | None = None
     attempt_heartbeat_at: str | None = None
+    attempt_generation: int = 0
+    attempt_token: str | None = None
     resolution_status: PortfolioReoptimizationResolutionStatus = (
         PortfolioReoptimizationResolutionStatus.UNRESOLVED
     )
@@ -1179,6 +1404,7 @@ class PortfolioReoptimizationRequestRecord:
             or self.state_version < 0
             or self.resume_count < 0
             or self.attempt_count < 0
+            or self.attempt_generation < 0
         ):
             raise ValueError("reoptimization versions must be non-negative")
         for value in (
@@ -1283,10 +1509,11 @@ class PortfolioReoptimizationRepository:
                     attempt_count, last_attempt_run_id, last_attempt_exchange_time,
                     attempt_owner_run_id, attempt_started_at,
                     attempt_lease_expires_at, attempt_heartbeat_at,
+                    attempt_generation, attempt_token,
                     resolution_status, resolved_at, resolved_by, resolution_reason,
                     state_version,
                     created_at, updated_at, payload_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     record.request_id,
@@ -1318,6 +1545,8 @@ class PortfolioReoptimizationRepository:
                     record.attempt_started_at,
                     record.attempt_lease_expires_at,
                     record.attempt_heartbeat_at,
+                    record.attempt_generation,
+                    record.attempt_token,
                     record.resolution_status.value,
                     record.resolved_at,
                     record.resolved_by,
@@ -1450,6 +1679,8 @@ class PortfolioReoptimizationRepository:
                     "reoptimization attempt lease is owned by another run"
                 )
         lease_expires_at = (attempted + timedelta(seconds=lease_seconds)).isoformat()
+        attempt_generation = existing.attempt_generation + 1
+        attempt_token = uuid4().hex
         resumed = existing.last_resumed_run_id != current_run_id
         async with aiosqlite.connect(self._db_path) as db:
             cur = await db.execute(
@@ -1459,6 +1690,7 @@ class PortfolioReoptimizationRepository:
                     last_attempt_run_id = ?, last_attempt_exchange_time = ?,
                     attempt_owner_run_id = ?, attempt_started_at = ?,
                     attempt_lease_expires_at = ?, attempt_heartbeat_at = ?,
+                    attempt_generation = ?, attempt_token = ?,
                     resolution_status = 'UNRESOLVED',
                     last_resumed_run_id = CASE WHEN ? THEN ? ELSE last_resumed_run_id END,
                     resume_count = resume_count + CASE WHEN ? THEN 1 ELSE 0 END,
@@ -1473,6 +1705,8 @@ class PortfolioReoptimizationRepository:
                     attempt_exchange_time,
                     lease_expires_at,
                     attempt_exchange_time,
+                    attempt_generation,
+                    attempt_token,
                     int(resumed),
                     current_run_id,
                     int(resumed),
@@ -1526,6 +1760,15 @@ class PortfolioReoptimizationRepository:
                     request_id,
                     existing.state_version,
                 ),
+            )
+            await _resolve_component_obligations(
+                db,
+                owner=existing.owner,
+                tuple_ids=existing.remaining_authorized_tuple_ids,
+                resolution_status=PortfolioComponentResolutionStatus.OPERATOR_RESOLVED,
+                resolved_at=resolved_at,
+                resolved_by=resolved_by,
+                resolution_reason=resolution_reason,
             )
             await db.commit()
         if cur.rowcount != 1:
@@ -1595,6 +1838,11 @@ class PortfolioReoptimizationRepository:
         existing = await self.get(request_id)
         if existing is None:
             raise KeyError(f"reoptimization request not found: {request_id}")
+        if status in {
+            PortfolioReoptimizationStatus.COMPLETED,
+            PortfolioReoptimizationStatus.FAILED,
+        }:
+            raise ValueError("terminal attempt updates must use complete_attempt/fail_attempt")
         if expected_state_version is not None and (
             existing.state_version != expected_state_version
         ):
@@ -1655,6 +1903,132 @@ class PortfolioReoptimizationRepository:
         assert stored is not None
         return stored
 
+    async def complete_attempt(
+        self,
+        *,
+        attempt: PortfolioReoptimizationRequestRecord,
+        completed_at: str,
+        replacement_decision_id: str,
+        replacement_action: str,
+    ) -> PortfolioReoptimizationRequestRecord:
+        if attempt.status != PortfolioReoptimizationStatus.RUNNING:
+            raise ValueError("only a running reoptimization attempt can complete")
+        parsed = datetime.fromisoformat(completed_at)
+        if parsed.tzinfo is None:
+            raise ValueError("completed_at must be timezone-aware")
+        if not replacement_decision_id or replacement_action not in {"WAIT", "ENTER"}:
+            raise ValueError("replacement completion provenance is incomplete")
+        async with aiosqlite.connect(self._db_path) as db:
+            cur = await db.execute(
+                """
+                UPDATE portfolio_reoptimization_requests
+                SET status = 'COMPLETED',
+                    replacement_decision_id = ?,
+                    replacement_action = ?,
+                    last_attempt_run_id = COALESCE(last_attempt_run_id, ?),
+                    last_attempt_exchange_time = ?,
+                    attempt_lease_expires_at = NULL,
+                    attempt_heartbeat_at = ?,
+                    state_version = state_version + 1,
+                    updated_at = ?
+                WHERE request_id = ?
+                  AND status = 'RUNNING'
+                  AND attempt_owner_run_id = ?
+                  AND attempt_generation = ?
+                  AND attempt_token = ?
+                  AND state_version = ?
+                """,
+                (
+                    replacement_decision_id,
+                    replacement_action,
+                    attempt.attempt_owner_run_id,
+                    completed_at,
+                    completed_at,
+                    completed_at,
+                    attempt.request_id,
+                    attempt.attempt_owner_run_id,
+                    attempt.attempt_generation,
+                    attempt.attempt_token,
+                    attempt.state_version,
+                ),
+            )
+            if cur.rowcount != 1:
+                await db.rollback()
+                raise PortfolioTransitionConflict(
+                    "reoptimization completion lost attempt fencing race"
+                )
+            await _resolve_component_obligations(
+                db,
+                owner=attempt.owner,
+                tuple_ids=attempt.remaining_authorized_tuple_ids,
+                resolution_status=PortfolioComponentResolutionStatus.SUPERSEDED,
+                resolved_at=completed_at,
+                resolved_by=str(attempt.attempt_owner_run_id or ""),
+                resolution_reason="reoptimization_completed",
+                superseded_by_reoptimization_request_id=attempt.request_id,
+                superseded_by_decision_id=replacement_decision_id,
+            )
+            await db.commit()
+        stored = await self.get(attempt.request_id)
+        assert stored is not None
+        return stored
+
+    async def fail_attempt(
+        self,
+        *,
+        attempt: PortfolioReoptimizationRequestRecord,
+        failed_at: str,
+        failure_reason: str,
+    ) -> PortfolioReoptimizationRequestRecord:
+        if attempt.status != PortfolioReoptimizationStatus.RUNNING:
+            raise ValueError("only a running reoptimization attempt can fail")
+        parsed = datetime.fromisoformat(failed_at)
+        if parsed.tzinfo is None:
+            raise ValueError("failed_at must be timezone-aware")
+        if not failure_reason:
+            raise ValueError("failure_reason is required")
+        async with aiosqlite.connect(self._db_path) as db:
+            cur = await db.execute(
+                """
+                UPDATE portfolio_reoptimization_requests
+                SET status = 'FAILED',
+                    failure_reason = ?,
+                    resolution_status = 'UNRESOLVED',
+                    last_attempt_run_id = COALESCE(last_attempt_run_id, ?),
+                    last_attempt_exchange_time = ?,
+                    attempt_lease_expires_at = NULL,
+                    attempt_heartbeat_at = ?,
+                    state_version = state_version + 1,
+                    updated_at = ?
+                WHERE request_id = ?
+                  AND status = 'RUNNING'
+                  AND attempt_owner_run_id = ?
+                  AND attempt_generation = ?
+                  AND attempt_token = ?
+                  AND state_version = ?
+                """,
+                (
+                    failure_reason,
+                    attempt.attempt_owner_run_id,
+                    failed_at,
+                    failed_at,
+                    failed_at,
+                    attempt.request_id,
+                    attempt.attempt_owner_run_id,
+                    attempt.attempt_generation,
+                    attempt.attempt_token,
+                    attempt.state_version,
+                ),
+            )
+            await db.commit()
+        if cur.rowcount != 1:
+            raise PortfolioTransitionConflict(
+                "reoptimization failure lost attempt fencing race"
+            )
+        stored = await self.get(attempt.request_id)
+        assert stored is not None
+        return stored
+
     @staticmethod
     def _row(row: aiosqlite.Row) -> PortfolioReoptimizationRequestRecord:
         return PortfolioReoptimizationRequestRecord(
@@ -1688,6 +2062,8 @@ class PortfolioReoptimizationRepository:
             attempt_started_at=row["attempt_started_at"],
             attempt_lease_expires_at=row["attempt_lease_expires_at"],
             attempt_heartbeat_at=row["attempt_heartbeat_at"],
+            attempt_generation=int(row["attempt_generation"] or 0),
+            attempt_token=row["attempt_token"],
             resolution_status=PortfolioReoptimizationResolutionStatus(
                 row["resolution_status"] or "UNRESOLVED"
             ),

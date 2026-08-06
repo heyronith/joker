@@ -253,8 +253,10 @@ def paper_run(
 
     from joker.broker.account_truth import hash_account_id
     from joker.cli.paper_goal_timing import (
+        DEFAULT_RECONCILIATION_RECOVERY_MINUTES,
         PaperGoalTimingError,
         format_timing_banner,
+        resolve_reconciliation_only_timing,
         resolve_paper_goal_timing,
     )
     from joker.cli.session_confirm import (
@@ -425,6 +427,8 @@ def paper_run(
     bundle = None
     existing_definition = None
     existing_state = None
+    unresolved_work = False
+    recovery_mode = "normal"
     if objective_enabled:
         from joker.objectives.repository import ObjectiveRepository
 
@@ -441,17 +445,31 @@ def paper_run(
                 )
             )
             existing_state = objective_repo.latest_state_for_session(session_id)
+        unresolved_work = asyncio.run(
+            has_unresolved_portfolio_work(
+                provenance_db_path=provenance_db,
+                session_id=session_id,
+                broker_account_identity=account_identity,
+                trading_date=exchange_now.date().isoformat(),
+            )
+        )
         try:
-            validate_objective_session_action(
+            resolved_session_action = validate_objective_session_action(
                 objective_session,
                 has_definition=existing_definition is not None,
                 latest_status=(
                     str(existing_state.status) if existing_state is not None else None
                 ),
+                unresolved_work=unresolved_work,
             )
         except ValueError as exc:
             console.print(f"[red]{exc}[/red]")
             raise typer.Exit(code=1) from exc
+        recovery_mode = (
+            "reconciliation_only"
+            if resolved_session_action == "reconciliation_only"
+            else "normal"
+        )
         if objective_session == "resume":
             try:
                 validate_resume_mutation_flags(
@@ -469,18 +487,14 @@ def paper_run(
             if bundle is None or bundle.deadline_exchange_time is None:
                 console.print("[red]Active objective recovery failed closed.[/red]")
                 raise typer.Exit(code=1)
-            console.print(
-                f"[green]Resuming durable objective session[/green] {session_id}"
+            label = (
+                "[yellow]Resuming terminal objective in reconciliation-only mode[/yellow]"
+                if recovery_mode == "reconciliation_only"
+                else "[green]Resuming durable objective session[/green]"
             )
+            console.print(f"{label} {session_id}")
         else:
-            if asyncio.run(
-                has_unresolved_portfolio_work(
-                    provenance_db_path=provenance_db,
-                    session_id=session_id,
-                    broker_account_identity=account_identity,
-                    trading_date=exchange_now.date().isoformat(),
-                )
-            ):
+            if unresolved_work:
                 console.print(
                     "[red]Durable portfolio execution or reoptimization work is still "
                     "owned by this account/date session. Resume and reconcile it before "
@@ -490,7 +504,11 @@ def paper_run(
 
     resolved_objective_duration = objective_duration_minutes
     resolved_target_deadline = target_deadline
-    if objective_session == "resume" and objective_enabled:
+    if (
+        objective_session == "resume"
+        and objective_enabled
+        and recovery_mode != "reconciliation_only"
+    ):
         assert bundle is not None and bundle.deadline_exchange_time is not None
         resolved_objective_duration = None
         resolved_target_deadline = bundle.deadline_exchange_time.isoformat()
@@ -516,15 +534,25 @@ def paper_run(
                 )
             )
     try:
-        timing = resolve_paper_goal_timing(
-            objective_duration_minutes=resolved_objective_duration,
-            target_deadline=resolved_target_deadline,
-            duration_minutes=duration_minutes,
-            exchange_tz=exchange_tz,
-            calendar=calendar,
-            now=exchange_now,
-            require_regular_session=True,
-        )
+        if recovery_mode == "reconciliation_only":
+            assert bundle is not None and bundle.deadline_exchange_time is not None
+            timing = resolve_reconciliation_only_timing(
+                original_deadline=bundle.deadline_exchange_time,
+                duration_minutes=duration_minutes,
+                calendar=calendar,
+                now=exchange_now,
+                require_regular_session=True,
+            )
+        else:
+            timing = resolve_paper_goal_timing(
+                objective_duration_minutes=resolved_objective_duration,
+                target_deadline=resolved_target_deadline,
+                duration_minutes=duration_minutes,
+                exchange_tz=exchange_tz,
+                calendar=calendar,
+                now=exchange_now,
+                require_regular_session=True,
+            )
     except PaperGoalTimingError as exc:
         console.print(f"[red]{exc}[/red]")
         raise typer.Exit(code=1) from exc
@@ -555,6 +583,12 @@ def paper_run(
         f"[bold]market session remaining[/bold] "
         f"{banner['remaining_market_session_seconds']}s"
     )
+    if recovery_mode == "reconciliation_only":
+        console.print(
+            f"[bold]Recovery mode[/bold] reconciliation_only  "
+            f"[bold]runtime[/bold] {timing.runtime_duration_minutes:.2f} minutes  "
+            f"[bold]new entries permitted[/bold] false"
+        )
 
     if objective_enabled:
         assert bundle is not None
@@ -598,6 +632,15 @@ def paper_run(
         "maximum concurrent positions",
         str(capital_budget.plan.max_concurrent_positions),
     )
+    obj_table.add_row(
+        "objective status",
+        str(getattr(existing_state, "status", "active")),
+    )
+    obj_table.add_row("recovery mode", recovery_mode)
+    obj_table.add_row(
+        "new entries permitted",
+        "false" if recovery_mode == "reconciliation_only" else "true",
+    )
     obj_table.add_row("paper broker account hash", paper_account_hash or "—")
     console.print(obj_table)
 
@@ -627,6 +670,24 @@ def paper_run(
             "authorized_capital_usd": capital_budget.authorized_usd,
             "target_profit_pct": capital_budget.plan.target_profit_pct,
             "target_profit_usd": target_profit_usd,
+            "objective_status": str(getattr(existing_state, "status", "active")),
+            "recovery_mode": recovery_mode,
+            "new_entries_permitted": recovery_mode != "reconciliation_only",
+            "original_objective_deadline": (
+                bundle.deadline_exchange_time.isoformat()
+                if bundle is not None and bundle.deadline_exchange_time is not None
+                else None
+            ),
+            "recovery_started_at": (
+                timing.exchange_now.isoformat()
+                if recovery_mode == "reconciliation_only"
+                else None
+            ),
+            "recovery_runtime_minutes": (
+                timing.runtime_duration_minutes
+                if recovery_mode == "reconciliation_only"
+                else None
+            ),
             **banner,
             "paper_account_hash": paper_account_hash,
         },
@@ -650,6 +711,24 @@ def paper_run(
             "exchange_now_at_start": timing.exchange_now.isoformat(),
             "session_close": timing.session_close.isoformat(),
             "shutdown_grace_seconds": timing.shutdown_grace_seconds,
+            "objective_status": str(getattr(existing_state, "status", "active")),
+            "recovery_mode": recovery_mode,
+            "new_entries_permitted": recovery_mode != "reconciliation_only",
+            "original_objective_deadline": (
+                bundle.deadline_exchange_time.isoformat()
+                if bundle is not None and bundle.deadline_exchange_time is not None
+                else None
+            ),
+            "recovery_started_at": (
+                timing.exchange_now.isoformat()
+                if recovery_mode == "reconciliation_only"
+                else None
+            ),
+            "recovery_runtime_minutes": (
+                timing.runtime_duration_minutes
+                if recovery_mode == "reconciliation_only"
+                else None
+            ),
         },
     )
     write_json(
@@ -940,6 +1019,14 @@ def paper_run(
         f"objective={timing.objective_duration_minutes:.1f}m, "
         f"agents={'openai' if use_openai else 'mock'}, broker={broker_label}"
     )
+    if recovery_mode == "reconciliation_only":
+        console.print(
+            f"[dim]Reconciliation-only recovery uses the persisted deadline and a bounded "
+            f"{timing.runtime_duration_minutes:.1f} minute recovery window. "
+            f"No new entries are permitted. Default recovery window is "
+            f"{DEFAULT_RECONCILIATION_RECOVERY_MINUTES:.0f} minutes when "
+            f"--duration-minutes is omitted.[/dim]"
+        )
     console.print(
         f"[dim]execution_mode={exec_mode} risk.policy={risk_policy}[/dim]"
     )
@@ -964,6 +1051,7 @@ def paper_run(
             objective_service=objective_service,
             cognitive_session_id_override=session_id if objective_enabled else None,
             objective_deadline_exchange=timing.objective_deadline,
+            reconciliation_only_recovery=(recovery_mode == "reconciliation_only"),
             shutdown_grace_seconds=timing.shutdown_grace_seconds,
         ),
         on_state=on_state,

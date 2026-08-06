@@ -10,7 +10,9 @@ import pytest
 
 from joker.cli.paper_goal_timing import (
     DEFAULT_OBJECTIVE_DURATION_MINUTES,
+    DEFAULT_RECONCILIATION_RECOVERY_MINUTES,
     PaperGoalTimingError,
+    resolve_reconciliation_only_timing,
     resolve_paper_goal_timing,
 )
 from joker.objectives.deadline import deadline_from_duration_minutes
@@ -132,6 +134,20 @@ def test_resume_near_close_uses_persisted_shorter_deadline() -> None:
     assert timing.objective_deadline == persisted
     assert timing.objective_duration_minutes == 20
     assert timing.runtime_duration_minutes == 20
+
+
+def test_reconciliation_only_resume_uses_bounded_runtime_not_new_objective_window() -> None:
+    now = _regular_now(15, 0)
+    original_deadline = now - timedelta(minutes=10)
+    timing = resolve_reconciliation_only_timing(
+        original_deadline=original_deadline,
+        duration_minutes=None,
+        now=now,
+    )
+    assert timing.objective_deadline == original_deadline
+    assert timing.objective_duration_minutes == 0
+    assert timing.runtime_duration_minutes == DEFAULT_RECONCILIATION_RECOVERY_MINUTES
+    assert timing.objective_source == "reconciliation_only"
 
 
 @pytest.mark.parametrize(
@@ -435,6 +451,15 @@ def test_resume_and_new_objective_are_explicitly_distinct() -> None:
         )
         == "new"
     )
+    assert (
+        validate_objective_session_action(
+            "resume",
+            has_definition=True,
+            latest_status="deadline_reached",
+            unresolved_work=True,
+        )
+        == "reconciliation_only"
+    )
     with pytest.raises(ValueError, match="no unfinished objective"):
         validate_objective_session_action(
             "resume", has_definition=False, latest_status=None
@@ -579,11 +604,10 @@ async def test_failed_reoptimization_blocks_new_objective_until_resolved(tmp_pat
         current_run_id="run-a",
         attempt_exchange_time=_regular_now(10, 0).isoformat(),
     )
-    await registry.portfolio_reoptimizations.transition(
-        request.request_id,
-        status=PortfolioReoptimizationStatus.FAILED,
+    await registry.portfolio_reoptimizations.fail_attempt(
+        attempt=running,
+        failed_at=_regular_now(10, 0).isoformat(),
         failure_reason="validation_failed",
-        expected_state_version=running.state_version,
     )
     assert await has_unresolved_portfolio_work(
         provenance_db_path=db,

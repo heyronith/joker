@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from decimal import Decimal
 from types import SimpleNamespace
 
@@ -42,6 +43,8 @@ def _position(tuple_id: str, contract_id: str) -> dict:
         "position_tuple_id": tuple_id,
         "contract_id": contract_id,
         "quantity": 1,
+        "strategy_id": f"strategy-{tuple_id}",
+        "capital_allocation": "100",
         "decision_id": "decision-new",
         "objective_version": 4,
         "snapshot_id": "snapshot-new",
@@ -102,6 +105,7 @@ def _result(positions: list[dict]) -> dict:
         "_target_portfolio_decision": {
             "decision_id": "decision-new",
             "action": "ENTER",
+            "selected_portfolio_id": "portfolio-new",
             "authorized_positions": positions,
             "objective_version": 4,
             "snapshot_id": "snapshot-new",
@@ -258,3 +262,101 @@ async def test_noncontiguous_replacement_components_are_rejected(tmp_path) -> No
     )
     assert valid is False
     assert reason == "replacement_component_order_invalid"
+
+
+@pytest.mark.asyncio
+async def test_replacement_strategy_mismatch_is_rejected(tmp_path) -> None:
+    position = _position("tuple-new-a", "SPY:2026-08-05:500:call")
+    bad = position | {"strategy_id": "different-strategy"}
+    runtime = await _runtime(
+        tmp_path,
+        [
+            _record(
+                "tuple-new-a",
+                position["contract_id"],
+                component_index=0,
+                component_count=1,
+                status=PortfolioComponentStatus.WORKING,
+            )
+        ],
+    )
+    valid, reason, *_ = await runtime._validate_reoptimization_result(
+        _request(), _result([bad])
+    )
+    assert valid is False
+    assert reason == "replacement_strategy_mismatch"
+
+
+@pytest.mark.asyncio
+async def test_replacement_capital_allocation_mismatch_is_rejected(tmp_path) -> None:
+    position = _position("tuple-new-a", "SPY:2026-08-05:500:call")
+    bad = position | {"capital_allocation": "125"}
+    runtime = await _runtime(
+        tmp_path,
+        [
+            _record(
+                "tuple-new-a",
+                position["contract_id"],
+                component_index=0,
+                component_count=1,
+                status=PortfolioComponentStatus.WORKING,
+            )
+        ],
+    )
+    valid, reason, *_ = await runtime._validate_reoptimization_result(
+        _request(), _result([bad])
+    )
+    assert valid is False
+    assert reason == "replacement_capital_allocation_mismatch"
+
+
+@pytest.mark.asyncio
+async def test_replacement_portfolio_id_mismatch_is_rejected(tmp_path) -> None:
+    position = _position("tuple-new-a", "SPY:2026-08-05:500:call")
+    result = _result([position])
+    result["_target_portfolio_decision"]["selected_portfolio_id"] = "portfolio-other"
+    runtime = await _runtime(
+        tmp_path,
+        [
+            _record(
+                "tuple-new-a",
+                position["contract_id"],
+                component_index=0,
+                component_count=1,
+                status=PortfolioComponentStatus.WORKING,
+            )
+        ],
+    )
+    valid, reason, *_ = await runtime._validate_reoptimization_result(
+        _request(), result
+    )
+    assert valid is False
+    assert reason == "replacement_portfolio_id_mismatch"
+
+
+@pytest.mark.asyncio
+async def test_filled_replacement_with_stale_submission_version_is_rejected(tmp_path) -> None:
+    position = _position("tuple-new-a", "SPY:2026-08-05:500:call")
+    filled = _record(
+        "tuple-new-a",
+        position["contract_id"],
+        component_index=0,
+        component_count=1,
+        status=PortfolioComponentStatus.FILLED,
+    )
+    filled = replace(
+        filled,
+        submission_objective_version=3,
+        continuation_ready=True,
+        post_fill_objective_version=4,
+        post_fill_objective_fingerprint='{"objective_id":"objective"}',
+        post_fill_snapshot_id="snapshot-new",
+        post_fill_exchange_time=NOW,
+        reconciled_filled_quantity=1,
+    )
+    runtime = await _runtime(tmp_path, [filled])
+    valid, reason, *_ = await runtime._validate_reoptimization_result(
+        _request(), _result([position])
+    )
+    assert valid is False
+    assert reason == "replacement_submission_provenance_invalid"

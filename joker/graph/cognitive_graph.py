@@ -1344,6 +1344,24 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
                             "prior_component_" + component_record.status.value.lower(),
                         )
                     break
+            if state.get("_reconciliation_only_recovery"):
+                await _mark_remaining_reoptimization(
+                    index,
+                    "reconciliation_only_resume_no_new_entries",
+                )
+                return {
+                    "_block_new_entries": True,
+                    "_execution_command_ids": command_ids,
+                    **append_error(
+                        state,
+                        node_name="submit_execution_command",
+                        error_code="reconciliation_only_resume_blocks_new_component",
+                        message=(
+                            "terminal objective recovery may reconcile existing broker work "
+                            "but cannot submit a new portfolio component"
+                        ),
+                    ),
+                }
             if position is not None and deps.objective_service is not None:
                 if deps.clock is not None and hasattr(
                     deps.objective_service, "recompute_from_truth"

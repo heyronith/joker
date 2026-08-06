@@ -881,6 +881,38 @@ async def test_restart_after_filled_first_component_submits_second_once(
 
 
 @pytest.mark.asyncio
+async def test_reconciliation_only_resume_never_submits_new_component(
+    tmp_path, monkeypatch
+) -> None:
+    from joker.persistence.cognitive_execution_provenance import (
+        PortfolioComponentResolutionStatus,
+        PortfolioComponentStatus,
+    )
+
+    broker = ControllablePaperBroker(["open", "filled"])
+    stack = await _two_contract_stack(tmp_path, monkeypatch, broker=broker)
+    try:
+        result = await stack["graph"].ainvoke(stack["state"], config=stack["config"])
+        decision_id = str(result["_target_portfolio_decision"]["decision_id"])
+        first_order = broker.list_open_orders()[0]
+        broker.fill_order(first_order.order_id)
+
+        runtime, registry = await _restart_portfolio_runtime(stack)
+        runtime.enable_reconciliation_only_recovery(True)
+        await runtime._resume_portfolio_decision(decision_id)
+
+        resumed = await registry.portfolio_executions.list_by_decision(decision_id)
+        assert broker.external_submission_count == 1
+        assert [record.status.value for record in resumed] == [
+            "FILLED",
+            "REOPTIMIZATION_REQUIRED",
+        ]
+        assert resumed[1].resolution_status == PortfolioComponentResolutionStatus.UNRESOLVED
+    finally:
+        await _teardown_stack(stack)
+
+
+@pytest.mark.asyncio
 async def test_compiled_graph_five_second_latency_allows_valid_submission(
     tmp_path, monkeypatch
 ) -> None:
@@ -1607,6 +1639,7 @@ async def test_valid_compiled_reoptimization_completes(
     tmp_path, monkeypatch, replacement_action
 ) -> None:
     from joker.persistence.cognitive_execution_provenance import (
+        PortfolioComponentResolutionStatus,
         PortfolioReoptimizationStatus,
     )
 
@@ -1664,6 +1697,9 @@ async def test_valid_compiled_reoptimization_completes(
             "contract_id"
         ]
         assert preserved[1].status.value == "REOPTIMIZATION_REQUIRED"
+        assert preserved[1].resolution_status == PortfolioComponentResolutionStatus.SUPERSEDED
+        assert preserved[1].superseded_by_reoptimization_request_id == request.request_id
+        assert preserved[1].superseded_by_decision_id == completed.replacement_decision_id
         if replacement_action == "WAIT":
             assert stack["broker"].external_submission_count == 1
         else:
