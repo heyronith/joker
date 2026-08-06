@@ -260,9 +260,10 @@ def paper_run(
     from joker.cli.session_confirm import (
         confirm_session_capital,
         confirm_session_objective,
-        has_unfinished_portfolio_execution,
+        has_unresolved_portfolio_work,
         recover_session_objective_bundle,
         validate_objective_session_action,
+        validate_resume_mutation_flags,
     )
     from joker.config.validation import validate_startup
     from joker.objectives.deadline import time_remaining_seconds
@@ -360,61 +361,17 @@ def paper_run(
             update={"mode": "PAPER", "live_trading_enabled": False}
         )
 
-    # Goal-test timing: resolve before objective creation.
-    # Interactive mode: prompt for deadline mode when flags omitted.
+    # Resolve stable broker/session authority before any new-objective timing.
+    # A resume is defined exclusively by its durable objective deadline.
     exchange_tz = str(result.app_settings.exchange.timezone)
-    resolved_objective_duration = objective_duration_minutes
-    resolved_target_deadline = target_deadline
-    if (
-        not yes
-        and objective_duration_minutes is None
-        and target_deadline is None
-    ):
-        console.print("\n[bold]Deadline mode[/bold]")
-        mode = typer.prompt(
-            "Deadline mode (1=Relative duration, 2=Absolute exchange deadline)",
-            default="1",
-        )
-        if str(mode).strip() in {"2", "absolute", "Absolute", "A", "a"}:
-            resolved_target_deadline = str(
-                typer.prompt(
-                    "Target deadline (e.g. 11:30 ET or ISO timestamp)",
-                    default="15:30 ET",
-                )
-            )
-        else:
-            resolved_objective_duration = float(
-                typer.prompt(
-                    "Objective duration in minutes",
-                    default=60.0,
-                    type=float,
-                )
-            )
-    try:
-        timing = resolve_paper_goal_timing(
-            objective_duration_minutes=resolved_objective_duration,
-            target_deadline=resolved_target_deadline,
-            duration_minutes=duration_minutes,
-            exchange_tz=exchange_tz,
-            calendar=MarketCalendar(),
-            require_regular_session=True,
-        )
-    except PaperGoalTimingError as exc:
-        console.print(f"[red]{exc}[/red]")
-        raise typer.Exit(code=1) from exc
+    calendar = MarketCalendar()
+    exchange_clock = SystemExchangeClock(calendar=calendar)
+    exchange_now = exchange_clock.now()
 
-    banner = format_timing_banner(timing)
-    console.print(
-        f"[bold]Exchange now[/bold] {banner['exchange_now']}  "
-        f"[bold]objective deadline[/bold] {banner['objective_deadline']}  "
-        f"[bold]market session remaining[/bold] "
-        f"{banner['remaining_market_session_seconds']}s"
-    )
-
-    # Enable objective path for goal-test workflow when duration flags are used
-    # or YAML already enables it.
     objective_enabled = bool(getattr(result.app_settings.objective, "enabled", False))
     if not objective_enabled and (
+        objective_session == "resume"
+        or
         objective_duration_minutes is not None
         or target_deadline is not None
         or require_webull_paper
@@ -457,19 +414,33 @@ def paper_run(
         env=result.env_settings,
     )
     session_id = stable_cognitive_session_id(
-        trading_date=timing.exchange_now.date(),
+        trading_date=exchange_now.date(),
         account_identity=account_identity,
     )
     task1_db = Path(result.app_settings.db_path).resolve().parent / "joker_task1.db"
+    provenance_db = task1_db.with_name(task1_db.stem + "_cognitive_provenance.db")
 
     objective_service = None
     objective_id = None
+    bundle = None
+    existing_definition = None
+    existing_state = None
     if objective_enabled:
         from joker.objectives.repository import ObjectiveRepository
 
         objective_repo = ObjectiveRepository(task1_db)
         existing_definition = objective_repo.latest_definition_for_session(session_id)
-        existing_state = objective_repo.latest_state_for_session(session_id)
+        if existing_definition is not None:
+            bundle = asyncio.run(
+                recover_session_objective_bundle(
+                    result.app_settings,
+                    session_id=session_id,
+                    db_path=task1_db,
+                    exchange_tz=exchange_tz,
+                    now=exchange_now,
+                )
+            )
+            existing_state = objective_repo.latest_state_for_session(session_id)
         try:
             validate_objective_session_action(
                 objective_session,
@@ -482,39 +453,32 @@ def paper_run(
             console.print(f"[red]{exc}[/red]")
             raise typer.Exit(code=1) from exc
         if objective_session == "resume":
-            bundle = asyncio.run(
-                recover_session_objective_bundle(
-                    result.app_settings,
-                    session_id=session_id,
-                    db_path=task1_db,
-                    exchange_tz=exchange_tz,
+            try:
+                validate_resume_mutation_flags(
+                    objective_duration_minutes=objective_duration_minutes,
+                    target_deadline=target_deadline,
+                    authorized_capital=authorized_capital,
+                    target_profit_pct=target_profit_pct,
+                    max_concurrent_positions=max_concurrent_positions,
                 )
-            )
+            except ValueError as exc:
+                console.print(
+                    f"[red]{exc}[/red]"
+                )
+                raise typer.Exit(code=1) from exc
             if bundle is None or bundle.deadline_exchange_time is None:
                 console.print("[red]Active objective recovery failed closed.[/red]")
                 raise typer.Exit(code=1)
-            timing = resolve_paper_goal_timing(
-                objective_duration_minutes=None,
-                target_deadline=bundle.deadline_exchange_time.isoformat(),
-                duration_minutes=duration_minutes,
-                exchange_tz=exchange_tz,
-                calendar=MarketCalendar(),
-                now=timing.exchange_now,
-                require_regular_session=True,
-            )
             console.print(
                 f"[green]Resuming durable objective session[/green] {session_id}"
             )
         else:
-            provenance_db = task1_db.with_name(
-                task1_db.stem + "_cognitive_provenance.db"
-            )
             if asyncio.run(
-                has_unfinished_portfolio_execution(
+                has_unresolved_portfolio_work(
                     provenance_db_path=provenance_db,
                     session_id=session_id,
                     broker_account_identity=account_identity,
-                    trading_date=timing.exchange_now.date().isoformat(),
+                    trading_date=exchange_now.date().isoformat(),
                 )
             ):
                 console.print(
@@ -523,27 +487,84 @@ def paper_run(
                     "starting a new objective.[/red]"
                 )
                 raise typer.Exit(code=1)
-            bundle = asyncio.run(
-                confirm_session_objective(
-                    result.app_settings,
-                    session_id=session_id,
-                    db_path=task1_db,
-                    console=console,
-                    authorized_usd=authorized_capital,
-                    target_profit_pct=target_profit_pct,
-                    target_deadline=None,
-                    deadline_exchange_time=timing.objective_deadline,
-                    confirmed_at_exchange_time=timing.exchange_now,
-                    max_concurrent_positions=max_concurrent_positions,
-                    acknowledge_total_loss=acknowledge_total_loss,
-                    yes=yes,
-                    exchange_tz=exchange_tz,
+
+    resolved_objective_duration = objective_duration_minutes
+    resolved_target_deadline = target_deadline
+    if objective_session == "resume" and objective_enabled:
+        assert bundle is not None and bundle.deadline_exchange_time is not None
+        resolved_objective_duration = None
+        resolved_target_deadline = bundle.deadline_exchange_time.isoformat()
+    elif not yes and objective_duration_minutes is None and target_deadline is None:
+        console.print("\n[bold]Deadline mode[/bold]")
+        mode = typer.prompt(
+            "Deadline mode (1=Relative duration, 2=Absolute exchange deadline)",
+            default="1",
+        )
+        if str(mode).strip() in {"2", "absolute", "Absolute", "A", "a"}:
+            resolved_target_deadline = str(
+                typer.prompt(
+                    "Target deadline (e.g. 11:30 ET or ISO timestamp)",
+                    default="15:30 ET",
                 )
             )
+        else:
+            resolved_objective_duration = float(
+                typer.prompt(
+                    "Objective duration in minutes",
+                    default=60.0,
+                    type=float,
+                )
+            )
+    try:
+        timing = resolve_paper_goal_timing(
+            objective_duration_minutes=resolved_objective_duration,
+            target_deadline=resolved_target_deadline,
+            duration_minutes=duration_minutes,
+            exchange_tz=exchange_tz,
+            calendar=calendar,
+            now=exchange_now,
+            require_regular_session=True,
+        )
+    except PaperGoalTimingError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1) from exc
+
+    if objective_enabled and objective_session == "new":
+        bundle = asyncio.run(
+            confirm_session_objective(
+                result.app_settings,
+                session_id=session_id,
+                db_path=task1_db,
+                console=console,
+                authorized_usd=authorized_capital,
+                target_profit_pct=target_profit_pct,
+                target_deadline=None,
+                deadline_exchange_time=timing.objective_deadline,
+                confirmed_at_exchange_time=timing.exchange_now,
+                max_concurrent_positions=max_concurrent_positions,
+                acknowledge_total_loss=acknowledge_total_loss,
+                yes=yes,
+                exchange_tz=exchange_tz,
+            )
+        )
+
+    banner = format_timing_banner(timing)
+    console.print(
+        f"[bold]Exchange now[/bold] {banner['exchange_now']}  "
+        f"[bold]objective deadline[/bold] {banner['objective_deadline']}  "
+        f"[bold]market session remaining[/bold] "
+        f"{banner['remaining_market_session_seconds']}s"
+    )
+
+    if objective_enabled:
+        assert bundle is not None
         capital_budget = bundle.capital_budget
         objective_service = bundle.objective_service
         objective_id = bundle.objective_id
     else:
+        if objective_session == "resume":
+            console.print("[red]Objective resume could not activate durable objective mode.[/red]")
+            raise typer.Exit(code=1)
         capital_budget = confirm_session_capital(
             result.app_settings.capital,
             console=console,

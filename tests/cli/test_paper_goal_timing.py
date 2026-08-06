@@ -120,6 +120,45 @@ def test_absolute_deadline_path_resolves() -> None:
     assert timing.runtime_duration_minutes == timing.objective_duration_minutes
 
 
+def test_resume_near_close_uses_persisted_shorter_deadline() -> None:
+    now = _regular_now(15, 35)
+    persisted = now + timedelta(minutes=20)
+    timing = resolve_paper_goal_timing(
+        objective_duration_minutes=None,
+        target_deadline=persisted.isoformat(),
+        duration_minutes=None,
+        now=now,
+    )
+    assert timing.objective_deadline == persisted
+    assert timing.objective_duration_minutes == 20
+    assert timing.runtime_duration_minutes == 20
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("objective_duration_minutes", 30.0),
+        ("target_deadline", "15:30 ET"),
+        ("authorized_capital", 250.0),
+        ("target_profit_pct", 10.0),
+        ("max_concurrent_positions", 2),
+    ],
+)
+def test_resume_rejects_new_objective_mutation_flags(field, value) -> None:
+    from joker.cli.session_confirm import validate_resume_mutation_flags
+
+    kwargs = {
+        "objective_duration_minutes": None,
+        "target_deadline": None,
+        "authorized_capital": None,
+        "target_profit_pct": None,
+        "max_concurrent_positions": None,
+    }
+    kwargs[field] = value
+    with pytest.raises(ValueError, match="rejects new-objective mutation flags"):
+        validate_resume_mutation_flags(**kwargs)
+
+
 @pytest.mark.asyncio
 async def test_cli_values_create_confirmed_objective(tmp_path: Path) -> None:
     from joker.app.safety import SafetyMode
@@ -442,3 +481,125 @@ async def test_confirmed_objective_recovers_for_stable_cli_session(tmp_path: Pat
     assert recovered.objective_id == created.objective_id
     assert recovered.capital_budget.authorized_usd == 250.0
     assert recovered.capital_budget.plan.max_concurrent_positions == 2
+
+
+@pytest.mark.asyncio
+async def test_past_deadline_objective_is_recomputed_before_session_action(
+    tmp_path: Path,
+) -> None:
+    from joker.app.safety import SafetyMode
+    from joker.cli.session_confirm import (
+        confirm_session_objective,
+        recover_session_objective_bundle,
+        validate_objective_session_action,
+    )
+    from joker.config.settings import AppSettings
+    from joker.objectives.config import ObjectiveSettings
+    from joker.objectives.repository import ObjectiveRepository
+    from joker.persistence.migrations import apply_task1_migrations
+
+    db = tmp_path / "t1.db"
+    apply_task1_migrations(db)
+    app = AppSettings(
+        mode=SafetyMode.PAPER,
+        live_trading_enabled=False,
+        objective=ObjectiveSettings(enabled=True),
+    )
+    session_id = "cog:paper:local_paper:2026-08-04"
+    deadline = _regular_now(10, 30)
+    await confirm_session_objective(
+        app,
+        session_id=session_id,
+        db_path=db,
+        authorized_usd=250.0,
+        target_profit_pct=10.0,
+        deadline_exchange_time=deadline,
+        confirmed_at_exchange_time=_regular_now(10, 0),
+        max_concurrent_positions=1,
+        acknowledge_total_loss=True,
+        yes=True,
+    )
+    await recover_session_objective_bundle(
+        app,
+        session_id=session_id,
+        db_path=db,
+        now=_regular_now(10, 31),
+    )
+    state = ObjectiveRepository(db).latest_state_for_session(session_id)
+    assert state is not None and state.status == "deadline_reached"
+    with pytest.raises(ValueError, match="no unfinished objective"):
+        validate_objective_session_action(
+            "resume", has_definition=True, latest_status=state.status
+        )
+
+
+@pytest.mark.asyncio
+async def test_failed_reoptimization_blocks_new_objective_until_resolved(tmp_path) -> None:
+    from joker.cli.session_confirm import has_unresolved_portfolio_work
+    from joker.persistence.cognitive_execution_provenance import (
+        CognitiveExecutionProvenanceRegistry,
+        PortfolioExecutionOwner,
+        PortfolioReoptimizationRequestRecord,
+        PortfolioReoptimizationStatus,
+        stable_reoptimization_request_id,
+    )
+
+    db = tmp_path / "provenance.db"
+    registry = CognitiveExecutionProvenanceRegistry(db)
+    await registry.initialize()
+    owner = PortfolioExecutionOwner("session-a", "local_paper", "2026-08-04")
+    request_id = stable_reoptimization_request_id(
+        session_id=owner.session_id,
+        broker_account_identity=owner.broker_account_identity,
+        trading_date=owner.trading_date,
+        original_portfolio_decision_id="decision-old",
+        remaining_authorized_tuple_ids=("tuple-old",),
+    )
+    request = await registry.portfolio_reoptimizations.enqueue(
+        PortfolioReoptimizationRequestRecord(
+            request_id=request_id,
+            session_id=owner.session_id,
+            origin_run_id="run-a",
+            broker_account_identity=owner.broker_account_identity,
+            trading_date=owner.trading_date,
+            original_portfolio_decision_id="decision-old",
+            already_filled_tuple_ids=("tuple-filled",),
+            open_positions=({"contract_id": "contract-open", "quantity": 1},),
+            remaining_authorized_tuple_ids=("tuple-old",),
+            reason_codes=("capital_changed",),
+            latest_objective_state={"version": 2},
+            latest_objective_version=2,
+            latest_snapshot_id="snapshot-new",
+            created_exchange_time=_regular_now(10, 0).isoformat(),
+        )
+    )
+    running = await registry.portfolio_reoptimizations.begin_attempt(
+        request.request_id,
+        owner=owner,
+        current_run_id="run-a",
+        attempt_exchange_time=_regular_now(10, 0).isoformat(),
+    )
+    await registry.portfolio_reoptimizations.transition(
+        request.request_id,
+        status=PortfolioReoptimizationStatus.FAILED,
+        failure_reason="validation_failed",
+        expected_state_version=running.state_version,
+    )
+    assert await has_unresolved_portfolio_work(
+        provenance_db_path=db,
+        session_id=owner.session_id,
+        broker_account_identity=owner.broker_account_identity,
+        trading_date=owner.trading_date,
+    )
+    await registry.portfolio_reoptimizations.resolve_failed(
+        request.request_id,
+        resolved_at=_regular_now(10, 1).isoformat(),
+        resolved_by="operator:test",
+        resolution_reason="reconciled",
+    )
+    assert not await has_unresolved_portfolio_work(
+        provenance_db_path=db,
+        session_id=owner.session_id,
+        broker_account_identity=owner.broker_account_identity,
+        trading_date=owner.trading_date,
+    )

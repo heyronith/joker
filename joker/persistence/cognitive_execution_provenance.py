@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from enum import StrEnum
 from pathlib import Path
@@ -79,6 +79,7 @@ CREATE TABLE IF NOT EXISTS portfolio_execution_components (
     reconciled_filled_quantity INTEGER,
     continuation_ready INTEGER NOT NULL DEFAULT 0,
     state_version INTEGER NOT NULL DEFAULT 0,
+    component_order_conflicted INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     payload_json TEXT NOT NULL DEFAULT '{}'
@@ -111,6 +112,14 @@ CREATE TABLE IF NOT EXISTS portfolio_reoptimization_requests (
     attempt_count INTEGER NOT NULL DEFAULT 0,
     last_attempt_run_id TEXT,
     last_attempt_exchange_time TEXT,
+    attempt_owner_run_id TEXT,
+    attempt_started_at TEXT,
+    attempt_lease_expires_at TEXT,
+    attempt_heartbeat_at TEXT,
+    resolution_status TEXT NOT NULL DEFAULT 'UNRESOLVED',
+    resolved_at TEXT,
+    resolved_by TEXT,
+    resolution_reason TEXT,
     state_version INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
@@ -139,6 +148,7 @@ _PORTFOLIO_COMPONENT_MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (
     ("reconciled_filled_quantity", "INTEGER"),
     ("continuation_ready", "INTEGER NOT NULL DEFAULT 0"),
     ("state_version", "INTEGER NOT NULL DEFAULT 0"),
+    ("component_order_conflicted", "INTEGER NOT NULL DEFAULT 0"),
 )
 
 _PORTFOLIO_REOPTIMIZATION_MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (
@@ -150,7 +160,26 @@ _PORTFOLIO_REOPTIMIZATION_MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (
     ("attempt_count", "INTEGER NOT NULL DEFAULT 0"),
     ("last_attempt_run_id", "TEXT"),
     ("last_attempt_exchange_time", "TEXT"),
+    ("attempt_owner_run_id", "TEXT"),
+    ("attempt_started_at", "TEXT"),
+    ("attempt_lease_expires_at", "TEXT"),
+    ("attempt_heartbeat_at", "TEXT"),
+    ("resolution_status", "TEXT NOT NULL DEFAULT 'UNRESOLVED'"),
+    ("resolved_at", "TEXT"),
+    ("resolved_by", "TEXT"),
+    ("resolution_reason", "TEXT"),
 )
+
+_UNRESOLVED_COMPONENT_STATUSES = (
+    "AUTHORIZED",
+    "READY",
+    "SUBMITTED",
+    "WORKING",
+    "PARTIALLY_FILLED",
+    "REOPTIMIZATION_REQUIRED",
+)
+
+DEFAULT_REOPTIMIZATION_LEASE_SECONDS = 300.0
 
 
 def apply_portfolio_execution_migration(db_path: str | Path) -> None:
@@ -240,14 +269,56 @@ def apply_portfolio_execution_migration(db_path: str | Path) -> None:
             """,
             (datetime.now(timezone.utc).isoformat(),),
         )
+        # Preserve duplicate legacy rows for reconciliation, but remove their
+        # executable authority before enforcing uniqueness for all clean rows.
+        duplicate_keys = list(
+            db.execute(
+                """SELECT session_id, broker_account_id, trading_date,
+                          target_portfolio_decision_id, component_index
+                   FROM portfolio_execution_components
+                   WHERE session_id IS NOT NULL AND session_id != ''
+                     AND broker_account_id IS NOT NULL AND broker_account_id != ''
+                     AND trading_date IS NOT NULL AND trading_date != ''
+                   GROUP BY session_id, broker_account_id, trading_date,
+                            target_portfolio_decision_id, component_index
+                   HAVING COUNT(*) > 1"""
+            )
+        )
+        migration_now = datetime.now(timezone.utc).isoformat()
+        for key in duplicate_keys:
+            db.execute(
+                """UPDATE portfolio_execution_components
+                   SET status = 'REOPTIMIZATION_REQUIRED',
+                       failure_reoptimization_reason =
+                           'duplicate_component_index_migration',
+                       state_version = state_version + 1,
+                       updated_at = ?
+                   WHERE session_id = ? AND broker_account_id = ?
+                     AND trading_date = ? AND target_portfolio_decision_id = ?
+                     AND component_index = ?
+                     AND component_order_conflicted = 0
+                     AND status IN (
+                         'AUTHORIZED', 'READY', 'SUBMITTED', 'WORKING',
+                         'PARTIALLY_FILLED', 'REOPTIMIZATION_REQUIRED'
+                     )""",
+                (migration_now, *key),
+            )
+            db.execute(
+                """UPDATE portfolio_execution_components
+                   SET component_order_conflicted = 1
+                   WHERE session_id = ? AND broker_account_id = ?
+                     AND trading_date = ? AND target_portfolio_decision_id = ?
+                     AND component_index = ?""",
+                key,
+            )
         db.executescript(
             """
             DROP INDEX IF EXISTS idx_portfolio_component_order;
-            CREATE INDEX idx_portfolio_component_order
+            CREATE UNIQUE INDEX idx_portfolio_component_order
                 ON portfolio_execution_components (
                     session_id, broker_account_id, trading_date,
                     target_portfolio_decision_id, component_index
-                );
+                ) WHERE component_order_conflicted = 0;
             CREATE INDEX IF NOT EXISTS idx_portfolio_component_owner_status
                 ON portfolio_execution_components (
                     session_id, broker_account_id, trading_date, status, updated_at
@@ -275,6 +346,10 @@ class PortfolioComponentStatus(StrEnum):
 
 class PortfolioTransitionConflict(RuntimeError):
     """A stale component writer lost the compare-and-swap race."""
+
+
+class PortfolioAttemptLeaseActive(PortfolioTransitionConflict):
+    """A different process owns an unexpired reoptimization attempt."""
 
 
 @dataclass(frozen=True)
@@ -414,6 +489,7 @@ class PortfolioExecutionComponentRecord:
     reconciled_filled_quantity: int | None = None
     continuation_ready: bool = False
     state_version: int = 0
+    component_order_conflicted: bool = False
     created_at: str | None = None
     updated_at: str | None = None
     extra: dict[str, Any] | None = None
@@ -512,9 +588,10 @@ class PortfolioExecutionRepository:
             raise ValueError("authorized portfolio component requires durable ownership")
         now = record.created_at or datetime.now(timezone.utc).isoformat()
         async with aiosqlite.connect(self._db_path) as db:
-            await db.execute(
-                """
-                INSERT OR IGNORE INTO portfolio_execution_components (
+            try:
+                await db.execute(
+                    """
+                INSERT INTO portfolio_execution_components (
                     session_id, run_id, origin_run_id, last_resumed_run_id,
                     resume_count, last_resumed_at,
                     broker_account_id, trading_date,
@@ -576,11 +653,18 @@ class PortfolioExecutionRepository:
                     now,
                     record.updated_at or now,
                     json.dumps(record.extra or {}, sort_keys=True),
-                ),
-            )
+                    ),
+                )
+            except aiosqlite.IntegrityError as exc:
+                existing = await self.get(record.authorized_position_tuple_id)
+                if existing is None:
+                    raise ValueError(
+                        "duplicate portfolio component index or client-order identity"
+                    ) from exc
             await db.commit()
         stored = await self.get(record.authorized_position_tuple_id)
-        assert stored is not None
+        if stored is None:
+            raise ValueError("portfolio component authority was not durably inserted")
         immutable = (
             "session_id",
             "origin_run_id",
@@ -938,6 +1022,34 @@ class PortfolioExecutionRepository:
             rows = await cur.fetchall()
         return [self._row(row) for row in rows]
 
+    async def has_unresolved(
+        self,
+        *,
+        session_id: str,
+        broker_account_identity: str,
+        trading_date: str,
+    ) -> bool:
+        """Return whether this stable owner retains executable or stale authority."""
+        await self._ensure()
+        placeholders = ", ".join("?" for _ in _UNRESOLVED_COMPONENT_STATUSES)
+        async with aiosqlite.connect(self._db_path) as db:
+            row = await (
+                await db.execute(
+                    f"""SELECT 1 FROM portfolio_execution_components
+                        WHERE session_id = ? AND broker_account_id = ?
+                          AND trading_date = ?
+                          AND status IN ({placeholders})
+                        LIMIT 1""",
+                    (
+                        session_id,
+                        broker_account_identity,
+                        trading_date,
+                        *_UNRESOLVED_COMPONENT_STATUSES,
+                    ),
+                )
+            ).fetchone()
+        return row is not None
+
     @staticmethod
     def _row(row: aiosqlite.Row) -> PortfolioExecutionComponentRecord:
         return PortfolioExecutionComponentRecord(
@@ -990,6 +1102,7 @@ class PortfolioExecutionRepository:
             ),
             continuation_ready=bool(row["continuation_ready"]),
             state_version=int(row["state_version"]),
+            component_order_conflicted=bool(row["component_order_conflicted"]),
             created_at=row["created_at"],
             updated_at=row["updated_at"],
             extra=json.loads(row["payload_json"] or "{}"),
@@ -1001,6 +1114,12 @@ class PortfolioReoptimizationStatus(StrEnum):
     RUNNING = "RUNNING"
     COMPLETED = "COMPLETED"
     FAILED = "FAILED"
+
+
+class PortfolioReoptimizationResolutionStatus(StrEnum):
+    UNRESOLVED = "UNRESOLVED"
+    RETRY_REQUESTED = "RETRY_REQUESTED"
+    RESOLVED = "RESOLVED"
 
 
 @dataclass(frozen=True)
@@ -1029,6 +1148,16 @@ class PortfolioReoptimizationRequestRecord:
     attempt_count: int = 0
     last_attempt_run_id: str | None = None
     last_attempt_exchange_time: str | None = None
+    attempt_owner_run_id: str | None = None
+    attempt_started_at: str | None = None
+    attempt_lease_expires_at: str | None = None
+    attempt_heartbeat_at: str | None = None
+    resolution_status: PortfolioReoptimizationResolutionStatus = (
+        PortfolioReoptimizationResolutionStatus.UNRESOLVED
+    )
+    resolved_at: str | None = None
+    resolved_by: str | None = None
+    resolution_reason: str | None = None
     state_version: int = 0
     created_at: str | None = None
     updated_at: str | None = None
@@ -1052,6 +1181,14 @@ class PortfolioReoptimizationRequestRecord:
             or self.attempt_count < 0
         ):
             raise ValueError("reoptimization versions must be non-negative")
+        for value in (
+            self.attempt_started_at,
+            self.attempt_lease_expires_at,
+            self.attempt_heartbeat_at,
+            self.resolved_at,
+        ):
+            if value and datetime.fromisoformat(value).tzinfo is None:
+                raise ValueError("reoptimization timestamps must be timezone-aware")
 
     @property
     def run_id(self) -> str:
@@ -1144,9 +1281,12 @@ class PortfolioReoptimizationRepository:
                     latest_snapshot_id, created_exchange_time, status,
                     replacement_decision_id, replacement_action, failure_reason,
                     attempt_count, last_attempt_run_id, last_attempt_exchange_time,
+                    attempt_owner_run_id, attempt_started_at,
+                    attempt_lease_expires_at, attempt_heartbeat_at,
+                    resolution_status, resolved_at, resolved_by, resolution_reason,
                     state_version,
                     created_at, updated_at, payload_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     record.request_id,
@@ -1174,6 +1314,14 @@ class PortfolioReoptimizationRepository:
                     record.attempt_count,
                     record.last_attempt_run_id,
                     record.last_attempt_exchange_time,
+                    record.attempt_owner_run_id,
+                    record.attempt_started_at,
+                    record.attempt_lease_expires_at,
+                    record.attempt_heartbeat_at,
+                    record.resolution_status.value,
+                    record.resolved_at,
+                    record.resolved_by,
+                    record.resolution_reason,
                     record.state_version,
                     now,
                     record.updated_at or now,
@@ -1230,6 +1378,34 @@ class PortfolioReoptimizationRepository:
             ).fetchall()
         return [self._row(row) for row in rows]
 
+    async def has_unresolved(
+        self,
+        *,
+        session_id: str,
+        broker_account_identity: str,
+        trading_date: str,
+    ) -> bool:
+        """FAILED remains owner-blocking until an explicit resolution is durable."""
+        await self._ensure()
+        async with aiosqlite.connect(self._db_path) as db:
+            row = await (
+                await db.execute(
+                    """SELECT 1 FROM portfolio_reoptimization_requests
+                       WHERE session_id = ? AND broker_account_id = ?
+                         AND trading_date = ?
+                         AND (
+                           status IN ('PENDING', 'RUNNING')
+                           OR (
+                             status = 'FAILED'
+                             AND COALESCE(resolution_status, 'UNRESOLVED') != 'RESOLVED'
+                           )
+                         )
+                       LIMIT 1""",
+                    (session_id, broker_account_identity, trading_date),
+                )
+            ).fetchone()
+        return row is not None
+
     async def begin_attempt(
         self,
         request_id: str,
@@ -1237,6 +1413,7 @@ class PortfolioReoptimizationRepository:
         owner: PortfolioExecutionOwner,
         current_run_id: str,
         attempt_exchange_time: str,
+        lease_seconds: float = DEFAULT_REOPTIMIZATION_LEASE_SECONDS,
     ) -> PortfolioReoptimizationRequestRecord:
         """Claim an owned request and durably record this process attempt."""
         existing = await self.get(request_id)
@@ -1254,6 +1431,25 @@ class PortfolioReoptimizationRepository:
             raise ValueError("attempt_exchange_time must be timezone-aware")
         if not current_run_id:
             raise ValueError("current_run_id is required")
+        if lease_seconds <= 0:
+            raise ValueError("reoptimization attempt lease must be positive")
+        if existing.status == PortfolioReoptimizationStatus.RUNNING:
+            lease_expiry = (
+                datetime.fromisoformat(existing.attempt_lease_expires_at)
+                if existing.attempt_lease_expires_at
+                else None
+            )
+            if (
+                existing.attempt_owner_run_id == current_run_id
+                and lease_expiry is not None
+                and attempted < lease_expiry
+            ):
+                return existing
+            if lease_expiry is not None and attempted < lease_expiry:
+                raise PortfolioAttemptLeaseActive(
+                    "reoptimization attempt lease is owned by another run"
+                )
+        lease_expires_at = (attempted + timedelta(seconds=lease_seconds)).isoformat()
         resumed = existing.last_resumed_run_id != current_run_id
         async with aiosqlite.connect(self._db_path) as db:
             cur = await db.execute(
@@ -1261,6 +1457,9 @@ class PortfolioReoptimizationRepository:
                 UPDATE portfolio_reoptimization_requests
                 SET status = 'RUNNING', attempt_count = attempt_count + 1,
                     last_attempt_run_id = ?, last_attempt_exchange_time = ?,
+                    attempt_owner_run_id = ?, attempt_started_at = ?,
+                    attempt_lease_expires_at = ?, attempt_heartbeat_at = ?,
+                    resolution_status = 'UNRESOLVED',
                     last_resumed_run_id = CASE WHEN ? THEN ? ELSE last_resumed_run_id END,
                     resume_count = resume_count + CASE WHEN ? THEN 1 ELSE 0 END,
                     last_resumed_at = CASE WHEN ? THEN ? ELSE last_resumed_at END,
@@ -1269,6 +1468,10 @@ class PortfolioReoptimizationRepository:
                 """,
                 (
                     current_run_id,
+                    attempt_exchange_time,
+                    current_run_id,
+                    attempt_exchange_time,
+                    lease_expires_at,
                     attempt_exchange_time,
                     int(resumed),
                     current_run_id,
@@ -1286,6 +1489,95 @@ class PortfolioReoptimizationRepository:
             raise PortfolioTransitionConflict(
                 "reoptimization attempt lost compare-and-swap race"
             )
+        stored = await self.get(request_id)
+        assert stored is not None
+        return stored
+
+    async def resolve_failed(
+        self,
+        request_id: str,
+        *,
+        resolved_at: str,
+        resolved_by: str,
+        resolution_reason: str,
+    ) -> PortfolioReoptimizationRequestRecord:
+        """Explicitly release the stable owner after operator reconciliation."""
+        existing = await self.get(request_id)
+        if existing is None:
+            raise KeyError(f"reoptimization request not found: {request_id}")
+        if existing.status != PortfolioReoptimizationStatus.FAILED:
+            raise ValueError("only a failed reoptimization request can be resolved")
+        parsed = datetime.fromisoformat(resolved_at)
+        if parsed.tzinfo is None or not resolved_by or not resolution_reason:
+            raise ValueError("failed-request resolution provenance is incomplete")
+        async with aiosqlite.connect(self._db_path) as db:
+            cur = await db.execute(
+                """UPDATE portfolio_reoptimization_requests
+                   SET resolution_status = 'RESOLVED', resolved_at = ?, resolved_by = ?,
+                       resolution_reason = ?, state_version = state_version + 1,
+                       updated_at = ?
+                   WHERE request_id = ? AND state_version = ? AND status = 'FAILED'
+                     AND COALESCE(resolution_status, 'UNRESOLVED') != 'RESOLVED'""",
+                (
+                    resolved_at,
+                    resolved_by,
+                    resolution_reason,
+                    resolved_at,
+                    request_id,
+                    existing.state_version,
+                ),
+            )
+            await db.commit()
+        if cur.rowcount != 1:
+            latest = await self.get(request_id)
+            if latest is not None and (
+                latest.resolution_status
+                == PortfolioReoptimizationResolutionStatus.RESOLVED
+            ):
+                return latest
+            raise PortfolioTransitionConflict("failed-request resolution lost CAS race")
+        stored = await self.get(request_id)
+        assert stored is not None
+        return stored
+
+    async def retry_failed(
+        self,
+        request_id: str,
+        *,
+        requested_at: str,
+        requested_by: str,
+        resolution_reason: str,
+    ) -> PortfolioReoptimizationRequestRecord:
+        """Explicitly return failed work to PENDING; it remains owner-blocking."""
+        existing = await self.get(request_id)
+        if existing is None:
+            raise KeyError(f"reoptimization request not found: {request_id}")
+        if existing.status != PortfolioReoptimizationStatus.FAILED:
+            raise ValueError("only a failed reoptimization request can be retried")
+        parsed = datetime.fromisoformat(requested_at)
+        if parsed.tzinfo is None or not requested_by or not resolution_reason:
+            raise ValueError("failed-request retry provenance is incomplete")
+        async with aiosqlite.connect(self._db_path) as db:
+            cur = await db.execute(
+                """UPDATE portfolio_reoptimization_requests
+                   SET status = 'PENDING', resolution_status = 'RETRY_REQUESTED',
+                       resolved_at = ?, resolved_by = ?, resolution_reason = ?,
+                       attempt_owner_run_id = NULL, attempt_started_at = NULL,
+                       attempt_lease_expires_at = NULL, attempt_heartbeat_at = NULL,
+                       state_version = state_version + 1, updated_at = ?
+                   WHERE request_id = ? AND state_version = ? AND status = 'FAILED'""",
+                (
+                    requested_at,
+                    requested_by,
+                    resolution_reason,
+                    requested_at,
+                    request_id,
+                    existing.state_version,
+                ),
+            )
+            await db.commit()
+        if cur.rowcount != 1:
+            raise PortfolioTransitionConflict("failed-request retry lost CAS race")
         stored = await self.get(request_id)
         assert stored is not None
         return stored
@@ -1330,6 +1622,14 @@ class PortfolioReoptimizationRepository:
                 SET status = ?, replacement_decision_id = COALESCE(?, replacement_decision_id),
                     replacement_action = COALESCE(?, replacement_action),
                     failure_reason = COALESCE(?, failure_reason),
+                    resolution_status = CASE
+                        WHEN ? = 'FAILED' THEN 'UNRESOLVED'
+                        ELSE resolution_status
+                    END,
+                    attempt_lease_expires_at = CASE
+                        WHEN ? IN ('COMPLETED', 'FAILED') THEN NULL
+                        ELSE attempt_lease_expires_at
+                    END,
                     state_version = state_version + 1, updated_at = ?
                 WHERE request_id = ? AND state_version = ? AND status = ?
                 """,
@@ -1338,6 +1638,8 @@ class PortfolioReoptimizationRepository:
                     replacement_decision_id,
                     replacement_action,
                     failure_reason,
+                    status.value,
+                    status.value,
                     datetime.now(timezone.utc).isoformat(),
                     request_id,
                     existing.state_version,
@@ -1382,6 +1684,16 @@ class PortfolioReoptimizationRepository:
             attempt_count=int(row["attempt_count"] or 0),
             last_attempt_run_id=row["last_attempt_run_id"],
             last_attempt_exchange_time=row["last_attempt_exchange_time"],
+            attempt_owner_run_id=row["attempt_owner_run_id"],
+            attempt_started_at=row["attempt_started_at"],
+            attempt_lease_expires_at=row["attempt_lease_expires_at"],
+            attempt_heartbeat_at=row["attempt_heartbeat_at"],
+            resolution_status=PortfolioReoptimizationResolutionStatus(
+                row["resolution_status"] or "UNRESOLVED"
+            ),
+            resolved_at=row["resolved_at"],
+            resolved_by=row["resolved_by"],
+            resolution_reason=row["resolution_reason"],
             state_version=int(row["state_version"]),
             created_at=row["created_at"],
             updated_at=row["updated_at"],

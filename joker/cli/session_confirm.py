@@ -62,6 +62,30 @@ def validate_objective_session_action(
     return action
 
 
+def validate_resume_mutation_flags(
+    *,
+    objective_duration_minutes: float | None,
+    target_deadline: str | None,
+    authorized_capital: float | None,
+    target_profit_pct: float | None,
+    max_concurrent_positions: int | None,
+) -> None:
+    """Reject any ambiguity between recovery and a new objective definition."""
+    values = {
+        "--objective-duration-minutes": objective_duration_minutes,
+        "--target-deadline": target_deadline,
+        "--authorized-capital": authorized_capital,
+        "--target-profit-pct": target_profit_pct,
+        "--max-concurrent-positions": max_concurrent_positions,
+    }
+    supplied = [name for name, value in values.items() if value is not None]
+    if supplied:
+        raise ValueError(
+            "--objective-session resume rejects new-objective mutation flags: "
+            + ", ".join(supplied)
+        )
+
+
 def _session_objective_service(
     app_settings: AppSettings,
     *,
@@ -137,6 +161,7 @@ async def recover_session_objective_bundle(
     session_id: str,
     db_path: Path,
     exchange_tz: str | None = None,
+    now: datetime | None = None,
 ) -> SessionObjectiveBundle | None:
     """Recover the confirmed objective for a stable paper session."""
     repository = ObjectiveRepository(db_path)
@@ -148,7 +173,7 @@ async def recover_session_objective_bundle(
         repository=repository,
         exchange_tz=exchange_tz or str(app_settings.exchange.timezone),
     )
-    state = await service.load_or_recover(session_id)
+    state = await service.load_or_recover(session_id, now=now)
     if state is None:
         return None
     return SessionObjectiveBundle(
@@ -159,7 +184,7 @@ async def recover_session_objective_bundle(
     )
 
 
-async def has_unfinished_portfolio_execution(
+async def has_unresolved_portfolio_work(
     *,
     provenance_db_path: Path,
     session_id: str,
@@ -173,17 +198,22 @@ async def has_unfinished_portfolio_execution(
 
     registry = CognitiveExecutionProvenanceRegistry(provenance_db_path)
     await registry.initialize()
-    components = await registry.portfolio_executions.list_resumable(
+    components = await registry.portfolio_executions.has_unresolved(
         session_id=session_id,
         broker_account_identity=broker_account_identity,
         trading_date=trading_date,
     )
-    requests = await registry.portfolio_reoptimizations.list_pending(
+    requests = await registry.portfolio_reoptimizations.has_unresolved(
         session_id=session_id,
         broker_account_identity=broker_account_identity,
         trading_date=trading_date,
     )
     return bool(components or requests)
+
+
+# Backward compatibility for callers outside the CLI. New-session authority
+# checks must use the broader unresolved semantics above.
+has_unfinished_portfolio_execution = has_unresolved_portfolio_work
 
 
 def plan_from_settings(settings: CapitalSettings) -> CapitalPlan:

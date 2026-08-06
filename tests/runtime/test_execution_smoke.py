@@ -265,6 +265,13 @@ def test_routes_through_execution_runtime(tmp_path: Path, monkeypatch) -> None:
     assert result.passed is True, result.errors
     assert submitted, "must submit via ExecutionRuntime/bridge path"
     assert isinstance(submitted[0], ExecutionCommand)
+    expected_identity = ExecutionSmokeRunner(
+        _app(), _env(), require_sandbox=True, confirm_place=True
+    )._paper_account_identity()
+    assert submitted[0].broker_account_id == expected_identity
+    assert submitted[0].broker_account_id.startswith("webull:")
+    assert submitted[0].broker_account_id != "webull_paper"
+    assert "PAPER_ACCT_TEST" not in submitted[0].broker_account_id
     assert broker._submit_calls
     assert broker._cancel_calls
     assert result.final_open_orders == 0
@@ -382,12 +389,14 @@ def test_build_smoke_command_unique_client_id() -> None:
         option_type="call",
         is_0dte=True,
     )
-    a = build_smoke_execution_command(contract)
-    b = build_smoke_execution_command(contract)
+    identity = "webull:non-reversible-test-hash"
+    a = build_smoke_execution_command(contract, broker_account_id=identity)
+    b = build_smoke_execution_command(contract, broker_account_id=identity)
     assert a.client_order_id != b.client_order_id
     assert a.client_order_id.startswith("smk")
     assert len(a.client_order_id) <= 32
     assert a.intent.limit_price == 0.01
+    assert a.broker_account_id == identity
 
 
 def _async_const(value):

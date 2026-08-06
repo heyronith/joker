@@ -323,13 +323,15 @@ class SessionObjectiveService:
         if unresolved:
             self.mark_truth_degraded(True, reason="reconciliation_unresolved")
 
-    async def load_or_recover(self, session_id: str) -> SessionObjectiveState | None:
+    async def load_or_recover(
+        self, session_id: str, *, now: datetime | None = None
+    ) -> SessionObjectiveState | None:
         definition = self._repo.latest_definition_for_session(session_id)
         if definition is None:
             return None
         self._objective_id = definition.objective_id
         self._broker_submission_seen = definition.first_broker_submission_at is not None
-        return await self.recompute_from_truth()
+        return await self.recompute_from_truth(now=now)
 
     def _sum_exposures(
         self, objective_id: UUID

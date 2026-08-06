@@ -628,13 +628,87 @@ class CognitiveAgentRuntime:
         }
         if set(tuple_ids) != set(durable_by_tuple):
             return False, "replacement_durable_authority_mismatch", replacement_id, action
-        if any(
-            component.submission_objective_version is None
-            or component.submission_objective_version < evaluated_objective_version
-            or component.latest_validation_snapshot_id != latest_snapshot_id
-            for component in durable_components
+        from joker.persistence.cognitive_execution_provenance import (
+            PortfolioComponentStatus,
+            stable_portfolio_client_order_id,
+        )
+
+        expected_indexes = list(range(len(durable_components)))
+        if (
+            [component.component_index for component in durable_components]
+            != expected_indexes
+            or any(
+                component.component_count != len(durable_components)
+                or component.target_portfolio_decision_id != replacement_id
+                for component in durable_components
+            )
         ):
-            return False, "replacement_submission_provenance_invalid", replacement_id, action
+            return False, "replacement_component_order_invalid", replacement_id, action
+
+        phase = "filled_prefix"
+        active_count = 0
+        unsubmitted = {
+            PortfolioComponentStatus.AUTHORIZED,
+            PortfolioComponentStatus.READY,
+        }
+        active = {
+            PortfolioComponentStatus.SUBMITTED,
+            PortfolioComponentStatus.WORKING,
+            PortfolioComponentStatus.PARTIALLY_FILLED,
+        }
+        for component in durable_components:
+            position = next(
+                item
+                for item in positions
+                if str(item.get("position_tuple_id") or "")
+                == component.authorized_position_tuple_id
+            )
+            if (
+                component.contract_id != str(position.get("contract_id") or "")
+                or component.authorized_quantity != int(position.get("quantity") or 0)
+                or component.original_decision_snapshot_id != latest_snapshot_id
+                or component.evaluated_objective_version != evaluated_objective_version
+                or component.client_order_id
+                != stable_portfolio_client_order_id(
+                    replacement_id, component.authorized_position_tuple_id
+                )
+            ):
+                return False, "replacement_component_authority_invalid", replacement_id, action
+            if component.status == PortfolioComponentStatus.FILLED:
+                if phase != "filled_prefix":
+                    return False, "replacement_component_sequence_invalid", replacement_id, action
+                if (
+                    component.filled_quantity != component.authorized_quantity
+                    or not component.broker_order_id
+                    or component.submission_objective_version is None
+                    or component.latest_validation_snapshot_id != latest_snapshot_id
+                ):
+                    return False, "replacement_submission_provenance_invalid", replacement_id, action
+                continue
+            if component.status in active:
+                if phase == "authorized_suffix" or active_count:
+                    return False, "replacement_component_sequence_invalid", replacement_id, action
+                phase = "active"
+                active_count += 1
+                if (
+                    not component.broker_order_id
+                    or component.submitted_quantity <= 0
+                    or component.submission_objective_version is None
+                    or component.submission_objective_version < evaluated_objective_version
+                    or component.latest_validation_snapshot_id != latest_snapshot_id
+                ):
+                    return False, "replacement_submission_provenance_invalid", replacement_id, action
+                continue
+            if component.status in unsubmitted:
+                phase = "authorized_suffix"
+                if component.submitted_quantity != 0 or component.filled_quantity != 0:
+                    return False, "replacement_unsubmitted_quantity_invalid", replacement_id, action
+                if component.status == PortfolioComponentStatus.READY and (
+                    component.latest_validation_snapshot_id != latest_snapshot_id
+                ):
+                    return False, "replacement_ready_provenance_invalid", replacement_id, action
+                continue
+            return False, "replacement_component_sequence_invalid", replacement_id, action
         completed_nodes: set[str] = set()
         for trace in result.get("node_trace") or []:
             name = getattr(trace, "node_name", None)
@@ -1050,6 +1124,7 @@ class CognitiveAgentRuntime:
                 PortfolioReoptimizationStatus,
             )
 
+            preclaim_request = reoptimization_request
             reoptimization_request = await (
                 self._deps.provenance_registry.portfolio_reoptimizations.begin_attempt(
                     reoptimization_request.request_id,
@@ -1058,6 +1133,13 @@ class CognitiveAgentRuntime:
                     attempt_exchange_time=self._deps.clock.now().isoformat(),
                 )
             )
+            if (
+                preclaim_request.status == PortfolioReoptimizationStatus.RUNNING
+                and reoptimization_request.state_version == preclaim_request.state_version
+            ):
+                # This run already owns an active attempt. Do not execute the
+                # graph twice for a duplicate wake-up from the same process.
+                return
             persisted_contract_ids = {
                 str(position.get("contract_id") or position.get("symbol") or "")
                 for position in reoptimization_request.open_positions

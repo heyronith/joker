@@ -274,7 +274,7 @@ def build_smoke_execution_command(
     client_order_id: str | None = None,
     limit_price: float = SMOKE_LIMIT_PRICE,
     quantity: int = 1,
-    broker_account_id: str = "webull_paper",
+    broker_account_id: str,
 ) -> ExecutionCommand:
     """Build the ExecutionCommand used by the production Task 1 path."""
     cid = client_order_id or f"smk{uuid4().hex[:29]}"
@@ -433,7 +433,10 @@ class ExecutionSmokeRunner:
             )
             result.contract_id = contract_id_for(contract)
 
-            command = build_smoke_execution_command(contract)
+            command = build_smoke_execution_command(
+                contract,
+                broker_account_id=self._paper_account_identity(),
+            )
             result.client_order_id = command.client_order_id
 
             order = bridge.submit_execution_command(command)

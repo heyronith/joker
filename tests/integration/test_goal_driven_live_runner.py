@@ -65,7 +65,13 @@ def _app(tmp_path, *, kill_switch: bool = False) -> AppSettings:
     )
 
 
-async def _ingest_market(session, *, ask: str = "1.10", bid: str = "1.00"):
+async def _ingest_market(
+    session,
+    *,
+    ask: str = "1.10",
+    bid: str = "1.00",
+    include_second_contract: bool = False,
+):
     start = datetime(2026, 7, 1, 10, 0, tzinfo=ET)
     market = session.supervisor.market_runtime
     assert market is not None
@@ -82,8 +88,7 @@ async def _ingest_market(session, *, ask: str = "1.10", bid: str = "1.00"):
             source_timestamp=ts,
             received_timestamp=ts,
         )
-    await market.ingest_option_quotes(
-        [
+    quotes = [
             {
                 "contract_id": CONTRACT_ID,
                 "symbol": "SPY",
@@ -95,7 +100,20 @@ async def _ingest_market(session, *, ask: str = "1.10", bid: str = "1.00"):
                 "quote_timestamp": start + timedelta(minutes=3),
             }
         ]
-    )
+    if include_second_contract:
+        quotes.append(
+            {
+                "contract_id": "SPY:2026-07-01:501.0:call",
+                "symbol": "SPY",
+                "expiry": date(2026, 7, 1),
+                "strike": "501",
+                "option_type": "call",
+                "bid": "0.45",
+                "ask": "0.50",
+                "quote_timestamp": start + timedelta(minutes=3),
+            }
+        )
+    await market.ingest_option_quotes(quotes)
     later = start + timedelta(minutes=3, seconds=3)
     if clock is not None and hasattr(clock, "set_now"):
         clock.set_now(later)
@@ -205,7 +223,7 @@ async def test_process_restart_recovers_stable_objective_and_working_component(
         session_id=stable_session_id,
         authorised_capital_usd=500,
         target_profit_pct=10,
-        deadline_exchange_time=datetime(2026, 7, 1, 15, 30, tzinfo=ET),
+        deadline_exchange_time=datetime.now(tz=ET) + timedelta(hours=4),
         max_concurrent_positions=2,
         accepted_total_loss_risk=True,
     )
@@ -329,6 +347,145 @@ async def test_process_restart_recovers_stable_objective_and_working_component(
         assert records[0].last_resumed_run_id == second_run_id
         assert records[0].resume_count == 1
         assert len(broker.list_open_orders()) == 1
+    finally:
+        await second.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_public_factory_compiled_portfolio_continues_after_process_restart(
+    tmp_path, monkeypatch
+) -> None:
+    """Production factory recovery advances a compiled two-component portfolio once."""
+    from joker.models.fake_provider import FakeModelProvider
+    from joker.runtime.cognitive_session import stable_cognitive_session_id
+    from tests.integration.test_full_chain_optimizer_graph import (
+        ControllablePaperBroker,
+        _enable_full_chain,
+        _force_two_component_optimize,
+    )
+
+    app = _app(tmp_path)
+    db = tmp_path / "live.db"
+    objective_db = tmp_path / "objective.db"
+    clock = FrozenExchangeClock(
+        datetime(2026, 7, 1, 10, 0, tzinfo=ET), calendar=MarketCalendar()
+    )
+    stable_session_id = stable_cognitive_session_id(
+        trading_date=clock.trading_date(), account_identity="local_paper"
+    )
+    apply_objective_migrations(objective_db)
+    first_service = SessionObjectiveService(ObjectiveRepository(objective_db))
+    definition = await first_service.create_objective(
+        session_id=stable_session_id,
+        authorised_capital_usd=500,
+        target_profit_pct=10,
+        deadline_exchange_time=datetime.now(tz=ET) + timedelta(hours=4),
+        max_concurrent_positions=2,
+        accepted_total_loss_risk=True,
+    )
+    await first_service.confirm_objective(
+        definition.objective_id, confirmed_at_exchange_time=clock.now()
+    )
+    broker = ControllablePaperBroker(["open", "filled"])
+    first_fake = FakeModelProvider(available=True)
+    first_run_id = str(uuid4())
+    _force_two_component_optimize(monkeypatch, qty_a=1, qty_b=1)
+    first = await prepare_cognitive_paper_session(
+        app_settings=app,
+        objective_service=first_service,
+        broker=broker,
+        db_path=db,
+        run_id=first_run_id,
+        fake_model_provider=first_fake,
+        clock=clock,
+        start_cognitive_agent=False,
+        start_evolution_workers=False,
+    )
+    tick, as_of = await _ingest_market(
+        first, ask="1.20", bid="1.00", include_second_contract=True
+    )
+    await first.supervisor.event_bus.drain()
+    cycle_id = "compiled-process-one"
+    register_full_path_canned(
+        first_fake,
+        tick.snapshot.snapshot_id,
+        cycle_id,
+        session=stable_session_id,
+    )
+    first_ckpt = await _bind_quote_loader(first, as_of)
+    _enable_full_chain(first.graph_deps)
+    first.graph_deps.max_quote_age_seconds = 3600
+    first.graph_deps.max_relative_spread = 0.50
+    graph = build_cognitive_graph(first.graph_deps)
+    state = initial_cycle_state(
+        session_id=stable_session_id,
+        run_id=first_run_id,
+        cycle_id=cycle_id,
+        trigger_event_id=str(uuid4()),
+        trigger_event_type=EventType.MARKET_SNAPSHOT_CREATED.value,
+        snapshot_id=str(tick.snapshot.snapshot_id),
+    )
+    result = await graph.ainvoke(
+        state,
+        config=ainvoke_config(
+            session_id=stable_session_id,
+            graph_kind="decision",
+            cycle_id=cycle_id,
+        ),
+    )
+    assert result.get("_target_portfolio_decision"), (
+        [
+            (getattr(error, "error_code", None), getattr(error, "message", None))
+            for error in result.get("errors") or []
+        ],
+        result.get("node_trace"),
+    )
+    decision_id = str(result["_target_portfolio_decision"]["decision_id"])
+    components = await first.graph_deps.provenance_registry.portfolio_executions.list_by_decision(
+        decision_id
+    )
+    assert [component.status.value for component in components] == [
+        "WORKING",
+        "AUTHORIZED",
+    ], (
+        [component.failure_reoptimization_reason for component in components],
+        [(getattr(error, "error_code", None), getattr(error, "message", None)) for error in result.get("errors") or []],
+    )
+    assert broker.external_submission_count == 1
+    first_client_order_id = components[0].client_order_id
+    await first_ckpt.close()
+    await first.shutdown()
+
+    second_run_id = str(uuid4())
+    second_service = SessionObjectiveService(ObjectiveRepository(objective_db))
+    await second_service.load_or_recover(stable_session_id, now=as_of)
+    second = await prepare_cognitive_paper_session(
+        app_settings=app,
+        objective_service=second_service,
+        broker=broker,
+        db_path=db,
+        run_id=second_run_id,
+        fake_model_provider=FakeModelProvider(available=True),
+        clock=clock,
+        start_cognitive_agent=False,
+        start_evolution_workers=False,
+    )
+    try:
+        _enable_full_chain(second.graph_deps)
+        second.agent_runtime._decision_graph = build_cognitive_graph(second.graph_deps)
+        await second.agent_runtime._resume_pending_portfolio_executions()
+        assert broker.external_submission_count == 1
+        broker.fill_order(broker.list_open_orders()[0].order_id)
+        await second.supervisor.execution_runtime.poll_order_status(first_client_order_id)
+        await second.agent_runtime._resume_portfolio_decision(decision_id)
+        resumed = await second.graph_deps.provenance_registry.portfolio_executions.list_by_decision(
+            decision_id
+        )
+        assert broker.external_submission_count == 2
+        assert [component.status.value for component in resumed] == ["FILLED", "FILLED"]
+        assert all(component.origin_run_id == first_run_id for component in resumed)
+        assert all(component.last_resumed_run_id == second_run_id for component in resumed)
+        assert len({component.client_order_id for component in resumed}) == 2
     finally:
         await second.shutdown()
 

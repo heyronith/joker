@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from uuid import uuid4
 
@@ -11,11 +11,14 @@ import pytest
 from joker.config.settings import EnvSettings
 from joker.persistence.cognitive_execution_provenance import (
     PortfolioComponentStatus,
+    PortfolioAttemptLeaseActive,
     PortfolioExecutionComponentRecord,
     PortfolioExecutionOwner,
     PortfolioExecutionRepository,
     PortfolioReoptimizationRepository,
     PortfolioReoptimizationRequestRecord,
+    PortfolioReoptimizationResolutionStatus,
+    PortfolioReoptimizationStatus,
     PortfolioTransitionConflict,
     apply_portfolio_execution_migration,
     stable_reoptimization_request_id,
@@ -545,3 +548,256 @@ def test_different_run_alone_does_not_change_reoptimization_identity() -> None:
     assert stable_reoptimization_request_id(**kwargs) == stable_reoptimization_request_id(
         **kwargs
     )
+
+
+@pytest.mark.asyncio
+async def test_duplicate_component_index_is_rejected(tmp_path) -> None:
+    repo = PortfolioExecutionRepository(tmp_path / "state.db")
+    await repo.authorize(
+        _record("tuple-a", component_index=0, component_count=2)
+    )
+    with pytest.raises(ValueError, match="duplicate portfolio component index"):
+        await repo.authorize(
+            _record("tuple-b", component_index=0, component_count=2)
+        )
+
+
+@pytest.mark.asyncio
+async def test_same_component_index_is_allowed_for_different_decisions_and_owners(
+    tmp_path,
+) -> None:
+    repo = PortfolioExecutionRepository(tmp_path / "state.db")
+    await repo.authorize(_record("tuple-a", decision_id="decision-a"))
+    await repo.authorize(_record("tuple-b", decision_id="decision-b"))
+    await repo.authorize(
+        _record(
+            "tuple-c",
+            decision_id="decision-a",
+            owner=_owner(session_id="session-b"),
+        )
+    )
+    assert await repo.get("tuple-b") is not None
+    assert await repo.get("tuple-c") is not None
+
+
+def test_migration_duplicate_component_order_fails_closed(tmp_path) -> None:
+    db_path = tmp_path / "duplicates.db"
+    apply_portfolio_execution_migration(db_path)
+    with sqlite3.connect(db_path) as db:
+        db.execute("DROP INDEX idx_portfolio_component_order")
+        base = _record("tuple-a", component_index=0, component_count=2)
+        columns = [
+            row[1]
+            for row in db.execute("PRAGMA table_info(portfolio_execution_components)")
+        ]
+        values = {
+            "session_id": base.session_id,
+            "run_id": base.origin_run_id,
+            "origin_run_id": base.origin_run_id,
+            "broker_account_id": base.broker_account_id,
+            "trading_date": base.trading_date,
+            "target_portfolio_decision_id": base.target_portfolio_decision_id,
+            "selected_portfolio_id": base.selected_portfolio_id,
+            "component_index": 0,
+            "component_count": 2,
+            "strategy_id": "strategy",
+            "contract_id": "contract",
+            "authorized_quantity": 1,
+            "capital_allocation": "100",
+            "status": "AUTHORIZED",
+            "submitted_quantity": 0,
+            "filled_quantity": 0,
+            "remaining_quantity": 1,
+            "original_decision_snapshot_id": "snapshot",
+            "evaluated_objective_version": 1,
+            "evaluated_timestamp": NOW,
+            "continuation_ready": 0,
+            "state_version": 0,
+            "component_order_conflicted": 0,
+            "created_at": NOW,
+            "updated_at": NOW,
+            "payload_json": "{}",
+        }
+        for suffix in ("a", "b"):
+            row = dict(values)
+            row["authorized_position_tuple_id"] = f"tuple-{suffix}"
+            row["client_order_id"] = f"client-{suffix}"
+            used = [column for column in columns if column in row]
+            db.execute(
+                f"INSERT INTO portfolio_execution_components ({','.join(used)}) "
+                f"VALUES ({','.join('?' for _ in used)})",
+                tuple(row[column] for column in used),
+            )
+        db.commit()
+
+    apply_portfolio_execution_migration(db_path)
+    with sqlite3.connect(db_path) as db:
+        rows = db.execute(
+            """SELECT status, failure_reoptimization_reason,
+                      component_order_conflicted
+               FROM portfolio_execution_components ORDER BY authorized_position_tuple_id"""
+        ).fetchall()
+        index_sql = db.execute(
+            "SELECT sql FROM sqlite_master WHERE name='idx_portfolio_component_order'"
+        ).fetchone()[0]
+    assert rows == [
+        ("REOPTIMIZATION_REQUIRED", "duplicate_component_index_migration", 1),
+        ("REOPTIMIZATION_REQUIRED", "duplicate_component_index_migration", 1),
+    ]
+    assert "UNIQUE INDEX" in index_sql
+
+
+@pytest.mark.asyncio
+async def test_unresolved_component_and_failed_request_block_until_resolution(tmp_path) -> None:
+    db = tmp_path / "state.db"
+    components = PortfolioExecutionRepository(db)
+    requests = PortfolioReoptimizationRepository(db)
+    await components.authorize(_record("tuple-a"))
+    assert await components.has_unresolved(
+        session_id="session-a",
+        broker_account_identity="paper-a",
+        trading_date="2026-08-05",
+    )
+    await components.transition(
+        "tuple-a",
+        owner=_owner(),
+        status=PortfolioComponentStatus.SUBMITTED,
+        submitted_quantity=2,
+    )
+    await components.transition(
+        "tuple-a",
+        owner=_owner(),
+        status=PortfolioComponentStatus.FILLED,
+        submitted_quantity=2,
+        filled_quantity=2,
+    )
+    assert not await components.has_unresolved(
+        session_id="session-a",
+        broker_account_identity="paper-a",
+        trading_date="2026-08-05",
+    )
+    request = await requests.enqueue(_reoptimization_request(origin_run_id="run-a"))
+    running = await requests.begin_attempt(
+        request.request_id,
+        owner=_owner(),
+        current_run_id="run-a",
+        attempt_exchange_time=NOW,
+    )
+    failed = await requests.transition(
+        request.request_id,
+        status=PortfolioReoptimizationStatus.FAILED,
+        failure_reason="manual_review_required",
+        expected_state_version=running.state_version,
+    )
+    assert failed.resolution_status == PortfolioReoptimizationResolutionStatus.UNRESOLVED
+    assert await requests.has_unresolved(
+        session_id="session-a",
+        broker_account_identity="paper-a",
+        trading_date="2026-08-05",
+    )
+    await requests.resolve_failed(
+        request.request_id,
+        resolved_at=NOW,
+        resolved_by="operator:test",
+        resolution_reason="broker truth reconciled",
+    )
+    assert not await requests.has_unresolved(
+        session_id="session-a",
+        broker_account_identity="paper-a",
+        trading_date="2026-08-05",
+    )
+
+
+@pytest.mark.asyncio
+async def test_reoptimization_attempt_lease_claim_and_takeover(tmp_path) -> None:
+    repo = PortfolioReoptimizationRepository(tmp_path / "state.db")
+    request = await repo.enqueue(_reoptimization_request(origin_run_id="origin"))
+    first = await repo.begin_attempt(
+        request.request_id,
+        owner=_owner(),
+        current_run_id="run-one",
+        attempt_exchange_time=NOW,
+        lease_seconds=30,
+    )
+    same = await repo.begin_attempt(
+        request.request_id,
+        owner=_owner(),
+        current_run_id="run-one",
+        attempt_exchange_time=(datetime.fromisoformat(NOW) + timedelta(seconds=1)).isoformat(),
+        lease_seconds=30,
+    )
+    assert same.state_version == first.state_version
+    assert same.attempt_count == 1
+    with pytest.raises(PortfolioAttemptLeaseActive):
+        await repo.begin_attempt(
+            request.request_id,
+            owner=_owner(),
+            current_run_id="run-two",
+            attempt_exchange_time=(
+                datetime.fromisoformat(NOW) + timedelta(seconds=2)
+            ).isoformat(),
+            lease_seconds=30,
+        )
+    takeover = await repo.begin_attempt(
+        request.request_id,
+        owner=_owner(),
+        current_run_id="run-two",
+        attempt_exchange_time=(datetime.fromisoformat(NOW) + timedelta(seconds=31)).isoformat(),
+        lease_seconds=30,
+    )
+    assert takeover.attempt_owner_run_id == "run-two"
+    assert takeover.attempt_count == 2
+
+
+@pytest.mark.asyncio
+async def test_concurrent_reoptimization_claim_has_one_winner(tmp_path) -> None:
+    repo = PortfolioReoptimizationRepository(tmp_path / "state.db")
+    request = await repo.enqueue(_reoptimization_request(origin_run_id="origin"))
+
+    async def claim(run_id):
+        try:
+            return await repo.begin_attempt(
+                request.request_id,
+                owner=_owner(),
+                current_run_id=run_id,
+                attempt_exchange_time=NOW,
+            )
+        except BaseException as exc:
+            return exc
+
+    results = await asyncio.gather(claim("run-one"), claim("run-two"))
+    assert sum(isinstance(result, PortfolioReoptimizationRequestRecord) for result in results) == 1
+    assert sum(isinstance(result, PortfolioTransitionConflict) for result in results) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "terminal_status",
+    [PortfolioReoptimizationStatus.COMPLETED, PortfolioReoptimizationStatus.FAILED],
+)
+async def test_terminal_reoptimization_cannot_be_reclaimed(
+    tmp_path, terminal_status
+) -> None:
+    repo = PortfolioReoptimizationRepository(tmp_path / "state.db")
+    request = await repo.enqueue(_reoptimization_request(origin_run_id="origin"))
+    running = await repo.begin_attempt(
+        request.request_id,
+        owner=_owner(),
+        current_run_id="run-one",
+        attempt_exchange_time=NOW,
+    )
+    await repo.transition(
+        request.request_id,
+        status=terminal_status,
+        replacement_decision_id=("decision-new" if terminal_status.value == "COMPLETED" else None),
+        replacement_action=("WAIT" if terminal_status.value == "COMPLETED" else None),
+        failure_reason=("manual resolution required" if terminal_status.value == "FAILED" else None),
+        expected_state_version=running.state_version,
+    )
+    with pytest.raises(ValueError, match="terminal"):
+        await repo.begin_attempt(
+            request.request_id,
+            owner=_owner(),
+            current_run_id="run-two",
+            attempt_exchange_time=(datetime.fromisoformat(NOW) + timedelta(minutes=10)).isoformat(),
+        )
