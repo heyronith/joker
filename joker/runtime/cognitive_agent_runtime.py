@@ -1200,32 +1200,6 @@ class CognitiveAgentRuntime:
         if not snapshot_id:
             return
         cycle_id = str(event.payload.get("cycle_id") or uuid4())
-        from joker.graph.langgraph_checkpointer import cognitive_thread_id
-        from joker.persistence.cognitive_cycle_registry import CognitiveCycleRecord
-
-        thread_id = cognitive_thread_id(
-            session_id=self._session_id, graph_kind="decision", cycle_id=cycle_id
-        )
-        if self._deps.cycle_registry is not None:
-            await self._deps.cycle_registry.upsert(
-                CognitiveCycleRecord(
-                    session_id=self._session_id,
-                    graph_kind="decision",
-                    cycle_id=cycle_id,
-                    trigger_event_id=str(event.event_id),
-                    snapshot_id=snapshot_id,
-                    status="running",
-                    checkpoint_thread_id=thread_id,
-                )
-            )
-        state = initial_cycle_state(
-            session_id=self._session_id,
-            run_id=self._run_id,
-            cycle_id=cycle_id,
-            trigger_event_id=str(event.event_id),
-            trigger_event_type=event.event_type.value,
-            snapshot_id=snapshot_id,
-        )
         if reoptimization_request is not None:
             from joker.persistence.cognitive_execution_provenance import (
                 PortfolioAttemptLeaseActive,
@@ -1256,6 +1230,33 @@ class CognitiveAgentRuntime:
                 # This run already owns an active attempt. Do not execute the
                 # graph twice for a duplicate wake-up from the same process.
                 return
+        from joker.graph.langgraph_checkpointer import cognitive_thread_id
+        from joker.persistence.cognitive_cycle_registry import CognitiveCycleRecord
+
+        thread_id = cognitive_thread_id(
+            session_id=self._session_id, graph_kind="decision", cycle_id=cycle_id
+        )
+        if self._deps.cycle_registry is not None:
+            await self._deps.cycle_registry.upsert(
+                CognitiveCycleRecord(
+                    session_id=self._session_id,
+                    graph_kind="decision",
+                    cycle_id=cycle_id,
+                    trigger_event_id=str(event.event_id),
+                    snapshot_id=snapshot_id,
+                    status="running",
+                    checkpoint_thread_id=thread_id,
+                )
+            )
+        state = initial_cycle_state(
+            session_id=self._session_id,
+            run_id=self._run_id,
+            cycle_id=cycle_id,
+            trigger_event_id=str(event.event_id),
+            trigger_event_type=event.event_type.value,
+            snapshot_id=snapshot_id,
+        )
+        if reoptimization_request is not None:
             persisted_contract_ids = {
                 str(position.get("contract_id") or position.get("symbol") or "")
                 for position in reoptimization_request.open_positions

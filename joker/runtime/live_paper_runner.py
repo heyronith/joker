@@ -206,7 +206,7 @@ class LivePaperRunner:
         if on_event is not None and should_stream_event(event_type):
             on_event(event_type, payload)
 
-    def _assert_safe_mode(self) -> None:
+    def _assert_safe_mode(self, *, require_market_data: bool = True) -> None:
         if self.app_settings.live_trading_enabled:
             raise LivePaperError(
                 "live_trading_enabled must be false for paper sessions"
@@ -218,7 +218,7 @@ class LivePaperRunner:
                 "Live paper requires mode PAPER (not LIVE_GATED). "
                 "Use config/paper.yaml."
             )
-        if not self.env_settings.webull_market_data_enabled:
+        if require_market_data and not self.env_settings.webull_market_data_enabled:
             raise LivePaperError(
                 "WEBULL_MARKET_DATA_ENABLED must be true for live paper"
             )
@@ -389,7 +389,8 @@ class LivePaperRunner:
         if config.symbol.upper() != "SPY":
             raise LivePaperError("Only SPY is supported")
 
-        self._assert_safe_mode()
+        recovery_only_mode = bool(config.reconciliation_only_recovery)
+        self._assert_safe_mode(require_market_data=not recovery_only_mode)
 
         # Force PAPER mode for this session regardless of display toggles.
         mode = SafetyMode.PAPER
@@ -439,7 +440,8 @@ class LivePaperRunner:
         injected_agent_runtime = None
         cognitive_graph_deps = None
         _cognitive_startup_payload: dict[str, Any] | None = None
-        if cognitive_mode:
+        bridge_session_id = config.cognitive_session_id_override or run_id
+        if not recovery_only_mode and cognitive_mode:
             import asyncio as _asyncio
 
             from joker.cognition.exceptions import CognitiveRuntimeConfigurationError
@@ -478,6 +480,7 @@ class LivePaperRunner:
                     env=self.env_settings,
                 )
             )
+            bridge_session_id = cognitive_session_id
             model_router = ModelRouter(
                 registry,
                 session_id=cognitive_session_id,
@@ -592,16 +595,11 @@ class LivePaperRunner:
                 ),
                 "notes": list(startup.availability.notes),
             }
-        elif null_agent_mode:
+        elif not recovery_only_mode and null_agent_mode:
             from joker.runtime.compatibility import NullAgentRuntime
 
             injected_agent_runtime = NullAgentRuntime()
 
-        bridge_session_id = (
-            cognitive_graph_deps.session_id
-            if cognitive_graph_deps is not None
-            else run_id
-        )
         task1_bridge = CompatibilityLivePaperBridge(
             broker=broker,
             db_path=task1_db,
@@ -613,8 +611,8 @@ class LivePaperRunner:
         )
         # Two-phase startup for cognitive mode:
         # Create Task 1 stores/ExecutionRuntime → bind gateway → start agent → resume.
-        task1_bridge.start(start_agent=not cognitive_mode)
-        if cognitive_mode and cognitive_graph_deps is not None:
+        task1_bridge.start(start_agent=not (recovery_only_mode or cognitive_mode))
+        if not recovery_only_mode and cognitive_mode and cognitive_graph_deps is not None:
             from joker.persistence.cognitive_execution_provenance import (
                 CognitiveExecutionProvenanceRegistry,
             )
@@ -826,7 +824,7 @@ class LivePaperRunner:
             },
         )
 
-        if config.reconciliation_only_recovery:
+        if recovery_only_mode:
             return self._run_reconciliation_only_recovery(
                 run_id=run_id,
                 selection=selection,

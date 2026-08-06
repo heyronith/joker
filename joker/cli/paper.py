@@ -275,7 +275,10 @@ def paper_run(
         validate_objective_session_action,
         validate_resume_mutation_flags,
     )
-    from joker.config.validation import validate_startup
+    from joker.config.validation import (
+        validate_entry_capable_startup,
+        load_startup_settings,
+    )
     from joker.objectives.deadline import time_remaining_seconds
     from joker.runtime.live_paper_runner import LivePaperRunConfig, LivePaperRunner
     from joker.runtime.paper_goal_result import (
@@ -301,7 +304,7 @@ def paper_run(
         console.print("[red]--resume-session-id requires --objective-session resume[/red]")
         raise typer.Exit(code=1)
 
-    result = validate_startup(config_path=config, skip_model_check=skip_model_check)
+    result = load_startup_settings(config_path=config)
     from joker.cli.graph_view import (
         GRAPH_EVENT_TYPES,
         GraphView,
@@ -318,22 +321,6 @@ def paper_run(
     except ValueError:
         console.print("[red]--graph-view must be compact, verbose, or json[/red]")
         raise typer.Exit(code=1) from None
-    if not skip_preflight:
-        from joker.data.webull_capability import capability_usable_for_shadow
-
-        if not result.env_settings.webull_market_data_enabled:
-            console.print("[red]WEBULL_MARKET_DATA_ENABLED required[/red]")
-            raise typer.Exit(code=1)
-        if not capability_usable_for_shadow():
-            console.print(
-                "[red]Options capability not verified. "
-                "Run: joker data verify-webull-options --symbol SPY[/red]"
-            )
-            raise typer.Exit(code=1)
-        if result.app_settings.live_trading_enabled:
-            console.print("[red]live_trading_enabled must be false[/red]")
-            raise typer.Exit(code=1)
-
     if result.env_settings.webull_live_trading_enabled:
         console.print(
             "[red]WEBULL_LIVE_TRADING_ENABLED must remain false for paper goal tests.[/red]"
@@ -358,13 +345,6 @@ def paper_run(
             "[red]Config broker.provider=webull_paper requires "
             "WEBULL_PAPER_TRADING_ENABLED=true, WEBULL_PAPER_ACCOUNT_ID, and "
             "WEBULL_LIVE_TRADING_ENABLED=false. Refusing PaperBroker fallback.[/red]"
-        )
-        raise typer.Exit(code=1)
-
-    if require_webull_paper and not use_openai:
-        console.print(
-            "[red]Paper goal test refuses --mock-agents when --require-webull-paper "
-            "is set. Use configured non-fake model providers.[/red]"
         )
         raise typer.Exit(code=1)
 
@@ -599,6 +579,34 @@ def paper_run(
                 )
                 raise typer.Exit(code=1)
 
+    entry_capable_recovery = recovery_mode == "normal"
+    if entry_capable_recovery:
+        result = validate_entry_capable_startup(
+            result,
+            skip_model_check=skip_model_check,
+        )
+        if not skip_preflight:
+            from joker.data.webull_capability import capability_usable_for_shadow
+
+            if not result.env_settings.webull_market_data_enabled:
+                console.print("[red]WEBULL_MARKET_DATA_ENABLED required[/red]")
+                raise typer.Exit(code=1)
+            if not capability_usable_for_shadow():
+                console.print(
+                    "[red]Options capability not verified. "
+                    "Run: joker data verify-webull-options --symbol SPY[/red]"
+                )
+                raise typer.Exit(code=1)
+            if result.app_settings.live_trading_enabled:
+                console.print("[red]live_trading_enabled must be false[/red]")
+                raise typer.Exit(code=1)
+        if require_webull_paper and not use_openai:
+            console.print(
+                "[red]Paper goal test refuses --mock-agents when --require-webull-paper "
+                "is set. Use configured non-fake model providers.[/red]"
+            )
+            raise typer.Exit(code=1)
+
     resolved_objective_duration = objective_duration_minutes
     resolved_target_deadline = target_deadline
     if (
@@ -609,7 +617,12 @@ def paper_run(
         assert bundle is not None and bundle.deadline_exchange_time is not None
         resolved_objective_duration = None
         resolved_target_deadline = bundle.deadline_exchange_time.isoformat()
-    elif not yes and objective_duration_minutes is None and target_deadline is None:
+    elif (
+        recovery_mode == "normal"
+        and not yes
+        and objective_duration_minutes is None
+        and target_deadline is None
+    ):
         console.print("\n[bold]Deadline mode[/bold]")
         mode = typer.prompt(
             "Deadline mode (1=Relative duration, 2=Absolute exchange deadline)",
@@ -683,9 +696,9 @@ def paper_run(
         f"[bold]market session remaining[/bold] "
         f"{banner['remaining_market_session_seconds']}s"
     )
-    if recovery_mode == "reconciliation_only":
+    if recovery_mode in {"reconciliation_only", "broker_only"}:
         console.print(
-            f"[bold]Recovery mode[/bold] reconciliation_only  "
+            f"[bold]Recovery mode[/bold] {recovery_mode}  "
             f"[bold]runtime[/bold] {timing.runtime_duration_minutes:.2f} minutes  "
             f"[bold]new entries permitted[/bold] false"
         )
@@ -739,7 +752,7 @@ def paper_run(
     obj_table.add_row("recovery mode", recovery_mode)
     obj_table.add_row(
         "new entries permitted",
-        "false" if recovery_mode == "reconciliation_only" else "true",
+        "true" if recovery_mode == "normal" else "false",
     )
     obj_table.add_row("paper broker account hash", paper_account_hash or "—")
     console.print(obj_table)
@@ -772,7 +785,7 @@ def paper_run(
             "target_profit_usd": target_profit_usd,
             "objective_status": str(getattr(existing_state, "status", "active")),
             "recovery_mode": recovery_mode,
-            "new_entries_permitted": recovery_mode != "reconciliation_only",
+            "new_entries_permitted": recovery_mode == "normal",
             "original_objective_deadline": (
                 bundle.deadline_exchange_time.isoformat()
                 if bundle is not None and bundle.deadline_exchange_time is not None
@@ -780,12 +793,12 @@ def paper_run(
             ),
             "recovery_started_at": (
                 timing.exchange_now.isoformat()
-                if recovery_mode == "reconciliation_only"
+                if recovery_mode in {"reconciliation_only", "broker_only"}
                 else None
             ),
             "recovery_runtime_minutes": (
                 timing.runtime_duration_minutes
-                if recovery_mode == "reconciliation_only"
+                if recovery_mode in {"reconciliation_only", "broker_only"}
                 else None
             ),
             **banner,
@@ -813,7 +826,7 @@ def paper_run(
             "shutdown_grace_seconds": timing.shutdown_grace_seconds,
             "objective_status": str(getattr(existing_state, "status", "active")),
             "recovery_mode": recovery_mode,
-            "new_entries_permitted": recovery_mode != "reconciliation_only",
+            "new_entries_permitted": recovery_mode == "normal",
             "original_objective_deadline": (
                 bundle.deadline_exchange_time.isoformat()
                 if bundle is not None and bundle.deadline_exchange_time is not None
@@ -821,12 +834,12 @@ def paper_run(
             ),
             "recovery_started_at": (
                 timing.exchange_now.isoformat()
-                if recovery_mode == "reconciliation_only"
+                if recovery_mode in {"reconciliation_only", "broker_only"}
                 else None
             ),
             "recovery_runtime_minutes": (
                 timing.runtime_duration_minutes
-                if recovery_mode == "reconciliation_only"
+                if recovery_mode in {"reconciliation_only", "broker_only"}
                 else None
             ),
         },
@@ -1128,9 +1141,9 @@ def paper_run(
         f"objective={timing.objective_duration_minutes:.1f}m, "
         f"agents={'openai' if use_openai else 'mock'}, broker={broker_label}"
     )
-    if recovery_mode == "reconciliation_only":
+    if recovery_mode in {"reconciliation_only", "broker_only"}:
         console.print(
-            f"[dim]Reconciliation-only recovery uses the persisted deadline and a bounded "
+            f"[dim]{recovery_mode} recovery uses the persisted deadline and a bounded "
             f"{timing.runtime_duration_minutes:.1f} minute recovery window. "
             f"No new entries are permitted. Default recovery window is "
             f"{DEFAULT_RECONCILIATION_RECOVERY_MINUTES:.0f} minutes when "

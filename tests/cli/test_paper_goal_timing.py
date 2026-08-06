@@ -5,9 +5,11 @@ from __future__ import annotations
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 import pytest
+from typer.testing import CliRunner
 
 from joker.cli.paper_goal_timing import (
     DEFAULT_OBJECTIVE_DURATION_MINUTES,
@@ -22,6 +24,7 @@ from joker.runtime.paper_goal_result import (
     contains_secrets,
     redact_mapping,
 )
+from joker.config.validation import ConfigValidationError
 from joker.time.calendar import MarketCalendar
 
 
@@ -31,6 +34,109 @@ ET = ZoneInfo("America/New_York")
 def _regular_now(hour: int = 10, minute: int = 0) -> datetime:
     """Pick a known regular-session weekday (Tuesday 2026-08-04)."""
     return datetime(2026, 8, 4, hour, minute, tzinfo=ET)
+
+
+def _fake_paper_validation_result(
+    tmp_path: Path,
+    *,
+    provider: str = "paper",
+    market_data_enabled: bool = True,
+    paper_enabled: bool = False,
+    paper_account_id: str | None = None,
+):
+    from joker.config.settings import AppSettings, EnvSettings
+
+    app = AppSettings(db_path=str(tmp_path / "app.db"))
+    app = app.model_copy(
+        update={"broker": app.broker.model_copy(update={"provider": provider})}
+    )
+    env = EnvSettings.model_construct(
+        openai_model="gpt-4o-mini",
+        webull_market_data_enabled=market_data_enabled,
+        webull_live_trading_enabled=False,
+        webull_paper_trading_enabled=paper_enabled,
+        webull_paper_account_id=paper_account_id,
+        webull_trade_api_env="paper",
+    )
+    return SimpleNamespace(app_settings=app, env_settings=env)
+
+
+def _patch_paper_cli_common(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    validation_result,
+    recovery_candidates: list | None = None,
+    runner_broker_kind: str = "local_paper",
+) -> None:
+    monkeypatch.setattr(
+        "joker.config.validation.load_startup_settings",
+        lambda **kwargs: validation_result,
+    )
+    def _evidence_dir(**kwargs):
+        path = tmp_path / "evidence"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+    monkeypatch.setattr(
+        "joker.runtime.paper_goal_result.evidence_dir",
+        _evidence_dir,
+    )
+    monkeypatch.setattr(
+        "joker.runtime.paper_goal_result.sqlite_checks",
+        lambda *args, **kwargs: {"ok": True},
+    )
+
+    async def _discover(**kwargs):
+        return list(recovery_candidates or [])
+
+    async def _has_unresolved(**kwargs):
+        return bool(recovery_candidates)
+
+    monkeypatch.setattr(
+        "joker.cli.session_confirm.discover_objective_recovery_candidates",
+        _discover,
+    )
+    monkeypatch.setattr(
+        "joker.cli.session_confirm.has_unresolved_portfolio_work",
+        _has_unresolved,
+    )
+
+    class _Repo:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def latest_definition_for_session(self, _session_id):
+            return None
+
+        def latest_state_for_session(self, _session_id):
+            return None
+
+    monkeypatch.setattr("joker.objectives.repository.ObjectiveRepository", _Repo)
+    monkeypatch.setattr(
+        "joker.runtime.live_paper_runner.LivePaperRunner.run",
+        lambda self, config, **kwargs: SimpleNamespace(
+            summary=SimpleNamespace(
+                events_processed=0,
+                signals_detected=0,
+                trades_entered=0,
+                trades_exited=0,
+                final_pnl_usd=0.0,
+            ),
+            report_path=None,
+            errors=[],
+            failures=[],
+            paper_pnl_usd=0.0,
+            open_positions_remaining=0,
+            working_orders_remaining=0,
+            reconciliation_clean=True,
+            objective_deadline_reached=False,
+            broker_kind=runner_broker_kind,
+            broker_label=runner_broker_kind,
+            feed_health="RECOVERY_ONLY",
+            options_available=False,
+            events_processed=0,
+        ),
+    )
 
 
 def test_objective_duration_defaults_to_60_minutes() -> None:
@@ -999,3 +1105,230 @@ async def test_corrupt_session_id_does_not_hide_unresolved_owner(tmp_path: Path)
     )
     assert [candidate.session_id for candidate in candidates] == ["broken-session-id"]
     assert candidates[0].classification == "corrupted_authority"
+
+
+def test_broker_only_resume_bypasses_model_and_options_preflight(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from joker.cli.paper import paper_app
+    from joker.cli.session_confirm import ObjectiveSessionRecoveryCandidate
+
+    validation = _fake_paper_validation_result(
+        tmp_path,
+        provider="webull_paper",
+        market_data_enabled=False,
+        paper_enabled=True,
+        paper_account_id="PAPER_ACCT_A",
+    )
+    _patch_paper_cli_common(
+        monkeypatch,
+        tmp_path,
+        validation_result=validation,
+        recovery_candidates=[
+            ObjectiveSessionRecoveryCandidate(
+                session_id="cog:paper:webull:2026-08-05",
+                trading_date="2026-08-05",
+                has_definition=False,
+                latest_status=None,
+                unresolved_work=True,
+                classification="corrupted_authority",
+            )
+        ],
+        runner_broker_kind="webull_paper",
+    )
+    monkeypatch.setattr(
+        "joker.config.validation.validate_entry_capable_startup",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("entry-capable model validation must be skipped")
+        ),
+    )
+    monkeypatch.setattr(
+        "joker.data.webull_capability.capability_usable_for_shadow",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("options capability check must be skipped")
+        ),
+    )
+
+    result = CliRunner().invoke(
+        paper_app,
+        [
+            "run",
+            "--config",
+            "config/paper.yaml",
+            "--objective-session",
+            "resume",
+            "--duration-minutes",
+            "0.01",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+
+
+def test_broker_only_resume_allows_mock_agents_with_required_webull_paper(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from joker.cli.paper import paper_app
+    from joker.cli.session_confirm import ObjectiveSessionRecoveryCandidate
+
+    validation = _fake_paper_validation_result(
+        tmp_path,
+        provider="webull_paper",
+        market_data_enabled=False,
+        paper_enabled=True,
+        paper_account_id="PAPER_ACCT_A",
+    )
+    _patch_paper_cli_common(
+        monkeypatch,
+        tmp_path,
+        validation_result=validation,
+        recovery_candidates=[
+            ObjectiveSessionRecoveryCandidate(
+                session_id="cog:paper:webull:2026-08-05",
+                trading_date="2026-08-05",
+                has_definition=False,
+                latest_status=None,
+                unresolved_work=True,
+                classification="corrupted_authority",
+            )
+        ],
+        runner_broker_kind="webull_paper",
+    )
+    monkeypatch.setattr(
+        "joker.config.validation.validate_entry_capable_startup",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("broker-only recovery must not require model validation")
+        ),
+    )
+
+    result = CliRunner().invoke(
+        paper_app,
+        [
+            "run",
+            "--config",
+            "config/paper.yaml",
+            "--objective-session",
+            "resume",
+            "--duration-minutes",
+            "0.01",
+            "--require-webull-paper",
+            "--mock-agents",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+
+
+def test_broker_only_resume_still_requires_exact_paper_account(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from joker.cli.paper import paper_app
+    from joker.runtime.cognitive_session import paper_account_identity
+
+    validation = _fake_paper_validation_result(
+        tmp_path,
+        provider="webull_paper",
+        market_data_enabled=False,
+        paper_enabled=True,
+        paper_account_id="PAPER_ACCT_B",
+    )
+    seen: dict[str, str] = {}
+
+    async def _discover(**kwargs):
+        seen["account_identity"] = kwargs["broker_account_identity"]
+        return []
+
+    _patch_paper_cli_common(
+        monkeypatch,
+        tmp_path,
+        validation_result=validation,
+        recovery_candidates=[],
+        runner_broker_kind="webull_paper",
+    )
+    monkeypatch.setattr(
+        "joker.cli.session_confirm.discover_objective_recovery_candidates",
+        _discover,
+    )
+    monkeypatch.setattr(
+        "joker.config.validation.validate_entry_capable_startup",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("resume without a matching owner must fail before entry preflight")
+        ),
+    )
+
+    result = CliRunner().invoke(
+        paper_app,
+        [
+            "run",
+            "--config",
+            "config/paper.yaml",
+            "--objective-session",
+            "resume",
+            "--resume-session-id",
+            "cog:paper:webull:2026-08-05",
+            "--duration-minutes",
+            "0.01",
+        ],
+    )
+    assert result.exit_code != 0
+    assert "no unfinished objective exists" in (result.output or "")
+    assert seen["account_identity"] == paper_account_identity(
+        broker_kind="webull_paper",
+        env=validation.env_settings,
+    )
+
+
+def test_normal_session_still_requires_model_and_options_preflight(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from joker.cli.paper import paper_app
+
+    validation = _fake_paper_validation_result(
+        tmp_path,
+        provider="paper",
+        market_data_enabled=True,
+    )
+    _patch_paper_cli_common(
+        monkeypatch,
+        tmp_path,
+        validation_result=validation,
+    )
+
+    monkeypatch.setattr(
+        "joker.config.validation.validate_entry_capable_startup",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            ConfigValidationError("model-preflight-called")
+        ),
+    )
+    result = CliRunner().invoke(
+        paper_app,
+        [
+            "run",
+            "--config",
+            "config/paper.yaml",
+            "--duration-minutes",
+            "0.01",
+        ],
+    )
+    assert result.exit_code != 0
+    assert isinstance(result.exception, ConfigValidationError)
+    assert str(result.exception) == "model-preflight-called"
+
+    monkeypatch.setattr(
+        "joker.config.validation.validate_entry_capable_startup",
+        lambda result, **kwargs: result,
+    )
+    monkeypatch.setattr(
+        "joker.data.webull_capability.capability_usable_for_shadow",
+        lambda: False,
+    )
+    result = CliRunner().invoke(
+        paper_app,
+        [
+            "run",
+            "--config",
+            "config/paper.yaml",
+            "--duration-minutes",
+            "0.01",
+        ],
+    )
+    assert result.exit_code != 0
+    assert "Options capability not verified" in (result.output or "")

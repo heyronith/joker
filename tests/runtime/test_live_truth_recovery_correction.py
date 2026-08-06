@@ -866,11 +866,86 @@ async def _recovery_gateway(
     return OrderActionGateway(deps), runtime
 
 
+async def _recovery_gateway_without_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    orders: list[Any] | None = None,
+    positions: dict[str, Any] | None = None,
+) -> tuple[OrderActionGateway, MagicMock]:
+    from joker.runtime import order_action_gateway as gw_mod
+
+    async def _no_snapshot(*_args, **_kwargs):
+        raise AssertionError(
+            "snapshot truth must not load for categorically blocked recovery action"
+        )
+
+    monkeypatch.setattr(gw_mod, "load_snapshot_truth", _no_snapshot)
+    runtime = MagicMock()
+    runtime.cancel_order = AsyncMock(return_value=None)
+    runtime.submit_execution_command = AsyncMock()
+    deps = CognitiveGraphDeps(
+        router=_router(),
+        config=CognitiveGraphSettings(),
+        session_id="gw",
+        run_id="gw",
+        execution_runtime=runtime,
+        projection_loader=AsyncMock(
+            return_value=SimpleNamespace(
+                positions=positions or {},
+                orders=orders or [],
+            )
+        ),
+        reconciliation_only_recovery=True,
+    )
+    return OrderActionGateway(deps), runtime
+
+
 @pytest.mark.asyncio
 async def test_reconciliation_only_blocks_position_add(monkeypatch) -> None:
     gateway, runtime = await _recovery_gateway(
         monkeypatch,
         contract_id=CONTRACT_ID,
+        positions={CONTRACT_ID: SimpleNamespace(quantity=Decimal("1"), contract_id=CONTRACT_ID)},
+    )
+    result = await gateway.submit(
+        OrderActionRequest(
+            action=OrderActionKind.ADD,
+            client_order_id="add-1",
+            contract_id=CONTRACT_ID,
+            side="buy",
+            quantity=1,
+            snapshot_id="snap",
+            limit_price=1.10,
+        )
+    )
+    assert result.submitted is False
+    assert result.blocked_reason == "reconciliation_only_blocks_new_risk"
+    runtime.submit_execution_command.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_entry_is_blocked_without_snapshot(monkeypatch) -> None:
+    gateway, runtime = await _recovery_gateway_without_snapshot(monkeypatch)
+    result = await gateway.submit(
+        OrderActionRequest(
+            action=OrderActionKind.ENTRY,
+            client_order_id="entry-1",
+            contract_id=CONTRACT_ID,
+            side="buy",
+            quantity=1,
+            snapshot_id="snap",
+            limit_price=1.10,
+        )
+    )
+    assert result.submitted is False
+    assert result.blocked_reason == "reconciliation_only_blocks_new_risk"
+    runtime.submit_execution_command.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_add_is_blocked_without_snapshot(monkeypatch) -> None:
+    gateway, runtime = await _recovery_gateway_without_snapshot(
+        monkeypatch,
         positions={CONTRACT_ID: SimpleNamespace(quantity=Decimal("1"), contract_id=CONTRACT_ID)},
     )
     result = await gateway.submit(
@@ -922,6 +997,37 @@ async def test_reconciliation_only_blocks_buy_entry_replace(monkeypatch) -> None
 
 
 @pytest.mark.asyncio
+async def test_buy_replace_is_blocked_without_snapshot(monkeypatch) -> None:
+    working = SimpleNamespace(
+        client_order_id="ord-1",
+        contract_id=CONTRACT_ID,
+        side="buy",
+        submitted_qty=1,
+        filled_qty=0,
+        status="accepted",
+    )
+    gateway, runtime = await _recovery_gateway_without_snapshot(
+        monkeypatch,
+        orders=[working],
+    )
+    result = await gateway.submit(
+        OrderActionRequest(
+            action=OrderActionKind.REPLACE,
+            client_order_id="ord-1:r",
+            replace_of_client_order_id="ord-1",
+            contract_id=CONTRACT_ID,
+            side="buy",
+            quantity=1,
+            snapshot_id="snap",
+            limit_price=1.05,
+        )
+    )
+    assert result.submitted is False
+    assert result.blocked_reason == "reconciliation_only_blocks_buy_side_replace"
+    runtime.cancel_order.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_reconciliation_only_blocks_quantity_increasing_replace(monkeypatch) -> None:
     working = SimpleNamespace(
         client_order_id="ord-1",
@@ -952,6 +1058,83 @@ async def test_reconciliation_only_blocks_quantity_increasing_replace(monkeypatc
     assert result.submitted is False
     assert result.blocked_reason == "reconciliation_only_blocks_quantity_increasing_replace"
     runtime.cancel_order.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_sell_exit_replace_requests_quote_only_after_authority_validation(
+    monkeypatch,
+) -> None:
+    from joker.runtime import order_action_gateway as gw_mod
+
+    working = SimpleNamespace(
+        client_order_id="ord-1",
+        contract_id=CONTRACT_ID,
+        side="sell",
+        submitted_qty=2,
+        filled_qty=1,
+        status="accepted",
+    )
+    runtime = MagicMock()
+    runtime.cancel_order = AsyncMock(return_value=None)
+    runtime.submit_execution_command = AsyncMock(
+        return_value=BrokerOrder(
+            order_id="wb-1",
+            intent_id="cid-1",
+            status="open",
+            contract=contract_today(),
+            side="sell",
+            quantity=1,
+            limit_price=1.10,
+        )
+    )
+    projection_loader = AsyncMock(
+        return_value=SimpleNamespace(
+            positions={CONTRACT_ID: SimpleNamespace(quantity=Decimal("1"), contract_id=CONTRACT_ID)},
+            orders=[working],
+        )
+    )
+    call_order: list[str] = []
+
+    async def _fake_load(deps, snapshot_id):
+        call_order.append("snapshot")
+        surface_id = uuid4()
+        return (
+            SimpleNamespace(
+                snapshot_id=snapshot_id,
+                trading_date=date(2026, 7, 1),
+                option_surface_id=surface_id,
+            ),
+            SimpleNamespace(usable_for_execution=True, severity=SimpleNamespace(value="ok")),
+            SimpleNamespace(surface_id=surface_id, contracts=(_surface_contract(CONTRACT_ID),)),
+            (),
+        )
+
+    monkeypatch.setattr(gw_mod, "load_snapshot_truth", _fake_load)
+    deps = CognitiveGraphDeps(
+        router=_router(),
+        config=CognitiveGraphSettings(),
+        session_id="gw",
+        run_id="gw",
+        execution_runtime=runtime,
+        projection_loader=projection_loader,
+        reconciliation_only_recovery=True,
+    )
+    gateway = OrderActionGateway(deps)
+    result = await gateway.submit(
+        OrderActionRequest(
+            action=OrderActionKind.REPLACE,
+            client_order_id="ord-1:r",
+            replace_of_client_order_id="ord-1",
+            contract_id=CONTRACT_ID,
+            side="sell",
+            quantity=1,
+            snapshot_id="snap",
+            limit_price=1.05,
+        )
+    )
+    assert result.submitted is True
+    projection_loader.assert_awaited_once()
+    assert call_order == ["snapshot"]
 
 
 @pytest.mark.asyncio

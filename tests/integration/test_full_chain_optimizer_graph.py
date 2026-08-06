@@ -306,6 +306,159 @@ async def test_compiled_graph_full_chain_enter_reaches_entry_tactician_without_e
 
 
 @pytest.mark.asyncio
+async def test_end_to_end_reoptimization_lease_retry_executes_compiled_graph_once(
+    tmp_path, monkeypatch
+) -> None:
+    import asyncio
+    import copy
+    import time as wall_time
+    from datetime import date, datetime, timedelta, timezone
+
+    from joker.persistence.cognitive_execution_provenance import (
+        CognitiveExecutionProvenanceRegistry,
+        PortfolioReoptimizationStatus,
+        PortfolioTransitionConflict,
+    )
+    from joker.runtime.cognitive_agent_runtime import CognitiveAgentRuntime
+
+    stack, _runtime, _registry, request, _original_result, _original_get_state = (
+        await _prepare_pending_reoptimization(tmp_path, monkeypatch)
+    )
+    try:
+        class _AdvancingClock:
+            def __init__(self) -> None:
+                self._base = datetime(2026, 7, 1, 14, 5, tzinfo=timezone.utc)
+                self._started = wall_time.monotonic()
+
+            def now(self) -> datetime:
+                return self._base + timedelta(seconds=wall_time.monotonic() - self._started)
+
+            def trading_date(self) -> date:
+                return date(2026, 7, 1)
+
+        async def _active_objective_state():
+            current = await _original_get_state()
+            return current.model_copy(
+                update={
+                    "status": "active",
+                    "entries_paused": False,
+                    "target_reached": False,
+                }
+            )
+
+        async def _active_recompute_from_truth(**_kwargs):
+            return await _active_objective_state()
+
+        stack["objective_service"].get_state = _active_objective_state
+        stack["objective_service"].recompute_from_truth = _active_recompute_from_truth
+        owner = request.owner
+        registry_a = CognitiveExecutionProvenanceRegistry(stack["deps"].db_path)
+        registry_b = CognitiveExecutionProvenanceRegistry(stack["deps"].db_path)
+        await registry_a.initialize()
+        await registry_b.initialize()
+
+        deps_a = copy.copy(stack["deps"])
+        deps_a.provenance_registry = registry_a
+        deps_a.clock = _AdvancingClock()
+        deps_b = copy.copy(stack["deps"])
+        deps_b.provenance_registry = registry_b
+        deps_b.clock = _AdvancingClock()
+
+        runtime_a = CognitiveAgentRuntime(
+            session_id=deps_a.session_id,
+            run_id="retry-run-a",
+            router=deps_a.router,
+            config=deps_a.config,
+            graph_deps=deps_a,
+        )
+        runtime_b = CognitiveAgentRuntime(
+            session_id=deps_b.session_id,
+            run_id="retry-run-b",
+            router=deps_b.router,
+            config=deps_b.config,
+            graph_deps=deps_b,
+        )
+
+        running = await registry_a.portfolio_reoptimizations.begin_attempt(
+            request.request_id,
+            owner=owner,
+            current_run_id=runtime_a._run_id,
+            attempt_exchange_time=deps_a.clock.now().isoformat(),
+            lease_seconds=0.2,
+        )
+
+        register_full_path_canned(
+            stack["fake_model_provider"],
+            UUID(request.latest_snapshot_id),
+            f"portfolio-reoptimization-{request.request_id}",
+            session=deps_b.session_id,
+        )
+        compiled_graph = build_cognitive_graph(deps_b)
+        graph_calls: list[str] = []
+
+        class _CountingGraph:
+            async def ainvoke(self, state, config=None):
+                graph_calls.append(str(state.get("_portfolio_reoptimization_request_id")))
+                return await compiled_graph.ainvoke(state, config=config)
+
+        runtime_b._decision_graph = _CountingGraph()
+        await runtime_b._resume_pending_portfolio_reoptimizations()
+        assert graph_calls == []
+        assert request.request_id in runtime_b._reoptimization_retry_tasks
+
+        completed = None
+        for _ in range(20):
+            await asyncio.sleep(0.1)
+            completed = await registry_b.portfolio_reoptimizations.get(request.request_id)
+            if (
+                completed is not None
+                and completed.status
+                in {
+                    PortfolioReoptimizationStatus.COMPLETED,
+                    PortfolioReoptimizationStatus.FAILED,
+                }
+            ):
+                break
+        assert completed is not None
+        assert completed.status in {
+            PortfolioReoptimizationStatus.COMPLETED,
+            PortfolioReoptimizationStatus.FAILED,
+        }
+        assert completed.last_attempt_run_id == runtime_b._run_id
+        assert completed.attempt_generation == running.attempt_generation + 1
+        assert graph_calls == [request.request_id]
+        assert request.request_id not in runtime_b._reoptimization_retry_tasks
+        if completed.status == PortfolioReoptimizationStatus.COMPLETED:
+            assert completed.replacement_action == "ENTER"
+            assert stack["broker"].external_submission_count == 2
+        else:
+            assert completed.failure_reason
+
+        now_iso = deps_a.clock.now().isoformat()
+        with pytest.raises(
+            PortfolioTransitionConflict,
+            match="reoptimization completion lost attempt fencing race",
+        ):
+            await registry_a.portfolio_reoptimizations.complete_attempt(
+                attempt=running,
+                completed_at=now_iso,
+                replacement_decision_id=str(uuid4()),
+                replacement_action="ENTER",
+            )
+        with pytest.raises(
+            PortfolioTransitionConflict,
+            match="reoptimization failure lost attempt fencing race",
+        ):
+            await registry_a.portfolio_reoptimizations.fail_attempt(
+                attempt=running,
+                failed_at=now_iso,
+                failure_reason="stale-run-a-cannot-win",
+            )
+    finally:
+        await _teardown_stack(stack)
+
+
+@pytest.mark.asyncio
 async def test_compiled_graph_builds_authoritative_portfolio_proposal(
     tmp_path,
 ) -> None:

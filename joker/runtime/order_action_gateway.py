@@ -298,9 +298,6 @@ class OrderActionGateway:
                 working_orders={},
             )
 
-        snapshot, data_quality, surface, _slice = await load_snapshot_truth(
-            self._deps, request.snapshot_id
-        )
         projection = None
         if self._deps.projection_loader is not None:
             projection = await self._deps.projection_loader()
@@ -317,6 +314,9 @@ class OrderActionGateway:
                 blocked_reason=recovery_block,
                 working_orders=working,
             )
+        snapshot, data_quality, surface, _slice = await load_snapshot_truth(
+            self._deps, request.snapshot_id
+        )
 
         try:
             command = self._validate_and_compile(
@@ -892,7 +892,7 @@ class OrderActionGateway:
         if request.side != "sell":
             return "reconciliation_only_blocks_buy_side_replace"
         if match is None:
-            return None
+            return "reconciliation_only_replace_requires_working_sell_order"
         if match.side != "sell":
             return "reconciliation_only_blocks_buy_side_replace"
         if request.quantity > match.remaining_quantity:

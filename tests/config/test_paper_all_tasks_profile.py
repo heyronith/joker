@@ -124,7 +124,7 @@ def test_paper_run_cli_fails_closed_without_require_flag(monkeypatch) -> None:
         env_settings = _env(WEBULL_PAPER_TRADING_ENABLED="false")
 
     monkeypatch.setattr(
-        "joker.config.validation.validate_startup",
+        "joker.config.validation.load_startup_settings",
         lambda **kwargs: _Result(),
     )
     runner = CliRunner()

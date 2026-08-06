@@ -122,13 +122,15 @@ def validate_model_available(
         )
 
 
-def validate_startup(
+def load_startup_settings(
     config_path: str | None = None,
     project_root: str | None = None,
-    skip_model_check: bool = False,
-    client_factory: Callable[[], OpenAI] | None = None,
 ) -> ValidationResult:
-    """Run all startup validations. Raises ConfigValidationError on failure."""
+    """Load settings and validate only structural + safety invariants.
+
+    This path is safe for recovery classification that must run before any
+    entry-capable model or option-market preflight.
+    """
     from pathlib import Path
 
     root = Path(project_root) if project_root else Path.cwd()
@@ -140,11 +142,34 @@ def validate_startup(
     except Exception as exc:
         raise ConfigValidationError(safe_error_message(exc)) from exc
 
-    validate_openai_env(env_settings)
     validate_mode(app_settings)
     validate_webull_env(env_settings, app_settings)
-
-    if not skip_model_check:
-        validate_model_available(env_settings, client_factory=client_factory)
-
     return ValidationResult(app_settings=app_settings, env_settings=env_settings)
+
+
+def validate_entry_capable_startup(
+    result: ValidationResult,
+    *,
+    skip_model_check: bool = False,
+    client_factory: Callable[[], OpenAI] | None = None,
+) -> ValidationResult:
+    """Validate model prerequisites required for entry-capable sessions."""
+    validate_openai_env(result.env_settings)
+    if not skip_model_check:
+        validate_model_available(result.env_settings, client_factory=client_factory)
+    return result
+
+
+def validate_startup(
+    config_path: str | None = None,
+    project_root: str | None = None,
+    skip_model_check: bool = False,
+    client_factory: Callable[[], OpenAI] | None = None,
+) -> ValidationResult:
+    """Run all startup validations. Raises ConfigValidationError on failure."""
+    result = load_startup_settings(config_path=config_path, project_root=project_root)
+    return validate_entry_capable_startup(
+        result,
+        skip_model_check=skip_model_check,
+        client_factory=client_factory,
+    )
