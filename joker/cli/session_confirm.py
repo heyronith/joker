@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
+from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
@@ -40,18 +41,32 @@ class ObjectiveSessionRecoveryCandidate:
     has_definition: bool
     latest_status: str | None
     unresolved_work: bool
+    classification: str = "resumable"
 
     @property
     def resumable(self) -> bool:
-        unfinished = self.has_definition and (
-            self.latest_status is None
-            or self.latest_status not in TERMINAL_OBJECTIVE_STATUSES
-        )
-        return unfinished or (
-            self.has_definition
-            and self.latest_status in TERMINAL_OBJECTIVE_STATUSES
-            and self.unresolved_work
-        )
+        return self.classification in {
+            RecoveryClassification.RESUMABLE.value,
+            RecoveryClassification.RECONCILIATION_REQUIRED.value,
+        }
+
+    @property
+    def blocks_new_objective(self) -> bool:
+        return self.resumable or self.unresolved_work
+
+    @property
+    def recovery_mode(self) -> str:
+        if self.classification == RecoveryClassification.RECONCILIATION_REQUIRED.value:
+            return "reconciliation_only"
+        if self.classification == RecoveryClassification.CORRUPTED_AUTHORITY.value:
+            return "broker_only"
+        return "normal"
+
+
+class RecoveryClassification(StrEnum):
+    RESUMABLE = "resumable"
+    RECONCILIATION_REQUIRED = "reconciliation_required"
+    CORRUPTED_AUTHORITY = "corrupted_authority"
 
 
 def select_recovery_candidate(
@@ -307,7 +322,14 @@ async def discover_objective_recovery_candidates(
         owner_record = (
             owners.get((session_id, parsed_trading_date.isoformat()))
             if parsed_trading_date is not None
-            else None
+            else next(
+                (
+                    owner
+                    for (owner_session_id, _owner_trading_date), owner in owners.items()
+                    if owner_session_id == session_id
+                ),
+                None,
+            )
         )
         owner_trading_date = (
             owner_record.trading_date
@@ -322,16 +344,31 @@ async def discover_objective_recovery_candidates(
                 broker_account_identity=broker_account_identity,
                 trading_date=owner_trading_date,
             )
+        if definition is None and not unresolved:
+            continue
+        latest_status = str(state.status) if state is not None else None
+        unfinished = definition is not None and (
+            latest_status is None or latest_status not in TERMINAL_OBJECTIVE_STATUSES
+        )
+        if definition is not None and unfinished:
+            classification = RecoveryClassification.RESUMABLE.value
+        elif definition is not None and unresolved:
+            classification = RecoveryClassification.RECONCILIATION_REQUIRED.value
+        elif unresolved:
+            classification = RecoveryClassification.CORRUPTED_AUTHORITY.value
+        else:
+            continue
         candidates.append(
             ObjectiveSessionRecoveryCandidate(
                 session_id=session_id,
                 trading_date=owner_trading_date,
                 has_definition=definition is not None,
-                latest_status=(str(state.status) if state is not None else None),
+                latest_status=latest_status,
                 unresolved_work=unresolved,
+                classification=classification,
             )
         )
-    return [candidate for candidate in candidates if candidate.resumable]
+    return candidates
 
 
 # Backward compatibility for callers outside the CLI. New-session authority

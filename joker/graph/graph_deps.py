@@ -103,6 +103,7 @@ class CognitiveGraphDeps:
     max_quote_age_seconds: int = 30
     max_relative_spread: float = 0.25
     objective_execution_settings: Any | None = None
+    reconciliation_only_recovery: bool = False
     # Active Task-3 configuration for leakage-safe historical queries.
     evolution_runtime: Any | None = None
     configuration_repo: Any | None = None

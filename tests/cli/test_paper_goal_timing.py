@@ -152,6 +152,51 @@ def test_reconciliation_only_resume_uses_bounded_runtime_not_new_objective_windo
 
 
 @pytest.mark.parametrize(
+    ("now", "expected_minutes"),
+    [
+        (datetime(2026, 8, 4, 16, 1, tzinfo=ET), DEFAULT_RECONCILIATION_RECOVERY_MINUTES),
+        (datetime(2026, 8, 4, 17, 30, tzinfo=ET), DEFAULT_RECONCILIATION_RECOVERY_MINUTES),
+        (datetime(2026, 8, 8, 11, 0, tzinfo=ET), DEFAULT_RECONCILIATION_RECOVERY_MINUTES),
+    ],
+)
+def test_post_close_and_weekend_recovery_use_bounded_wall_clock_runtime(
+    now: datetime,
+    expected_minutes: float,
+) -> None:
+    timing = resolve_reconciliation_only_timing(
+        original_deadline=None,
+        duration_minutes=None,
+        now=now,
+        require_regular_session=False,
+    )
+    assert timing.runtime_duration_minutes == expected_minutes
+    assert timing.remaining_session_seconds == 0
+
+
+def test_recovery_after_2000_does_not_use_next_close_as_duration() -> None:
+    now = datetime(2026, 8, 4, 20, 30, tzinfo=ET)
+    timing = resolve_reconciliation_only_timing(
+        original_deadline=None,
+        duration_minutes=None,
+        now=now,
+        require_regular_session=False,
+    )
+    assert timing.runtime_duration_minutes == DEFAULT_RECONCILIATION_RECOVERY_MINUTES
+    assert timing.remaining_session_seconds == 0
+
+
+def test_regular_session_recovery_still_caps_at_close() -> None:
+    now = _regular_now(15, 55)
+    timing = resolve_reconciliation_only_timing(
+        original_deadline=now - timedelta(minutes=5),
+        duration_minutes=None,
+        now=now,
+        require_regular_session=False,
+    )
+    assert timing.runtime_duration_minutes == 5.0
+
+
+@pytest.mark.parametrize(
     ("field", "value"),
     [
         ("objective_duration_minutes", 30.0),
@@ -859,3 +904,98 @@ async def test_multiple_prior_sessions_fail_closed(tmp_path: Path) -> None:
     )
     with pytest.raises(ValueError, match="multiple unresolved or resumable objective sessions"):
         select_recovery_candidate(candidates)
+
+
+@pytest.mark.asyncio
+async def test_unresolved_component_without_objective_blocks_new_objective(
+    tmp_path: Path,
+) -> None:
+    from joker.cli.session_confirm import discover_objective_recovery_candidates
+    from joker.persistence.cognitive_execution_provenance import (
+        CognitiveExecutionProvenanceRegistry,
+        PortfolioComponentStatus,
+        PortfolioExecutionComponentRecord,
+    )
+
+    objective_db = tmp_path / "task1.db"
+    provenance_db = tmp_path / "prov.db"
+    registry = CognitiveExecutionProvenanceRegistry(provenance_db)
+    await registry.initialize()
+    await registry.portfolio_executions.authorize(
+        PortfolioExecutionComponentRecord(
+            session_id="paper:local_paper:2026-08-04",
+            origin_run_id="run-a",
+            broker_account_identity="local_paper",
+            trading_date="2026-08-04",
+            target_portfolio_decision_id="decision-a",
+            selected_portfolio_id="portfolio-a",
+            authorized_position_tuple_id="tuple-a",
+            component_index=0,
+            component_count=1,
+            strategy_id="strategy-a",
+            contract_id="contract-a",
+            authorized_quantity=1,
+            capital_allocation=Decimal("100"),
+            client_order_id="client-a",
+            status=PortfolioComponentStatus.WORKING,
+            submitted_quantity=1,
+            remaining_quantity=1,
+            original_decision_snapshot_id="snapshot-a",
+            evaluated_objective_version=1,
+            evaluated_timestamp=_regular_now(10, 0).isoformat(),
+        )
+    )
+    candidates = await discover_objective_recovery_candidates(
+        objective_db_path=objective_db,
+        provenance_db_path=provenance_db,
+        broker_account_identity="local_paper",
+    )
+    assert len(candidates) == 1
+    assert candidates[0].classification == "corrupted_authority"
+    assert candidates[0].blocks_new_objective is True
+
+
+@pytest.mark.asyncio
+async def test_corrupt_session_id_does_not_hide_unresolved_owner(tmp_path: Path) -> None:
+    from joker.cli.session_confirm import discover_objective_recovery_candidates
+    from joker.persistence.cognitive_execution_provenance import (
+        CognitiveExecutionProvenanceRegistry,
+        PortfolioComponentStatus,
+        PortfolioExecutionComponentRecord,
+    )
+
+    objective_db = tmp_path / "task1.db"
+    provenance_db = tmp_path / "prov.db"
+    registry = CognitiveExecutionProvenanceRegistry(provenance_db)
+    await registry.initialize()
+    await registry.portfolio_executions.authorize(
+        PortfolioExecutionComponentRecord(
+            session_id="broken-session-id",
+            origin_run_id="run-a",
+            broker_account_identity="local_paper",
+            trading_date="2026-08-04",
+            target_portfolio_decision_id="decision-a",
+            selected_portfolio_id="portfolio-a",
+            authorized_position_tuple_id="tuple-a",
+            component_index=0,
+            component_count=1,
+            strategy_id="strategy-a",
+            contract_id="contract-a",
+            authorized_quantity=1,
+            capital_allocation=Decimal("100"),
+            client_order_id="client-a",
+            status=PortfolioComponentStatus.WORKING,
+            submitted_quantity=1,
+            remaining_quantity=1,
+            original_decision_snapshot_id="snapshot-a",
+            evaluated_objective_version=1,
+            evaluated_timestamp=_regular_now(10, 0).isoformat(),
+        )
+    )
+    candidates = await discover_objective_recovery_candidates(
+        objective_db_path=objective_db,
+        provenance_db_path=provenance_db,
+        broker_account_identity="local_paper",
+    )
+    assert [candidate.session_id for candidate in candidates] == ["broken-session-id"]
+    assert candidates[0].classification == "corrupted_authority"

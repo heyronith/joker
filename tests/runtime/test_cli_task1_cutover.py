@@ -139,3 +139,51 @@ def test_live_paper_runner_constructs_bridge_on_run_start(tmp_path: Path, monkey
     assert isinstance(created["bridge"].supervisor, SessionSupervisor)
     assert runner.task1_bridge is None
     assert result.errors
+
+
+def test_reconciliation_only_recovery_starts_without_option_surface(
+    tmp_path: Path, monkeypatch
+) -> None:
+    app = AppSettings(db_path=str(tmp_path / "app.db"))
+    monkeypatch.setenv("OPENAI_API_KEY", "test-ci-key-not-real")
+    monkeypatch.setenv("WEBULL_MARKET_DATA_ENABLED", "true")
+    monkeypatch.setenv("WEBULL_LIVE_TRADING_ENABLED", "false")
+    env = EnvSettings(
+        _env_file=None,
+        OPENAI_API_KEY="test-ci-key-not-real",
+        WEBULL_MARKET_DATA_ENABLED=True,
+        WEBULL_LIVE_TRADING_ENABLED=False,
+    )
+    runner = LivePaperRunner(app, env)
+    broker = PaperBroker(slippage_pct=0)
+
+    monkeypatch.setattr(
+        "joker.runtime.live_paper_runner.resolve_live_paper_broker",
+        lambda *a, **k: MagicMock(
+            client=broker,
+            kind="local_paper",
+            label="paper",
+            auto_orders=True,
+        ),
+    )
+
+    class ForbiddenMarketLoop:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("market loop must not start during reconciliation-only recovery")
+
+    monkeypatch.setattr(
+        "joker.runtime.live_paper_runner.LiveMarketDataLoop",
+        ForbiddenMarketLoop,
+    )
+
+    result = runner.run(
+        LivePaperRunConfig(
+            duration_seconds=0.1,
+            mock_agents=True,
+            require_options=True,
+            reconciliation_only_recovery=True,
+            broker=broker,
+        )
+    )
+    assert result.feed_health == "RECOVERY_ONLY"
+    assert result.options_available is False

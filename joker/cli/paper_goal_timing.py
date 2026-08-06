@@ -196,7 +196,7 @@ def format_timing_banner(timing: PaperGoalTiming) -> dict[str, Any]:
 
 def resolve_reconciliation_only_timing(
     *,
-    original_deadline: datetime,
+    original_deadline: datetime | None,
     duration_minutes: float | None,
     calendar: MarketCalendar | None = None,
     now: datetime | None = None,
@@ -208,7 +208,9 @@ def resolve_reconciliation_only_timing(
     cal = calendar or MarketCalendar()
     clock = SystemExchangeClock(calendar=cal)
     exchange_now = now or clock.now()
-    if exchange_now.tzinfo is None or original_deadline.tzinfo is None:
+    if exchange_now.tzinfo is None or (
+        original_deadline is not None and original_deadline.tzinfo is None
+    ):
         raise PaperGoalTimingError("recovery timing requires timezone-aware datetimes")
     phase = clock.session_phase(exchange_now)
     if require_regular_session and phase is not SessionPhase.REGULAR:
@@ -216,19 +218,34 @@ def resolve_reconciliation_only_timing(
             f"paper goal test requires regular market session "
             f"(phase={phase.value}, exchange_now={exchange_now.isoformat()})"
         )
-    trading_date = cal.current_or_next_session(exchange_now)
-    session_close = cal.session_close(trading_date)
-    remaining_session_minutes = max(
-        0.0, (session_close - exchange_now).total_seconds() / 60.0
-    )
-    runtime_duration_minutes = (
-        float(duration_minutes)
-        if duration_minutes is not None
-        else min(float(default_runtime_minutes), remaining_session_minutes)
-    )
+    if phase is SessionPhase.REGULAR:
+        trading_date = exchange_now.date()
+        session_close = cal.session_close(trading_date)
+        remaining_session_minutes = max(
+            0.0, (session_close - exchange_now).total_seconds() / 60.0
+        )
+        runtime_duration_minutes = (
+            float(duration_minutes)
+            if duration_minutes is not None
+            else min(float(default_runtime_minutes), remaining_session_minutes)
+        )
+    else:
+        if cal.is_trading_day(exchange_now.date()):
+            reference_session = exchange_now.date()
+        else:
+            reference_session = cal.previous_session(exchange_now.date())
+        session_close = cal.session_close(reference_session)
+        remaining_session_minutes = max(
+            0.0, (session_close - exchange_now).total_seconds() / 60.0
+        )
+        runtime_duration_minutes = (
+            float(duration_minutes)
+            if duration_minutes is not None
+            else float(default_runtime_minutes)
+        )
     if runtime_duration_minutes <= 0:
         raise PaperGoalTimingError("reconciliation-only recovery runtime must be > 0")
-    if runtime_duration_minutes - remaining_session_minutes > 1e-9:
+    if phase is SessionPhase.REGULAR and runtime_duration_minutes - remaining_session_minutes > 1e-9:
         raise PaperGoalTimingError(
             "reconciliation-only recovery runtime must fit before regular-session close "
             f"(runtime_minutes={runtime_duration_minutes}, "
@@ -236,7 +253,7 @@ def resolve_reconciliation_only_timing(
         )
     return PaperGoalTiming(
         exchange_now=exchange_now,
-        objective_deadline=original_deadline,
+        objective_deadline=original_deadline or exchange_now,
         objective_duration_minutes=0.0,
         runtime_duration_minutes=runtime_duration_minutes,
         session_close=session_close,

@@ -306,6 +306,17 @@ class OrderActionGateway:
             projection = await self._deps.projection_loader()
         working = working_orders_from_projection(projection)
         open_positions = open_positions_from_projection(projection)
+        recovery_block = self._reconciliation_only_block_reason(
+            request,
+            working=working,
+        )
+        if recovery_block is not None:
+            return OrderActionResult(
+                submitted=False,
+                client_order_id=request.client_order_id,
+                blocked_reason=recovery_block,
+                working_orders=working,
+            )
 
         try:
             command = self._validate_and_compile(
@@ -859,6 +870,34 @@ class OrderActionGateway:
             command=command,
             working_orders=working,
         )
+
+    def _reconciliation_only_block_reason(
+        self,
+        request: OrderActionRequest,
+        *,
+        working: Sequence[WorkingOrderTruth],
+    ) -> str | None:
+        if not bool(getattr(self._deps, "reconciliation_only_recovery", False)):
+            return None
+        if request.action in {
+            OrderActionKind.ENTRY,
+            OrderActionKind.PROBE,
+            OrderActionKind.ADD,
+        }:
+            return "reconciliation_only_blocks_new_risk"
+        if request.action != OrderActionKind.REPLACE:
+            return None
+        prior = request.replace_of_client_order_id
+        match = next((order for order in working if order.client_order_id == prior), None)
+        if request.side != "sell":
+            return "reconciliation_only_blocks_buy_side_replace"
+        if match is None:
+            return None
+        if match.side != "sell":
+            return "reconciliation_only_blocks_buy_side_replace"
+        if request.quantity > match.remaining_quantity:
+            return "reconciliation_only_blocks_quantity_increasing_replace"
+        return None
 
     def _validate_and_compile(
         self,

@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from decimal import Decimal
 from pathlib import Path
+import time as wall_time
 from typing import Any, Callable
 
 from joker.agents.council import create_agent_council
@@ -222,6 +223,162 @@ class LivePaperRunner:
                 "WEBULL_MARKET_DATA_ENABLED must be true for live paper"
             )
 
+    @staticmethod
+    def _working_client_order_ids(projection: Any | None) -> list[str]:
+        orders = getattr(projection, "orders", None) or {}
+        values = orders.values() if isinstance(orders, dict) else list(orders or [])
+        ids: list[str] = []
+        for order in values:
+            status = str(getattr(order, "status", "") or "").lower()
+            if status not in {
+                "submitted",
+                "accepted",
+                "partially_filled",
+                "open",
+                "pending",
+                "working",
+            }:
+                continue
+            client_order_id = str(getattr(order, "client_order_id", "") or "")
+            if client_order_id:
+                ids.append(client_order_id)
+        return list(dict.fromkeys(ids))
+
+    def _run_reconciliation_only_recovery(
+        self,
+        *,
+        run_id: str,
+        selection: Any,
+        config: LivePaperRunConfig,
+        result: LivePaperRunResult,
+        task1_bridge: CompatibilityLivePaperBridge,
+        capital_budget: CapitalBudget,
+        failures: list[str],
+        log: Callable[[str, dict[str, Any]], None],
+        on_state: Callable[[dict[str, Any]], None] | None,
+        run_manager: RunManager,
+        shutdown_task1: Callable[[], None],
+    ) -> LivePaperRunResult:
+        """Broker-only recovery path: poll broker/order truth without market warmup."""
+        log(
+            "live_paper.started",
+            {
+                "symbol": config.symbol,
+                "duration_seconds": config.duration_seconds,
+                "mock_agents": config.mock_agents,
+                "broker": selection.kind,
+                "broker_label": selection.label,
+                "auto_orders": selection.auto_orders,
+                "live_money_orders": False,
+                "is_synthetic": False,
+                "capital": capital_budget.prompt_dict(),
+                "task1_session_supervisor": True,
+                "task1_session_id": task1_bridge.session_id,
+                "reconciliation_only_recovery": True,
+                "broker_only_recovery": True,
+            },
+        )
+        log(
+            "objective.reconciliation_only_started",
+            {
+                "new_entries_blocked": True,
+                "runtime_seconds": float(config.duration_seconds),
+                "original_objective_deadline": (
+                    config.objective_deadline_exchange.isoformat()
+                    if config.objective_deadline_exchange is not None
+                    else None
+                ),
+                "market_warmup_skipped": True,
+                "option_surface_optional": True,
+            },
+        )
+        poll = max(0.5, self.app_settings.data.quote_poll_interval_seconds)
+        deadline = wall_time.monotonic() + max(float(config.duration_seconds), poll)
+        errors: list[str] = []
+        projection = None
+        while wall_time.monotonic() < deadline:
+            try:
+                projection = task1_bridge.project_session()
+                for client_order_id in self._working_client_order_ids(projection):
+                    try:
+                        task1_bridge.poll_order_status(client_order_id)
+                    except Exception as exc:  # noqa: BLE001
+                        errors.append(str(exc))
+                        log(
+                            "order.recovery_poll_failed",
+                            {
+                                "client_order_id": client_order_id,
+                                "reason": str(exc),
+                            },
+                        )
+                if on_state is not None:
+                    orders = getattr(projection, "orders", None) or {}
+                    positions = getattr(projection, "positions", None) or {}
+                    on_state(
+                        {
+                            "run_id": run_id,
+                            "provider": selection.kind,
+                            "market_price": None,
+                            "feed_health": "RECOVERY_ONLY",
+                            "delayed": None,
+                            "options_available": False,
+                            "signals": 0,
+                            "trades_entered": 0,
+                            "trades_exited": 0,
+                            "paper_pnl": selection.client.get_daily_pnl(),
+                            "engine_state": "recovery_only",
+                            "intraday_calls": 0,
+                            "decision_calls": 0,
+                            "proposals_acted": 0,
+                            "execution_mode": "recovery_only",
+                            "capital_available": capital_budget.available_usd,
+                            "capital_goal_pct": capital_budget.progress_to_goal_pct,
+                            "broker": selection.kind,
+                            "broker_label": selection.label,
+                            "pending_order": any(
+                                str(getattr(order, "status", "") or "").lower()
+                                in {"submitted", "accepted", "partially_filled", "open", "working"}
+                                for order in (orders.values() if isinstance(orders, dict) else orders)
+                            ),
+                            "open_trade": bool(positions),
+                            "auto_orders": selection.auto_orders,
+                            "live_money_orders": False,
+                        }
+                    )
+            except Exception as exc:  # noqa: BLE001
+                errors.append(str(exc))
+                log("broker_only_recovery_failed", {"reason": str(exc)})
+            wall_time.sleep(min(poll, max(0.0, deadline - wall_time.monotonic())))
+        report = task1_bridge.run_coro(task1_bridge.supervisor.execution_runtime.run_reconciliation())
+        projection = task1_bridge.project_session()
+        positions = getattr(projection, "positions", None) or {}
+        orders = getattr(projection, "orders", None) or {}
+        result.feed_health = "RECOVERY_ONLY"
+        result.options_available = False
+        result.errors.extend(errors)
+        result.failures.extend(failures)
+        result.working_orders_remaining = len(self._working_client_order_ids(projection))
+        result.open_positions_remaining = len(positions)
+        result.reconciliation_clean = bool(getattr(report, "is_consistent", False))
+        from joker.schemas.replay import ReplaySummary
+
+        result.summary = ReplaySummary(
+            run_id=run_id,
+            session_name="live_paper",
+            is_synthetic=False,
+            mock_agents=config.mock_agents,
+            events_processed=0,
+            signals_detected=0,
+            trades_entered=0,
+            trades_exited=0,
+            final_pnl_usd=selection.client.get_daily_pnl(),
+            risk_rejections=0,
+            failures=list(result.failures) + list(result.errors),
+        )
+        run_manager.end_run(run_id)
+        shutdown_task1()
+        return result
+
     def run(
         self,
         config: LivePaperRunConfig,
@@ -402,6 +559,7 @@ class LivePaperRunner:
                 kill_switch=bool(self.app_settings.risk.kill_switch),
                 max_quote_age_seconds=max_quote_age,
                 max_relative_spread=max_spread,
+                reconciliation_only_recovery=bool(config.reconciliation_only_recovery),
                 **objective_engine_kwargs,
                 **repos,
             )
@@ -667,6 +825,21 @@ class LivePaperRunner:
                 "task1_session_id": task1_bridge.session_id,
             },
         )
+
+        if config.reconciliation_only_recovery:
+            return self._run_reconciliation_only_recovery(
+                run_id=run_id,
+                selection=selection,
+                config=config,
+                result=result,
+                task1_bridge=task1_bridge,
+                capital_budget=capital_budget,
+                failures=failures,
+                log=log,
+                on_state=on_state,
+                run_manager=run_manager,
+                shutdown_task1=shutdown_task1,
+            )
 
         market_loop = LiveMarketDataLoop(
             app_settings=self.app_settings,

@@ -270,6 +270,7 @@ def paper_run(
         confirm_session_objective,
         has_unresolved_portfolio_work,
         recover_session_objective_bundle,
+        SessionObjectiveBundle,
         select_recovery_candidate,
         validate_objective_session_action,
         validate_resume_mutation_flags,
@@ -441,8 +442,10 @@ def paper_run(
     existing_state = None
     unresolved_work = False
     recovery_mode = "normal"
+    selected_candidate = None
     if objective_enabled:
         from joker.objectives.repository import ObjectiveRepository
+        from joker.risk.capital import CapitalBudget, CapitalPlan
 
         objective_repo = ObjectiveRepository(task1_db)
         recovery_candidates = asyncio.run(
@@ -473,7 +476,7 @@ def paper_run(
                 session_id = selected_candidate.session_id
             elif requested_resume_session_id is not None:
                 session_id = requested_resume_session_id
-        elif recovery_candidates:
+        elif any(candidate.blocks_new_objective for candidate in recovery_candidates):
             console.print(
                 "[red]An unfinished or unresolved durable objective session already "
                 "exists for this account. Resume and reconcile it before starting "
@@ -509,23 +512,26 @@ def paper_run(
                 trading_date=persisted_trading_date,
             )
         )
-        try:
-            resolved_session_action = validate_objective_session_action(
-                objective_session,
-                has_definition=existing_definition is not None,
-                latest_status=(
-                    str(existing_state.status) if existing_state is not None else None
-                ),
-                unresolved_work=unresolved_work,
+        if selected_candidate is not None:
+            recovery_mode = selected_candidate.recovery_mode
+        else:
+            try:
+                resolved_session_action = validate_objective_session_action(
+                    objective_session,
+                    has_definition=existing_definition is not None,
+                    latest_status=(
+                        str(existing_state.status) if existing_state is not None else None
+                    ),
+                    unresolved_work=unresolved_work,
+                )
+            except ValueError as exc:
+                console.print(f"[red]{exc}[/red]")
+                raise typer.Exit(code=1) from exc
+            recovery_mode = (
+                "reconciliation_only"
+                if resolved_session_action == "reconciliation_only"
+                else "normal"
             )
-        except ValueError as exc:
-            console.print(f"[red]{exc}[/red]")
-            raise typer.Exit(code=1) from exc
-        recovery_mode = (
-            "reconciliation_only"
-            if resolved_session_action == "reconciliation_only"
-            else "normal"
-        )
         if objective_session == "resume":
             try:
                 validate_resume_mutation_flags(
@@ -540,13 +546,48 @@ def paper_run(
                     f"[red]{exc}[/red]"
                 )
                 raise typer.Exit(code=1) from exc
-            if bundle is None or bundle.deadline_exchange_time is None:
+            if recovery_mode == "broker_only":
+                bundle = SessionObjectiveBundle(
+                    capital_budget=CapitalBudget(
+                        plan=CapitalPlan(
+                            authorized_usd=float(result.app_settings.capital.authorized_usd),
+                            target_profit_pct=float(result.app_settings.capital.target_profit_pct),
+                            max_concurrent_positions=int(
+                                result.app_settings.capital.max_concurrent_positions
+                            ),
+                            max_contracts_per_trade=int(
+                                result.app_settings.capital.max_contracts_per_trade
+                            ),
+                            min_contracts_per_trade=int(
+                                result.app_settings.capital.min_contracts_per_trade
+                            ),
+                            aggression_mode=str(result.app_settings.capital.aggression_mode),
+                            max_kelly_fraction=float(
+                                result.app_settings.capital.max_kelly_fraction
+                            ),
+                            min_win_probability=float(
+                                result.app_settings.capital.min_win_probability
+                            ),
+                            behind_goal_boost=float(
+                                result.app_settings.capital.behind_goal_boost
+                            ),
+                            ahead_goal_dampen=float(
+                                result.app_settings.capital.ahead_goal_dampen
+                            ),
+                        )
+                    )
+                )
+            elif bundle is None or bundle.deadline_exchange_time is None:
                 console.print("[red]Active objective recovery failed closed.[/red]")
                 raise typer.Exit(code=1)
             label = (
+                "[yellow]Resuming broker-only reconciliation for orphaned durable owner[/yellow]"
+                if recovery_mode == "broker_only"
+                else (
                 "[yellow]Resuming terminal objective in reconciliation-only mode[/yellow]"
                 if recovery_mode == "reconciliation_only"
                 else "[green]Resuming durable objective session[/green]"
+                )
             )
             console.print(f"{label} {session_id}")
         else:
@@ -563,7 +604,7 @@ def paper_run(
     if (
         objective_session == "resume"
         and objective_enabled
-        and recovery_mode != "reconciliation_only"
+        and recovery_mode == "normal"
     ):
         assert bundle is not None and bundle.deadline_exchange_time is not None
         resolved_objective_duration = None
@@ -590,10 +631,13 @@ def paper_run(
                 )
             )
     try:
-        if recovery_mode == "reconciliation_only":
-            assert bundle is not None and bundle.deadline_exchange_time is not None
+        if recovery_mode in {"reconciliation_only", "broker_only"}:
             timing = resolve_reconciliation_only_timing(
-                original_deadline=bundle.deadline_exchange_time,
+                original_deadline=(
+                    bundle.deadline_exchange_time
+                    if bundle is not None
+                    else None
+                ),
                 duration_minutes=duration_minutes,
                 calendar=calendar,
                 now=exchange_now,
@@ -807,7 +851,16 @@ def paper_run(
         },
     )
 
-    runner = LivePaperRunner(result.app_settings, result.env_settings)
+    runner_settings = result.app_settings
+    if recovery_mode == "broker_only":
+        runner_settings = result.app_settings.model_copy(
+            update={
+                "objective": result.app_settings.objective.model_copy(
+                    update={"enabled": False}
+                )
+            }
+        )
+    runner = LivePaperRunner(runner_settings, result.env_settings)
     last_heartbeat = 0.0
     latest_graph_action = "—"
     latest_no_trade_reason = "—"
@@ -1102,12 +1155,14 @@ def paper_run(
             symbol=symbol,
             duration_seconds=timing.runtime_seconds,
             mock_agents=not use_openai,
-            require_options=True,
+            require_options=(recovery_mode == "normal"),
             capital_budget=capital_budget,
             objective_service=objective_service,
-            cognitive_session_id_override=session_id if objective_enabled else None,
+            cognitive_session_id_override=(
+                session_id if (objective_enabled or recovery_mode == "broker_only") else None
+            ),
             objective_deadline_exchange=timing.objective_deadline,
-            reconciliation_only_recovery=(recovery_mode == "reconciliation_only"),
+            reconciliation_only_recovery=(recovery_mode in {"reconciliation_only", "broker_only"}),
             shutdown_grace_seconds=timing.shutdown_grace_seconds,
         ),
         on_state=on_state,
