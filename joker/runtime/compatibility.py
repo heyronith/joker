@@ -92,6 +92,7 @@ class CompatibilityLivePaperBridge:
         run_id: str | None = None,
         clock: ExchangeClock | None = None,
         broker_account_id: str = "paper",
+        broker_account_identity: str | None = None,
         health_failure_threshold: int = 1,
         agent_runtime: AgentRuntime | None = None,
         market_config: Any | None = None,
@@ -105,6 +106,7 @@ class CompatibilityLivePaperBridge:
             "session_id": self.session_id,
             "run_id": run_id,
             "broker_account_id": broker_account_id,
+            "broker_account_identity": broker_account_identity,
         }
         if market_config is not None:
             supervisor_kwargs["market"] = market_config

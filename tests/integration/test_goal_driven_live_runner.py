@@ -178,6 +178,162 @@ async def _track_submits(gateway):
 
 
 @pytest.mark.asyncio
+async def test_process_restart_recovers_stable_objective_and_working_component(
+    tmp_path,
+) -> None:
+    from joker.persistence.cognitive_execution_provenance import (
+        PortfolioComponentStatus,
+        PortfolioExecutionComponentRecord,
+        stable_portfolio_client_order_id,
+    )
+    from joker.runtime.cognitive_session import stable_cognitive_session_id
+    from joker.runtime.execution_runtime import ExecutionCommand
+    from joker.schemas.domain import OptionContract, OrderIntent
+
+    app = _app(tmp_path)
+    db = tmp_path / "live.db"
+    clock = FrozenExchangeClock(
+        datetime(2026, 7, 1, 10, 0, tzinfo=ET), calendar=MarketCalendar()
+    )
+    stable_session_id = stable_cognitive_session_id(
+        trading_date=clock.trading_date(), account_identity="local_paper"
+    )
+    apply_objective_migrations(db)
+    repository = ObjectiveRepository(db)
+    first_service = SessionObjectiveService(repository)
+    definition = await first_service.create_objective(
+        session_id=stable_session_id,
+        authorised_capital_usd=500,
+        target_profit_pct=10,
+        deadline_exchange_time=datetime(2026, 7, 1, 15, 30, tzinfo=ET),
+        max_concurrent_positions=2,
+        accepted_total_loss_risk=True,
+    )
+    await first_service.confirm_objective(
+        definition.objective_id,
+        confirmed_at_exchange_time=clock.now(),
+    )
+    broker = PaperBroker(slippage_pct=2.0)
+    from joker.models.fake_provider import FakeModelProvider
+
+    first_run_id = str(uuid4())
+    first = await prepare_cognitive_paper_session(
+        app_settings=app,
+        objective_service=first_service,
+        broker=broker,
+        db_path=db,
+        run_id=first_run_id,
+        fake_model_provider=FakeModelProvider(available=True),
+        clock=clock,
+        start_cognitive_agent=False,
+        start_evolution_workers=False,
+    )
+    decision_id = str(uuid4())
+    first_tuple_id = str(uuid4())
+    second_tuple_id = str(uuid4())
+    first_client_order_id = stable_portfolio_client_order_id(
+        decision_id, first_tuple_id
+    )
+    contract = OptionContract(
+        expiration=clock.trading_date(), strike=500.0, option_type="call"
+    )
+    order = await first.supervisor.execution_runtime.submit_execution_command(
+        ExecutionCommand(
+            client_order_id=first_client_order_id,
+            intent=OrderIntent(
+                intent_id=first_client_order_id,
+                candidate_id="restart-fixture",
+                contract=contract,
+                side="buy",
+                quantity=1,
+                limit_price=1.0,
+                position_intent="BUY_TO_OPEN",
+            ),
+            broker_account_id="local_paper",
+            provenance={"fixture": "stable_restart"},
+        )
+    )
+    assert order.status == "open"
+    portfolio_repo = first.graph_deps.provenance_registry.portfolio_executions
+    common = {
+        "session_id": stable_session_id,
+        "origin_run_id": first_run_id,
+        "broker_account_identity": "local_paper",
+        "trading_date": clock.trading_date().isoformat(),
+        "target_portfolio_decision_id": decision_id,
+        "selected_portfolio_id": str(uuid4()),
+        "component_count": 2,
+        "strategy_id": str(uuid4()),
+        "authorized_quantity": 1,
+        "capital_allocation": Decimal("100"),
+        "remaining_quantity": 1,
+        "original_decision_snapshot_id": str(uuid4()),
+        "evaluated_objective_version": 1,
+        "evaluated_timestamp": clock.now().isoformat(),
+        "extra": {},
+    }
+    await portfolio_repo.authorize(
+        PortfolioExecutionComponentRecord(
+            **common,
+            authorized_position_tuple_id=first_tuple_id,
+            component_index=0,
+            contract_id=CONTRACT_ID,
+            client_order_id=first_client_order_id,
+            broker_order_id=order.order_id,
+            status=PortfolioComponentStatus.WORKING,
+            submitted_quantity=1,
+        )
+    )
+    await portfolio_repo.authorize(
+        PortfolioExecutionComponentRecord(
+            **common,
+            authorized_position_tuple_id=second_tuple_id,
+            component_index=1,
+            contract_id="SPY:2026-07-01:501:call",
+            client_order_id=stable_portfolio_client_order_id(
+                decision_id, second_tuple_id
+            ),
+            status=PortfolioComponentStatus.AUTHORIZED,
+        )
+    )
+    await first.shutdown()
+
+    second_run_id = str(uuid4())
+    second_service = SessionObjectiveService(ObjectiveRepository(db))
+    second = await prepare_cognitive_paper_session(
+        app_settings=app,
+        objective_service=second_service,
+        broker=broker,
+        db_path=db,
+        run_id=second_run_id,
+        fake_model_provider=FakeModelProvider(available=True),
+        clock=clock,
+        start_cognitive_agent=False,
+        start_evolution_workers=False,
+    )
+    try:
+        assert second.session_id == first.session_id == stable_session_id
+        assert second.run_id != first.run_id
+        recovered_objective = await second.objective_service.get_state()
+        assert str(recovered_objective.objective_id) == str(definition.objective_id)
+        second.agent_runtime._decision_graph = build_cognitive_graph(second.graph_deps)
+        await second.agent_runtime._resume_pending_portfolio_executions()
+        records = await second.graph_deps.provenance_registry.portfolio_executions.list_by_decision(
+            decision_id
+        )
+        assert [record.status for record in records] == [
+            PortfolioComponentStatus.WORKING,
+            PortfolioComponentStatus.AUTHORIZED,
+        ]
+        assert records[0].origin_run_id == first_run_id
+        assert records[0].last_resumed_run_id == second_run_id
+        assert records[0].resume_count == 1
+        assert len(broker.list_open_orders()) == 1
+    finally:
+        await second.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_public_live_runner_positive_ev_reaches_paper_broker(tmp_path) -> None:
     session, objective_service, fake = await _prepare_confirmed_session(
         tmp_path, session_id="live-sess"

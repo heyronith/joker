@@ -53,6 +53,7 @@ class CognitiveGraphDeps:
     config: CognitiveGraphSettings
     session_id: str
     run_id: str
+    broker_account_identity: str | None = None
     context_assembler: ContextAssembler = field(default_factory=ContextAssembler)
     snapshot_repo: SnapshotRepository | None = None
     option_surface_repo: OptionSurfaceRepository | None = None

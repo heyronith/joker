@@ -323,6 +323,11 @@ class ExecutionSmokeRunner:
         self._db_path = db_path
         self._http_clients: list[Any] = []
 
+    def _paper_account_identity(self) -> str:
+        from joker.runtime.cognitive_session import paper_account_identity
+
+        return paper_account_identity(broker_kind="webull_paper", env=self.env)
+
     def run(self) -> ExecutionSmokeResult:
         if not self.require_sandbox or not self.confirm_place:
             raise ExecutionSmokeError(
@@ -596,6 +601,7 @@ class ExecutionSmokeRunner:
             config=self.app_settings.cognitive_graph,
             session_id=session_id,
             run_id=run_id,
+            broker_account_identity=self._paper_account_identity(),
             context_assembler=context_assembler_from_settings(
                 self.app_settings.cognitive_graph
             ),
@@ -619,7 +625,8 @@ class ExecutionSmokeRunner:
             db_path=task1_db,
             session_id=session_id,
             run_id=run_id,
-            broker_account_id="webull_paper",
+            broker_account_id=self._paper_account_identity(),
+            broker_account_identity=self._paper_account_identity(),
             agent_runtime=cognitive,
         )
         bridge.start(start_agent=False)
@@ -689,7 +696,7 @@ class ExecutionSmokeRunner:
         cmd = ExecutionCommand(
             client_order_id=flatten_id,
             intent=intent,
-            broker_account_id="webull_paper",
+            broker_account_id=self._paper_account_identity(),
         )
         try:
             order = bridge.submit_execution_command(cmd)

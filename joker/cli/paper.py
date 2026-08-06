@@ -241,6 +241,11 @@ def paper_run(
         "--graph-view",
         help="Cognitive graph evidence view: compact, verbose, or json",
     ),
+    objective_session: str = typer.Option(
+        "new",
+        "--objective-session",
+        help="Objective lifecycle: 'new' starts a new objective; 'resume' recovers the active one",
+    ),
 ) -> None:
     """Run the full live paper loop: monitor → decide → risk → auto order → log."""
     import asyncio
@@ -252,7 +257,13 @@ def paper_run(
         format_timing_banner,
         resolve_paper_goal_timing,
     )
-    from joker.cli.session_confirm import confirm_session_capital, confirm_session_objective
+    from joker.cli.session_confirm import (
+        confirm_session_capital,
+        confirm_session_objective,
+        has_unfinished_portfolio_execution,
+        recover_session_objective_bundle,
+        validate_objective_session_action,
+    )
     from joker.config.validation import validate_startup
     from joker.objectives.deadline import time_remaining_seconds
     from joker.runtime.live_paper_runner import LivePaperRunConfig, LivePaperRunner
@@ -265,12 +276,15 @@ def paper_run(
         sqlite_checks,
         write_json,
     )
-    from joker.storage.models import new_run_id
     from joker.time.calendar import MarketCalendar
     from joker.time.clock import SystemExchangeClock
 
     if symbol.upper() != "SPY":
         console.print("[red]Only SPY is supported.[/red]")
+        raise typer.Exit(code=1)
+    objective_session = objective_session.strip().lower()
+    if objective_session not in {"new", "resume"}:
+        console.print("[red]--objective-session must be 'new' or 'resume'[/red]")
         raise typer.Exit(code=1)
 
     result = validate_startup(config_path=config, skip_model_check=skip_model_check)
@@ -432,29 +446,100 @@ def paper_run(
             str(result.env_settings.webull_paper_account_id).strip()
         )
 
-    session_id = f"paper-{new_run_id()}"
+    from joker.runtime.cognitive_session import (
+        paper_account_identity,
+        stable_cognitive_session_id,
+    )
+
+    broker_kind = "webull_paper" if broker_ready else "local_paper"
+    account_identity = paper_account_identity(
+        broker_kind=broker_kind,
+        env=result.env_settings,
+    )
+    session_id = stable_cognitive_session_id(
+        trading_date=timing.exchange_now.date(),
+        account_identity=account_identity,
+    )
     task1_db = Path(result.app_settings.db_path).resolve().parent / "joker_task1.db"
 
     objective_service = None
     objective_id = None
     if objective_enabled:
-        bundle = asyncio.run(
-            confirm_session_objective(
-                result.app_settings,
-                session_id=session_id,
-                db_path=task1_db,
-                console=console,
-                authorized_usd=authorized_capital,
-                target_profit_pct=target_profit_pct,
-                target_deadline=None,
-                deadline_exchange_time=timing.objective_deadline,
-                confirmed_at_exchange_time=timing.exchange_now,
-                max_concurrent_positions=max_concurrent_positions,
-                acknowledge_total_loss=acknowledge_total_loss,
-                yes=yes,
-                exchange_tz=exchange_tz,
+        from joker.objectives.repository import ObjectiveRepository
+
+        objective_repo = ObjectiveRepository(task1_db)
+        existing_definition = objective_repo.latest_definition_for_session(session_id)
+        existing_state = objective_repo.latest_state_for_session(session_id)
+        try:
+            validate_objective_session_action(
+                objective_session,
+                has_definition=existing_definition is not None,
+                latest_status=(
+                    str(existing_state.status) if existing_state is not None else None
+                ),
             )
-        )
+        except ValueError as exc:
+            console.print(f"[red]{exc}[/red]")
+            raise typer.Exit(code=1) from exc
+        if objective_session == "resume":
+            bundle = asyncio.run(
+                recover_session_objective_bundle(
+                    result.app_settings,
+                    session_id=session_id,
+                    db_path=task1_db,
+                    exchange_tz=exchange_tz,
+                )
+            )
+            if bundle is None or bundle.deadline_exchange_time is None:
+                console.print("[red]Active objective recovery failed closed.[/red]")
+                raise typer.Exit(code=1)
+            timing = resolve_paper_goal_timing(
+                objective_duration_minutes=None,
+                target_deadline=bundle.deadline_exchange_time.isoformat(),
+                duration_minutes=duration_minutes,
+                exchange_tz=exchange_tz,
+                calendar=MarketCalendar(),
+                now=timing.exchange_now,
+                require_regular_session=True,
+            )
+            console.print(
+                f"[green]Resuming durable objective session[/green] {session_id}"
+            )
+        else:
+            provenance_db = task1_db.with_name(
+                task1_db.stem + "_cognitive_provenance.db"
+            )
+            if asyncio.run(
+                has_unfinished_portfolio_execution(
+                    provenance_db_path=provenance_db,
+                    session_id=session_id,
+                    broker_account_identity=account_identity,
+                    trading_date=timing.exchange_now.date().isoformat(),
+                )
+            ):
+                console.print(
+                    "[red]Durable portfolio execution or reoptimization work is still "
+                    "owned by this account/date session. Resume and reconcile it before "
+                    "starting a new objective.[/red]"
+                )
+                raise typer.Exit(code=1)
+            bundle = asyncio.run(
+                confirm_session_objective(
+                    result.app_settings,
+                    session_id=session_id,
+                    db_path=task1_db,
+                    console=console,
+                    authorized_usd=authorized_capital,
+                    target_profit_pct=target_profit_pct,
+                    target_deadline=None,
+                    deadline_exchange_time=timing.objective_deadline,
+                    confirmed_at_exchange_time=timing.exchange_now,
+                    max_concurrent_positions=max_concurrent_positions,
+                    acknowledge_total_loss=acknowledge_total_loss,
+                    yes=yes,
+                    exchange_tz=exchange_tz,
+                )
+            )
         capital_budget = bundle.capital_budget
         objective_service = bundle.objective_service
         objective_id = bundle.objective_id

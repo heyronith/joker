@@ -136,6 +136,12 @@ class CognitiveAgentRuntime:
     def deps(self) -> CognitiveGraphDeps:
         return self._deps
 
+    def _broker_account_identity(self) -> str:
+        execution = self._deps.execution_runtime
+        if execution is not None:
+            return execution.broker_account_identity
+        return str(self._deps.broker_account_identity or "")
+
     def suppress_new_entry_snapshots(self, suppressed: bool = True) -> None:
         """Block new-entry decision enqueue while still allowing position cycles."""
         self._suppress_new_entry_snapshots = bool(suppressed)
@@ -216,15 +222,12 @@ class CognitiveAgentRuntime:
         registry = self._deps.provenance_registry
         if registry is None or self._decision_graph is None or self._deps.clock is None:
             return
-        broker_account_id = (
-            self._deps.execution_runtime.broker_account_id
-            if self._deps.execution_runtime is not None
-            else "default"
-        )
+        broker_account_id = self._broker_account_identity()
+        if not broker_account_id:
+            return
         records = await registry.portfolio_executions.list_resumable(
             session_id=self._session_id,
-            run_id=self._run_id,
-            broker_account_id=broker_account_id,
+            broker_account_identity=broker_account_id,
             trading_date=self._deps.clock.trading_date().isoformat(),
         )
         decision_ids = sorted({record.target_portfolio_decision_id for record in records})
@@ -244,17 +247,22 @@ class CognitiveAgentRuntime:
             return
         owner = PortfolioExecutionOwner(
             session_id=self._session_id,
-            run_id=self._run_id,
-            broker_account_id=(
-                self._deps.execution_runtime.broker_account_id
-                if self._deps.execution_runtime is not None
-                else "default"
-            ),
+            broker_account_identity=self._broker_account_identity(),
             trading_date=self._deps.clock.trading_date().isoformat(),
         )
         records = await registry.portfolio_executions.list_by_decision(decision_id, owner=owner)
         if not records:
             return
+        resumed_at = self._deps.clock.now().isoformat()
+        records = [
+            await registry.portfolio_executions.record_resume(
+                record.authorized_position_tuple_id,
+                owner=owner,
+                current_run_id=self._run_id,
+                resumed_at=resumed_at,
+            )
+            for record in records
+        ]
 
         execution_runtime = self._deps.execution_runtime
         if execution_runtime is not None:
@@ -322,15 +330,12 @@ class CognitiveAgentRuntime:
             PortfolioExecutionOwner,
         )
 
-        broker_account_id = (
-            self._deps.execution_runtime.broker_account_id
-            if self._deps.execution_runtime is not None
-            else "default"
-        )
+        broker_account_id = self._broker_account_identity()
+        if not broker_account_id:
+            return
         owner = PortfolioExecutionOwner(
             session_id=self._session_id,
-            run_id=self._run_id,
-            broker_account_id=broker_account_id,
+            broker_account_identity=broker_account_id,
             trading_date=self._deps.clock.trading_date().isoformat(),
         )
         component = await registry.portfolio_executions.get_by_client_order_id(
@@ -345,15 +350,12 @@ class CognitiveAgentRuntime:
         registry = self._deps.provenance_registry
         if registry is None or self._decision_graph is None or self._deps.clock is None:
             return
-        broker_account_id = (
-            self._deps.execution_runtime.broker_account_id
-            if self._deps.execution_runtime is not None
-            else "default"
-        )
+        broker_account_id = self._broker_account_identity()
+        if not broker_account_id:
+            return
         requests = await registry.portfolio_reoptimizations.list_pending(
             session_id=self._session_id,
-            run_id=self._run_id,
-            broker_account_id=broker_account_id,
+            broker_account_identity=broker_account_id,
             trading_date=self._deps.clock.trading_date().isoformat(),
         )
         for request in requests:
@@ -509,6 +511,144 @@ class CognitiveAgentRuntime:
             return True
         # Delayed / evidence / hold without order still count if a persist node ran.
         return False
+
+    async def _validate_reoptimization_result(
+        self,
+        request: Any,
+        result: Any,
+    ) -> tuple[bool, str, str | None, str | None]:
+        """Validate graph output before durable reoptimization completion."""
+        if not isinstance(result, dict):
+            return False, "reoptimization_result_not_dictionary", None, None
+        blocking_error_codes = {
+            "no_submit_callback",
+            "no_order_action_gateway",
+            "gateway_blocked",
+            "submit_validation_failed",
+            "validation_failed",
+            "cycle_recovery_failed",
+            "target_attainment_recalculation_required",
+        }
+        for error in result.get("errors") or []:
+            code = getattr(error, "error_code", None)
+            if code is None and isinstance(error, dict):
+                code = error.get("error_code")
+            if code in blocking_error_codes:
+                return False, "reoptimization_graph_has_blocking_error", None, None
+        if not self._cycle_reached_terminal_outcome(result, graph_kind="decision"):
+            return False, "reoptimization_terminal_outcome_missing", None, None
+        if str(result.get("_portfolio_reoptimization_request_id") or "") != request.request_id:
+            return False, "reoptimization_request_provenance_mismatch", None, None
+        if result.get("_portfolio_execution_owner") != {
+            "session_id": request.session_id,
+            "broker_account_identity": request.broker_account_identity,
+            "trading_date": request.trading_date,
+        }:
+            return False, "reoptimization_owner_provenance_mismatch", None, None
+        replacement_raw = result.get("_target_portfolio_decision")
+        if not isinstance(replacement_raw, dict):
+            return False, "replacement_decision_missing", None, None
+        replacement_id = str(replacement_raw.get("decision_id") or "")
+        if not replacement_id or replacement_id == request.original_portfolio_decision_id:
+            return False, "replacement_decision_id_invalid", None, None
+        action = str(replacement_raw.get("action") or "").upper()
+        if action not in {"WAIT", "ENTER"}:
+            return False, "replacement_action_invalid", replacement_id, action or None
+        positions = replacement_raw.get("authorized_positions")
+        state_positions = result.get("_target_authorized_positions")
+        if not isinstance(positions, list) or not isinstance(state_positions, list):
+            return False, "replacement_authority_invalid", replacement_id, action
+        if positions != state_positions:
+            return False, "replacement_authority_channels_disagree", replacement_id, action
+        proposal = result.get("execution_proposal")
+        command_ids = result.get("_execution_command_ids") or []
+        if action == "WAIT":
+            if positions or proposal is not None or command_ids or result.get("execution_command_id"):
+                return False, "wait_reoptimization_retains_authority", replacement_id, action
+            return True, "", replacement_id, action
+
+        if not positions or proposal is None:
+            return False, "enter_reoptimization_missing_authority", replacement_id, action
+        old_tuple_ids = set(request.already_filled_tuple_ids) | set(
+            request.remaining_authorized_tuple_ids
+        )
+        tuple_ids = [str(position.get("position_tuple_id") or "") for position in positions]
+        if any(not tuple_id for tuple_id in tuple_ids) or len(tuple_ids) != len(set(tuple_ids)):
+            return False, "replacement_tuple_identity_invalid", replacement_id, action
+        if old_tuple_ids.intersection(tuple_ids):
+            return False, "replacement_reuses_old_tuple", replacement_id, action
+        existing_contract_ids = {
+            str(position.get("contract_id") or position.get("symbol") or "")
+            for position in request.open_positions
+        }
+        current_open_contract_ids = {
+            str(contract_id)
+            for contract_id in (result.get("_reoptimization_excluded_contract_ids") or [])
+        }
+        selected_contract_ids = {
+            str(position.get("contract_id") or "") for position in positions
+        }
+        if (existing_contract_ids | current_open_contract_ids).intersection(
+            selected_contract_ids
+        ):
+            return False, "replacement_selects_existing_contract", replacement_id, action
+        current_objective_version = int(
+            result.get("_reoptimization_expected_objective_version") or -1
+        )
+        latest_snapshot_id = str(
+            result.get("_reoptimization_expected_snapshot_id") or ""
+        )
+        if current_objective_version < 0 or not latest_snapshot_id:
+            return False, "reoptimization_expected_provenance_missing", replacement_id, action
+        evaluated_objective_version = int(
+            replacement_raw.get("objective_version") or -1
+        )
+        if evaluated_objective_version < current_objective_version:
+            return False, "replacement_objective_provenance_stale", replacement_id, action
+        if str(replacement_raw.get("snapshot_id") or "") != latest_snapshot_id:
+            return False, "replacement_snapshot_provenance_stale", replacement_id, action
+        for position in positions:
+            if (
+                int(position.get("objective_version") or -1)
+                != evaluated_objective_version
+                or str(position.get("snapshot_id") or "") != latest_snapshot_id
+                or str(position.get("decision_id") or "") != replacement_id
+            ):
+                return False, "replacement_tuple_provenance_stale", replacement_id, action
+        registry = self._deps.provenance_registry
+        if registry is None:
+            return False, "replacement_durable_authority_missing", replacement_id, action
+        durable_components = await registry.portfolio_executions.list_by_decision(
+            replacement_id,
+            owner=request.owner,
+        )
+        durable_by_tuple = {
+            component.authorized_position_tuple_id: component
+            for component in durable_components
+        }
+        if set(tuple_ids) != set(durable_by_tuple):
+            return False, "replacement_durable_authority_mismatch", replacement_id, action
+        if any(
+            component.submission_objective_version is None
+            or component.submission_objective_version < evaluated_objective_version
+            or component.latest_validation_snapshot_id != latest_snapshot_id
+            for component in durable_components
+        ):
+            return False, "replacement_submission_provenance_invalid", replacement_id, action
+        completed_nodes: set[str] = set()
+        for trace in result.get("node_trace") or []:
+            name = getattr(trace, "node_name", None)
+            status = getattr(trace, "status", None)
+            if isinstance(trace, dict):
+                name = name or trace.get("node_name")
+                status = status or trace.get("status")
+            if name and status == "completed":
+                completed_nodes.add(str(name))
+        if not {"validate_execution_proposal", "submit_execution_command"}.issubset(
+            completed_nodes
+        ):
+            return False, "replacement_execution_validation_incomplete", replacement_id, action
+        return True, "", replacement_id, action
 
     async def pause_event_workers(self) -> None:
         """Stop event-driven decision/position workers without tearing down deps.
@@ -841,6 +981,10 @@ class CognitiveAgentRuntime:
             event.payload.get("portfolio_reoptimization_request_id") or ""
         )
         if reoptimization_request_id:
+            from joker.persistence.cognitive_execution_provenance import (
+                PortfolioExecutionOwner,
+            )
+
             registry = self._deps.provenance_registry
             if registry is None:
                 return
@@ -849,18 +993,15 @@ class CognitiveAgentRuntime:
             )
             if reoptimization_request is None or self._deps.clock is None:
                 return
-            broker_account_id = (
-                self._deps.execution_runtime.broker_account_id
-                if self._deps.execution_runtime is not None
-                else "default"
+            broker_account_id = self._broker_account_identity()
+            if not broker_account_id:
+                return
+            runtime_owner = PortfolioExecutionOwner(
+                session_id=self._session_id,
+                broker_account_identity=broker_account_id,
+                trading_date=self._deps.clock.trading_date().isoformat(),
             )
-            if (
-                reoptimization_request.session_id != self._session_id
-                or reoptimization_request.run_id != self._run_id
-                or reoptimization_request.broker_account_id != broker_account_id
-                or reoptimization_request.trading_date
-                != self._deps.clock.trading_date().isoformat()
-            ):
+            if reoptimization_request.owner != runtime_owner:
                 logger.warning(
                     "portfolio_reoptimization_owner_mismatch",
                     extra={"request_id": reoptimization_request_id},
@@ -909,14 +1050,14 @@ class CognitiveAgentRuntime:
                 PortfolioReoptimizationStatus,
             )
 
-            if reoptimization_request.status == PortfolioReoptimizationStatus.PENDING:
-                reoptimization_request = await (
-                    self._deps.provenance_registry.portfolio_reoptimizations.transition(
-                        reoptimization_request.request_id,
-                        status=PortfolioReoptimizationStatus.RUNNING,
-                        expected_state_version=reoptimization_request.state_version,
-                    )
+            reoptimization_request = await (
+                self._deps.provenance_registry.portfolio_reoptimizations.begin_attempt(
+                    reoptimization_request.request_id,
+                    owner=reoptimization_request.owner,
+                    current_run_id=self._run_id,
+                    attempt_exchange_time=self._deps.clock.now().isoformat(),
                 )
+            )
             persisted_contract_ids = {
                 str(position.get("contract_id") or position.get("symbol") or "")
                 for position in reoptimization_request.open_positions
@@ -926,19 +1067,36 @@ class CognitiveAgentRuntime:
             excluded_contract_ids = sorted(
                 persisted_contract_ids | current_open_contract_ids
             )
+            expected_objective_version = reoptimization_request.latest_objective_version
             if (
                 self._deps.objective_service is not None
                 and hasattr(self._deps.objective_service, "recompute_from_truth")
             ):
-                await self._deps.objective_service.recompute_from_truth(
+                recomputed = await self._deps.objective_service.recompute_from_truth(
                     now=self._deps.clock.now()
+                )
+                expected_objective_version = int(
+                    getattr(recomputed, "version", expected_objective_version)
                 )
             state.update(
                 {
                     "_portfolio_reoptimization_request_id": (reoptimization_request.request_id),
+                    "_portfolio_execution_owner": {
+                        "session_id": reoptimization_request.session_id,
+                        "broker_account_identity": (
+                            reoptimization_request.broker_account_identity
+                        ),
+                        "trading_date": reoptimization_request.trading_date,
+                    },
                     "_reoptimization_excluded_contract_ids": excluded_contract_ids,
                     "_reoptimization_existing_positions": list(
                         reoptimization_request.open_positions
+                    ),
+                    "_reoptimization_expected_objective_version": (
+                        expected_objective_version
+                    ),
+                    "_reoptimization_expected_snapshot_id": (
+                        reoptimization_request.latest_snapshot_id
                     ),
                 }
             )
@@ -981,18 +1139,18 @@ class CognitiveAgentRuntime:
                     PortfolioReoptimizationStatus,
                 )
 
-                replacement = dict(result_state.get("_target_portfolio_decision") or {})
-                replacement_id = str(replacement.get("decision_id") or "")
-                if (
-                    not replacement_id
-                    or replacement_id == reoptimization_request.original_portfolio_decision_id
-                ):
-                    raise RuntimeError("continuation optimization did not create a new decision")
+                valid, reason, replacement_id, replacement_action = (
+                    await self._validate_reoptimization_result(
+                        reoptimization_request, result_state
+                    )
+                )
+                if not valid:
+                    raise RuntimeError(reason)
                 await self._deps.provenance_registry.portfolio_reoptimizations.transition(
                     reoptimization_request.request_id,
                     status=PortfolioReoptimizationStatus.COMPLETED,
                     replacement_decision_id=replacement_id,
-                    replacement_action=str(replacement.get("action") or "WAIT"),
+                    replacement_action=replacement_action,
                 )
             self._counters.last_success_at = datetime.now(timezone.utc)
             self._status = "healthy"
@@ -1033,6 +1191,7 @@ class CognitiveAgentRuntime:
                 await self._deps.provenance_registry.portfolio_reoptimizations.transition(
                     reoptimization_request.request_id,
                     status=PortfolioReoptimizationStatus.FAILED,
+                    failure_reason="reoptimization_cycle_timeout",
                 )
         except Exception as exc:
             self._counters.last_error = CognitiveError(
@@ -1056,6 +1215,7 @@ class CognitiveAgentRuntime:
                     await self._deps.provenance_registry.portfolio_reoptimizations.transition(
                         reoptimization_request.request_id,
                         status=PortfolioReoptimizationStatus.FAILED,
+                        failure_reason=str(exc),
                     )
 
     async def _resolve_provenance(self, event: DomainEvent) -> dict[str, Any]:

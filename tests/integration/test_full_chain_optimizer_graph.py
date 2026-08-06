@@ -25,7 +25,7 @@ from joker.objectives.target_attainment import (
     TargetAttainmentContext,
     TargetAttainmentPolicy,
 )
-from tests.cognitive.task2_canned import CONTRACT_ID
+from tests.cognitive.task2_canned import CONTRACT_ID, register_full_path_canned
 from tests.integration.test_goal_driven_full_graph import (
     _prepare_stack,
     _teardown_stack,
@@ -455,6 +455,7 @@ def _force_two_component_optimize(
         )
 
     monkeypatch.setattr(fco_mod, "optimize_full_chain", _wrapped)
+    return real_optimize
 
 
 async def _two_contract_stack(
@@ -505,7 +506,9 @@ async def _two_contract_stack(
         broker=broker,
     )
     _enable_full_chain(stack["deps"])
-    _force_two_component_optimize(monkeypatch, qty_a=qty_a, qty_b=qty_b)
+    stack["real_optimize_full_chain"] = _force_two_component_optimize(
+        monkeypatch, qty_a=qty_a, qty_b=qty_b
+    )
     provenance = CognitiveExecutionProvenanceRegistry(stack["deps"].db_path)
     await provenance.initialize()
     stack["deps"].provenance_registry = provenance
@@ -730,6 +733,36 @@ async def test_restart_after_first_component_does_not_duplicate_or_skip(
 
 
 @pytest.mark.asyncio
+async def test_same_session_account_date_genuinely_new_run_resumes_component(
+    tmp_path, monkeypatch
+) -> None:
+    broker = ControllablePaperBroker(["open", "filled"])
+    stack = await _two_contract_stack(tmp_path, monkeypatch, broker=broker)
+    try:
+        result = await stack["graph"].ainvoke(stack["state"], config=stack["config"])
+        decision_id = str(result["_target_portfolio_decision"]["decision_id"])
+        origin_run_id = stack["deps"].run_id
+        new_run_id = str(uuid4())
+        assert new_run_id != origin_run_id
+        stack["deps"].run_id = new_run_id
+        runtime, registry = await _restart_portfolio_runtime(stack)
+        assert runtime._run_id == new_run_id
+
+        await runtime._resume_portfolio_decision(decision_id)
+
+        records = await registry.portfolio_executions.list_by_decision(decision_id)
+        assert broker.external_submission_count == 1
+        assert [record.status.value for record in records] == [
+            "WORKING",
+            "AUTHORIZED",
+        ]
+        assert all(record.origin_run_id == origin_run_id for record in records)
+        assert all(record.last_resumed_run_id == new_run_id for record in records)
+    finally:
+        await _teardown_stack(stack)
+
+
+@pytest.mark.asyncio
 async def test_different_session_pending_portfolio_is_not_resumed_by_runtime(
     tmp_path, monkeypatch
 ) -> None:
@@ -801,8 +834,7 @@ async def test_material_change_after_first_fill_enqueues_reoptimization(
         assert "available_capital" in str(records[1].failure_reoptimization_reason)
         pending = await registry.portfolio_reoptimizations.list_pending(
             session_id=records[0].session_id,
-            run_id=records[0].run_id,
-            broker_account_id=records[0].broker_account_id,
+            broker_account_identity=records[0].broker_account_identity,
             trading_date=records[0].trading_date,
         )
         assert len(pending) == 1
@@ -1267,8 +1299,7 @@ async def test_crash_after_filled_transition_before_post_fill_fingerprint(
         )
         owner = PortfolioExecutionOwner(
             session_id=records[0].session_id,
-            run_id=records[0].run_id,
-            broker_account_id=records[0].broker_account_id,
+            broker_account_identity=records[0].broker_account_identity,
             trading_date=records[0].trading_date,
         )
         await stack["deps"].provenance_registry.portfolio_executions.transition(
@@ -1383,89 +1414,259 @@ async def test_crash_after_next_submission_before_component_state_update(
         await _teardown_stack(stack)
 
 
+async def _prepare_pending_reoptimization(tmp_path, monkeypatch):
+    from joker.persistence.cognitive_execution_provenance import (
+        CognitiveExecutionProvenanceRegistry,
+    )
+    from joker.objectives import full_chain_optimizer as fco_mod
+
+    broker = ControllablePaperBroker(["open", "filled"])
+    stack = await _two_contract_stack(tmp_path, monkeypatch, broker=broker)
+    result = await stack["graph"].ainvoke(stack["state"], config=stack["config"])
+    decision_id = str(result["_target_portfolio_decision"]["decision_id"])
+    broker.fill_order(broker.list_open_orders()[0].order_id)
+    service = stack["objective_service"]
+    original_get_state = service.get_state
+
+    async def _materially_changed_capital():
+        current = await original_get_state()
+        return current.model_copy(update={"available_capital_usd": Decimal("1.00")})
+
+    service.get_state = _materially_changed_capital  # type: ignore[method-assign]
+    runtime, registry = await _restart_portfolio_runtime(stack)
+    await runtime._resume_portfolio_decision(decision_id)
+    components = await registry.portfolio_executions.list_by_decision(decision_id)
+    pending = await registry.portfolio_reoptimizations.list_pending(
+        session_id=components[0].session_id,
+        broker_account_identity=components[0].broker_account_identity,
+        trading_date=components[0].trading_date,
+    )
+    assert len(pending) == 1
+    request = pending[0]
+    assert request.open_positions
+    assert request.already_filled_tuple_ids == (components[0].authorized_position_tuple_id,)
+    monkeypatch.setattr(
+        fco_mod, "optimize_full_chain", stack["real_optimize_full_chain"]
+    )
+    # Reopen the registry just as a new process would.
+    registry = CognitiveExecutionProvenanceRegistry(stack["deps"].db_path)
+    await registry.initialize()
+    stack["deps"].provenance_registry = registry
+    runtime._deps.provenance_registry = registry
+    return stack, runtime, registry, request, result, original_get_state
+
+
+@pytest.mark.asyncio
+async def test_new_decision_without_terminal_node_does_not_complete_request(
+    tmp_path, monkeypatch
+) -> None:
+    from joker.persistence.cognitive_execution_provenance import (
+        PortfolioReoptimizationStatus,
+    )
+
+    stack, runtime, registry, request, _result, _original_get_state = (
+        await _prepare_pending_reoptimization(tmp_path, monkeypatch)
+    )
+    try:
+        class _IncompleteGraph:
+            async def ainvoke(self, state, config=None):
+                return {
+                    **state,
+                    "_target_portfolio_decision": {
+                        "decision_id": str(uuid4()),
+                        "action": "wait",
+                        "authorized_positions": [],
+                    },
+                    "_target_authorized_positions": [],
+                    "node_trace": [],
+                    "errors": [],
+                }
+
+        runtime._decision_graph = _IncompleteGraph()
+        await runtime._resume_pending_portfolio_reoptimizations()
+        failed = await registry.portfolio_reoptimizations.get(request.request_id)
+        assert failed is not None
+        assert failed.status == PortfolioReoptimizationStatus.FAILED
+        assert failed.failure_reason == "reoptimization_terminal_outcome_missing"
+        assert failed.attempt_count == 1
+        assert failed.last_attempt_run_id == runtime._run_id
+    finally:
+        await _teardown_stack(stack)
+
+
+def _validation_runtime_and_request():
+    from joker.runtime.cognitive_agent_runtime import CognitiveAgentRuntime
+
+    runtime = CognitiveAgentRuntime.__new__(CognitiveAgentRuntime)
+    runtime._deps = SimpleNamespace()
+    runtime._session_id = "session-a"
+    request = SimpleNamespace(
+        request_id="request-a",
+        session_id="session-a",
+        broker_account_identity="paper-a",
+        trading_date="2026-08-05",
+        original_portfolio_decision_id="decision-old",
+        already_filled_tuple_ids=("tuple-filled",),
+        remaining_authorized_tuple_ids=("tuple-old-pending",),
+        open_positions=({"contract_id": CONTRACT_ID, "quantity": 1},),
+    )
+    base = {
+        "_portfolio_reoptimization_request_id": request.request_id,
+        "_portfolio_execution_owner": {
+            "session_id": request.session_id,
+            "broker_account_identity": request.broker_account_identity,
+            "trading_date": request.trading_date,
+        },
+        "node_trace": [{"node_name": "persist_cycle", "status": "completed"}],
+        "errors": [],
+    }
+    return runtime, request, base
+
+
+@pytest.mark.asyncio
+async def test_new_decision_with_blocking_error_does_not_complete_request() -> None:
+    runtime, request, base = _validation_runtime_and_request()
+    valid, reason, _decision_id, _action = await runtime._validate_reoptimization_result(
+        request,
+        {
+            **base,
+            "errors": [{"error_code": "validation_failed"}],
+            "_target_portfolio_decision": {
+                "decision_id": "decision-new",
+                "action": "wait",
+                "authorized_positions": [],
+            },
+            "_target_authorized_positions": [],
+        },
+    )
+    assert valid is False
+    assert reason == "reoptimization_graph_has_blocking_error"
+
+
+@pytest.mark.asyncio
+async def test_wait_reoptimization_completes_only_with_empty_authority() -> None:
+    runtime, request, base = _validation_runtime_and_request()
+    stale = [{"position_tuple_id": "tuple-old-pending", "contract_id": SECOND_CONTRACT_ID}]
+    valid, reason, _decision_id, _action = await runtime._validate_reoptimization_result(
+        request,
+        {
+            **base,
+            "_target_portfolio_decision": {
+                "decision_id": "decision-new",
+                "action": "wait",
+                "authorized_positions": stale,
+            },
+            "_target_authorized_positions": stale,
+            "execution_proposal": object(),
+        },
+    )
+    assert valid is False
+    assert reason == "wait_reoptimization_retains_authority"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tuple_id", "contract_id", "expected_reason"),
+    [
+        ("tuple-old-pending", SECOND_CONTRACT_ID, "replacement_reuses_old_tuple"),
+        ("tuple-new", CONTRACT_ID, "replacement_selects_existing_contract"),
+    ],
+)
+async def test_enter_reoptimization_rejects_stale_authority(
+    tuple_id, contract_id, expected_reason
+) -> None:
+    runtime, request, base = _validation_runtime_and_request()
+    positions = [
+        {
+            "position_tuple_id": tuple_id,
+            "contract_id": contract_id,
+            "decision_id": "decision-new",
+        }
+    ]
+    valid, reason, _decision_id, _action = await runtime._validate_reoptimization_result(
+        request,
+        {
+            **base,
+            "_target_portfolio_decision": {
+                "decision_id": "decision-new",
+                "action": "enter",
+                "authorized_positions": positions,
+            },
+            "_target_authorized_positions": positions,
+            "_reoptimization_excluded_contract_ids": [CONTRACT_ID],
+            "execution_proposal": object(),
+        },
+    )
+    assert valid is False
+    assert reason == expected_reason
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("replacement_action", ["WAIT", "ENTER"])
-async def test_reoptimization_runs_while_first_component_is_open(
+async def test_valid_compiled_reoptimization_completes(
     tmp_path, monkeypatch, replacement_action
 ) -> None:
     from joker.persistence.cognitive_execution_provenance import (
         PortfolioReoptimizationStatus,
     )
 
-    broker = ControllablePaperBroker(["open", "filled"])
-    stack = await _two_contract_stack(tmp_path, monkeypatch, broker=broker)
+    stack, runtime, registry, request, original_result, original_get_state = (
+        await _prepare_pending_reoptimization(tmp_path, monkeypatch)
+    )
     try:
-        result = await stack["graph"].ainvoke(stack["state"], config=stack["config"])
-        decision_id = str(result["_target_portfolio_decision"]["decision_id"])
-        broker.fill_order(broker.list_open_orders()[0].order_id)
-
-        service = stack["objective_service"]
-        original_get_state = service.get_state
-
-        async def _materially_changed_capital():
-            current = await original_get_state()
-            return current.model_copy(update={"available_capital_usd": Decimal("1.00")})
-
-        service.get_state = _materially_changed_capital  # type: ignore[method-assign]
-        runtime, registry = await _restart_portfolio_runtime(stack)
-        await runtime._resume_portfolio_decision(decision_id)
-        components = await registry.portfolio_executions.list_by_decision(decision_id)
-        pending = await registry.portfolio_reoptimizations.list_pending(
-            session_id=components[0].session_id,
-            run_id=components[0].run_id,
-            broker_account_id=components[0].broker_account_id,
-            trading_date=components[0].trading_date,
+        if replacement_action == "WAIT":
+            stack["deps"].kill_switch = True
+        else:
+            stack["objective_service"].get_state = original_get_state
+        cycle_id = f"portfolio-reoptimization-{request.request_id}"
+        register_full_path_canned(
+            stack["fake_model_provider"],
+            UUID(request.latest_snapshot_id),
+            cycle_id,
+            session=stack["deps"].session_id,
         )
-        assert len(pending) == 1
-        request = pending[0]
-        assert request.open_positions
-        assert request.already_filled_tuple_ids == (components[0].authorized_position_tuple_id,)
+        captured_result = {}
+        original_validator = runtime._validate_reoptimization_result
 
-        captured_state = {}
-        replacement_decision_id = str(uuid4())
-        new_tuple_id = str(uuid4())
+        async def _capture_validation(persisted_request, result_state):
+            captured_result.update(result_state)
+            return await original_validator(persisted_request, result_state)
 
-        class _ReplacementGraph:
-            async def ainvoke(self, state, config=None):
-                captured_state.update(state)
-                authorized_positions = (
-                    [
-                        {
-                            "position_tuple_id": new_tuple_id,
-                            "contract_id": SECOND_CONTRACT_ID,
-                            "quantity": 1,
-                        }
-                    ]
-                    if replacement_action == "ENTER"
-                    else []
-                )
-                return {
-                    **state,
-                    "_target_portfolio_decision": {
-                        "decision_id": replacement_decision_id,
-                        "action": replacement_action,
-                        "authorized_positions": authorized_positions,
-                    },
-                    "node_trace": [{"node_name": "persist_cycle", "status": "completed"}],
-                    "errors": [],
-                }
-
-        runtime._decision_graph = _ReplacementGraph()
+        runtime._validate_reoptimization_result = _capture_validation
+        runtime._decision_graph = build_cognitive_graph(stack["deps"])
         await runtime._resume_pending_portfolio_reoptimizations()
 
         completed = await registry.portfolio_reoptimizations.get(request.request_id)
         assert completed is not None
-        assert completed.status == PortfolioReoptimizationStatus.COMPLETED
-        assert completed.replacement_decision_id == replacement_decision_id
-        assert completed.replacement_decision_id != decision_id
+        assert completed.status == PortfolioReoptimizationStatus.COMPLETED, (
+            completed.failure_reason,
+            request.open_positions,
+            await runtime._open_position_contract_ids(),
+            (captured_result.get("_target_portfolio_decision") or {}).get(
+                "authorized_positions"
+            ),
+            captured_result.get("_reoptimization_expected_objective_version"),
+            (captured_result.get("_target_portfolio_decision") or {}).get(
+                "objective_version"
+            ),
+            (captured_result.get("_target_portfolio_decision") or {}).get(
+                "submission_objective_version"
+            ),
+        )
+        assert completed.replacement_decision_id
+        assert completed.replacement_decision_id != request.original_portfolio_decision_id
         assert completed.replacement_action == replacement_action
-        assert captured_state["_reoptimization_existing_positions"]
-        assert captured_state["_reoptimization_excluded_contract_ids"]
-
-        preserved = await registry.portfolio_executions.list_by_decision(decision_id)
+        preserved = await registry.portfolio_executions.list_by_decision(
+            request.original_portfolio_decision_id
+        )
         assert preserved[0].status.value == "FILLED"
-        assert preserved[0].contract_id == result["_target_authorized_positions"][0]["contract_id"]
+        assert preserved[0].contract_id == original_result["_target_authorized_positions"][0][
+            "contract_id"
+        ]
         assert preserved[1].status.value == "REOPTIMIZATION_REQUIRED"
-        assert broker.external_submission_count == 1
+        if replacement_action == "WAIT":
+            assert stack["broker"].external_submission_count == 1
+        else:
+            assert stack["broker"].external_submission_count == 2
     finally:
         await _teardown_stack(stack)

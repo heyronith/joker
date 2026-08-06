@@ -370,3 +370,75 @@ def test_require_regular_session_rejects_closed() -> None:
             now=sunday,
             require_regular_session=True,
         )
+
+
+def test_new_objective_fails_closed_when_unfinished_session_exists() -> None:
+    from joker.cli.session_confirm import validate_objective_session_action
+
+    with pytest.raises(ValueError, match="unfinished objective"):
+        validate_objective_session_action(
+            "new", has_definition=True, latest_status="active"
+        )
+
+
+def test_resume_and_new_objective_are_explicitly_distinct() -> None:
+    from joker.cli.session_confirm import validate_objective_session_action
+
+    assert (
+        validate_objective_session_action(
+            "resume", has_definition=True, latest_status="paused"
+        )
+        == "resume"
+    )
+    assert (
+        validate_objective_session_action(
+            "new", has_definition=True, latest_status="target_reached"
+        )
+        == "new"
+    )
+    with pytest.raises(ValueError, match="no unfinished objective"):
+        validate_objective_session_action(
+            "resume", has_definition=False, latest_status=None
+        )
+
+
+@pytest.mark.asyncio
+async def test_confirmed_objective_recovers_for_stable_cli_session(tmp_path: Path) -> None:
+    from joker.app.safety import SafetyMode
+    from joker.cli.session_confirm import (
+        confirm_session_objective,
+        recover_session_objective_bundle,
+    )
+    from joker.config.settings import AppSettings
+    from joker.objectives.config import ObjectiveSettings
+    from joker.persistence.migrations import apply_task1_migrations
+
+    db = tmp_path / "t1.db"
+    apply_task1_migrations(db)
+    app = AppSettings(
+        mode=SafetyMode.PAPER,
+        live_trading_enabled=False,
+        objective=ObjectiveSettings(enabled=True),
+    )
+    created = await confirm_session_objective(
+        app,
+        session_id="cog:paper:local_paper:2026-08-05",
+        db_path=db,
+        authorized_usd=250.0,
+        target_profit_pct=10.0,
+        deadline_exchange_time=datetime(2026, 8, 5, 15, 30, tzinfo=ET),
+        confirmed_at_exchange_time=datetime(2026, 8, 5, 10, 0, tzinfo=ET),
+        max_concurrent_positions=2,
+        acknowledge_total_loss=True,
+        yes=True,
+    )
+    recovered = await recover_session_objective_bundle(
+        app,
+        session_id="cog:paper:local_paper:2026-08-05",
+        db_path=db,
+    )
+
+    assert recovered is not None
+    assert recovered.objective_id == created.objective_id
+    assert recovered.capital_budget.authorized_usd == 250.0
+    assert recovered.capital_budget.plan.max_concurrent_positions == 2

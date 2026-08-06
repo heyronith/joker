@@ -43,6 +43,10 @@ CREATE INDEX IF NOT EXISTS idx_cog_exec_prov_lifecycle
 CREATE TABLE IF NOT EXISTS portfolio_execution_components (
     session_id TEXT NOT NULL,
     run_id TEXT NOT NULL,
+    origin_run_id TEXT NOT NULL,
+    last_resumed_run_id TEXT,
+    resume_count INTEGER NOT NULL DEFAULT 0,
+    last_resumed_at TEXT,
     broker_account_id TEXT NOT NULL,
     trading_date TEXT NOT NULL,
     target_portfolio_decision_id TEXT NOT NULL,
@@ -85,6 +89,10 @@ CREATE TABLE IF NOT EXISTS portfolio_reoptimization_requests (
     request_id TEXT PRIMARY KEY NOT NULL,
     session_id TEXT NOT NULL,
     run_id TEXT NOT NULL,
+    origin_run_id TEXT NOT NULL,
+    last_resumed_run_id TEXT,
+    resume_count INTEGER NOT NULL DEFAULT 0,
+    last_resumed_at TEXT,
     broker_account_id TEXT NOT NULL,
     trading_date TEXT NOT NULL,
     original_portfolio_decision_id TEXT NOT NULL,
@@ -99,6 +107,10 @@ CREATE TABLE IF NOT EXISTS portfolio_reoptimization_requests (
     status TEXT NOT NULL,
     replacement_decision_id TEXT,
     replacement_action TEXT,
+    failure_reason TEXT,
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    last_attempt_run_id TEXT,
+    last_attempt_exchange_time TEXT,
     state_version INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
@@ -114,6 +126,10 @@ CREATE INDEX IF NOT EXISTS idx_portfolio_reopt_owner_status
 _PORTFOLIO_COMPONENT_MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (
     ("session_id", "TEXT"),
     ("run_id", "TEXT"),
+    ("origin_run_id", "TEXT"),
+    ("last_resumed_run_id", "TEXT"),
+    ("resume_count", "INTEGER NOT NULL DEFAULT 0"),
+    ("last_resumed_at", "TEXT"),
     ("broker_account_id", "TEXT"),
     ("trading_date", "TEXT"),
     ("post_fill_objective_version", "INTEGER"),
@@ -123,6 +139,17 @@ _PORTFOLIO_COMPONENT_MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (
     ("reconciled_filled_quantity", "INTEGER"),
     ("continuation_ready", "INTEGER NOT NULL DEFAULT 0"),
     ("state_version", "INTEGER NOT NULL DEFAULT 0"),
+)
+
+_PORTFOLIO_REOPTIMIZATION_MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("origin_run_id", "TEXT"),
+    ("last_resumed_run_id", "TEXT"),
+    ("resume_count", "INTEGER NOT NULL DEFAULT 0"),
+    ("last_resumed_at", "TEXT"),
+    ("failure_reason", "TEXT"),
+    ("attempt_count", "INTEGER NOT NULL DEFAULT 0"),
+    ("last_attempt_run_id", "TEXT"),
+    ("last_attempt_exchange_time", "TEXT"),
 )
 
 
@@ -146,6 +173,28 @@ def apply_portfolio_execution_migration(db_path: str | Path) -> None:
                 db.execute(
                     f"ALTER TABLE portfolio_execution_components ADD COLUMN {name} {declaration}"
                 )
+        reoptimization_columns = {
+            str(row[1])
+            for row in db.execute(
+                "PRAGMA table_info(portfolio_reoptimization_requests)"
+            )
+        }
+        for name, declaration in _PORTFOLIO_REOPTIMIZATION_MIGRATION_COLUMNS:
+            if name not in reoptimization_columns:
+                db.execute(
+                    f"ALTER TABLE portfolio_reoptimization_requests "
+                    f"ADD COLUMN {name} {declaration}"
+                )
+        db.execute(
+            """UPDATE portfolio_execution_components
+            SET origin_run_id = run_id
+            WHERE origin_run_id IS NULL OR origin_run_id = ''"""
+        )
+        db.execute(
+            """UPDATE portfolio_reoptimization_requests
+            SET origin_run_id = run_id
+            WHERE origin_run_id IS NULL OR origin_run_id = ''"""
+        )
         db.execute(
             """
             UPDATE portfolio_execution_components
@@ -158,8 +207,9 @@ def apply_portfolio_execution_migration(db_path: str | Path) -> None:
                 updated_at = ?
             WHERE (
                 session_id IS NULL OR session_id = ''
-                OR run_id IS NULL OR run_id = ''
+                OR origin_run_id IS NULL OR origin_run_id = ''
                 OR broker_account_id IS NULL OR broker_account_id = ''
+                OR broker_account_id IN ('webull_paper', 'webull_live')
                 OR trading_date IS NULL OR trading_date = ''
             )
               AND (
@@ -169,12 +219,33 @@ def apply_portfolio_execution_migration(db_path: str | Path) -> None:
             """,
             (datetime.now(timezone.utc).isoformat(),),
         )
+        db.execute(
+            """
+            UPDATE portfolio_reoptimization_requests
+            SET status = 'FAILED',
+                failure_reason = COALESCE(
+                    failure_reason,
+                    'legacy_unscoped_reoptimization_request'
+                ),
+                state_version = state_version + 1,
+                updated_at = ?
+            WHERE (
+                session_id IS NULL OR session_id = ''
+                OR origin_run_id IS NULL OR origin_run_id = ''
+                OR broker_account_id IS NULL OR broker_account_id = ''
+                OR broker_account_id IN ('webull_paper', 'webull_live')
+                OR trading_date IS NULL OR trading_date = ''
+            )
+              AND status IN ('PENDING', 'RUNNING')
+            """,
+            (datetime.now(timezone.utc).isoformat(),),
+        )
         db.executescript(
             """
             DROP INDEX IF EXISTS idx_portfolio_component_order;
-            CREATE UNIQUE INDEX idx_portfolio_component_order
+            CREATE INDEX idx_portfolio_component_order
                 ON portfolio_execution_components (
-                    session_id, run_id, broker_account_id, trading_date,
+                    session_id, broker_account_id, trading_date,
                     target_portfolio_decision_id, component_index
                 );
             CREATE INDEX IF NOT EXISTS idx_portfolio_component_owner_status
@@ -209,29 +280,37 @@ class PortfolioTransitionConflict(RuntimeError):
 @dataclass(frozen=True)
 class PortfolioExecutionOwner:
     session_id: str
-    run_id: str
-    broker_account_id: str
+    broker_account_identity: str
     trading_date: str
 
     def __post_init__(self) -> None:
         if not all(
             (
                 self.session_id,
-                self.run_id,
-                self.broker_account_id,
+                self.broker_account_identity,
                 self.trading_date,
             )
         ):
             raise ValueError("portfolio execution ownership is incomplete")
+        if self.broker_account_identity.strip().lower() in {
+            "webull",
+            "webull_paper",
+            "webull_live",
+        }:
+            raise ValueError("broker provider kind is not an account identity")
         date.fromisoformat(self.trading_date)
 
     def matches(self, record: PortfolioExecutionComponentRecord) -> bool:
         return (
             record.session_id == self.session_id
-            and record.run_id == self.run_id
-            and record.broker_account_id == self.broker_account_id
+            and record.broker_account_identity == self.broker_account_identity
             and record.trading_date == self.trading_date
         )
+
+    @property
+    def broker_account_id(self) -> str:
+        """Compatibility alias; the persisted value is an account identity."""
+        return self.broker_account_identity
 
 
 _COMPONENT_TRANSITIONS: dict[PortfolioComponentStatus, frozenset[PortfolioComponentStatus]] = {
@@ -299,8 +378,8 @@ def stable_portfolio_client_order_id(
 @dataclass(frozen=True)
 class PortfolioExecutionComponentRecord:
     session_id: str | None
-    run_id: str | None
-    broker_account_id: str | None
+    origin_run_id: str | None
+    broker_account_identity: str | None
     trading_date: str | None
     target_portfolio_decision_id: str
     selected_portfolio_id: str | None
@@ -325,6 +404,9 @@ class PortfolioExecutionComponentRecord:
     last_validation_timestamp: str | None = None
     last_reconciliation_timestamp: str | None = None
     failure_reoptimization_reason: str | None = None
+    last_resumed_run_id: str | None = None
+    resume_count: int = 0
+    last_resumed_at: str | None = None
     post_fill_objective_version: int | None = None
     post_fill_objective_fingerprint: str | None = None
     post_fill_snapshot_id: str | None = None
@@ -358,6 +440,8 @@ class PortfolioExecutionComponentRecord:
             date.fromisoformat(self.trading_date)
         if self.state_version < 0:
             raise ValueError("state_version must be non-negative")
+        if self.resume_count < 0:
+            raise ValueError("resume_count must be non-negative")
         if self.status == PortfolioComponentStatus.FILLED and (
             self.filled_quantity != self.authorized_quantity
         ):
@@ -383,14 +467,17 @@ class PortfolioExecutionComponentRecord:
 
     @property
     def has_scoped_owner(self) -> bool:
-        return all(
-            (
-                self.session_id,
-                self.run_id,
-                self.broker_account_id,
-                self.trading_date,
-            )
-        )
+        return all((self.session_id, self.broker_account_identity, self.trading_date))
+
+    @property
+    def run_id(self) -> str | None:
+        """Backward-compatible alias for immutable origin process provenance."""
+        return self.origin_run_id
+
+    @property
+    def broker_account_id(self) -> str | None:
+        """Compatibility alias for the legacy SQLite column name."""
+        return self.broker_account_identity
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -428,7 +515,9 @@ class PortfolioExecutionRepository:
             await db.execute(
                 """
                 INSERT OR IGNORE INTO portfolio_execution_components (
-                    session_id, run_id, broker_account_id, trading_date,
+                    session_id, run_id, origin_run_id, last_resumed_run_id,
+                    resume_count, last_resumed_at,
+                    broker_account_id, trading_date,
                     target_portfolio_decision_id, selected_portfolio_id,
                     authorized_position_tuple_id, component_index, component_count,
                     strategy_id, contract_id, authorized_quantity, capital_allocation,
@@ -443,11 +532,15 @@ class PortfolioExecutionRepository:
                     post_fill_exchange_time, reconciled_filled_quantity,
                     continuation_ready, state_version,
                     created_at, updated_at, payload_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     record.session_id,
-                    record.run_id,
+                    record.origin_run_id,
+                    record.origin_run_id,
+                    record.last_resumed_run_id,
+                    record.resume_count,
+                    record.last_resumed_at,
                     record.broker_account_id,
                     record.trading_date,
                     record.target_portfolio_decision_id,
@@ -490,7 +583,7 @@ class PortfolioExecutionRepository:
         assert stored is not None
         immutable = (
             "session_id",
-            "run_id",
+            "origin_run_id",
             "broker_account_id",
             "trading_date",
             "target_portfolio_decision_id",
@@ -508,6 +601,55 @@ class PortfolioExecutionRepository:
         )
         if any(getattr(stored, name) != getattr(record, name) for name in immutable):
             raise ValueError("authorized portfolio component conflicts with durable authority")
+        return stored
+
+    async def record_resume(
+        self,
+        authorized_position_tuple_id: str,
+        *,
+        owner: PortfolioExecutionOwner,
+        current_run_id: str,
+        resumed_at: str,
+    ) -> PortfolioExecutionComponentRecord:
+        """Record process provenance without changing the stable execution owner."""
+        existing = await self.get(authorized_position_tuple_id)
+        if existing is None:
+            raise KeyError(f"portfolio component not found: {authorized_position_tuple_id}")
+        if not owner.matches(existing) or not existing.has_scoped_owner:
+            raise PermissionError("portfolio component owner does not match runtime")
+        parsed = datetime.fromisoformat(resumed_at)
+        if parsed.tzinfo is None:
+            raise ValueError("resumed_at must be timezone-aware")
+        if not current_run_id:
+            raise ValueError("current_run_id is required")
+        if existing.last_resumed_run_id == current_run_id:
+            return existing
+        async with aiosqlite.connect(self._db_path) as db:
+            cur = await db.execute(
+                """
+                UPDATE portfolio_execution_components
+                SET last_resumed_run_id = ?, resume_count = resume_count + 1,
+                    last_resumed_at = ?, state_version = state_version + 1,
+                    updated_at = ?
+                WHERE authorized_position_tuple_id = ?
+                  AND state_version = ? AND status = ?
+                """,
+                (
+                    current_run_id,
+                    resumed_at,
+                    resumed_at,
+                    authorized_position_tuple_id,
+                    existing.state_version,
+                    existing.status.value,
+                ),
+            )
+            await db.commit()
+        if cur.rowcount != 1:
+            raise PortfolioTransitionConflict(
+                "portfolio component resume lost compare-and-swap race"
+            )
+        stored = await self.get(authorized_position_tuple_id)
+        assert stored is not None
         return stored
 
     async def transition(
@@ -713,12 +855,11 @@ class PortfolioExecutionRepository:
             cur = await db.execute(
                 """SELECT * FROM portfolio_execution_components
                 WHERE client_order_id = ?
-                  AND session_id = ? AND run_id = ?
+                  AND session_id = ?
                   AND broker_account_id = ? AND trading_date = ?""",
                 (
                     client_order_id,
                     owner.session_id,
-                    owner.run_id,
                     owner.broker_account_id,
                     owner.trading_date,
                 ),
@@ -746,13 +887,12 @@ class PortfolioExecutionRepository:
                 cur = await db.execute(
                     """SELECT * FROM portfolio_execution_components
                     WHERE target_portfolio_decision_id = ?
-                      AND session_id = ? AND run_id = ?
+                      AND session_id = ?
                       AND broker_account_id = ? AND trading_date = ?
                     ORDER BY component_index ASC""",
                     (
                         target_portfolio_decision_id,
                         owner.session_id,
-                        owner.run_id,
                         owner.broker_account_id,
                         owner.trading_date,
                     ),
@@ -764,8 +904,7 @@ class PortfolioExecutionRepository:
         self,
         *,
         session_id: str,
-        run_id: str,
-        broker_account_id: str,
+        broker_account_identity: str,
         trading_date: str,
     ) -> list[PortfolioExecutionComponentRecord]:
         await self._ensure()
@@ -773,7 +912,7 @@ class PortfolioExecutionRepository:
             db.row_factory = aiosqlite.Row
             cur = await db.execute(
                 """SELECT * FROM portfolio_execution_components
-                WHERE session_id = ? AND run_id = ?
+                WHERE session_id = ?
                   AND broker_account_id = ? AND trading_date = ?
                   AND status IN (
                     'AUTHORIZED', 'READY', 'SUBMITTED', 'WORKING',
@@ -784,7 +923,6 @@ class PortfolioExecutionRepository:
                     WHERE pending.target_portfolio_decision_id =
                           portfolio_execution_components.target_portfolio_decision_id
                       AND pending.session_id = portfolio_execution_components.session_id
-                      AND pending.run_id = portfolio_execution_components.run_id
                       AND pending.broker_account_id =
                           portfolio_execution_components.broker_account_id
                       AND pending.trading_date =
@@ -795,7 +933,7 @@ class PortfolioExecutionRepository:
                       )
                   )
                 ORDER BY target_portfolio_decision_id, component_index""",
-                (session_id, run_id, broker_account_id, trading_date),
+                (session_id, broker_account_identity, trading_date),
             )
             rows = await cur.fetchall()
         return [self._row(row) for row in rows]
@@ -804,8 +942,8 @@ class PortfolioExecutionRepository:
     def _row(row: aiosqlite.Row) -> PortfolioExecutionComponentRecord:
         return PortfolioExecutionComponentRecord(
             session_id=row["session_id"],
-            run_id=row["run_id"],
-            broker_account_id=row["broker_account_id"],
+            origin_run_id=row["origin_run_id"] or row["run_id"],
+            broker_account_identity=row["broker_account_id"],
             trading_date=row["trading_date"],
             target_portfolio_decision_id=row["target_portfolio_decision_id"],
             selected_portfolio_id=row["selected_portfolio_id"],
@@ -834,6 +972,9 @@ class PortfolioExecutionRepository:
             last_validation_timestamp=row["last_validation_timestamp"],
             last_reconciliation_timestamp=row["last_reconciliation_timestamp"],
             failure_reoptimization_reason=row["failure_reoptimization_reason"],
+            last_resumed_run_id=row["last_resumed_run_id"],
+            resume_count=int(row["resume_count"] or 0),
+            last_resumed_at=row["last_resumed_at"],
             post_fill_objective_version=(
                 int(row["post_fill_objective_version"])
                 if row["post_fill_objective_version"] is not None
@@ -866,8 +1007,8 @@ class PortfolioReoptimizationStatus(StrEnum):
 class PortfolioReoptimizationRequestRecord:
     request_id: str
     session_id: str
-    run_id: str
-    broker_account_id: str
+    origin_run_id: str
+    broker_account_identity: str
     trading_date: str
     original_portfolio_decision_id: str
     already_filled_tuple_ids: tuple[str, ...]
@@ -881,6 +1022,13 @@ class PortfolioReoptimizationRequestRecord:
     status: PortfolioReoptimizationStatus = PortfolioReoptimizationStatus.PENDING
     replacement_decision_id: str | None = None
     replacement_action: str | None = None
+    last_resumed_run_id: str | None = None
+    resume_count: int = 0
+    last_resumed_at: str | None = None
+    failure_reason: str | None = None
+    attempt_count: int = 0
+    last_attempt_run_id: str | None = None
+    last_attempt_exchange_time: str | None = None
     state_version: int = 0
     created_at: str | None = None
     updated_at: str | None = None
@@ -889,8 +1037,7 @@ class PortfolioReoptimizationRequestRecord:
     def __post_init__(self) -> None:
         PortfolioExecutionOwner(
             session_id=self.session_id,
-            run_id=self.run_id,
-            broker_account_id=self.broker_account_id,
+            broker_account_identity=self.broker_account_identity,
             trading_date=self.trading_date,
         )
         created = datetime.fromisoformat(self.created_exchange_time)
@@ -898,15 +1045,37 @@ class PortfolioReoptimizationRequestRecord:
             raise ValueError("created_exchange_time must be timezone-aware")
         if not self.original_portfolio_decision_id or not self.latest_snapshot_id:
             raise ValueError("reoptimization provenance is incomplete")
-        if self.latest_objective_version < 0 or self.state_version < 0:
+        if (
+            self.latest_objective_version < 0
+            or self.state_version < 0
+            or self.resume_count < 0
+            or self.attempt_count < 0
+        ):
             raise ValueError("reoptimization versions must be non-negative")
+
+    @property
+    def run_id(self) -> str:
+        """Backward-compatible alias for immutable origin process provenance."""
+        return self.origin_run_id
+
+    @property
+    def owner(self) -> PortfolioExecutionOwner:
+        return PortfolioExecutionOwner(
+            session_id=self.session_id,
+            broker_account_identity=self.broker_account_identity,
+            trading_date=self.trading_date,
+        )
+
+    @property
+    def broker_account_id(self) -> str:
+        """Compatibility alias for the legacy SQLite column name."""
+        return self.broker_account_identity
 
 
 def stable_reoptimization_request_id(
     *,
     session_id: str,
-    run_id: str,
-    broker_account_id: str,
+    broker_account_identity: str,
     trading_date: str,
     original_portfolio_decision_id: str,
     remaining_authorized_tuple_ids: tuple[str, ...],
@@ -914,7 +1083,7 @@ def stable_reoptimization_request_id(
     return uuid5(
         NAMESPACE_URL,
         "joker:portfolio-reoptimization:"
-        f"{session_id}:{run_id}:{broker_account_id}:{trading_date}:"
+        f"{session_id}:{broker_account_identity}:{trading_date}:"
         f"{original_portfolio_decision_id}:"
         + ",".join(remaining_authorized_tuple_ids),
     ).hex
@@ -941,23 +1110,52 @@ class PortfolioReoptimizationRepository:
         await self._ensure()
         now = record.created_at or datetime.now(timezone.utc).isoformat()
         async with aiosqlite.connect(self._db_path) as db:
+            db.row_factory = aiosqlite.Row
+            existing_row = await (
+                await db.execute(
+                    """
+                    SELECT * FROM portfolio_reoptimization_requests
+                    WHERE session_id = ? AND broker_account_id = ? AND trading_date = ?
+                      AND original_portfolio_decision_id = ?
+                      AND remaining_authorized_tuple_ids_json = ?
+                    ORDER BY created_at LIMIT 1
+                    """,
+                    (
+                        record.session_id,
+                        record.broker_account_id,
+                        record.trading_date,
+                        record.original_portfolio_decision_id,
+                        json.dumps(record.remaining_authorized_tuple_ids),
+                    ),
+                )
+            ).fetchone()
+            if existing_row is not None:
+                return self._row(existing_row)
             await db.execute(
                 """
                 INSERT OR IGNORE INTO portfolio_reoptimization_requests (
-                    request_id, session_id, run_id, broker_account_id, trading_date,
+                    request_id, session_id, run_id, origin_run_id,
+                    last_resumed_run_id, resume_count, last_resumed_at,
+                    broker_account_id, trading_date,
                     original_portfolio_decision_id,
                     already_filled_tuple_ids_json, open_positions_json,
                     remaining_authorized_tuple_ids_json, reason_codes_json,
                     latest_objective_state_json, latest_objective_version,
                     latest_snapshot_id, created_exchange_time, status,
-                    replacement_decision_id, replacement_action, state_version,
+                    replacement_decision_id, replacement_action, failure_reason,
+                    attempt_count, last_attempt_run_id, last_attempt_exchange_time,
+                    state_version,
                     created_at, updated_at, payload_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     record.request_id,
                     record.session_id,
-                    record.run_id,
+                    record.origin_run_id,
+                    record.origin_run_id,
+                    record.last_resumed_run_id,
+                    record.resume_count,
+                    record.last_resumed_at,
                     record.broker_account_id,
                     record.trading_date,
                     record.original_portfolio_decision_id,
@@ -972,6 +1170,10 @@ class PortfolioReoptimizationRepository:
                     record.status.value,
                     record.replacement_decision_id,
                     record.replacement_action,
+                    record.failure_reason,
+                    record.attempt_count,
+                    record.last_attempt_run_id,
+                    record.last_attempt_exchange_time,
                     record.state_version,
                     now,
                     record.updated_at or now,
@@ -983,7 +1185,7 @@ class PortfolioReoptimizationRepository:
         assert stored is not None
         if (
             stored.session_id != record.session_id
-            or stored.run_id != record.run_id
+            or stored.origin_run_id != record.origin_run_id
             or stored.broker_account_id != record.broker_account_id
             or stored.trading_date != record.trading_date
             or stored.original_portfolio_decision_id != record.original_portfolio_decision_id
@@ -1008,8 +1210,7 @@ class PortfolioReoptimizationRepository:
         self,
         *,
         session_id: str,
-        run_id: str,
-        broker_account_id: str,
+        broker_account_identity: str,
         trading_date: str,
     ) -> list[PortfolioReoptimizationRequestRecord]:
         await self._ensure()
@@ -1019,15 +1220,75 @@ class PortfolioReoptimizationRepository:
                 await db.execute(
                     """
                     SELECT * FROM portfolio_reoptimization_requests
-                    WHERE session_id = ? AND run_id = ?
+                    WHERE session_id = ?
                       AND broker_account_id = ? AND trading_date = ?
                       AND status IN ('PENDING', 'RUNNING')
                     ORDER BY created_at, request_id
                     """,
-                    (session_id, run_id, broker_account_id, trading_date),
+                    (session_id, broker_account_identity, trading_date),
                 )
             ).fetchall()
         return [self._row(row) for row in rows]
+
+    async def begin_attempt(
+        self,
+        request_id: str,
+        *,
+        owner: PortfolioExecutionOwner,
+        current_run_id: str,
+        attempt_exchange_time: str,
+    ) -> PortfolioReoptimizationRequestRecord:
+        """Claim an owned request and durably record this process attempt."""
+        existing = await self.get(request_id)
+        if existing is None:
+            raise KeyError(f"reoptimization request not found: {request_id}")
+        if existing.owner != owner:
+            raise PermissionError("reoptimization request owner does not match runtime")
+        if existing.status not in {
+            PortfolioReoptimizationStatus.PENDING,
+            PortfolioReoptimizationStatus.RUNNING,
+        }:
+            raise ValueError(f"reoptimization request is terminal: {existing.status}")
+        attempted = datetime.fromisoformat(attempt_exchange_time)
+        if attempted.tzinfo is None:
+            raise ValueError("attempt_exchange_time must be timezone-aware")
+        if not current_run_id:
+            raise ValueError("current_run_id is required")
+        resumed = existing.last_resumed_run_id != current_run_id
+        async with aiosqlite.connect(self._db_path) as db:
+            cur = await db.execute(
+                """
+                UPDATE portfolio_reoptimization_requests
+                SET status = 'RUNNING', attempt_count = attempt_count + 1,
+                    last_attempt_run_id = ?, last_attempt_exchange_time = ?,
+                    last_resumed_run_id = CASE WHEN ? THEN ? ELSE last_resumed_run_id END,
+                    resume_count = resume_count + CASE WHEN ? THEN 1 ELSE 0 END,
+                    last_resumed_at = CASE WHEN ? THEN ? ELSE last_resumed_at END,
+                    state_version = state_version + 1, updated_at = ?
+                WHERE request_id = ? AND state_version = ? AND status = ?
+                """,
+                (
+                    current_run_id,
+                    attempt_exchange_time,
+                    int(resumed),
+                    current_run_id,
+                    int(resumed),
+                    int(resumed),
+                    attempt_exchange_time,
+                    attempt_exchange_time,
+                    request_id,
+                    existing.state_version,
+                    existing.status.value,
+                ),
+            )
+            await db.commit()
+        if cur.rowcount != 1:
+            raise PortfolioTransitionConflict(
+                "reoptimization attempt lost compare-and-swap race"
+            )
+        stored = await self.get(request_id)
+        assert stored is not None
+        return stored
 
     async def transition(
         self,
@@ -1036,6 +1297,7 @@ class PortfolioReoptimizationRepository:
         status: PortfolioReoptimizationStatus,
         replacement_decision_id: str | None = None,
         replacement_action: str | None = None,
+        failure_reason: str | None = None,
         expected_state_version: int | None = None,
     ) -> PortfolioReoptimizationRequestRecord:
         existing = await self.get(request_id)
@@ -1067,6 +1329,7 @@ class PortfolioReoptimizationRepository:
                 UPDATE portfolio_reoptimization_requests
                 SET status = ?, replacement_decision_id = COALESCE(?, replacement_decision_id),
                     replacement_action = COALESCE(?, replacement_action),
+                    failure_reason = COALESCE(?, failure_reason),
                     state_version = state_version + 1, updated_at = ?
                 WHERE request_id = ? AND state_version = ? AND status = ?
                 """,
@@ -1074,6 +1337,7 @@ class PortfolioReoptimizationRepository:
                     status.value,
                     replacement_decision_id,
                     replacement_action,
+                    failure_reason,
                     datetime.now(timezone.utc).isoformat(),
                     request_id,
                     existing.state_version,
@@ -1094,8 +1358,8 @@ class PortfolioReoptimizationRepository:
         return PortfolioReoptimizationRequestRecord(
             request_id=row["request_id"],
             session_id=row["session_id"],
-            run_id=row["run_id"],
-            broker_account_id=row["broker_account_id"],
+            origin_run_id=row["origin_run_id"] or row["run_id"],
+            broker_account_identity=row["broker_account_id"],
             trading_date=row["trading_date"],
             original_portfolio_decision_id=row["original_portfolio_decision_id"],
             already_filled_tuple_ids=tuple(json.loads(row["already_filled_tuple_ids_json"])),
@@ -1111,6 +1375,13 @@ class PortfolioReoptimizationRepository:
             status=PortfolioReoptimizationStatus(row["status"]),
             replacement_decision_id=row["replacement_decision_id"],
             replacement_action=row["replacement_action"],
+            last_resumed_run_id=row["last_resumed_run_id"],
+            resume_count=int(row["resume_count"] or 0),
+            last_resumed_at=row["last_resumed_at"],
+            failure_reason=row["failure_reason"],
+            attempt_count=int(row["attempt_count"] or 0),
+            last_attempt_run_id=row["last_attempt_run_id"],
+            last_attempt_exchange_time=row["last_attempt_exchange_time"],
             state_version=int(row["state_version"]),
             created_at=row["created_at"],
             updated_at=row["updated_at"],

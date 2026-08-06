@@ -43,6 +43,7 @@ class SessionSupervisorConfig:
     session_id: str | None = None
     run_id: str | None = None
     broker_account_id: str = "default"
+    broker_account_identity: str | None = None
     late_observation_tolerance_seconds: float = 2.0
     event_handler_timeout_seconds: float = 10.0
     auto_apply_reconciliation_corrections: bool = True
@@ -231,6 +232,7 @@ class SessionSupervisor:
             clock=self._clock,
             session_id=self._session_id,
             broker_account_id=self._config.broker_account_id,
+            broker_account_identity=self._config.broker_account_identity,
         )
         await self._execution.restore_order_mappings()
 

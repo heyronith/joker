@@ -266,6 +266,7 @@ async def _prepare_stack(
         "engines": engines,
         "evo": evo,
         "deps": deps,
+        "fake_model_provider": fake,
     }
 
 

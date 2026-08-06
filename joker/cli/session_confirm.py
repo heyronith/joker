@@ -33,6 +33,159 @@ class SessionObjectiveBundle:
     deadline_exchange_time: datetime | None = None
 
 
+TERMINAL_OBJECTIVE_STATUSES = frozenset(
+    {"target_reached", "capital_exhausted", "deadline_reached", "stopped_by_user"}
+)
+
+
+def validate_objective_session_action(
+    requested: str,
+    *,
+    has_definition: bool,
+    latest_status: str | None,
+) -> str:
+    """Resolve explicit new/resume intent and reject ambiguous ownership."""
+    action = requested.strip().lower()
+    if action not in {"new", "resume"}:
+        raise ValueError("objective session action must be 'new' or 'resume'")
+    unfinished = has_definition and (
+        latest_status is None or latest_status not in TERMINAL_OBJECTIVE_STATUSES
+    )
+    if action == "new" and unfinished:
+        raise ValueError(
+            "unfinished objective exists; use --objective-session resume or reconcile it"
+        )
+    if action == "resume" and not unfinished:
+        raise ValueError(
+            "no unfinished objective exists; use --objective-session new"
+        )
+    return action
+
+
+def _session_objective_service(
+    app_settings: AppSettings,
+    *,
+    repository: ObjectiveRepository,
+    exchange_tz: str,
+) -> SessionObjectiveService:
+    settings = app_settings.objective
+    return SessionObjectiveService(
+        repository,
+        exchange_tz=exchange_tz,
+        operator_events=BoundedOperatorEventProjection(
+            capacity=int(getattr(settings, "operator_event_capacity", 256))
+        ),
+        pause_entries_when_goal_met=bool(settings.pause_entries_when_goal_met),
+        stop_new_entries_at_deadline=bool(settings.stop_new_entries_at_deadline),
+        require_positive_expected_value=(
+            bool(settings.require_positive_expected_value)
+            if not settings.is_target_attainment
+            else False
+        ),
+        minimum_win_probability=(
+            float(settings.minimum_win_probability)
+            if not settings.is_target_attainment
+            else 0.0
+        ),
+        objective_policy=str(settings.policy),
+        shadow_baseline_enabled=bool(settings.shadow_baseline_enabled),
+    )
+
+
+def _capital_budget_from_definition(
+    app_settings: AppSettings, definition: Any
+) -> CapitalBudget:
+    capital = app_settings.capital
+    objective = app_settings.objective
+    return CapitalBudget(
+        plan=CapitalPlan(
+            authorized_usd=float(definition.authorised_capital_usd),
+            target_profit_pct=float(definition.target_profit_pct),
+            max_concurrent_positions=int(definition.max_concurrent_positions),
+            max_contracts_per_trade=int(
+                getattr(
+                    objective,
+                    "maximum_authorised_contracts",
+                    capital.max_contracts_per_trade,
+                )
+            ),
+            min_contracts_per_trade=int(capital.min_contracts_per_trade),
+            aggression_mode=(
+                "target_attainment"
+                if objective.is_target_attainment
+                else str(capital.aggression_mode)
+            ),
+            max_kelly_fraction=(
+                1.0
+                if objective.is_target_attainment
+                else float(capital.max_kelly_fraction)
+            ),
+            min_win_probability=(
+                0.0
+                if objective.is_target_attainment
+                else float(objective.minimum_win_probability)
+            ),
+            behind_goal_boost=float(capital.behind_goal_boost),
+            ahead_goal_dampen=float(capital.ahead_goal_dampen),
+        )
+    )
+
+
+async def recover_session_objective_bundle(
+    app_settings: AppSettings,
+    *,
+    session_id: str,
+    db_path: Path,
+    exchange_tz: str | None = None,
+) -> SessionObjectiveBundle | None:
+    """Recover the confirmed objective for a stable paper session."""
+    repository = ObjectiveRepository(db_path)
+    definition = repository.latest_definition_for_session(session_id)
+    if definition is None:
+        return None
+    service = _session_objective_service(
+        app_settings,
+        repository=repository,
+        exchange_tz=exchange_tz or str(app_settings.exchange.timezone),
+    )
+    state = await service.load_or_recover(session_id)
+    if state is None:
+        return None
+    return SessionObjectiveBundle(
+        capital_budget=_capital_budget_from_definition(app_settings, definition),
+        objective_service=service,
+        objective_id=str(definition.objective_id),
+        deadline_exchange_time=definition.deadline_exchange_time,
+    )
+
+
+async def has_unfinished_portfolio_execution(
+    *,
+    provenance_db_path: Path,
+    session_id: str,
+    broker_account_identity: str,
+    trading_date: str,
+) -> bool:
+    """Return whether durable broker-affecting work still owns this session."""
+    from joker.persistence.cognitive_execution_provenance import (
+        CognitiveExecutionProvenanceRegistry,
+    )
+
+    registry = CognitiveExecutionProvenanceRegistry(provenance_db_path)
+    await registry.initialize()
+    components = await registry.portfolio_executions.list_resumable(
+        session_id=session_id,
+        broker_account_identity=broker_account_identity,
+        trading_date=trading_date,
+    )
+    requests = await registry.portfolio_reoptimizations.list_pending(
+        session_id=session_id,
+        broker_account_identity=broker_account_identity,
+        trading_date=trading_date,
+    )
+    return bool(components or requests)
+
+
 def plan_from_settings(settings: CapitalSettings) -> CapitalPlan:
     return CapitalPlan(
         authorized_usd=float(settings.authorized_usd),
@@ -287,27 +440,10 @@ async def confirm_session_objective(
             raise typer.Abort()
 
     repo = ObjectiveRepository(db_path)
-    events = BoundedOperatorEventProjection(
-        capacity=int(getattr(obj_settings, "operator_event_capacity", 256))
-    )
-    service = SessionObjectiveService(
-        repo,
+    service = _session_objective_service(
+        app_settings,
+        repository=repo,
         exchange_tz=tz,
-        operator_events=events,
-        pause_entries_when_goal_met=bool(obj_settings.pause_entries_when_goal_met),
-        stop_new_entries_at_deadline=bool(obj_settings.stop_new_entries_at_deadline),
-        require_positive_expected_value=(
-            bool(obj_settings.require_positive_expected_value)
-            if not obj_settings.is_target_attainment
-            else False
-        ),
-        minimum_win_probability=(
-            float(obj_settings.minimum_win_probability)
-            if not obj_settings.is_target_attainment
-            else 0.0
-        ),
-        objective_policy=str(obj_settings.policy),
-        shadow_baseline_enabled=bool(obj_settings.shadow_baseline_enabled),
     )
     definition = await service.create_objective(
         session_id=session_id,

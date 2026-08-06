@@ -55,6 +55,7 @@ class PreparedTradingSession:
     run_id: str
     db_path: Path
     broker_kind: str = "local_paper"
+    broker_account_identity: str = "local_paper"
     safety_mode: str = "PAPER"
 
     @property
@@ -124,6 +125,7 @@ async def prepare_agentic_trading_session(
     start_cognitive_agent: bool = True,
     start_evolution_workers: bool = True,
     broker_account_id: str = "local_paper",
+    broker_account_identity: str | None = None,
     entry_permission: Any | None = None,
 ) -> PreparedTradingSession:
     """Shared session construction for paper and live — identical graph/EV/sizing."""
@@ -135,7 +137,21 @@ async def prepare_agentic_trading_session(
     paper = broker
     task1_db = Path(db_path or app_settings.db_path)
     task1_db.parent.mkdir(parents=True, exist_ok=True)
-    sid = session_id or f"sess-{uuid4().hex[:12]}"
+    resolved_account_identity = broker_account_identity or broker_account_id
+    if resolved_account_identity in {"webull_paper", "webull_live", "webull"}:
+        raise ValueError("provider kind is not a durable broker account identity")
+    from joker.runtime.cognitive_session import (
+        exchange_trading_date,
+        stable_cognitive_session_id,
+    )
+
+    trading_date = (
+        clock.trading_date() if clock is not None else exchange_trading_date()
+    )
+    sid = session_id or stable_cognitive_session_id(
+        trading_date=trading_date,
+        account_identity=resolved_account_identity,
+    )
     rid = run_id or f"run-{uuid4().hex[:12]}"
 
     fake_env = os.environ.get(FAKE_OVERRIDE_ENV, "").strip().lower() in {
@@ -205,6 +221,7 @@ async def prepare_agentic_trading_session(
         config=app_settings.cognitive_graph,
         session_id=sid,
         run_id=rid,
+        broker_account_identity=resolved_account_identity,
         context_assembler=context_assembler_from_settings(app_settings.cognitive_graph),
         snapshot_repo=SnapshotRepository(task1_db),
         option_surface_repo=OptionSurfaceRepository(task1_db),
@@ -253,6 +270,7 @@ async def prepare_agentic_trading_session(
         run_id=rid,
         clock=clock,
         broker_account_id=broker_account_id,
+        broker_account_identity=resolved_account_identity,
         agent_runtime=agent_runtime,
         market_config=MarketRuntimeConfig(
             min_option_contracts=1,
@@ -329,6 +347,7 @@ async def prepare_agentic_trading_session(
         run_id=rid,
         db_path=task1_db,
         broker_kind=broker_kind,
+        broker_account_identity=resolved_account_identity,
         safety_mode=safety_mode,
     )
 
@@ -354,6 +373,11 @@ async def prepare_cognitive_paper_session(
     if isinstance(paper, WebullLiveClient):
         raise ValueError("prepare_cognitive_paper_session rejects webull_live broker")
     kind = "webull_paper" if paper.__class__.__name__ == "WebullClient" else "local_paper"
+    account_identity = (
+        str(getattr(paper, "account_identity"))
+        if kind == "webull_paper"
+        else "local_paper"
+    )
     return await prepare_agentic_trading_session(
         app_settings=app_settings,
         objective_service=objective_service,
@@ -368,7 +392,8 @@ async def prepare_cognitive_paper_session(
         start_cognitive_agent=start_cognitive_agent,
         start_evolution_workers=start_evolution_workers,
         entry_permission=entry_permission,
-        broker_account_id="local_paper" if kind == "local_paper" else "webull_paper",
+        broker_account_id=account_identity,
+        broker_account_identity=account_identity,
     )
 
 
@@ -416,4 +441,5 @@ async def prepare_cognitive_live_session(
         start_evolution_workers=start_evolution_workers,
         entry_permission=entry_permission,
         broker_account_id=broker.account_id_hash,
+        broker_account_identity=f"live:{broker.account_id_hash}",
     )

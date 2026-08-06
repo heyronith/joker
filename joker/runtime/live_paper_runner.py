@@ -252,6 +252,12 @@ class LivePaperRunner:
             raise LivePaperError(str(exc)) from exc
 
         broker = selection.client
+        from joker.runtime.cognitive_session import paper_account_identity
+
+        account_identity = paper_account_identity(
+            broker_kind=selection.kind,
+            env=self.env_settings,
+        )
         result.broker_kind = selection.kind
         result.broker_label = selection.label
         if (self.app_settings.broker.provider or "").strip().lower() in {
@@ -376,6 +382,7 @@ class LivePaperRunner:
                 config=self.app_settings.cognitive_graph,
                 session_id=cognitive_session_id,
                 run_id=run_id,
+                broker_account_identity=account_identity,
                 context_assembler=context_assembler_from_settings(
                     self.app_settings.cognitive_graph
                 ),
@@ -439,7 +446,8 @@ class LivePaperRunner:
             db_path=task1_db,
             session_id=bridge_session_id,
             run_id=run_id,
-            broker_account_id=selection.kind,
+            broker_account_id=account_identity,
+            broker_account_identity=account_identity,
             agent_runtime=injected_agent_runtime,
         )
         # Two-phase startup for cognitive mode:
@@ -576,7 +584,7 @@ class LivePaperRunner:
         execution_broker = ExecutionDelegatingBroker(
             inner=broker,
             bridge=task1_bridge,
-            broker_account_id=selection.kind,
+            broker_account_id=account_identity,
         )
         _http_clients: list[Any] = [broker]
 

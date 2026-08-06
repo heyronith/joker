@@ -318,6 +318,12 @@ async def publish_execution_observable_event(
         {
             "cycle_id": state.get("cycle_id"),
             "snapshot_id": state.get("snapshot_id"),
+            "session_id": deps.session_id,
+            "current_run_id": deps.run_id,
+            "broker_account_identity": deps.broker_account_identity,
+            "trading_date": (
+                deps.clock.trading_date().isoformat() if deps.clock is not None else None
+            ),
             **payload,
         },
         correlation=_correlation_id(state),

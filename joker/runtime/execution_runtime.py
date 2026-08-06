@@ -100,6 +100,7 @@ class ExecutionRuntime:
         clock: ExchangeClock | None = None,
         session_id: str,
         broker_account_id: str = "default",
+        broker_account_identity: str | None = None,
     ) -> None:
         self._broker = broker
         self._ledger = ledger_store
@@ -108,7 +109,7 @@ class ExecutionRuntime:
         self._bus = event_bus
         self._clock = clock
         self._session_id = session_id
-        self._broker_account_id = broker_account_id
+        self._broker_account_id = broker_account_identity or broker_account_id
         self._correlation_id = uuid4()
         self._client_to_broker: dict[str, str] = {}
         self._unresolved: UnresolvedReconciliation | None = None
@@ -119,6 +120,10 @@ class ExecutionRuntime:
 
     @property
     def broker_account_id(self) -> str:
+        return self._broker_account_id
+
+    @property
+    def broker_account_identity(self) -> str:
         return self._broker_account_id
 
     @property

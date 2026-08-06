@@ -68,9 +68,19 @@ class WebullClient(BrokerClient):
             )
         self._env = env
         self._account_id = str(env.webull_paper_account_id)
+        from joker.runtime.cognitive_session import paper_account_identity
+
+        self._account_identity = paper_account_identity(
+            broker_kind="webull_paper", env=env
+        )
         self._api = trade_api or _default_trade_api(env)
         self._orders: dict[str, BrokerOrder] = {}
         self._intent_by_order: dict[str, OrderIntent] = {}
+
+    @property
+    def account_identity(self) -> str:
+        """Non-reversible durable identity; the raw account id stays private."""
+        return self._account_identity
 
     def close(self) -> None:
         """Close the underlying Webull trade HTTP client when present."""

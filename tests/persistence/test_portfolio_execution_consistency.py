@@ -4,17 +4,23 @@ import asyncio
 import sqlite3
 from datetime import datetime, timezone
 from decimal import Decimal
+from uuid import uuid4
 
 import pytest
 
+from joker.config.settings import EnvSettings
 from joker.persistence.cognitive_execution_provenance import (
     PortfolioComponentStatus,
     PortfolioExecutionComponentRecord,
     PortfolioExecutionOwner,
     PortfolioExecutionRepository,
+    PortfolioReoptimizationRepository,
+    PortfolioReoptimizationRequestRecord,
     PortfolioTransitionConflict,
     apply_portfolio_execution_migration,
+    stable_reoptimization_request_id,
 )
+from joker.runtime.cognitive_session import paper_account_identity
 
 
 NOW = datetime(2026, 8, 5, 15, 0, tzinfo=timezone.utc).isoformat()
@@ -23,14 +29,13 @@ NOW = datetime(2026, 8, 5, 15, 0, tzinfo=timezone.utc).isoformat()
 def _owner(
     *,
     session_id: str = "session-a",
-    run_id: str = "run-a",
     broker_account_id: str = "paper-a",
+    trading_date: str = "2026-08-05",
 ) -> PortfolioExecutionOwner:
     return PortfolioExecutionOwner(
         session_id=session_id,
-        run_id=run_id,
-        broker_account_id=broker_account_id,
-        trading_date="2026-08-05",
+        broker_account_identity=broker_account_id,
+        trading_date=trading_date,
     )
 
 
@@ -42,12 +47,13 @@ def _record(
     component_index: int = 0,
     component_count: int = 1,
     quantity: int = 2,
+    origin_run_id: str = "run-a",
 ) -> PortfolioExecutionComponentRecord:
     scoped = owner or _owner()
     return PortfolioExecutionComponentRecord(
         session_id=scoped.session_id,
-        run_id=scoped.run_id,
-        broker_account_id=scoped.broker_account_id,
+        origin_run_id=origin_run_id,
+        broker_account_identity=scoped.broker_account_identity,
         trading_date=scoped.trading_date,
         target_portfolio_decision_id=decision_id,
         selected_portfolio_id="portfolio-a",
@@ -75,8 +81,7 @@ async def test_different_session_pending_portfolio_is_not_resumed(tmp_path) -> N
     assert (
         await repo.list_resumable(
             session_id="session-a",
-            run_id="run-a",
-            broker_account_id="paper-a",
+            broker_account_identity="paper-a",
             trading_date="2026-08-05",
         )
         == []
@@ -93,8 +98,7 @@ async def test_different_broker_account_pending_portfolio_is_not_resumed(
     assert (
         await repo.list_resumable(
             session_id="session-a",
-            run_id="run-a",
-            broker_account_id="paper-a",
+            broker_account_identity="paper-a",
             trading_date="2026-08-05",
         )
         == []
@@ -108,11 +112,118 @@ async def test_matching_session_and_account_resume_normally(tmp_path) -> None:
 
     rows = await repo.list_resumable(
         session_id="session-a",
-        run_id="run-a",
-        broker_account_id="paper-a",
+        broker_account_identity="paper-a",
         trading_date="2026-08-05",
     )
     assert [row.authorized_position_tuple_id for row in rows] == ["tuple-a"]
+
+
+@pytest.mark.asyncio
+async def test_same_session_account_date_new_run_resumes_component(tmp_path) -> None:
+    repo = PortfolioExecutionRepository(tmp_path / "state.db")
+    await repo.authorize(_record("tuple-a", origin_run_id=str(uuid4())))
+    current_run_id = str(uuid4())
+
+    rows = await repo.list_resumable(
+        session_id="session-a",
+        broker_account_identity="paper-a",
+        trading_date="2026-08-05",
+    )
+    resumed = await repo.record_resume(
+        rows[0].authorized_position_tuple_id,
+        owner=_owner(),
+        current_run_id=current_run_id,
+        resumed_at=NOW,
+    )
+
+    assert resumed.origin_run_id != current_run_id
+    assert resumed.last_resumed_run_id == current_run_id
+    assert resumed.resume_count == 1
+
+
+@pytest.mark.asyncio
+async def test_origin_run_id_remains_immutable_after_resume(tmp_path) -> None:
+    repo = PortfolioExecutionRepository(tmp_path / "state.db")
+    origin_run_id = str(uuid4())
+    await repo.authorize(_record("tuple-a", origin_run_id=origin_run_id))
+    await repo.record_resume(
+        "tuple-a",
+        owner=_owner(),
+        current_run_id=str(uuid4()),
+        resumed_at=NOW,
+    )
+    stored = await repo.get("tuple-a")
+    assert stored is not None
+    assert stored.origin_run_id == origin_run_id
+
+
+@pytest.mark.asyncio
+async def test_different_trading_date_still_cannot_resume(tmp_path) -> None:
+    repo = PortfolioExecutionRepository(tmp_path / "state.db")
+    await repo.authorize(_record("tuple-a", owner=_owner(trading_date="2026-08-04")))
+    assert await repo.list_resumable(
+        session_id="session-a",
+        broker_account_identity="paper-a",
+        trading_date="2026-08-05",
+    ) == []
+
+
+def test_provider_kind_alone_is_not_account_identity() -> None:
+    with pytest.raises(ValueError, match="provider kind"):
+        _owner(broker_account_id="webull_paper")
+
+
+@pytest.mark.asyncio
+async def test_raw_webull_account_id_is_never_persisted(tmp_path) -> None:
+    raw_account_id = "RAW_WEBULL_ACCOUNT_123456"
+    identity = paper_account_identity(
+        broker_kind="webull_paper",
+        env=EnvSettings.model_construct(webull_paper_account_id=raw_account_id),
+    )
+    db_path = tmp_path / "state.db"
+    repo = PortfolioExecutionRepository(db_path)
+    await repo.authorize(
+        _record("tuple-a", owner=_owner(broker_account_id=identity))
+    )
+
+    assert raw_account_id.encode() not in db_path.read_bytes()
+    stored = await repo.get("tuple-a")
+    assert stored is not None and stored.broker_account_id == identity
+
+
+@pytest.mark.asyncio
+async def test_matching_hashed_account_resumes_normally(tmp_path) -> None:
+    identity = paper_account_identity(
+        broker_kind="webull_paper",
+        env=EnvSettings.model_construct(webull_paper_account_id="ACCOUNT_A"),
+    )
+    repo = PortfolioExecutionRepository(tmp_path / "state.db")
+    await repo.authorize(_record("tuple-a", owner=_owner(broker_account_id=identity)))
+    rows = await repo.list_resumable(
+        session_id="session-a",
+        broker_account_identity=identity,
+        trading_date="2026-08-05",
+    )
+    assert [row.authorized_position_tuple_id for row in rows] == ["tuple-a"]
+
+
+@pytest.mark.asyncio
+async def test_different_hashed_account_cannot_resume(tmp_path) -> None:
+    identity_a = paper_account_identity(
+        broker_kind="webull_paper",
+        env=EnvSettings.model_construct(webull_paper_account_id="ACCOUNT_A"),
+    )
+    identity_b = paper_account_identity(
+        broker_kind="webull_paper",
+        env=EnvSettings.model_construct(webull_paper_account_id="ACCOUNT_B"),
+    )
+    repo = PortfolioExecutionRepository(tmp_path / "state.db")
+    await repo.authorize(_record("tuple-a", owner=_owner(broker_account_id=identity_a)))
+    assert await repo.list_resumable(
+        session_id="session-a",
+        broker_account_identity=identity_b,
+        trading_date="2026-08-05",
+    ) == []
 
 
 @pytest.mark.asyncio
@@ -122,15 +233,15 @@ async def test_two_sessions_in_one_database_do_not_cross_resume(tmp_path) -> Non
     await repo.authorize(
         _record(
             "tuple-b",
-            owner=_owner(session_id="session-b", run_id="run-b"),
+            owner=_owner(session_id="session-b"),
+            origin_run_id="run-b",
             decision_id="decision-b",
         )
     )
 
     rows = await repo.list_resumable(
         session_id="session-a",
-        run_id="run-a",
-        broker_account_id="paper-a",
+        broker_account_identity="paper-a",
         trading_date="2026-08-05",
     )
     assert [row.authorized_position_tuple_id for row in rows] == ["tuple-a"]
@@ -368,3 +479,69 @@ async def test_post_fill_checkpoint_is_atomic_and_authoritative(tmp_path) -> Non
     assert filled.post_fill_snapshot_id == "snapshot-post-fill"
     assert filled.reconciled_filled_quantity == 1
     assert filled.state_version == submitted.state_version + 1
+
+
+def _reoptimization_request(*, origin_run_id: str) -> PortfolioReoptimizationRequestRecord:
+    request_id = stable_reoptimization_request_id(
+        session_id="session-a",
+        broker_account_identity="paper-a",
+        trading_date="2026-08-05",
+        original_portfolio_decision_id="decision-a",
+        remaining_authorized_tuple_ids=("tuple-b",),
+    )
+    return PortfolioReoptimizationRequestRecord(
+        request_id=request_id,
+        session_id="session-a",
+        origin_run_id=origin_run_id,
+        broker_account_identity="paper-a",
+        trading_date="2026-08-05",
+        original_portfolio_decision_id="decision-a",
+        already_filled_tuple_ids=("tuple-a",),
+        open_positions=({"contract_id": "contract-a", "quantity": 1},),
+        remaining_authorized_tuple_ids=("tuple-b",),
+        reason_codes=("capital_changed",),
+        latest_objective_state={"version": 2},
+        latest_objective_version=2,
+        latest_snapshot_id="snapshot-b",
+        created_exchange_time=NOW,
+    )
+
+
+@pytest.mark.asyncio
+async def test_same_session_account_date_new_run_resumes_reoptimization(tmp_path) -> None:
+    repo = PortfolioReoptimizationRepository(tmp_path / "state.db")
+    origin_run_id = str(uuid4())
+    request = await repo.enqueue(_reoptimization_request(origin_run_id=origin_run_id))
+    current_run_id = str(uuid4())
+
+    pending = await repo.list_pending(
+        session_id="session-a",
+        broker_account_identity="paper-a",
+        trading_date="2026-08-05",
+    )
+    attempted = await repo.begin_attempt(
+        pending[0].request_id,
+        owner=_owner(),
+        current_run_id=current_run_id,
+        attempt_exchange_time=NOW,
+    )
+
+    assert attempted.request_id == request.request_id
+    assert attempted.origin_run_id == origin_run_id
+    assert attempted.last_resumed_run_id == current_run_id
+    assert attempted.last_attempt_run_id == current_run_id
+    assert attempted.resume_count == 1
+    assert attempted.attempt_count == 1
+
+
+def test_different_run_alone_does_not_change_reoptimization_identity() -> None:
+    kwargs = {
+        "session_id": "session-a",
+        "broker_account_identity": "paper-a",
+        "trading_date": "2026-08-05",
+        "original_portfolio_decision_id": "decision-a",
+        "remaining_authorized_tuple_ids": ("tuple-b",),
+    }
+    assert stable_reoptimization_request_id(**kwargs) == stable_reoptimization_request_id(
+        **kwargs
+    )

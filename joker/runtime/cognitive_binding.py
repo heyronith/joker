@@ -75,6 +75,7 @@ def bind_cognitive_graph_to_task1(
         return await dq_repo.get_by_id(report_id)
 
     deps.execution_runtime = execution
+    deps.broker_account_identity = execution.broker_account_identity
     deps.submit_callback = _submit_callback
     deps.projection_loader = _projection_loader
     deps.data_quality_loader = _data_quality_loader

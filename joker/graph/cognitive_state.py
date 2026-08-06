@@ -115,8 +115,11 @@ class CognitiveGraphState(TypedDict, total=False):
     _execution_command_ids: list[str] | None
     _portfolio_execution_state: list | None
     _portfolio_reoptimization_request_id: str | None
+    _portfolio_execution_owner: dict[str, str] | None
     _reoptimization_excluded_contract_ids: list[str] | None
     _reoptimization_existing_positions: list[dict] | None
+    _reoptimization_expected_objective_version: int | None
+    _reoptimization_expected_snapshot_id: str | None
 
     # Position graph channels
     _position_id: str | None

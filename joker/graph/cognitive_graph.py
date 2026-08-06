@@ -804,10 +804,17 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
                 else deps.session_id
             )
             broker_account_id = (
-                deps.execution_runtime.broker_account_id
+                deps.execution_runtime.broker_account_identity
                 if deps.execution_runtime is not None
-                else "default"
+                else deps.broker_account_identity
             )
+            if not broker_account_id:
+                return append_error(
+                    state,
+                    node_name="submit_execution_command",
+                    error_code="portfolio_execution_owner_unavailable",
+                    message="broker account identity required for portfolio ownership",
+                )
             if runtime_session != deps.session_id or (
                 state.get("session_id") and str(state["session_id"]) != deps.session_id
             ):
@@ -826,8 +833,7 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
                 )
             portfolio_owner = PortfolioExecutionOwner(
                 session_id=deps.session_id,
-                run_id=deps.run_id,
-                broker_account_id=broker_account_id,
+                broker_account_identity=broker_account_id,
                 trading_date=deps.clock.trading_date().isoformat(),
             )
         if deps.provenance_registry is not None and portfolio_decision.get("decision_id"):
@@ -873,8 +879,20 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
             for component_index, position in enumerate(authorized_positions):
                 tuple_id = str(position["position_tuple_id"])
                 legacy = submitted_by_tuple.get(tuple_id)
+                durable_existing = await portfolio_execution_repo.get(tuple_id)
+                if durable_existing is not None and not portfolio_owner.matches(
+                    durable_existing
+                ):
+                    return append_error(
+                        state,
+                        node_name="submit_execution_command",
+                        error_code="portfolio_execution_owner_mismatch",
+                        message="authorized tuple is owned by a different durable session",
+                    )
                 client_order_id = (
-                    legacy.client_order_id
+                    durable_existing.client_order_id
+                    if durable_existing is not None
+                    else legacy.client_order_id
                     if legacy is not None
                     else stable_portfolio_client_order_id(
                         str(portfolio_decision["decision_id"]), tuple_id
@@ -882,8 +900,12 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
                 )
                 record = PortfolioExecutionComponentRecord(
                     session_id=portfolio_owner.session_id,
-                    run_id=portfolio_owner.run_id,
-                    broker_account_id=portfolio_owner.broker_account_id,
+                    origin_run_id=(
+                        durable_existing.origin_run_id
+                        if durable_existing is not None
+                        else deps.run_id
+                    ),
+                    broker_account_identity=portfolio_owner.broker_account_identity,
                     trading_date=portfolio_owner.trading_date,
                     target_portfolio_decision_id=str(portfolio_decision["decision_id"]),
                     selected_portfolio_id=(
@@ -906,7 +928,30 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
                     original_decision_snapshot_id=str(position["snapshot_id"]),
                     evaluated_objective_version=int(position["objective_version"]),
                     evaluated_timestamp=str(evaluated_timestamp),
+                    last_resumed_run_id=(
+                        durable_existing.last_resumed_run_id
+                        if durable_existing is not None
+                        else None
+                    ),
+                    resume_count=(
+                        durable_existing.resume_count
+                        if durable_existing is not None
+                        else 0
+                    ),
+                    last_resumed_at=(
+                        durable_existing.last_resumed_at
+                        if durable_existing is not None
+                        else None
+                    ),
                     extra={
+                        "stable_owner": {
+                            "session_id": portfolio_owner.session_id,
+                            "broker_account_identity": (
+                                portfolio_owner.broker_account_identity
+                            ),
+                            "trading_date": portfolio_owner.trading_date,
+                        },
+                        "origin_run_id": deps.run_id,
                         "portfolio_decision": portfolio_decision,
                         "authorized_positions": authorized_positions,
                         "execution_proposal": proposal.model_dump(mode="json"),
@@ -1017,8 +1062,7 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
             )
             request_id = stable_reoptimization_request_id(
                 session_id=portfolio_owner.session_id,
-                run_id=portfolio_owner.run_id,
-                broker_account_id=portfolio_owner.broker_account_id,
+                broker_account_identity=portfolio_owner.broker_account_identity,
                 trading_date=portfolio_owner.trading_date,
                 original_portfolio_decision_id=str(portfolio_decision.get("decision_id") or ""),
                 remaining_authorized_tuple_ids=remaining,
@@ -1027,8 +1071,8 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
                 PortfolioReoptimizationRequestRecord(
                     request_id=request_id,
                     session_id=portfolio_owner.session_id,
-                    run_id=portfolio_owner.run_id,
-                    broker_account_id=portfolio_owner.broker_account_id,
+                    origin_run_id=deps.run_id,
+                    broker_account_identity=portfolio_owner.broker_account_identity,
                     trading_date=portfolio_owner.trading_date,
                     original_portfolio_decision_id=str(portfolio_decision.get("decision_id") or ""),
                     already_filled_tuple_ids=tuple(
@@ -1048,6 +1092,14 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
                         else datetime.now(timezone.utc).isoformat()
                     ),
                     extra={
+                        "stable_owner": {
+                            "session_id": portfolio_owner.session_id,
+                            "broker_account_identity": (
+                                portfolio_owner.broker_account_identity
+                            ),
+                            "trading_date": portfolio_owner.trading_date,
+                        },
+                        "origin_run_id": deps.run_id,
                         "original_authorized_positions": authorized_positions,
                         "source_cycle_id": state.get("cycle_id"),
                     },
@@ -1633,7 +1685,7 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
                 action_request = replace(
                     action_request,
                     session_id=(portfolio_owner.session_id if portfolio_owner else None),
-                    run_id=(portfolio_owner.run_id if portfolio_owner else None),
+                    run_id=deps.run_id,
                     broker_account_id=(
                         portfolio_owner.broker_account_id
                         if portfolio_owner
@@ -1788,11 +1840,19 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
                                     if portfolio_owner
                                     else deps.session_id
                                 ),
-                                "run_id": (
-                                    portfolio_owner.run_id if portfolio_owner else deps.run_id
+                                "run_id": deps.run_id,
+                                "origin_run_id": (
+                                    component_record.origin_run_id
+                                    if component_record is not None
+                                    else deps.run_id
                                 ),
-                                "broker_account_id": (
-                                    portfolio_owner.broker_account_id
+                                "last_resumed_run_id": (
+                                    component_record.last_resumed_run_id
+                                    if component_record is not None
+                                    else None
+                                ),
+                                "broker_account_identity": (
+                                    portfolio_owner.broker_account_identity
                                     if portfolio_owner
                                     else "default"
                                 ),
