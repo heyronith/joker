@@ -890,6 +890,76 @@ async def test_resolve_failed_request_also_resolves_associated_components(tmp_pa
 
 
 @pytest.mark.asyncio
+async def test_terminal_recovery_supersedes_authorized_suffix(tmp_path) -> None:
+    db = tmp_path / "state.db"
+    components = PortfolioExecutionRepository(db)
+    requests = PortfolioReoptimizationRepository(db)
+    owner = _owner()
+    await components.authorize(_record("tuple-b", owner=owner))
+    record = _reoptimization_request(origin_run_id="run-a")
+
+    resolved = await requests.resolve_terminal_recovery(
+        record,
+        resolved_at=NOW,
+        resolved_by="run-terminal",
+        terminal_recovery_reason="reconciliation_only_resume_no_new_entries",
+        objective_status="deadline_reached",
+    )
+    component = await components.get("tuple-b")
+    assert resolved.status == PortfolioReoptimizationStatus.COMPLETED
+    assert resolved.replacement_action == "WAIT"
+    assert component is not None
+    assert component.status == PortfolioComponentStatus.REOPTIMIZATION_REQUIRED
+    assert component.resolution_status == PortfolioComponentResolutionStatus.OPERATOR_RESOLVED
+    assert component.resolution_reason == "reconciliation_only_resume_no_new_entries"
+
+
+@pytest.mark.asyncio
+async def test_terminal_recovery_leaves_no_pending_reoptimization(tmp_path) -> None:
+    db = tmp_path / "state.db"
+    components = PortfolioExecutionRepository(db)
+    requests = PortfolioReoptimizationRepository(db)
+    await components.authorize(_record("tuple-b"))
+    await requests.resolve_terminal_recovery(
+        _reoptimization_request(origin_run_id="run-a"),
+        resolved_at=NOW,
+        resolved_by="run-terminal",
+        terminal_recovery_reason="reconciliation_only_resume_no_new_entries",
+        objective_status="deadline_reached",
+    )
+    assert not await requests.list_pending(
+        session_id="session-a",
+        broker_account_identity="paper-a",
+        trading_date="2026-08-05",
+    )
+
+
+@pytest.mark.asyncio
+async def test_terminal_recovery_resolution_releases_owner_gate(tmp_path) -> None:
+    db = tmp_path / "state.db"
+    components = PortfolioExecutionRepository(db)
+    requests = PortfolioReoptimizationRepository(db)
+    await components.authorize(_record("tuple-b"))
+    await requests.resolve_terminal_recovery(
+        _reoptimization_request(origin_run_id="run-a"),
+        resolved_at=NOW,
+        resolved_by="run-terminal",
+        terminal_recovery_reason="reconciliation_only_resume_no_new_entries",
+        objective_status="deadline_reached",
+    )
+    assert not await components.has_unresolved(
+        session_id="session-a",
+        broker_account_identity="paper-a",
+        trading_date="2026-08-05",
+    )
+    assert not await requests.has_unresolved(
+        session_id="session-a",
+        broker_account_identity="paper-a",
+        trading_date="2026-08-05",
+    )
+
+
+@pytest.mark.asyncio
 async def test_retry_failed_request_keeps_components_unresolved(tmp_path) -> None:
     db = tmp_path / "state.db"
     components = PortfolioExecutionRepository(db)
@@ -926,6 +996,64 @@ async def test_retry_failed_request_keeps_components_unresolved(tmp_path) -> Non
         broker_account_identity="paper-a",
         trading_date="2026-08-05",
     )
+
+
+@pytest.mark.asyncio
+async def test_lost_request_cas_rolls_back_component_resolution(tmp_path) -> None:
+    db = tmp_path / "state.db"
+    components = PortfolioExecutionRepository(db)
+    requests_a = PortfolioReoptimizationRepository(db)
+    requests_b = PortfolioReoptimizationRepository(db)
+    await components.authorize(_record("tuple-b"))
+    await components.transition(
+        "tuple-b",
+        owner=_owner(),
+        status=PortfolioComponentStatus.REOPTIMIZATION_REQUIRED,
+    )
+    request = await requests_a.enqueue(_reoptimization_request(origin_run_id="run-a"))
+    running = await requests_a.begin_attempt(
+        request.request_id,
+        owner=_owner(),
+        current_run_id="run-a",
+        attempt_exchange_time=NOW,
+    )
+    await requests_a.fail_attempt(
+        attempt=running,
+        failed_at=NOW,
+        failure_reason="manual_review_required",
+    )
+    stale_failed = await requests_a.get(request.request_id)
+    assert stale_failed is not None
+    original_get = requests_a.get
+    calls = 0
+
+    async def _stale_then_live(request_id: str):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return stale_failed
+        return await original_get(request_id)
+
+    requests_a.get = _stale_then_live  # type: ignore[method-assign]
+    await requests_b.retry_failed(
+        request.request_id,
+        requested_at=(datetime.fromisoformat(NOW) + timedelta(seconds=1)).isoformat(),
+        requested_by="operator:other",
+        resolution_reason="won race",
+    )
+    try:
+        with pytest.raises(PortfolioTransitionConflict, match="lost CAS race"):
+            await requests_a.resolve_failed(
+                request.request_id,
+                resolved_at=(datetime.fromisoformat(NOW) + timedelta(seconds=2)).isoformat(),
+                resolved_by="operator:self",
+                resolution_reason="lost race",
+            )
+    finally:
+        requests_a.get = original_get  # type: ignore[method-assign]
+    component = await components.get("tuple-b")
+    assert component is not None
+    assert component.resolution_status == PortfolioComponentResolutionStatus.UNRESOLVED
 
 
 @pytest.mark.asyncio

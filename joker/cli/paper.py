@@ -246,6 +246,11 @@ def paper_run(
         "--objective-session",
         help="Objective lifecycle: 'new' starts a new objective; 'resume' recovers the active one",
     ),
+    resume_session_id: Optional[str] = typer.Option(
+        None,
+        "--resume-session-id",
+        help="Explicit stable session id to recover when multiple unresolved sessions exist",
+    ),
 ) -> None:
     """Run the full live paper loop: monitor → decide → risk → auto order → log."""
     import asyncio
@@ -261,9 +266,11 @@ def paper_run(
     )
     from joker.cli.session_confirm import (
         confirm_session_capital,
+        discover_objective_recovery_candidates,
         confirm_session_objective,
         has_unresolved_portfolio_work,
         recover_session_objective_bundle,
+        select_recovery_candidate,
         validate_objective_session_action,
         validate_resume_mutation_flags,
     )
@@ -288,6 +295,9 @@ def paper_run(
     objective_session = objective_session.strip().lower()
     if objective_session not in {"new", "resume"}:
         console.print("[red]--objective-session must be 'new' or 'resume'[/red]")
+        raise typer.Exit(code=1)
+    if resume_session_id is not None and objective_session != "resume":
+        console.print("[red]--resume-session-id requires --objective-session resume[/red]")
         raise typer.Exit(code=1)
 
     result = validate_startup(config_path=config, skip_model_check=skip_model_check)
@@ -407,6 +417,7 @@ def paper_run(
 
     from joker.runtime.cognitive_session import (
         paper_account_identity,
+        stable_cognitive_session_trading_date,
         stable_cognitive_session_id,
     )
 
@@ -415,10 +426,11 @@ def paper_run(
         broker_kind=broker_kind,
         env=result.env_settings,
     )
-    session_id = stable_cognitive_session_id(
+    current_session_id = stable_cognitive_session_id(
         trading_date=exchange_now.date(),
         account_identity=account_identity,
     )
+    session_id = current_session_id
     task1_db = Path(result.app_settings.db_path).resolve().parent / "joker_task1.db"
     provenance_db = task1_db.with_name(task1_db.stem + "_cognitive_provenance.db")
 
@@ -433,6 +445,41 @@ def paper_run(
         from joker.objectives.repository import ObjectiveRepository
 
         objective_repo = ObjectiveRepository(task1_db)
+        recovery_candidates = asyncio.run(
+            discover_objective_recovery_candidates(
+                objective_db_path=task1_db,
+                provenance_db_path=provenance_db,
+                broker_account_identity=account_identity,
+            )
+        )
+        candidates_by_session = {
+            candidate.session_id: candidate for candidate in recovery_candidates
+        }
+        if objective_session == "resume":
+            requested_resume_session_id = (
+                resume_session_id.strip() if resume_session_id is not None else None
+            ) or None
+            try:
+                selected_candidate = select_recovery_candidate(
+                    recovery_candidates,
+                    requested_session_id=requested_resume_session_id,
+                )
+            except ValueError as exc:
+                console.print(
+                    f"[red]{exc}[/red]"
+                )
+                raise typer.Exit(code=1) from exc
+            if selected_candidate is not None:
+                session_id = selected_candidate.session_id
+            elif requested_resume_session_id is not None:
+                session_id = requested_resume_session_id
+        elif recovery_candidates:
+            console.print(
+                "[red]An unfinished or unresolved durable objective session already "
+                "exists for this account. Resume and reconcile it before starting "
+                "a new objective.[/red]"
+            )
+            raise typer.Exit(code=1)
         existing_definition = objective_repo.latest_definition_for_session(session_id)
         if existing_definition is not None:
             bundle = asyncio.run(
@@ -445,12 +492,21 @@ def paper_run(
                 )
             )
             existing_state = objective_repo.latest_state_for_session(session_id)
+        persisted_trading_date = (
+            candidates_by_session[session_id].trading_date
+            if session_id in candidates_by_session
+            else (
+                stable_cognitive_session_trading_date(session_id).isoformat()
+                if stable_cognitive_session_trading_date(session_id) is not None
+                else exchange_now.date().isoformat()
+            )
+        )
         unresolved_work = asyncio.run(
             has_unresolved_portfolio_work(
                 provenance_db_path=provenance_db,
                 session_id=session_id,
                 broker_account_identity=account_identity,
-                trading_date=exchange_now.date().isoformat(),
+                trading_date=persisted_trading_date,
             )
         )
         try:
@@ -541,7 +597,7 @@ def paper_run(
                 duration_minutes=duration_minutes,
                 calendar=calendar,
                 now=exchange_now,
-                require_regular_session=True,
+                require_regular_session=False,
             )
         else:
             timing = resolve_paper_goal_timing(

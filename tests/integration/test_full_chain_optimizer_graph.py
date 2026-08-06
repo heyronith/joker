@@ -887,6 +887,9 @@ async def test_reconciliation_only_resume_never_submits_new_component(
     from joker.persistence.cognitive_execution_provenance import (
         PortfolioComponentResolutionStatus,
         PortfolioComponentStatus,
+        PortfolioExecutionOwner,
+        PortfolioReoptimizationStatus,
+        stable_reoptimization_request_id,
     )
 
     broker = ControllablePaperBroker(["open", "filled"])
@@ -902,12 +905,44 @@ async def test_reconciliation_only_resume_never_submits_new_component(
         await runtime._resume_portfolio_decision(decision_id)
 
         resumed = await registry.portfolio_executions.list_by_decision(decision_id)
+        owner = PortfolioExecutionOwner(
+            session_id=resumed[0].session_id,
+            broker_account_identity=resumed[0].broker_account_identity,
+            trading_date=resumed[0].trading_date,
+        )
+        request_id = stable_reoptimization_request_id(
+            session_id=owner.session_id,
+            broker_account_identity=owner.broker_account_identity,
+            trading_date=owner.trading_date,
+            original_portfolio_decision_id=decision_id,
+            remaining_authorized_tuple_ids=(resumed[1].authorized_position_tuple_id,),
+        )
+        terminal_request = await registry.portfolio_reoptimizations.get(request_id)
         assert broker.external_submission_count == 1
         assert [record.status.value for record in resumed] == [
             "FILLED",
             "REOPTIMIZATION_REQUIRED",
         ]
-        assert resumed[1].resolution_status == PortfolioComponentResolutionStatus.UNRESOLVED
+        assert resumed[1].resolution_status == PortfolioComponentResolutionStatus.OPERATOR_RESOLVED
+        assert resumed[1].resolution_reason == "reconciliation_only_resume_no_new_entries"
+        assert terminal_request is not None
+        assert terminal_request.status == PortfolioReoptimizationStatus.COMPLETED
+        assert terminal_request.replacement_action == "WAIT"
+        assert not await registry.portfolio_reoptimizations.list_pending(
+            session_id=owner.session_id,
+            broker_account_identity=owner.broker_account_identity,
+            trading_date=owner.trading_date,
+        )
+        assert not await registry.portfolio_executions.has_unresolved(
+            session_id=owner.session_id,
+            broker_account_identity=owner.broker_account_identity,
+            trading_date=owner.trading_date,
+        )
+        assert not await registry.portfolio_reoptimizations.has_unresolved(
+            session_id=owner.session_id,
+            broker_account_identity=owner.broker_account_identity,
+            trading_date=owner.trading_date,
+        )
     finally:
         await _teardown_stack(stack)
 

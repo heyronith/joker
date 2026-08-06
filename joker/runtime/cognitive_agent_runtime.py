@@ -125,6 +125,7 @@ class CognitiveAgentRuntime:
         # not enqueue new-entry decision cycles (shadow evidence collection).
         self._suppress_new_entry_snapshots = False
         self._reconciliation_only_recovery = False
+        self._reoptimization_retry_tasks: dict[str, asyncio.Task[None]] = {}
         self._counters = _RuntimeCounters()
         self._status: str = "healthy"
         self._received_events: list[DomainEvent] = []
@@ -143,6 +144,16 @@ class CognitiveAgentRuntime:
         if execution is not None:
             return execution.broker_account_identity
         return str(self._deps.broker_account_identity or "")
+
+    def _stable_trading_date(self) -> str:
+        from joker.runtime.cognitive_session import stable_cognitive_session_trading_date
+
+        parsed = stable_cognitive_session_trading_date(self._session_id)
+        if parsed is not None:
+            return parsed.isoformat()
+        if self._deps.clock is None:
+            raise RuntimeError("exchange clock required for stable trading date")
+        return self._deps.clock.trading_date().isoformat()
 
     def suppress_new_entry_snapshots(self, suppressed: bool = True) -> None:
         """Block new-entry decision enqueue while still allowing position cycles."""
@@ -236,7 +247,7 @@ class CognitiveAgentRuntime:
         records = await registry.portfolio_executions.list_resumable(
             session_id=self._session_id,
             broker_account_identity=broker_account_id,
-            trading_date=self._deps.clock.trading_date().isoformat(),
+            trading_date=self._stable_trading_date(),
         )
         decision_ids = sorted({record.target_portfolio_decision_id for record in records})
         for decision_id in decision_ids:
@@ -256,7 +267,7 @@ class CognitiveAgentRuntime:
         owner = PortfolioExecutionOwner(
             session_id=self._session_id,
             broker_account_identity=self._broker_account_identity(),
-            trading_date=self._deps.clock.trading_date().isoformat(),
+            trading_date=self._stable_trading_date(),
         )
         records = await registry.portfolio_executions.list_by_decision(decision_id, owner=owner)
         if not records:
@@ -345,7 +356,7 @@ class CognitiveAgentRuntime:
         owner = PortfolioExecutionOwner(
             session_id=self._session_id,
             broker_account_identity=broker_account_id,
-            trading_date=self._deps.clock.trading_date().isoformat(),
+            trading_date=self._stable_trading_date(),
         )
         component = await registry.portfolio_executions.get_by_client_order_id(
             client_order_id, owner=owner
@@ -367,7 +378,7 @@ class CognitiveAgentRuntime:
         requests = await registry.portfolio_reoptimizations.list_pending(
             session_id=self._session_id,
             broker_account_identity=broker_account_id,
-            trading_date=self._deps.clock.trading_date().isoformat(),
+            trading_date=self._stable_trading_date(),
         )
         for request in requests:
             event = make_event(
@@ -382,6 +393,64 @@ class CognitiveAgentRuntime:
                 },
             )
             await self._invoke_decision_graph(event)
+
+    async def _schedule_reoptimization_retry(
+        self, request: Any, *, lease_expiry: str
+    ) -> None:
+        """Retry a fenced request after the current owner's lease expires."""
+        if self._deps.provenance_registry is None or self._deps.clock is None:
+            return
+        try:
+            expiry = datetime.fromisoformat(lease_expiry)
+        except ValueError:
+            return
+        if expiry.tzinfo is None:
+            return
+        existing = self._reoptimization_retry_tasks.get(str(request.request_id))
+        if existing is not None and not existing.done():
+            return
+        delay = max(0.0, (expiry - self._deps.clock.now()).total_seconds()) + 0.05
+        request_id = str(request.request_id)
+        attempt_generation = int(getattr(request, "attempt_generation", 0) or 0)
+
+        async def _retry() -> None:
+            try:
+                await asyncio.sleep(delay)
+                if self._shutdown or self._reconciliation_only_recovery:
+                    return
+                latest = await self._deps.provenance_registry.portfolio_reoptimizations.get(
+                    request_id
+                )
+                if latest is None:
+                    return
+                if latest.status.value not in {"PENDING", "RUNNING"}:
+                    return
+                if (
+                    latest.status.value == "RUNNING"
+                    and latest.attempt_owner_run_id != self._run_id
+                    and latest.attempt_lease_expires_at
+                ):
+                    try:
+                        latest_expiry = datetime.fromisoformat(latest.attempt_lease_expires_at)
+                    except ValueError:
+                        latest_expiry = None
+                    if latest_expiry is not None and latest_expiry.tzinfo is not None:
+                        if self._deps.clock.now() < latest_expiry:
+                            if latest.attempt_generation != attempt_generation:
+                                self._reoptimization_retry_tasks.pop(request_id, None)
+                            await self._schedule_reoptimization_retry(
+                                latest, lease_expiry=latest.attempt_lease_expires_at
+                            )
+                            return
+                await self._resume_pending_portfolio_reoptimizations()
+            finally:
+                current = self._reoptimization_retry_tasks.get(request_id)
+                if current is asyncio.current_task():
+                    self._reoptimization_retry_tasks.pop(request_id, None)
+
+        self._reoptimization_retry_tasks[request_id] = asyncio.create_task(
+            _retry(), name=f"portfolio-reoptimization-retry:{request_id}"
+        )
 
     async def _resume_unfinished_cycles(self) -> None:
         registry = self._deps.cycle_registry
@@ -778,6 +847,15 @@ class CognitiveAgentRuntime:
                     await worker
                 except asyncio.CancelledError:
                     pass
+        retry_tasks = list(self._reoptimization_retry_tasks.values())
+        for task in retry_tasks:
+            task.cancel()
+        for task in retry_tasks:
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        self._reoptimization_retry_tasks.clear()
         self._decision_worker = None
         self._position_worker = None
         self._status = "paused"
@@ -1102,7 +1180,7 @@ class CognitiveAgentRuntime:
             runtime_owner = PortfolioExecutionOwner(
                 session_id=self._session_id,
                 broker_account_identity=broker_account_id,
-                trading_date=self._deps.clock.trading_date().isoformat(),
+                trading_date=self._stable_trading_date(),
             )
             if reoptimization_request.owner != runtime_owner:
                 logger.warning(
@@ -1150,18 +1228,27 @@ class CognitiveAgentRuntime:
         )
         if reoptimization_request is not None:
             from joker.persistence.cognitive_execution_provenance import (
+                PortfolioAttemptLeaseActive,
                 PortfolioReoptimizationStatus,
             )
 
             preclaim_request = reoptimization_request
-            reoptimization_request = await (
-                self._deps.provenance_registry.portfolio_reoptimizations.begin_attempt(
-                    reoptimization_request.request_id,
-                    owner=reoptimization_request.owner,
-                    current_run_id=self._run_id,
-                    attempt_exchange_time=self._deps.clock.now().isoformat(),
+            try:
+                reoptimization_request = await (
+                    self._deps.provenance_registry.portfolio_reoptimizations.begin_attempt(
+                        reoptimization_request.request_id,
+                        owner=reoptimization_request.owner,
+                        current_run_id=self._run_id,
+                        attempt_exchange_time=self._deps.clock.now().isoformat(),
+                    )
                 )
-            )
+            except PortfolioAttemptLeaseActive:
+                if preclaim_request.attempt_lease_expires_at:
+                    await self._schedule_reoptimization_retry(
+                        preclaim_request,
+                        lease_expiry=preclaim_request.attempt_lease_expires_at,
+                    )
+                return
             if (
                 preclaim_request.status == PortfolioReoptimizationStatus.RUNNING
                 and reoptimization_request.state_version == preclaim_request.state_version

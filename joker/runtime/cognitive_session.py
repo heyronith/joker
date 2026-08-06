@@ -63,6 +63,17 @@ def stable_cognitive_session_id(
     return f"cog:{mode_key}:{identity}:{trading_date.isoformat()}"
 
 
+def stable_cognitive_session_trading_date(session_id: str) -> date | None:
+    """Best-effort recovery of the durable trading date from a stable session id."""
+    raw = (session_id or "").strip()
+    if not raw:
+        return None
+    try:
+        return date.fromisoformat(raw.rsplit(":", 1)[-1])
+    except ValueError:
+        return None
+
+
 def live_paper_cognitive_session_id(
     *,
     broker_kind: str,

@@ -330,6 +330,30 @@ class ObjectiveRepository:
             return None
         return SessionObjectiveDefinition.model_validate_json(row["payload_json"])
 
+    def list_sessions_for_account_identity(
+        self,
+        *,
+        account_identity: str,
+        mode: str = "paper",
+    ) -> list[str]:
+        """List durable objective session ids for one stable account identity."""
+        prefix = (
+            f"cog:{(mode or 'paper').strip().lower()}:"
+            f"{(account_identity or '').strip().lower()}:"
+        )
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT session_id, MAX(created_at) AS latest_created_at
+                FROM session_objective_definitions
+                WHERE LOWER(session_id) LIKE ?
+                GROUP BY session_id
+                ORDER BY latest_created_at DESC, session_id ASC
+                """,
+                (prefix + "%",),
+            ).fetchall()
+        return [str(row["session_id"]) for row in rows if row["session_id"]]
+
     def append_state(self, state: SessionObjectiveState) -> None:
         with self._connect() as conn:
             self._insert_state(conn, state)

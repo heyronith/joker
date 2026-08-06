@@ -1263,6 +1263,44 @@ class PortfolioExecutionRepository:
             ).fetchone()
         return row is not None
 
+    async def list_unresolved_owners(
+        self, *, broker_account_identity: str
+    ) -> list[PortfolioExecutionOwner]:
+        """Discover stable owners that still retain unresolved component work."""
+        await self._ensure()
+        async with aiosqlite.connect(self._db_path) as db:
+            db.row_factory = aiosqlite.Row
+            rows = await (
+                await db.execute(
+                    """
+                    SELECT DISTINCT session_id, broker_account_id, trading_date
+                    FROM portfolio_execution_components
+                    WHERE broker_account_id = ?
+                      AND (
+                        status IN (
+                            'AUTHORIZED', 'READY', 'SUBMITTED',
+                            'WORKING', 'PARTIALLY_FILLED'
+                        )
+                        OR (
+                            status = 'REOPTIMIZATION_REQUIRED'
+                            AND COALESCE(resolution_status, 'UNRESOLVED') = 'UNRESOLVED'
+                        )
+                      )
+                    ORDER BY trading_date DESC, session_id ASC
+                    """,
+                    (broker_account_identity,),
+                )
+            ).fetchall()
+        return [
+            PortfolioExecutionOwner(
+                session_id=str(row["session_id"]),
+                broker_account_identity=str(row["broker_account_id"]),
+                trading_date=str(row["trading_date"]),
+            )
+            for row in rows
+            if row["session_id"] and row["broker_account_id"] and row["trading_date"]
+        ]
+
     @staticmethod
     def _row(row: aiosqlite.Row) -> PortfolioExecutionComponentRecord:
         return PortfolioExecutionComponentRecord(
@@ -1635,6 +1673,41 @@ class PortfolioReoptimizationRepository:
             ).fetchone()
         return row is not None
 
+    async def list_unresolved_owners(
+        self, *, broker_account_identity: str
+    ) -> list[PortfolioExecutionOwner]:
+        """Discover stable owners that still retain unresolved reoptimization work."""
+        await self._ensure()
+        async with aiosqlite.connect(self._db_path) as db:
+            db.row_factory = aiosqlite.Row
+            rows = await (
+                await db.execute(
+                    """
+                    SELECT DISTINCT session_id, broker_account_id, trading_date
+                    FROM portfolio_reoptimization_requests
+                    WHERE broker_account_id = ?
+                      AND (
+                        status IN ('PENDING', 'RUNNING')
+                        OR (
+                            status = 'FAILED'
+                            AND COALESCE(resolution_status, 'UNRESOLVED') != 'RESOLVED'
+                        )
+                      )
+                    ORDER BY trading_date DESC, session_id ASC
+                    """,
+                    (broker_account_identity,),
+                )
+            ).fetchall()
+        return [
+            PortfolioExecutionOwner(
+                session_id=str(row["session_id"]),
+                broker_account_identity=str(row["broker_account_id"]),
+                trading_date=str(row["trading_date"]),
+            )
+            for row in rows
+            if row["session_id"] and row["broker_account_id"] and row["trading_date"]
+        ]
+
     async def begin_attempt(
         self,
         request_id: str,
@@ -1761,6 +1834,15 @@ class PortfolioReoptimizationRepository:
                     existing.state_version,
                 ),
             )
+            if cur.rowcount != 1:
+                await db.rollback()
+                latest = await self.get(request_id)
+                if latest is not None and (
+                    latest.resolution_status
+                    == PortfolioReoptimizationResolutionStatus.RESOLVED
+                ):
+                    return latest
+                raise PortfolioTransitionConflict("failed-request resolution lost CAS race")
             await _resolve_component_obligations(
                 db,
                 owner=existing.owner,
@@ -1771,15 +1853,197 @@ class PortfolioReoptimizationRepository:
                 resolution_reason=resolution_reason,
             )
             await db.commit()
-        if cur.rowcount != 1:
-            latest = await self.get(request_id)
-            if latest is not None and (
-                latest.resolution_status
-                == PortfolioReoptimizationResolutionStatus.RESOLVED
-            ):
-                return latest
-            raise PortfolioTransitionConflict("failed-request resolution lost CAS race")
         stored = await self.get(request_id)
+        assert stored is not None
+        return stored
+
+    async def resolve_terminal_recovery(
+        self,
+        record: PortfolioReoptimizationRequestRecord,
+        *,
+        resolved_at: str,
+        resolved_by: str,
+        terminal_recovery_reason: str,
+        objective_status: str,
+    ) -> PortfolioReoptimizationRequestRecord:
+        """Terminally close no-new-entry suffix work in one SQLite transaction."""
+        parsed = datetime.fromisoformat(resolved_at)
+        if parsed.tzinfo is None:
+            raise ValueError("resolved_at must be timezone-aware")
+        if not resolved_by or not terminal_recovery_reason or not objective_status:
+            raise ValueError("terminal recovery provenance is incomplete")
+        await self._ensure()
+        existing = await self.get(record.request_id)
+        if existing is not None and existing.owner != record.owner:
+            raise PermissionError("terminal recovery request owner does not match")
+        if existing is not None and existing.status == PortfolioReoptimizationStatus.COMPLETED:
+            return existing
+        payload = json.loads(json.dumps(record.extra or {}, default=str))
+        payload.update(
+            {
+                "terminal_recovery": {
+                    "objective_status": str(objective_status),
+                    "terminal_recovery_reason": str(terminal_recovery_reason),
+                    "affected_tuple_ids": list(record.remaining_authorized_tuple_ids),
+                    "resolution_time": resolved_at,
+                    "resolving_run": resolved_by,
+                    "new_entries_prohibited": True,
+                }
+            }
+        )
+        now = record.created_at or resolved_at
+        async with aiosqlite.connect(self._db_path) as db:
+            if existing is None:
+                await db.execute(
+                    """
+                    INSERT INTO portfolio_reoptimization_requests (
+                        request_id, session_id, run_id, origin_run_id,
+                        last_resumed_run_id, resume_count, last_resumed_at,
+                        broker_account_id, trading_date,
+                        original_portfolio_decision_id,
+                        already_filled_tuple_ids_json, open_positions_json,
+                        remaining_authorized_tuple_ids_json, reason_codes_json,
+                        latest_objective_state_json, latest_objective_version,
+                        latest_snapshot_id, created_exchange_time, status,
+                        replacement_decision_id, replacement_action, failure_reason,
+                        attempt_count, last_attempt_run_id, last_attempt_exchange_time,
+                        attempt_owner_run_id, attempt_started_at,
+                        attempt_lease_expires_at, attempt_heartbeat_at,
+                        attempt_generation, attempt_token,
+                        resolution_status, resolved_at, resolved_by, resolution_reason,
+                        state_version,
+                        created_at, updated_at, payload_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        record.request_id,
+                        record.session_id,
+                        record.origin_run_id,
+                        record.origin_run_id,
+                        record.last_resumed_run_id,
+                        record.resume_count,
+                        record.last_resumed_at,
+                        record.broker_account_id,
+                        record.trading_date,
+                        record.original_portfolio_decision_id,
+                        json.dumps(record.already_filled_tuple_ids),
+                        json.dumps(record.open_positions, sort_keys=True),
+                        json.dumps(record.remaining_authorized_tuple_ids),
+                        json.dumps(record.reason_codes),
+                        json.dumps(record.latest_objective_state, sort_keys=True),
+                        record.latest_objective_version,
+                        record.latest_snapshot_id,
+                        record.created_exchange_time,
+                        PortfolioReoptimizationStatus.COMPLETED.value,
+                        None,
+                        "WAIT",
+                        None,
+                        0,
+                        resolved_by,
+                        resolved_at,
+                        None,
+                        None,
+                        None,
+                        resolved_at,
+                        0,
+                        None,
+                        PortfolioReoptimizationResolutionStatus.RESOLVED.value,
+                        resolved_at,
+                        resolved_by,
+                        terminal_recovery_reason,
+                        0,
+                        now,
+                        resolved_at,
+                        json.dumps(payload, sort_keys=True),
+                    ),
+                )
+            else:
+                cur = await db.execute(
+                    """
+                    UPDATE portfolio_reoptimization_requests
+                    SET status = 'COMPLETED',
+                        replacement_action = 'WAIT',
+                        failure_reason = NULL,
+                        last_attempt_run_id = COALESCE(last_attempt_run_id, ?),
+                        last_attempt_exchange_time = ?,
+                        attempt_owner_run_id = NULL,
+                        attempt_started_at = NULL,
+                        attempt_lease_expires_at = NULL,
+                        attempt_heartbeat_at = ?,
+                        resolution_status = 'RESOLVED',
+                        resolved_at = ?,
+                        resolved_by = ?,
+                        resolution_reason = ?,
+                        state_version = state_version + 1,
+                        updated_at = ?,
+                        payload_json = ?
+                    WHERE request_id = ?
+                      AND session_id = ?
+                      AND broker_account_id = ?
+                      AND trading_date = ?
+                      AND status IN ('PENDING', 'RUNNING', 'FAILED')
+                    """,
+                    (
+                        resolved_by,
+                        resolved_at,
+                        resolved_at,
+                        resolved_at,
+                        resolved_by,
+                        terminal_recovery_reason,
+                        resolved_at,
+                        json.dumps(payload, sort_keys=True),
+                        record.request_id,
+                        record.session_id,
+                        record.broker_account_identity,
+                        record.trading_date,
+                    ),
+                )
+                if cur.rowcount != 1:
+                    await db.rollback()
+                    latest = await self.get(record.request_id)
+                    if latest is not None and latest.status == PortfolioReoptimizationStatus.COMPLETED:
+                        return latest
+                    raise PortfolioTransitionConflict(
+                        "terminal recovery request lost compare-and-swap race"
+                    )
+            if record.remaining_authorized_tuple_ids:
+                placeholders = ", ".join("?" for _ in record.remaining_authorized_tuple_ids)
+                await db.execute(
+                    f"""
+                    UPDATE portfolio_execution_components
+                    SET status = 'REOPTIMIZATION_REQUIRED',
+                        failure_reoptimization_reason = COALESCE(
+                            failure_reoptimization_reason, ?
+                        ),
+                        state_version = state_version + 1,
+                        updated_at = ?
+                    WHERE session_id = ?
+                      AND broker_account_id = ?
+                      AND trading_date = ?
+                      AND authorized_position_tuple_id IN ({placeholders})
+                      AND status IN ('AUTHORIZED', 'READY')
+                    """,
+                    (
+                        terminal_recovery_reason,
+                        resolved_at,
+                        record.session_id,
+                        record.broker_account_identity,
+                        record.trading_date,
+                        *record.remaining_authorized_tuple_ids,
+                    ),
+                )
+            await _resolve_component_obligations(
+                db,
+                owner=record.owner,
+                tuple_ids=record.remaining_authorized_tuple_ids,
+                resolution_status=PortfolioComponentResolutionStatus.OPERATOR_RESOLVED,
+                resolved_at=resolved_at,
+                resolved_by=resolved_by,
+                resolution_reason=terminal_recovery_reason,
+                superseded_by_reoptimization_request_id=record.request_id,
+            )
+            await db.commit()
+        stored = await self.get(record.request_id)
         assert stored is not None
         return stored
 

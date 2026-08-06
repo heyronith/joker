@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -627,3 +628,234 @@ async def test_failed_reoptimization_blocks_new_objective_until_resolved(tmp_pat
         broker_account_identity=owner.broker_account_identity,
         trading_date=owner.trading_date,
     )
+
+
+@pytest.mark.asyncio
+async def test_post_close_resume_discovers_prior_session(tmp_path: Path) -> None:
+    from joker.app.safety import SafetyMode
+    from joker.cli.session_confirm import (
+        confirm_session_objective,
+        discover_objective_recovery_candidates,
+        select_recovery_candidate,
+    )
+    from joker.config.settings import AppSettings
+    from joker.objectives.config import ObjectiveSettings
+    from joker.persistence.cognitive_execution_provenance import (
+        CognitiveExecutionProvenanceRegistry,
+        PortfolioExecutionComponentRecord,
+        PortfolioComponentStatus,
+    )
+    from joker.runtime.cognitive_session import stable_cognitive_session_id
+
+    objective_db = tmp_path / "task1.db"
+    provenance_db = tmp_path / "prov.db"
+    app = AppSettings(
+        mode=SafetyMode.PAPER,
+        live_trading_enabled=False,
+        objective=ObjectiveSettings(enabled=True),
+    )
+    session_id = stable_cognitive_session_id(
+        trading_date=date(2026, 8, 4),
+        account_identity="local_paper",
+    )
+    await confirm_session_objective(
+        app,
+        session_id=session_id,
+        db_path=objective_db,
+        authorized_usd=250.0,
+        target_profit_pct=10.0,
+        deadline_exchange_time=_regular_now(15, 0),
+        confirmed_at_exchange_time=_regular_now(10, 0),
+        max_concurrent_positions=2,
+        acknowledge_total_loss=True,
+        yes=True,
+    )
+    registry = CognitiveExecutionProvenanceRegistry(provenance_db)
+    await registry.initialize()
+    await registry.portfolio_executions.authorize(
+        PortfolioExecutionComponentRecord(
+            session_id=session_id,
+            origin_run_id="run-a",
+            broker_account_identity="local_paper",
+            trading_date="2026-08-04",
+            target_portfolio_decision_id="decision-a",
+            selected_portfolio_id="portfolio-a",
+            authorized_position_tuple_id="tuple-a",
+            component_index=0,
+            component_count=1,
+            strategy_id="strategy-a",
+            contract_id="contract-a",
+            authorized_quantity=1,
+            capital_allocation=Decimal("100"),
+            client_order_id="client-a",
+            status=PortfolioComponentStatus.WORKING,
+            submitted_quantity=1,
+            remaining_quantity=1,
+            original_decision_snapshot_id="snapshot-a",
+            evaluated_objective_version=1,
+            evaluated_timestamp=_regular_now(10, 0).isoformat(),
+        )
+    )
+    candidates = await discover_objective_recovery_candidates(
+        objective_db_path=objective_db,
+        provenance_db_path=provenance_db,
+        broker_account_identity="local_paper",
+    )
+    selected = select_recovery_candidate(candidates)
+    assert selected is not None
+    assert selected.session_id == session_id
+    assert selected.trading_date == "2026-08-04"
+
+
+@pytest.mark.asyncio
+async def test_next_day_resume_discovers_prior_unresolved_owner(tmp_path: Path) -> None:
+    from joker.app.safety import SafetyMode
+    from joker.cli.session_confirm import discover_objective_recovery_candidates
+    from joker.config.settings import AppSettings
+    from joker.objectives.config import ObjectiveSettings
+    from joker.persistence.cognitive_execution_provenance import (
+        CognitiveExecutionProvenanceRegistry,
+        PortfolioExecutionComponentRecord,
+        PortfolioComponentStatus,
+    )
+    from joker.runtime.cognitive_session import stable_cognitive_session_id
+    from joker.cli.session_confirm import confirm_session_objective
+
+    objective_db = tmp_path / "task1.db"
+    provenance_db = tmp_path / "prov.db"
+    app = AppSettings(
+        mode=SafetyMode.PAPER,
+        live_trading_enabled=False,
+        objective=ObjectiveSettings(enabled=True),
+    )
+    session_id = stable_cognitive_session_id(
+        trading_date=date(2026, 8, 5),
+        account_identity="local_paper",
+    )
+    await confirm_session_objective(
+        app,
+        session_id=session_id,
+        db_path=objective_db,
+        authorized_usd=250.0,
+        target_profit_pct=10.0,
+        deadline_exchange_time=_regular_now(15, 0) + timedelta(days=1),
+        confirmed_at_exchange_time=_regular_now(10, 0) + timedelta(days=1),
+        max_concurrent_positions=2,
+        acknowledge_total_loss=True,
+        yes=True,
+    )
+    registry = CognitiveExecutionProvenanceRegistry(provenance_db)
+    await registry.initialize()
+    await registry.portfolio_executions.authorize(
+        PortfolioExecutionComponentRecord(
+            session_id=session_id,
+            origin_run_id="run-a",
+            broker_account_identity="local_paper",
+            trading_date="2026-08-05",
+            target_portfolio_decision_id="decision-a",
+            selected_portfolio_id="portfolio-a",
+            authorized_position_tuple_id="tuple-a",
+            component_index=0,
+            component_count=1,
+            strategy_id="strategy-a",
+            contract_id="contract-a",
+            authorized_quantity=1,
+            capital_allocation=Decimal("100"),
+            client_order_id="client-a",
+            status=PortfolioComponentStatus.WORKING,
+            submitted_quantity=1,
+            remaining_quantity=1,
+            original_decision_snapshot_id="snapshot-a",
+            evaluated_objective_version=1,
+            evaluated_timestamp=(_regular_now(10, 0) + timedelta(days=1)).isoformat(),
+        )
+    )
+    candidates = await discover_objective_recovery_candidates(
+        objective_db_path=objective_db,
+        provenance_db_path=provenance_db,
+        broker_account_identity="local_paper",
+    )
+    assert [candidate.session_id for candidate in candidates] == [session_id]
+
+
+@pytest.mark.asyncio
+async def test_multiple_prior_sessions_fail_closed(tmp_path: Path) -> None:
+    from joker.app.safety import SafetyMode
+    from joker.cli.session_confirm import (
+        confirm_session_objective,
+        discover_objective_recovery_candidates,
+        select_recovery_candidate,
+    )
+    from joker.config.settings import AppSettings
+    from joker.objectives.config import ObjectiveSettings
+    from joker.persistence.cognitive_execution_provenance import (
+        CognitiveExecutionProvenanceRegistry,
+        PortfolioExecutionComponentRecord,
+        PortfolioComponentStatus,
+    )
+    from joker.runtime.cognitive_session import stable_cognitive_session_id
+
+    objective_db = tmp_path / "task1.db"
+    provenance_db = tmp_path / "prov.db"
+    app = AppSettings(
+        mode=SafetyMode.PAPER,
+        live_trading_enabled=False,
+        objective=ObjectiveSettings(enabled=True),
+    )
+    registry = CognitiveExecutionProvenanceRegistry(provenance_db)
+    await registry.initialize()
+    for offset in (0, 1):
+        trading_day = date(2026, 8, 4 + offset)
+        session_id = stable_cognitive_session_id(
+            trading_date=trading_day,
+            account_identity="local_paper",
+        )
+        await confirm_session_objective(
+            app,
+            session_id=session_id,
+            db_path=objective_db,
+            authorized_usd=250.0,
+            target_profit_pct=10.0,
+            deadline_exchange_time=datetime(
+                trading_day.year, trading_day.month, trading_day.day, 15, 0, tzinfo=ET
+            ),
+            confirmed_at_exchange_time=datetime(
+                trading_day.year, trading_day.month, trading_day.day, 10, 0, tzinfo=ET
+            ),
+            max_concurrent_positions=2,
+            acknowledge_total_loss=True,
+            yes=True,
+        )
+        await registry.portfolio_executions.authorize(
+            PortfolioExecutionComponentRecord(
+                session_id=session_id,
+                origin_run_id=f"run-{offset}",
+                broker_account_identity="local_paper",
+                trading_date=trading_day.isoformat(),
+                target_portfolio_decision_id=f"decision-{offset}",
+                selected_portfolio_id="portfolio-a",
+                authorized_position_tuple_id=f"tuple-{offset}",
+                component_index=0,
+                component_count=1,
+                strategy_id="strategy-a",
+                contract_id=f"contract-{offset}",
+                authorized_quantity=1,
+                capital_allocation=Decimal("100"),
+                client_order_id=f"client-{offset}",
+                status=PortfolioComponentStatus.WORKING,
+                submitted_quantity=1,
+                remaining_quantity=1,
+                original_decision_snapshot_id="snapshot-a",
+                evaluated_objective_version=1,
+                evaluated_timestamp=datetime(
+                    trading_day.year, trading_day.month, trading_day.day, 10, 0, tzinfo=ET
+                ).isoformat(),
+            )
+        )
+    candidates = await discover_objective_recovery_candidates(
+        objective_db_path=objective_db,
+        provenance_db_path=provenance_db,
+        broker_account_identity="local_paper",
+    )
+    with pytest.raises(ValueError, match="multiple unresolved or resumable objective sessions"):
+        select_recovery_candidate(candidates)

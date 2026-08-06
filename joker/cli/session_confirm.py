@@ -33,6 +33,46 @@ class SessionObjectiveBundle:
     deadline_exchange_time: datetime | None = None
 
 
+@dataclass(frozen=True)
+class ObjectiveSessionRecoveryCandidate:
+    session_id: str
+    trading_date: str
+    has_definition: bool
+    latest_status: str | None
+    unresolved_work: bool
+
+    @property
+    def resumable(self) -> bool:
+        unfinished = self.has_definition and (
+            self.latest_status is None
+            or self.latest_status not in TERMINAL_OBJECTIVE_STATUSES
+        )
+        return unfinished or (
+            self.has_definition
+            and self.latest_status in TERMINAL_OBJECTIVE_STATUSES
+            and self.unresolved_work
+        )
+
+
+def select_recovery_candidate(
+    candidates: list[ObjectiveSessionRecoveryCandidate],
+    *,
+    requested_session_id: str | None = None,
+) -> ObjectiveSessionRecoveryCandidate | None:
+    """Resolve a single durable resume owner or fail closed on ambiguity."""
+    explicit = (requested_session_id or "").strip()
+    if explicit:
+        return next((candidate for candidate in candidates if candidate.session_id == explicit), None)
+    if len(candidates) == 1:
+        return candidates[0]
+    if len(candidates) > 1:
+        raise ValueError(
+            "multiple unresolved or resumable objective sessions exist; "
+            "use --resume-session-id"
+        )
+    return None
+
+
 TERMINAL_OBJECTIVE_STATUSES = frozenset(
     {"target_reached", "capital_exhausted", "deadline_reached", "stopped_by_user"}
 )
@@ -219,6 +259,79 @@ async def has_unresolved_portfolio_work(
         trading_date=trading_date,
     )
     return bool(components or requests)
+
+
+async def discover_objective_recovery_candidates(
+    *,
+    objective_db_path: Path,
+    provenance_db_path: Path,
+    broker_account_identity: str,
+    mode: str = "paper",
+) -> list[ObjectiveSessionRecoveryCandidate]:
+    """Discover durable objective sessions for one account that may be resumed."""
+    from joker.objectives.repository import ObjectiveRepository
+    from joker.persistence.cognitive_execution_provenance import (
+        CognitiveExecutionProvenanceRegistry,
+    )
+    from joker.runtime.cognitive_session import stable_cognitive_session_trading_date
+
+    objective_repo = ObjectiveRepository(objective_db_path)
+    provenance = CognitiveExecutionProvenanceRegistry(provenance_db_path)
+    await provenance.initialize()
+    owners = {
+        (
+            owner.session_id,
+            owner.trading_date,
+        ): owner
+        for owner in (
+            await provenance.portfolio_executions.list_unresolved_owners(
+                broker_account_identity=broker_account_identity
+            )
+            + await provenance.portfolio_reoptimizations.list_unresolved_owners(
+                broker_account_identity=broker_account_identity
+            )
+        )
+    }
+    session_ids = set(
+        objective_repo.list_sessions_for_account_identity(
+            account_identity=broker_account_identity,
+            mode=mode,
+        )
+    )
+    session_ids.update(session_id for session_id, _ in owners.keys())
+    candidates: list[ObjectiveSessionRecoveryCandidate] = []
+    for session_id in sorted(session_ids):
+        definition = objective_repo.latest_definition_for_session(session_id)
+        state = objective_repo.latest_state_for_session(session_id)
+        parsed_trading_date = stable_cognitive_session_trading_date(session_id)
+        owner_record = (
+            owners.get((session_id, parsed_trading_date.isoformat()))
+            if parsed_trading_date is not None
+            else None
+        )
+        owner_trading_date = (
+            owner_record.trading_date
+            if owner_record is not None
+            else parsed_trading_date.isoformat() if parsed_trading_date is not None else ""
+        )
+        unresolved = False
+        if owner_trading_date:
+            unresolved = await has_unresolved_portfolio_work(
+                provenance_db_path=provenance_db_path,
+                session_id=session_id,
+                broker_account_identity=broker_account_identity,
+                trading_date=owner_trading_date,
+            )
+        candidates.append(
+            ObjectiveSessionRecoveryCandidate(
+                session_id=session_id,
+                trading_date=owner_trading_date,
+                has_definition=definition is not None,
+                latest_status=(str(state.status) if state is not None else None),
+                unresolved_work=unresolved,
+            )
+        )
+    return [candidate for candidate in candidates if candidate.resumable]
 
 
 # Backward compatibility for callers outside the CLI. New-session authority

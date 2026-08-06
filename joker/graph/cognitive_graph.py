@@ -831,10 +831,19 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
                     error_code="portfolio_execution_owner_unavailable",
                     message="exchange clock required for portfolio ownership",
                 )
+            from joker.runtime.cognitive_session import (
+                stable_cognitive_session_trading_date,
+            )
+
+            stable_trading_date = stable_cognitive_session_trading_date(deps.session_id)
             portfolio_owner = PortfolioExecutionOwner(
                 session_id=deps.session_id,
                 broker_account_identity=broker_account_id,
-                trading_date=deps.clock.trading_date().isoformat(),
+                trading_date=(
+                    stable_trading_date.isoformat()
+                    if stable_trading_date is not None
+                    else deps.clock.trading_date().isoformat()
+                ),
             )
         if deps.provenance_registry is not None and portfolio_decision.get("decision_id"):
             prior_components = await deps.provenance_registry.list_by_target_portfolio_decision_id(
@@ -1067,43 +1076,57 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
                 original_portfolio_decision_id=str(portfolio_decision.get("decision_id") or ""),
                 remaining_authorized_tuple_ids=remaining,
             )
-            await deps.provenance_registry.portfolio_reoptimizations.enqueue(
-                PortfolioReoptimizationRequestRecord(
-                    request_id=request_id,
-                    session_id=portfolio_owner.session_id,
-                    origin_run_id=deps.run_id,
-                    broker_account_identity=portfolio_owner.broker_account_identity,
-                    trading_date=portfolio_owner.trading_date,
-                    original_portfolio_decision_id=str(portfolio_decision.get("decision_id") or ""),
-                    already_filled_tuple_ids=tuple(
-                        record.authorized_position_tuple_id
-                        for record in records
-                        if record.status == PortfolioComponentStatus.FILLED
-                    ),
-                    open_positions=open_positions,
-                    remaining_authorized_tuple_ids=remaining,
-                    reason_codes=(reason,),
-                    latest_objective_state=json.loads(json.dumps(objective_payload, default=str)),
-                    latest_objective_version=int(getattr(objective, "version", 0) or 0),
-                    latest_snapshot_id=latest_snapshot_id,
-                    created_exchange_time=(
+            request_record = PortfolioReoptimizationRequestRecord(
+                request_id=request_id,
+                session_id=portfolio_owner.session_id,
+                origin_run_id=deps.run_id,
+                broker_account_identity=portfolio_owner.broker_account_identity,
+                trading_date=portfolio_owner.trading_date,
+                original_portfolio_decision_id=str(portfolio_decision.get("decision_id") or ""),
+                already_filled_tuple_ids=tuple(
+                    record.authorized_position_tuple_id
+                    for record in records
+                    if record.status == PortfolioComponentStatus.FILLED
+                ),
+                open_positions=open_positions,
+                remaining_authorized_tuple_ids=remaining,
+                reason_codes=(reason,),
+                latest_objective_state=json.loads(json.dumps(objective_payload, default=str)),
+                latest_objective_version=int(getattr(objective, "version", 0) or 0),
+                latest_snapshot_id=latest_snapshot_id,
+                created_exchange_time=(
+                    deps.clock.now().isoformat()
+                    if deps.clock is not None
+                    else datetime.now(timezone.utc).isoformat()
+                ),
+                extra={
+                    "stable_owner": {
+                        "session_id": portfolio_owner.session_id,
+                        "broker_account_identity": (
+                            portfolio_owner.broker_account_identity
+                        ),
+                        "trading_date": portfolio_owner.trading_date,
+                    },
+                    "origin_run_id": deps.run_id,
+                    "original_authorized_positions": authorized_positions,
+                    "source_cycle_id": state.get("cycle_id"),
+                },
+            )
+            if state.get("_reconciliation_only_recovery"):
+                await deps.provenance_registry.portfolio_reoptimizations.resolve_terminal_recovery(
+                    request_record,
+                    resolved_at=(
                         deps.clock.now().isoformat()
                         if deps.clock is not None
                         else datetime.now(timezone.utc).isoformat()
                     ),
-                    extra={
-                        "stable_owner": {
-                            "session_id": portfolio_owner.session_id,
-                            "broker_account_identity": (
-                                portfolio_owner.broker_account_identity
-                            ),
-                            "trading_date": portfolio_owner.trading_date,
-                        },
-                        "origin_run_id": deps.run_id,
-                        "original_authorized_positions": authorized_positions,
-                        "source_cycle_id": state.get("cycle_id"),
-                    },
+                    resolved_by=str(deps.run_id),
+                    terminal_recovery_reason=reason,
+                    objective_status=str(getattr(objective, "status", "unknown") or "unknown"),
                 )
+                return
+            await deps.provenance_registry.portfolio_reoptimizations.enqueue(
+                request_record
             )
 
         from joker.objectives.decision_fingerprint import (
