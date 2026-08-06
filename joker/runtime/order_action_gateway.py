@@ -23,6 +23,7 @@ from joker.market.option_surface import OptionContractSnapshot
 from joker.market.quality import DataQualityReport
 from joker.market.snapshots import MarketSnapshot
 from joker.runtime.execution_runtime import ExecutionCommand, contract_id_for
+from joker.runtime.recovery_mode import recovery_mode_value
 from joker.schemas.domain import BrokerOrder, OptionContract, OrderIntent
 
 logger = logging.getLogger(__name__)
@@ -298,22 +299,24 @@ class OrderActionGateway:
                 working_orders={},
             )
 
-        projection = None
+        recovery_projection = None
         if self._deps.projection_loader is not None:
-            projection = await self._deps.projection_loader()
-        working = working_orders_from_projection(projection)
-        open_positions = open_positions_from_projection(projection)
+            recovery_projection = await self._deps.projection_loader()
         recovery_block = self._reconciliation_only_block_reason(
             request,
-            working=working,
+            working=working_orders_from_projection(recovery_projection),
         )
         if recovery_block is not None:
             return OrderActionResult(
                 submitted=False,
                 client_order_id=request.client_order_id,
                 blocked_reason=recovery_block,
-                working_orders=working,
+                working_orders=working_orders_from_projection(recovery_projection),
             )
+
+        projection = recovery_projection
+        working = working_orders_from_projection(projection)
+        open_positions = open_positions_from_projection(projection)
         snapshot, data_quality, surface, _slice = await load_snapshot_truth(
             self._deps, request.snapshot_id
         )
@@ -877,7 +880,7 @@ class OrderActionGateway:
         *,
         working: Sequence[WorkingOrderTruth],
     ) -> str | None:
-        if not bool(getattr(self._deps, "reconciliation_only_recovery", False)):
+        if recovery_mode_value(self._deps).value == "normal":
             return None
         if request.action in {
             OrderActionKind.ENTRY,

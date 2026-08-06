@@ -28,6 +28,8 @@ from joker.graph.discovery_graph import build_discovery_graph
 from joker.graph.graph_deps import CognitiveGraphDeps
 from joker.graph.node_helpers import append_error, append_trace, trace_update, utc_now
 from joker.graph.perception_graph import build_perception_graph
+from joker.runtime.portfolio_recovery import PortfolioRecoveryCoordinator
+from joker.runtime.recovery_mode import recovery_mode_value
 from joker.graph.strategy_graph import build_strategy_graph
 from joker.graph.objective_nodes import (
     apply_objective_sizing_to_proposal,
@@ -778,6 +780,7 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
         submitted_by_tuple: dict[str, Any] = {}
         portfolio_execution_repo = None
         portfolio_owner = None
+        portfolio_recovery = None
         if authorized_positions:
             if deps.provenance_registry is None and deps.db_path is not None:
                 from joker.persistence.cognitive_execution_provenance import (
@@ -844,6 +847,14 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
                     if stable_trading_date is not None
                     else deps.clock.trading_date().isoformat()
                 ),
+            )
+            portfolio_recovery = PortfolioRecoveryCoordinator(
+                execution_runtime=deps.execution_runtime,
+                provenance_registry=deps.provenance_registry,
+                stable_owner=portfolio_owner,
+                clock=deps.clock,
+                objective_service=deps.objective_service,
+                recovery_mode=recovery_mode_value(deps),
             )
         if deps.provenance_registry is not None and portfolio_decision.get("decision_id"):
             prior_components = await deps.provenance_registry.list_by_target_portfolio_decision_id(
@@ -983,150 +994,24 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
                     )
 
         async def _mark_remaining_reoptimization(start_index: int, reason: str) -> None:
-            if portfolio_execution_repo is None:
+            if portfolio_recovery is None:
                 return
-            records = await portfolio_execution_repo.list_by_decision(
-                str(portfolio_decision.get("decision_id") or ""),
-                owner=portfolio_owner,
-            )
-            for record in records:
-                if record.component_index < start_index:
-                    continue
-                if record.status not in {
-                    PortfolioComponentStatus.AUTHORIZED,
-                    PortfolioComponentStatus.READY,
-                }:
-                    continue
-                await portfolio_execution_repo.transition(
-                    record.authorized_position_tuple_id,
-                    owner=portfolio_owner,
-                    status=PortfolioComponentStatus.REOPTIMIZATION_REQUIRED,
-                    failure_reoptimization_reason=reason,
-                )
-            if deps.provenance_registry is None:
-                return
-            records = await portfolio_execution_repo.list_by_decision(
-                str(portfolio_decision.get("decision_id") or ""),
-                owner=portfolio_owner,
-            )
-            remaining = tuple(
-                record.authorized_position_tuple_id
-                for record in records
-                if record.status == PortfolioComponentStatus.REOPTIMIZATION_REQUIRED
-            )
-            if not remaining or portfolio_owner is None:
-                return
-            from joker.persistence.cognitive_execution_provenance import (
-                PortfolioReoptimizationRequestRecord,
-                stable_reoptimization_request_id,
-            )
-
-            objective = (
-                await deps.objective_service.get_state()
-                if deps.objective_service is not None
-                else None
-            )
-            objective_payload = (
-                objective.as_dict()
-                if objective is not None and hasattr(objective, "as_dict")
-                else objective.model_dump(mode="json")
-                if objective is not None and hasattr(objective, "model_dump")
-                else dict(vars(objective))
-                if objective is not None and hasattr(objective, "__dict__")
-                else {}
-            )
-            projection = (
-                await deps.projection_loader() if deps.projection_loader is not None else None
-            )
-            raw_positions = (
-                projection.get("positions", {})
-                if isinstance(projection, dict)
-                else getattr(projection, "positions", {})
-                if projection is not None
-                else {}
-            )
-            position_values = (
-                raw_positions.values() if isinstance(raw_positions, dict) else raw_positions
-            )
-            open_positions = tuple(
-                json.loads(
-                    json.dumps(
-                        position.model_dump(mode="json")
-                        if hasattr(position, "model_dump")
-                        else dict(vars(position))
-                        if hasattr(position, "__dict__")
-                        else position,
-                        default=str,
-                    )
-                )
-                for position in position_values
-            )
-            latest_snapshot = (
-                await deps.snapshot_repo.get_latest(deps.session_id)
-                if deps.snapshot_repo is not None
-                else None
-            )
-            latest_snapshot_id = str(
-                getattr(latest_snapshot, "snapshot_id", None) or state.get("snapshot_id") or ""
-            )
-            request_id = stable_reoptimization_request_id(
-                session_id=portfolio_owner.session_id,
-                broker_account_identity=portfolio_owner.broker_account_identity,
-                trading_date=portfolio_owner.trading_date,
-                original_portfolio_decision_id=str(portfolio_decision.get("decision_id") or ""),
-                remaining_authorized_tuple_ids=remaining,
-            )
-            request_record = PortfolioReoptimizationRequestRecord(
-                request_id=request_id,
-                session_id=portfolio_owner.session_id,
+            objective_status = None
+            if state.get("_reconciliation_only_recovery") and deps.objective_service is not None:
+                objective = await deps.objective_service.get_state()
+                objective_status = str(getattr(objective, "status", "unknown") or "unknown")
+            await portfolio_recovery.request_suffix_reoptimization(
+                decision_id=str(portfolio_decision.get("decision_id") or ""),
+                reason=reason,
                 origin_run_id=deps.run_id,
-                broker_account_identity=portfolio_owner.broker_account_identity,
-                trading_date=portfolio_owner.trading_date,
-                original_portfolio_decision_id=str(portfolio_decision.get("decision_id") or ""),
-                already_filled_tuple_ids=tuple(
-                    record.authorized_position_tuple_id
-                    for record in records
-                    if record.status == PortfolioComponentStatus.FILLED
-                ),
-                open_positions=open_positions,
-                remaining_authorized_tuple_ids=remaining,
-                reason_codes=(reason,),
-                latest_objective_state=json.loads(json.dumps(objective_payload, default=str)),
-                latest_objective_version=int(getattr(objective, "version", 0) or 0),
-                latest_snapshot_id=latest_snapshot_id,
-                created_exchange_time=(
-                    deps.clock.now().isoformat()
-                    if deps.clock is not None
-                    else datetime.now(timezone.utc).isoformat()
-                ),
-                extra={
-                    "stable_owner": {
-                        "session_id": portfolio_owner.session_id,
-                        "broker_account_identity": (
-                            portfolio_owner.broker_account_identity
-                        ),
-                        "trading_date": portfolio_owner.trading_date,
-                    },
-                    "origin_run_id": deps.run_id,
-                    "original_authorized_positions": authorized_positions,
-                    "source_cycle_id": state.get("cycle_id"),
-                },
-            )
-            if state.get("_reconciliation_only_recovery"):
-                await deps.provenance_registry.portfolio_reoptimizations.resolve_terminal_recovery(
-                    request_record,
-                    resolved_at=(
-                        deps.clock.now().isoformat()
-                        if deps.clock is not None
-                        else datetime.now(timezone.utc).isoformat()
-                    ),
-                    resolved_by=str(deps.run_id),
-                    terminal_recovery_reason=reason,
-                    objective_status=str(getattr(objective, "status", "unknown") or "unknown"),
+                start_component_index=start_index,
+                state=state,
+                terminal_recovery=bool(state.get("_reconciliation_only_recovery")),
+                latest_snapshot_id=str(
+                    state.get("snapshot_id") or state.get("latest_known_snapshot_id") or ""
                 )
-                return
-            await deps.provenance_registry.portfolio_reoptimizations.enqueue(
-                request_record
+                or None,
+                objective_status=objective_status,
             )
 
         from joker.objectives.decision_fingerprint import (
@@ -1173,45 +1058,23 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
             filled_quantity: int,
             broker_order_id: str | None = None,
         ) -> Any:
-            if filled_quantity != component.authorized_quantity:
-                raise ValueError("filled component quantity is not fully reconciled")
-            if deps.objective_service is None or deps.clock is None or deps.snapshot_repo is None:
-                raise RuntimeError("post-fill continuation truth is unavailable")
-            await deps.objective_service.recompute_from_truth(now=deps.clock.now())
-            post_objective = await deps.objective_service.get_state()
-            post_projection = (
-                await deps.projection_loader() if deps.projection_loader is not None else None
+            if portfolio_recovery is None:
+                raise RuntimeError("deterministic portfolio recovery is unavailable")
+            latest_snapshot = None
+            if deps.snapshot_repo is not None:
+                latest_snapshot = await deps.snapshot_repo.get_latest(deps.session_id)
+            latest_snapshot_id = (
+                str(getattr(latest_snapshot, "snapshot_id", "") or "")
+                if latest_snapshot is not None
+                else None
             )
-            post_fingerprint = _current_fingerprint(
-                post_objective,
-                working_order_count=len(working_orders_from_projection(post_projection)),
-            )
-            latest_snapshot = await deps.snapshot_repo.get_latest(deps.session_id)
-            if latest_snapshot is None:
+            if not latest_snapshot_id:
                 raise RuntimeError("post-fill snapshot is unavailable")
-            exchange_time = deps.clock.now().isoformat()
-            return await portfolio_execution_repo.transition(
-                component.authorized_position_tuple_id,
-                owner=portfolio_owner,
-                status=PortfolioComponentStatus.FILLED,
-                broker_order_id=broker_order_id,
-                submitted_quantity=component.authorized_quantity,
+            return await portfolio_recovery.persist_filled_continuation(
+                component,
+                latest_snapshot_id=latest_snapshot_id,
                 filled_quantity=filled_quantity,
-                last_reconciliation_timestamp=exchange_time,
-                post_fill_objective_version=int(post_objective.version),
-                post_fill_objective_fingerprint=post_fingerprint.canonical_json,
-                post_fill_snapshot_id=str(latest_snapshot.snapshot_id),
-                post_fill_exchange_time=exchange_time,
-                reconciled_filled_quantity=filled_quantity,
-                continuation_ready=True,
-                extra_update={
-                    "post_fill_objective_version": int(post_objective.version),
-                    "post_fill_objective_fingerprint": (post_fingerprint.canonical_json),
-                    "post_fill_snapshot_id": str(latest_snapshot.snapshot_id),
-                    "post_fill_exchange_time": exchange_time,
-                    "reconciled_filled_quantity": filled_quantity,
-                    "continuation_ready": True,
-                },
+                broker_order_id=broker_order_id,
             )
 
         if portfolio_execution_repo is not None:

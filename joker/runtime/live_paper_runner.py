@@ -27,6 +27,8 @@ from joker.config.settings import AppSettings, EnvSettings
 from joker.data.provider_factory import ProviderKind
 from joker.data.webull_capability import capability_usable_for_shadow
 from joker.runtime.live_market_data_loop import LiveMarketDataError, LiveMarketDataLoop
+from joker.runtime.portfolio_recovery import PortfolioRecoveryCoordinator
+from joker.runtime.recovery_mode import RecoveryMode, is_recovery_only_mode, recovery_mode_value
 from joker.execution.exit_manager import ExitManager
 from joker.execution.option_selector import OptionSelector, OptionSelectorConfig
 from joker.features.engine import FeatureEngine
@@ -78,12 +80,23 @@ class LivePaperRunConfig:
     # Task-1 durable objective service (required when objective.enabled)
     objective_service: Any | None = None
     cognitive_session_id_override: str | None = None
+    recovery_mode: RecoveryMode | str = RecoveryMode.NORMAL
     # Exchange-aware objective deadline (blocks new entries via objective service).
     objective_deadline_exchange: datetime | None = None
     reconciliation_only_recovery: bool = False
     # Extra wall-clock seconds after duration to finish agent-managed exits only.
     # Default 0 so existing short paper tests are not extended; CLI goal-test sets 120.
     shutdown_grace_seconds: float = 0.0
+
+    def __post_init__(self) -> None:
+        self.recovery_mode = RecoveryMode(str(self.recovery_mode).strip().lower())
+        if self.reconciliation_only_recovery:
+            if self.recovery_mode is RecoveryMode.NORMAL:
+                self.recovery_mode = RecoveryMode.RECONCILIATION_ONLY
+        self.reconciliation_only_recovery = self.recovery_mode in {
+            RecoveryMode.RECONCILIATION_ONLY,
+            RecoveryMode.BROKER_ONLY,
+        }
 
 
 @dataclass
@@ -258,8 +271,33 @@ class LivePaperRunner:
         on_state: Callable[[dict[str, Any]], None] | None,
         run_manager: RunManager,
         shutdown_task1: Callable[[], None],
+        recovery_mode: RecoveryMode,
     ) -> LivePaperRunResult:
         """Broker-only recovery path: poll broker/order truth without market warmup."""
+        from joker.persistence.cognitive_execution_provenance import (
+            CognitiveExecutionProvenanceRegistry,
+            PortfolioExecutionOwner,
+        )
+
+        task1_db = Path(self.app_settings.db_path).parent / "joker_task1.db"
+        provenance = CognitiveExecutionProvenanceRegistry(
+            task1_db.with_name(task1_db.stem + "_cognitive_provenance.db")
+        )
+        task1_bridge.run_coro(provenance.initialize())
+        stable_trading_date = task1_bridge.supervisor.clock.trading_date().isoformat()
+        owner = PortfolioExecutionOwner(
+            session_id=task1_bridge.session_id,
+            broker_account_identity=task1_bridge.execution_runtime.broker_account_identity,
+            trading_date=stable_trading_date,
+        )
+        coordinator = PortfolioRecoveryCoordinator(
+            execution_runtime=task1_bridge.execution_runtime,
+            provenance_registry=provenance,
+            stable_owner=owner,
+            clock=task1_bridge.supervisor.clock,
+            objective_service=config.objective_service,
+            recovery_mode=recovery_mode,
+        )
         log(
             "live_paper.started",
             {
@@ -296,21 +334,44 @@ class LivePaperRunner:
         deadline = wall_time.monotonic() + max(float(config.duration_seconds), poll)
         errors: list[str] = []
         projection = None
+        def _poll_working_orders(current_projection: Any | None) -> None:
+            for client_order_id in coordinator.working_client_order_ids(current_projection):
+                task1_bridge.poll_order_status(client_order_id)
+
         while wall_time.monotonic() < deadline:
             try:
                 projection = task1_bridge.project_session()
-                for client_order_id in self._working_client_order_ids(projection):
-                    try:
-                        task1_bridge.poll_order_status(client_order_id)
-                    except Exception as exc:  # noqa: BLE001
-                        errors.append(str(exc))
-                        log(
-                            "order.recovery_poll_failed",
-                            {
-                                "client_order_id": client_order_id,
-                                "reason": str(exc),
-                            },
-                        )
+                _poll_working_orders(projection)
+                latest_snapshot_id = None
+                snapshot_repo = task1_bridge.supervisor.snapshot_repository
+                if snapshot_repo is not None:
+                    latest_snapshot = task1_bridge.run_coro(
+                        snapshot_repo.get_latest(task1_bridge.session_id)
+                    )
+                    if latest_snapshot is not None:
+                        latest_snapshot_id = str(latest_snapshot.snapshot_id)
+                objective_status = None
+                if config.objective_service is not None:
+                    objective_state = task1_bridge.run_coro(config.objective_service.get_state())
+                    objective_status = str(getattr(objective_state, "status", "unknown") or "unknown")
+                task1_bridge.run_coro(
+                    coordinator.reconcile_owner_components(
+                        projection=projection,
+                        latest_snapshot_id=latest_snapshot_id,
+                        terminal_recovery_reason=(
+                            "reconciliation_only_resume_no_new_entries"
+                            if recovery_mode is RecoveryMode.RECONCILIATION_ONLY
+                            else None
+                        ),
+                        objective_status=objective_status,
+                        origin_run_id=run_id,
+                        state={
+                            "run_id": run_id,
+                            "cycle_id": None,
+                            "snapshot_id": latest_snapshot_id,
+                        },
+                    )
+                )
                 if on_state is not None:
                     orders = getattr(projection, "orders", None) or {}
                     positions = getattr(projection, "positions", None) or {}
@@ -349,8 +410,66 @@ class LivePaperRunner:
                 errors.append(str(exc))
                 log("broker_only_recovery_failed", {"reason": str(exc)})
             wall_time.sleep(min(poll, max(0.0, deadline - wall_time.monotonic())))
-        report = task1_bridge.run_coro(task1_bridge.supervisor.execution_runtime.run_reconciliation())
+        report = task1_bridge.run_coro(
+            task1_bridge.supervisor.execution_runtime.run_reconciliation()
+        )
         projection = task1_bridge.project_session()
+        latest_snapshot_id = None
+        snapshot_repo = task1_bridge.supervisor.snapshot_repository
+        if snapshot_repo is not None:
+            latest_snapshot = task1_bridge.run_coro(
+                snapshot_repo.get_latest(task1_bridge.session_id)
+            )
+            if latest_snapshot is not None:
+                latest_snapshot_id = str(latest_snapshot.snapshot_id)
+        objective_status = None
+        if config.objective_service is not None:
+            objective_state = task1_bridge.run_coro(config.objective_service.get_state())
+            objective_status = str(getattr(objective_state, "status", "unknown") or "unknown")
+        task1_bridge.run_coro(
+            coordinator.reconcile_owner_components(
+                projection=projection,
+                latest_snapshot_id=latest_snapshot_id,
+                terminal_recovery_reason=(
+                    "reconciliation_only_resume_no_new_entries"
+                    if recovery_mode is RecoveryMode.RECONCILIATION_ONLY
+                    else None
+                ),
+                objective_status=objective_status,
+                origin_run_id=run_id,
+                state={
+                    "run_id": run_id,
+                    "cycle_id": None,
+                    "snapshot_id": latest_snapshot_id,
+                },
+            )
+        )
+        if recovery_mode is RecoveryMode.BROKER_ONLY:
+            unresolved_components = task1_bridge.run_coro(
+                provenance.portfolio_executions.has_unresolved(
+                    session_id=task1_bridge.session_id,
+                    broker_account_identity=task1_bridge.execution_runtime.broker_account_identity,
+                    trading_date=stable_trading_date,
+                )
+            )
+            unresolved_requests = task1_bridge.run_coro(
+                provenance.portfolio_reoptimizations.has_unresolved(
+                    session_id=task1_bridge.session_id,
+                    broker_account_identity=task1_bridge.execution_runtime.broker_account_identity,
+                    trading_date=stable_trading_date,
+                )
+            )
+            if unresolved_components or unresolved_requests:
+                log(
+                    "broker_only.operator_resolution_required",
+                    {
+                        "session_id": task1_bridge.session_id,
+                        "broker_account_identity": task1_bridge.execution_runtime.broker_account_identity,
+                        "trading_date": stable_trading_date,
+                        "unresolved_components": unresolved_components,
+                        "unresolved_requests": unresolved_requests,
+                    },
+                )
         positions = getattr(projection, "positions", None) or {}
         orders = getattr(projection, "orders", None) or {}
         result.feed_health = "RECOVERY_ONLY"
@@ -389,7 +508,8 @@ class LivePaperRunner:
         if config.symbol.upper() != "SPY":
             raise LivePaperError("Only SPY is supported")
 
-        recovery_only_mode = bool(config.reconciliation_only_recovery)
+        recovery_mode = recovery_mode_value(config)
+        recovery_only_mode = is_recovery_only_mode(config)
         self._assert_safe_mode(require_market_data=not recovery_only_mode)
 
         # Force PAPER mode for this session regardless of display toggles.
@@ -440,8 +560,9 @@ class LivePaperRunner:
         injected_agent_runtime = None
         cognitive_graph_deps = None
         _cognitive_startup_payload: dict[str, Any] | None = None
+        objective_service = config.objective_service
         bridge_session_id = config.cognitive_session_id_override or run_id
-        if not recovery_only_mode and cognitive_mode:
+        if recovery_mode is RecoveryMode.NORMAL and cognitive_mode:
             import asyncio as _asyncio
 
             from joker.cognition.exceptions import CognitiveRuntimeConfigurationError
@@ -488,7 +609,6 @@ class LivePaperRunner:
             )
             repos = build_default_repositories(task1_db)
             model_router.set_model_call_repo(repos["model_call_repo"])
-            objective_service = config.objective_service
             obj_settings = getattr(self.app_settings, "objective", None)
             if (
                 obj_settings is not None
@@ -562,7 +682,8 @@ class LivePaperRunner:
                 kill_switch=bool(self.app_settings.risk.kill_switch),
                 max_quote_age_seconds=max_quote_age,
                 max_relative_spread=max_spread,
-                reconciliation_only_recovery=bool(config.reconciliation_only_recovery),
+                recovery_mode=recovery_mode,
+                reconciliation_only_recovery=recovery_only_mode,
                 **objective_engine_kwargs,
                 **repos,
             )
@@ -580,7 +701,7 @@ class LivePaperRunner:
                 registry=registry,
                 checkpointer_path=task1_db.with_name(task1_db.stem + "_cognitive_ckpt.db"),
             )
-            if config.reconciliation_only_recovery:
+            if recovery_only_mode:
                 injected_agent_runtime.enable_reconciliation_only_recovery(True)
             # Startup details are logged after the session log() helper is defined.
             _cognitive_startup_payload = {
@@ -595,7 +716,7 @@ class LivePaperRunner:
                 ),
                 "notes": list(startup.availability.notes),
             }
-        elif not recovery_only_mode and null_agent_mode:
+        elif recovery_mode is RecoveryMode.NORMAL and null_agent_mode:
             from joker.runtime.compatibility import NullAgentRuntime
 
             injected_agent_runtime = NullAgentRuntime()
@@ -612,7 +733,25 @@ class LivePaperRunner:
         # Two-phase startup for cognitive mode:
         # Create Task 1 stores/ExecutionRuntime → bind gateway → start agent → resume.
         task1_bridge.start(start_agent=not (recovery_only_mode or cognitive_mode))
-        if not recovery_only_mode and cognitive_mode and cognitive_graph_deps is not None:
+        if recovery_mode is not RecoveryMode.NORMAL:
+            if (
+                recovery_mode is RecoveryMode.RECONCILIATION_ONLY
+                and objective_service is not None
+            ):
+                from joker.runtime.objective_recovery import recover_session_objective
+
+                task1_bridge.supervisor.bind_objective_service(objective_service)
+                task1_bridge.run_coro(
+                    recover_session_objective(
+                        objective_service,
+                        session_id=bridge_session_id,
+                        execution_runtime=task1_bridge.execution_runtime,
+                        unresolved_reconciliation=(
+                            task1_bridge.supervisor.unresolved_reconciliation is not None
+                        ),
+                    )
+                )
+        if recovery_mode is RecoveryMode.NORMAL and cognitive_mode and cognitive_graph_deps is not None:
             from joker.persistence.cognitive_execution_provenance import (
                 CognitiveExecutionProvenanceRegistry,
             )
@@ -659,20 +798,6 @@ class LivePaperRunner:
 
             assert cognitive_graph_deps.event_bus is not None
             cognitive_graph_deps.event_bus.subscribe(None, _stream_graph_evidence)
-            if objective_service is not None:
-                from joker.runtime.objective_recovery import recover_session_objective
-
-                task1_bridge.supervisor.bind_objective_service(objective_service)
-                task1_bridge.run_coro(
-                    recover_session_objective(
-                        objective_service,
-                        session_id=bridge_session_id,
-                        execution_runtime=task1_bridge.execution_runtime,
-                        unresolved_reconciliation=(
-                            task1_bridge.supervisor.unresolved_reconciliation is not None
-                        ),
-                    )
-                )
             if bool(getattr(self.app_settings.evolution, "enabled", False)):
                 from joker.evolution.runtime import EvolutionRuntime
 
@@ -824,7 +949,7 @@ class LivePaperRunner:
             },
         )
 
-        if recovery_only_mode:
+        if recovery_mode is not RecoveryMode.NORMAL:
             return self._run_reconciliation_only_recovery(
                 run_id=run_id,
                 selection=selection,
@@ -837,6 +962,7 @@ class LivePaperRunner:
                 on_state=on_state,
                 run_manager=run_manager,
                 shutdown_task1=shutdown_task1,
+                recovery_mode=recovery_mode,
             )
 
         market_loop = LiveMarketDataLoop(
@@ -1189,8 +1315,8 @@ class LivePaperRunner:
                 max_decision_calls = int(
                     getattr(agent_cfg, "max_decision_calls_per_session", 40) or 40
                 )
-                objective_entries_blocked = bool(config.reconciliation_only_recovery)
-                if config.reconciliation_only_recovery:
+                objective_entries_blocked = bool(recovery_only_mode)
+                if recovery_only_mode:
                     log(
                         "objective.reconciliation_only_started",
                         {

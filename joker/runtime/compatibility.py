@@ -145,6 +145,9 @@ class CompatibilityLivePaperBridge:
         then ``start_agent()`` resumes unfinished cycles.
         """
         self.run_coro(self._supervisor.start(start_agent=start_agent))
+        execution = self._supervisor.execution_runtime
+        if execution is not None:
+            setattr(execution, "_bridge_poll_order_status", self.poll_order_status)
         self._started = True
 
     async def astart(self, *, start_agent: bool = True) -> None:

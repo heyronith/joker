@@ -21,6 +21,7 @@ from joker.models.router import ModelRouter
 from joker.persistence.cognitive_execution_provenance import (
     CognitiveExecutionProvenanceRegistry,
 )
+from joker.runtime.recovery_mode import RecoveryMode, recovery_mode_value
 from joker.persistence.cognitive_repositories import (
     DebateRepository,
     DecisionRepository,
@@ -103,10 +104,20 @@ class CognitiveGraphDeps:
     max_quote_age_seconds: int = 30
     max_relative_spread: float = 0.25
     objective_execution_settings: Any | None = None
+    recovery_mode: RecoveryMode | str = RecoveryMode.NORMAL
     reconciliation_only_recovery: bool = False
     # Active Task-3 configuration for leakage-safe historical queries.
     evolution_runtime: Any | None = None
     configuration_repo: Any | None = None
+
+    def __post_init__(self) -> None:
+        self.recovery_mode = recovery_mode_value(self)
+        self.reconciliation_only_recovery = bool(
+            self.recovery_mode in {
+                RecoveryMode.RECONCILIATION_ONLY,
+                RecoveryMode.BROKER_ONLY,
+            }
+        )
 
     def limits_dict(self) -> dict[str, int]:
         return {

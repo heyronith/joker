@@ -17,7 +17,8 @@ def test_live_paper_runner_gates_legacy_loop_when_cognitive_mode() -> None:
 def test_live_paper_runner_two_phase_cognitive_startup_ordering() -> None:
     """Task 1 ExecutionRuntime must bind before CognitiveAgentRuntime.start/resume."""
     source = inspect.getsource(LivePaperRunner.run)
-    assert "recovery_only_mode = bool(config.reconciliation_only_recovery)" in source
+    assert "recovery_mode = recovery_mode_value(config)" in source
+    assert "recovery_only_mode = is_recovery_only_mode(config)" in source
     assert "start_agent=not (recovery_only_mode or cognitive_mode)" in source
     assert "bind_cognitive_graph_to_task1(" in source
     assert "task1_bridge.start_agent()" in source
