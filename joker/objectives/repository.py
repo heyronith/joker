@@ -31,6 +31,9 @@ CrashPoint = Literal[
     "after_state_append",
     "after_audit_append",
     "after_broker_accept_before_association",
+    "after_historical_query",
+    "after_historical_summary",
+    "after_historical_leakage",
 ]
 
 # Keep objective wait budgets well below the default 90s cognitive cycle timeout.
@@ -723,25 +726,108 @@ class ObjectiveRepository:
             return None
         return StrategyObjectiveEstimate.model_validate_json(row["payload_json"])
 
+    def _insert_historical_query(
+        self, conn: sqlite3.Connection, query: HistoricalOutcomeQuery
+    ) -> None:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO objective_historical_queries (
+                query_id, objective_id, strategy_id, snapshot_id,
+                payload_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                str(query.query_id),
+                str(query.objective_id),
+                str(query.strategy_id),
+                str(query.snapshot_id),
+                _dumps(query),
+                query.created_at.isoformat(),
+            ),
+        )
+
+    def _insert_historical_summary(
+        self, conn: sqlite3.Connection, summary: HistoricalOutcomeSummary
+    ) -> None:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO objective_historical_summaries (
+                summary_id, query_id, strategy_id, snapshot_id, valid_for_ev,
+                payload_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                str(summary.summary_id),
+                str(summary.query_id),
+                str(summary.strategy_id),
+                str(summary.snapshot_id),
+                1 if summary.valid_for_ev else 0,
+                _dumps(summary),
+                summary.created_at.isoformat(),
+            ),
+        )
+
+    def _insert_leakage_report(
+        self, conn: sqlite3.Connection, report: HistoricalLeakageReport
+    ) -> None:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO objective_historical_leakage_reports (
+                query_id, safe, payload_json, created_at
+            ) VALUES (?, ?, ?, ?)
+            """,
+            (
+                str(report.query_id),
+                1 if report.safe else 0,
+                _dumps(report),
+                datetime.now().astimezone().isoformat(),
+            ),
+        )
+
+    def persist_historical_result_atomic(
+        self,
+        query: HistoricalOutcomeQuery,
+        summary: HistoricalOutcomeSummary,
+        leakage_report: HistoricalLeakageReport,
+    ) -> None:
+        """Persist query + summary + leakage report in one BEGIN IMMEDIATE txn.
+
+        Callers on the cognitive asyncio loop must invoke this via
+        ``asyncio.to_thread`` (or an equivalent off-loop boundary).
+        """
+        if str(summary.query_id) != str(query.query_id):
+            raise ValueError("historical summary query_id mismatch")
+        if str(leakage_report.query_id) != str(query.query_id):
+            raise ValueError("historical leakage report query_id mismatch")
+
+        def _op() -> None:
+            self._maybe_crash("before_transaction")
+            with self._connect() as conn:
+                try:
+                    conn.execute("BEGIN IMMEDIATE")
+                    self._insert_historical_query(conn, query)
+                    self._maybe_crash("after_historical_query")
+                    self._insert_historical_summary(conn, summary)
+                    self._maybe_crash("after_historical_summary")
+                    self._insert_leakage_report(conn, leakage_report)
+                    self._maybe_crash("after_historical_leakage")
+                    conn.commit()
+                except CrashInjected:
+                    conn.rollback()
+                    raise
+                except Exception:
+                    conn.rollback()
+                    raise
+
+        self._with_busy_retry(_op)
+
     def save_historical_query(self, query: HistoricalOutcomeQuery) -> None:
-        with self._connect() as conn:
-            conn.execute(
-                """
-                INSERT OR REPLACE INTO objective_historical_queries (
-                    query_id, objective_id, strategy_id, snapshot_id,
-                    payload_json, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    str(query.query_id),
-                    str(query.objective_id),
-                    str(query.strategy_id),
-                    str(query.snapshot_id),
-                    _dumps(query),
-                    query.created_at.isoformat(),
-                ),
-            )
-            conn.commit()
+        def _op() -> None:
+            with self._connect() as conn:
+                self._insert_historical_query(conn, query)
+                conn.commit()
+
+        self._with_busy_retry(_op)
 
     def get_historical_query(
         self, query_id: UUID | str
@@ -756,25 +842,12 @@ class ObjectiveRepository:
         return HistoricalOutcomeQuery.model_validate_json(row["payload_json"])
 
     def save_historical_summary(self, summary: HistoricalOutcomeSummary) -> None:
-        with self._connect() as conn:
-            conn.execute(
-                """
-                INSERT OR REPLACE INTO objective_historical_summaries (
-                    summary_id, query_id, strategy_id, snapshot_id, valid_for_ev,
-                    payload_json, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    str(summary.summary_id),
-                    str(summary.query_id),
-                    str(summary.strategy_id),
-                    str(summary.snapshot_id),
-                    1 if summary.valid_for_ev else 0,
-                    _dumps(summary),
-                    summary.created_at.isoformat(),
-                ),
-            )
-            conn.commit()
+        def _op() -> None:
+            with self._connect() as conn:
+                self._insert_historical_summary(conn, summary)
+                conn.commit()
+
+        self._with_busy_retry(_op)
 
     def get_historical_summary(
         self, summary_id: UUID | str
@@ -805,21 +878,27 @@ class ObjectiveRepository:
         return HistoricalOutcomeSummary.model_validate_json(row["payload_json"])
 
     def save_leakage_report(self, report: HistoricalLeakageReport) -> None:
+        def _op() -> None:
+            with self._connect() as conn:
+                self._insert_leakage_report(conn, report)
+                conn.commit()
+
+        self._with_busy_retry(_op)
+
+    def get_leakage_report(
+        self, query_id: UUID | str
+    ) -> HistoricalLeakageReport | None:
         with self._connect() as conn:
-            conn.execute(
+            row = conn.execute(
                 """
-                INSERT OR REPLACE INTO objective_historical_leakage_reports (
-                    query_id, safe, payload_json, created_at
-                ) VALUES (?, ?, ?, ?)
+                SELECT payload_json FROM objective_historical_leakage_reports
+                WHERE query_id=?
                 """,
-                (
-                    str(report.query_id),
-                    1 if report.safe else 0,
-                    _dumps(report),
-                    datetime.now().astimezone().isoformat(),
-                ),
-            )
-            conn.commit()
+                (str(query_id),),
+            ).fetchone()
+        if row is None:
+            return None
+        return HistoricalLeakageReport.model_validate_json(row["payload_json"])
 
     def append_audit(
         self,

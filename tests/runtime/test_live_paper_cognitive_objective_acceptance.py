@@ -376,21 +376,34 @@ def test_live_paper_runner_normal_cognitive_path_under_contention(
 
     real_start = CompatibilityLivePaperBridge.start_agent
     observed: list[str] = []
+    cycle_completed_payloads: list[dict[str, Any]] = []
     stop_writers = threading.Event()
     writers_seen = threading.Event()
+    thesis_while_writer_active = threading.Event()
 
+    required_events = {
+        "graph.cycle.started",
+        "strategy.thesis.generated",
+        "debate.review.completed",
+        "graph.cycle.completed",
+    }
     preferred = {
         "chain.universe.built",
         "contract.grid.scored",
         "portfolio.grid.scored",
-        "debate.review.completed",
         "target.wait.selected",
         "target.portfolio.selected",
-        "graph.cycle.completed",
     }
 
-    def _on_event(event_type: str, _payload: dict[str, Any]) -> None:
+    def _on_event(event_type: str, payload: dict[str, Any]) -> None:
         observed.append(event_type)
+        if event_type == "graph.cycle.completed":
+            cycle_completed_payloads.append(dict(payload or {}))
+        if event_type == "strategy.thesis.generated":
+            if writers_seen.is_set() and not stop_writers.is_set():
+                thesis_while_writer_active.set()
+            # Contended through historical scoring; thesis is emitted after it.
+            stop_writers.set()
 
     submit_count = {"n": 0}
     broker = PaperBroker(initial_balance=25000.0, slippage_pct=0.0)
@@ -403,20 +416,18 @@ def test_live_paper_runner_normal_cognitive_path_under_contention(
     broker.submit_order = _count_submit  # type: ignore[method-assign]
 
     def _writer_thread() -> None:
-        """Contend during objective gate / early persistence, then stop.
+        """Intermittent BEGIN IMMEDIATE pulses through historical scoring.
 
-        Long-lived BEGIN IMMEDIATE writers across the full ~40s canned cycle
-        starve bridge ``run_coro`` pumping and hang shutdown. The dedicated
-        downstream contention suite covers sustained IMMEDIATE load; here we
-        keep a real shared Task-1 writer overlapping startup + early graph.
+        Pulses release the write lock between iterations so the cognitive
+        cycle can progress; the writer stays active until thesis (post-scoring).
         """
         writers_seen.set()
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
 
         async def _run() -> None:
-            end = time.monotonic() + 12.0
-            while not stop_writers.is_set() and time.monotonic() < end:
+            hard_cap = time.monotonic() + 90.0
+            while not stop_writers.is_set() and time.monotonic() < hard_cap:
                 try:
                     async with aiosqlite.connect(task1_db) as conn:
                         await conn.execute("PRAGMA busy_timeout = 100")
@@ -428,7 +439,7 @@ def test_live_paper_runner_normal_cognitive_path_under_contention(
                         await conn.commit()
                 except Exception:
                     pass
-                await asyncio.sleep(0.04)
+                await asyncio.sleep(0.05)
 
         try:
             loop.run_until_complete(_run())
@@ -490,16 +501,32 @@ def test_live_paper_runner_normal_cognitive_path_under_contention(
         asyncio.run(drain_aiosqlite_workers(timeout=1.0))
 
     assert writers_seen.is_set(), "competing Task-1 writer never started"
+    assert thesis_while_writer_active.is_set(), (
+        "strategy.thesis.generated must occur while competing writers are still active"
+    )
     assert timeline.index("bind") < timeline.index("projector") < timeline.index(
         "start_agent"
     )
-    assert "strategy.thesis.generated" in observed, (
-        f"missing thesis event; observed={observed[:40]} errors={result.errors}"
-    )
-    assert preferred.intersection(observed), (
-        f"thesis observed but no downstream cognitive evidence: {observed}"
-    )
-    assert "graph.cycle.started" in observed
+    missing = required_events - set(observed)
+    assert not missing, f"missing required events {missing}; observed={observed[:40]}"
+    assert preferred.intersection(observed) or "graph.cycle.completed" in observed
+
+    for payload in cycle_completed_payloads:
+        codes = {
+            str(c)
+            for c in (payload.get("error_codes") or [])
+        }
+        assert "objective_unavailable" not in codes, payload
+        for err in payload.get("errors") or []:
+            message = str(
+                (err.get("message") if isinstance(err, dict) else err) or ""
+            ).lower()
+            code = str(
+                (err.get("code") if isinstance(err, dict) else "") or ""
+            ).lower()
+            assert "database is locked" not in message, err
+            assert "objective persistence busy" not in message, err
+            assert code != "objective_unavailable", err
 
     joined_errors = " ".join(result.errors + result.failures).lower()
     assert "objective_unavailable" not in joined_errors

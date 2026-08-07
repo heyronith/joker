@@ -5,6 +5,7 @@ Production live estimates use completed, leakage-safe paper episodes only.
 
 from __future__ import annotations
 
+import asyncio
 import math
 from collections.abc import Awaitable, Callable, Sequence
 from datetime import datetime, timedelta, time, timezone
@@ -170,6 +171,23 @@ class HistoricalOutcomeService:
         """Unit-test helper only — production tests must persist via repositories."""
         self._seeded = list(episodes)
 
+    async def _persist_historical_result(
+        self,
+        query: HistoricalOutcomeQuery,
+        summary: HistoricalOutcomeSummary,
+        report: HistoricalLeakageReport,
+    ) -> None:
+        """Off-loop atomic durable write for one historical evaluation result."""
+        if self._repo is None:
+            return
+
+        await asyncio.to_thread(
+            self._repo.persist_historical_result_atomic,
+            query,
+            summary,
+            report,
+        )
+
     async def query_comparable_outcomes(
         self,
         query: HistoricalOutcomeQuery,
@@ -196,10 +214,7 @@ class HistoricalOutcomeService:
                 notes=("missing_or_naive_as_of_timestamp",),
             )
             summary = self._aggregate(query, (), {"as_of_invalid": 1}, report)
-            if self._repo is not None:
-                self._repo.save_historical_query(query)
-                self._repo.save_historical_summary(summary)
-                self._repo.save_leakage_report(report)
+            await self._persist_historical_result(query, summary, report)
             return summary, report, ()
 
         datasets = await self._load_datasets()
@@ -222,10 +237,7 @@ class HistoricalOutcomeService:
             summary = self._aggregate(
                 query, (), {"configuration_dataset_provenance_missing": 1}, report
             )
-            if self._repo is not None:
-                self._repo.save_historical_query(query)
-                self._repo.save_historical_summary(summary)
-                self._repo.save_leakage_report(report)
+            await self._persist_historical_result(query, summary, report)
             return summary, report, ()
         # Unresolved overlap: blocked dataset IDs were supplied but loader missing.
         if (
@@ -355,10 +367,7 @@ class HistoricalOutcomeService:
             notes=tuple(dict.fromkeys(unsafe_notes)),
         )
         summary = self._aggregate(query, selected, exclusion, report)
-        if self._repo is not None:
-            self._repo.save_historical_query(query)
-            self._repo.save_historical_summary(summary)
-            self._repo.save_leakage_report(report)
+        await self._persist_historical_result(query, summary, report)
         return summary, report, tuple(selected)
 
     async def summarize_for_strategy(
