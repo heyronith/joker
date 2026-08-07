@@ -784,6 +784,52 @@ class LivePaperRunner:
             )
             assert cognitive_graph_deps.execution_runtime is not None
             assert cognitive_graph_deps.order_action_gateway is not None
+            if objective_service is not None:
+                # Normal cognitive startup must use the same durable objective
+                # binding as the recovery paths: bind the Task-1 capital
+                # projector, then prove the confirmed objective is readable
+                # before the graph is allowed to gate on it. Never fabricate,
+                # replace, re-capitalise or extend an objective here.
+                from joker.runtime.objective_recovery import recover_session_objective
+
+                task1_bridge.supervisor.bind_objective_service(objective_service)
+                recovered = task1_bridge.run_coro(
+                    recover_session_objective(
+                        objective_service,
+                        session_id=bridge_session_id,
+                        execution_runtime=task1_bridge.execution_runtime,
+                        unresolved_reconciliation=(
+                            task1_bridge.supervisor.unresolved_reconciliation is not None
+                        ),
+                    )
+                )
+                if recovered is None:
+                    raise LivePaperError(
+                        "cognitive startup requires a durable confirmed objective "
+                        f"for session {bridge_session_id}; none was recovered"
+                    )
+                recovered_session = str(getattr(recovered, "session_id", "") or "")
+                if recovered_session != str(bridge_session_id):
+                    raise LivePaperError(
+                        "recovered objective belongs to session "
+                        f"{recovered_session!r}, expected {bridge_session_id!r}"
+                    )
+                try:
+                    # Explicit readiness refresh after recover — prove the same
+                    # service can durably recompute before cognitive trading starts.
+                    readiness = task1_bridge.run_coro(
+                        objective_service.recompute_from_truth()
+                    )
+                except Exception as exc:
+                    raise LivePaperError(
+                        f"objective readiness check failed at cognitive startup: {exc}"
+                    ) from exc
+                readiness_status = str(getattr(readiness, "status", "") or "")
+                if readiness_status in {"", "pending_confirmation"}:
+                    raise LivePaperError(
+                        "objective is not confirmed at cognitive startup "
+                        f"(status={readiness_status!r})"
+                    )
             graph_event_values = {
                 "graph.cycle.started",
                 "strategy.thesis.generated",

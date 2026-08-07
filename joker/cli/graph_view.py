@@ -136,9 +136,41 @@ def _compact(event_type: str, payload: dict[str, Any]) -> str:
             f"verdict={payload.get('verdict')} "
             f"confidence={payload.get('confidence')}"
         )
+    if event_type == "graph.cycle.completed":
+        line = (
+            f"CYCLE {payload.get('outcome')} "
+            f"action={payload.get('decision_action')}"
+        )
+        errors = _structured_errors(payload)
+        if errors:
+            line += "\n" + "\n".join(_error_lines(errors, verbose=False))
+        return line
     return f"{event_type} " + " ".join(
         f"{key}={payload.get(key)}" for key in list(payload)[:4]
     )
+
+
+def _structured_errors(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    errors = payload.get("errors")
+    if not isinstance(errors, list):
+        return []
+    return [error for error in errors if isinstance(error, dict)]
+
+
+def _error_lines(errors: list[dict[str, Any]], *, verbose: bool) -> list[str]:
+    """Render blocking-reason lines so operators never see a bare error code."""
+    lines: list[str] = []
+    for error in errors:
+        message = str(error.get("message") or "")
+        if not verbose and len(message) > 200:
+            message = message[:200] + "…"
+        lines.append(
+            f"  OBJECTIVE ERROR code={error.get('code')} "
+            f"node={error.get('node')} "
+            f"recoverable={error.get('recoverable')} "
+            f"message={message}"
+        )
+    return lines
 
 
 def _verbose(
@@ -149,6 +181,22 @@ def _verbose(
     top_portfolio_rows: int,
 ) -> str:
     sections: list[str] = [f"── {event_type} ──"]
+    if event_type == "graph.cycle.completed":
+        sections.extend(
+            [
+                "CYCLE",
+                _fields(
+                    payload,
+                    (
+                        "cycle_id",
+                        "outcome",
+                        "decision_action",
+                        "execution_command_ids",
+                        "error_codes",
+                    ),
+                ),
+            ]
+        )
     goal = payload.get("goal")
     if isinstance(goal, dict):
         sections.extend(
@@ -279,6 +327,10 @@ def _verbose(
     execution = payload.get("execution")
     if isinstance(execution, dict):
         sections.extend(["EXECUTION", _fields(execution, tuple(execution.keys()))])
+    errors = _structured_errors(payload)
+    if errors:
+        sections.append("ERRORS")
+        sections.extend(_error_lines(errors, verbose=True))
     if len(sections) == 1:
         sections.append(_fields(payload, tuple(payload.keys())))
     return "\n".join(section for section in sections if section)

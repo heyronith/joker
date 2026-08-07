@@ -19,6 +19,40 @@ paper_app = typer.Typer(
 console = Console()
 
 
+def agent_runtime_label(app_settings) -> str:
+    """Describe who produces agent output. Never claim a specific provider."""
+    agents = getattr(app_settings, "agents", None)
+    if bool(getattr(agents, "mock_agents", False)):
+        return "mock agents (no model provider calls)"
+    runtime = (getattr(agents, "runtime", "") or "legacy").strip().lower()
+    if runtime == "cognitive_graph":
+        return "cognitive graph / configured model router"
+    if runtime == "null":
+        return "null agent runtime (no agent output)"
+    return "legacy agent council / configured model router"
+
+
+def model_provider_label(app_settings, availability=None) -> str:
+    """Report configured (and, when known, verified) model providers.
+
+    ``availability`` is the startup probe result. Health is only reported when
+    it has actually been measured — configuration alone never implies a
+    reachable provider.
+    """
+    models = getattr(app_settings, "models", None)
+
+    def _state(name: str) -> str:
+        enabled = bool(getattr(getattr(models, name, None), "enabled", False))
+        if not enabled:
+            return "disabled"
+        healthy = getattr(availability, f"{name}_healthy", None) if availability else None
+        if healthy is None:
+            return "enabled"
+        return "enabled/healthy" if healthy else "enabled/unhealthy"
+
+    return f"Ollama={_state('ollama')}, OpenAI={_state('openai')}"
+
+
 def _broker_status_row(env) -> tuple[str, str]:
     if webull_paper_env_ready(env):
         return (
@@ -86,10 +120,8 @@ def paper_preflight(
             "[green]set[/green]" if env.webull_paper_account_id else "[red]missing[/red]",
         )
     table.add_row("Default provider", app_settings.data.default_provider)
-    table.add_row(
-        "Agents",
-        "mock" if app_settings.agents.mock_agents else "OpenAI council + intraday",
-    )
+    table.add_row("Agents", agent_runtime_label(app_settings))
+    table.add_row("Models", model_provider_label(app_settings))
     table.add_row(
         "Allow delayed quotes",
         "yes" if app_settings.risk.allow_delayed_quotes else "no",
@@ -1136,11 +1168,24 @@ def paper_run(
         result.app_settings.agents.execution_mode or "rules_hybrid"
     ).strip().lower()
     risk_policy = (result.app_settings.risk.policy or "strict").strip().lower()
+    agents_label = agent_runtime_label(
+        result.app_settings.model_copy(
+            update={
+                "agents": result.app_settings.agents.model_copy(
+                    update={"mock_agents": not use_openai}
+                )
+            }
+        )
+    )
     console.print(
         f"[bold]Starting live paper loop[/bold] — "
         f"runtime={timing.runtime_duration_minutes:.1f}m, "
         f"objective={timing.objective_duration_minutes:.1f}m, "
-        f"agents={'openai' if use_openai else 'mock'}, broker={broker_label}"
+        f"broker={broker_label}"
+    )
+    console.print(
+        f"[dim]Agents: {agents_label}[/dim]\n"
+        f"[dim]Models: {model_provider_label(result.app_settings)}[/dim]"
     )
     if recovery_mode in {"reconciliation_only", "broker_only"}:
         console.print(

@@ -269,10 +269,28 @@ async def publish_cycle_observable_events(
                 getattr(error, "error_code", None)
                 for error in state.get("errors") or []
             ],
+            "errors": _structured_errors(state),
         },
         correlation=correlation,
         timestamp=timestamp,
     )
+
+
+def _structured_errors(state: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Sanitised per-error diagnostics so operators see *why* a cycle blocked."""
+    structured: list[dict[str, Any]] = []
+    for error in state.get("errors") or []:
+        structured.append(
+            {
+                "code": getattr(error, "error_code", None),
+                "node": getattr(error, "node_name", None),
+                "message": sanitize_graph_evidence(
+                    str(getattr(error, "message", "") or ""), key="message"
+                ),
+                "recoverable": bool(getattr(error, "recoverable", True)),
+            }
+        )
+    return structured
 
 
 async def publish_graph_cycle_started(
@@ -281,18 +299,22 @@ async def publish_graph_cycle_started(
 ) -> None:
     if deps.event_bus is None:
         return
+    payload: dict[str, Any] = {
+        "cycle_id": state.get("cycle_id"),
+        "snapshot_id": state.get("snapshot_id"),
+    }
+    # Objective context is hydrated later in the cycle. Publishing
+    # objective_version=None here reads as "no objective" to operators, so omit
+    # the field entirely until a real confirmed version exists.
+    objective_context = state.get("_objective_context")
+    if isinstance(objective_context, dict):
+        version = objective_context.get("version")
+        if version is not None:
+            payload["objective_version"] = version
     await _publish(
         deps,
         EventType.GRAPH_CYCLE_STARTED,
-        {
-            "cycle_id": state.get("cycle_id"),
-            "snapshot_id": state.get("snapshot_id"),
-            "objective_version": (
-                (state.get("_objective_context") or {}).get("version")
-                if isinstance(state.get("_objective_context"), dict)
-                else None
-            ),
-        },
+        payload,
         correlation=_correlation_id(state),
         timestamp=_now(deps),
     )
