@@ -458,3 +458,277 @@ async def test_newly_polled_fill_is_recorded_in_terminal_request(tmp_path) -> No
         broker_account_identity=OWNER.broker_account_identity,
         trading_date=OWNER.trading_date,
     )
+
+
+def test_production_runner_post_poll_fill_is_recorded_in_terminal_request(
+    tmp_path, monkeypatch
+) -> None:
+    """LivePaperRunner must reconcile from a post-poll projection in the same pass."""
+    import asyncio
+    from pathlib import Path
+
+    from joker.broker.webull_trade_api import MockWebullTradeApi
+    from joker.config.settings import AppSettings, EnvSettings
+    from joker.runtime.cognitive_session import paper_account_identity
+    from joker.runtime.compatibility import CompatibilityLivePaperBridge
+    from joker.runtime.live_paper_runner import LivePaperRunConfig, LivePaperRunner
+    from joker.runtime.portfolio_recovery import PortfolioRecoveryCoordinator
+
+    prior_date = "2026-08-05"
+    app = AppSettings(db_path=str(tmp_path / "app.db"))
+    app = app.model_copy(
+        update={
+            "broker": app.broker.model_copy(update={"provider": "webull_paper"}),
+            "agents": app.agents.model_copy(update={"runtime": "cognitive_graph"}),
+        }
+    )
+    env = EnvSettings(
+        _env_file=None,
+        OPENAI_API_KEY="test-ci-key-not-real",
+        WEBULL_MARKET_DATA_ENABLED=False,
+        WEBULL_LIVE_TRADING_ENABLED=False,
+        WEBULL_PAPER_TRADING_ENABLED=True,
+        WEBULL_PAPER_ACCOUNT_ID="PAPER_ACCT_1",
+        WEBULL_APP_KEY="paper-key",
+        WEBULL_APP_SECRET="paper-secret",
+        WEBULL_ACCESS_TOKEN="paper-token",
+    )
+    runner = LivePaperRunner(app, env)
+    api = MockWebullTradeApi(account_id="PAPER_ACCT_1")
+    account_identity = paper_account_identity(broker_kind="webull_paper", env=env)
+    session_id = f"cog:paper:{account_identity}:{prior_date}"
+    client_filled = "client-tuple-a"
+    client_suffix = "client-tuple-b"
+    ordering: list[str] = []
+
+    async def _seed() -> CognitiveExecutionProvenanceRegistry:
+        task1_db = Path(app.db_path).parent / "joker_task1.db"
+        registry = CognitiveExecutionProvenanceRegistry(
+            task1_db.with_name(task1_db.stem + "_cognitive_provenance.db")
+        )
+        await registry.initialize()
+        owner = PortfolioExecutionOwner(
+            session_id=session_id,
+            broker_account_identity=account_identity,
+            trading_date=prior_date,
+        )
+        working = PortfolioExecutionComponentRecord(
+            session_id=owner.session_id,
+            origin_run_id="run-a",
+            broker_account_identity=owner.broker_account_identity,
+            trading_date=owner.trading_date,
+            target_portfolio_decision_id="decision-a",
+            selected_portfolio_id="portfolio-a",
+            authorized_position_tuple_id="tuple-a",
+            component_index=0,
+            component_count=2,
+            strategy_id="strategy-tuple-a",
+            contract_id="contract-tuple-a",
+            authorized_quantity=1,
+            capital_allocation=Decimal("100"),
+            client_order_id=client_filled,
+            status=PortfolioComponentStatus.WORKING,
+            remaining_quantity=1,
+            submitted_quantity=1,
+            filled_quantity=0,
+            original_decision_snapshot_id="snapshot-a",
+            evaluated_objective_version=1,
+            evaluated_timestamp=NOW.isoformat(),
+        )
+        await registry.portfolio_executions.authorize(working)
+        authorized = await registry.portfolio_executions.authorize(
+            PortfolioExecutionComponentRecord(
+                session_id=owner.session_id,
+                origin_run_id="run-a",
+                broker_account_identity=owner.broker_account_identity,
+                trading_date=owner.trading_date,
+                target_portfolio_decision_id="decision-a",
+                selected_portfolio_id="portfolio-a",
+                authorized_position_tuple_id="tuple-b",
+                component_index=1,
+                component_count=2,
+                strategy_id="strategy-tuple-b",
+                contract_id="contract-tuple-b",
+                authorized_quantity=1,
+                capital_allocation=Decimal("100"),
+                client_order_id=client_suffix,
+                status=PortfolioComponentStatus.AUTHORIZED,
+                remaining_quantity=1,
+                original_decision_snapshot_id="snapshot-a",
+                evaluated_objective_version=1,
+                evaluated_timestamp=NOW.isoformat(),
+            )
+        )
+        assert authorized.status == PortfolioComponentStatus.AUTHORIZED
+        return registry
+
+    registry = asyncio.run(_seed())
+
+    class Obj:
+        version = 5
+        status = "deadline_reached"
+        objective_id = "objective-a"
+        available_capital_usd = Decimal("900")
+        reserved_capital_usd = Decimal("100")
+        working_order_reservation_usd = Decimal("0")
+        filled_position_exposure_usd = Decimal("100")
+        required_profit_remaining_usd = Decimal("50")
+        realised_pnl_usd = Decimal("0")
+        deadline_exchange_time = NOW
+        time_remaining_seconds = 0
+        entries_paused = True
+        truth_degraded = False
+        open_position_count = 1
+        max_concurrent_positions = 3
+
+        def as_dict(self):
+            return {"version": 5, "status": "deadline_reached"}
+
+    objective_service = SimpleNamespace(
+        get_state=AsyncMock(return_value=Obj()),
+        recompute_from_truth=AsyncMock(return_value=Obj()),
+        repository=None,
+    )
+    real_bridge = CompatibilityLivePaperBridge
+
+    class TrackingBridge(real_bridge):
+        def start(self, *, start_agent: bool = True) -> None:
+            super().start(start_agent=start_agent)
+            self._fill_written = False
+            self._project_count = 0
+            if self.supervisor.snapshot_repository is not None:
+                self.supervisor.snapshot_repository.get_latest = AsyncMock(  # type: ignore[method-assign]
+                    return_value=SimpleNamespace(snapshot_id="snapshot-post-fill")
+                )
+
+        def project_session(self):
+            self._project_count += 1
+            if not self._fill_written:
+                ordering.append("project:WORKING")
+                return SimpleNamespace(
+                    orders={
+                        client_filled: SimpleNamespace(
+                            client_order_id=client_filled,
+                            status="working",
+                            filled_qty=0,
+                            order_id="broker-a",
+                        )
+                    },
+                    positions={},
+                )
+            ordering.append("project:FILLED")
+            return SimpleNamespace(
+                orders={
+                    client_filled: SimpleNamespace(
+                        client_order_id=client_filled,
+                        status="filled",
+                        filled_qty=1,
+                        order_id="broker-a",
+                    )
+                },
+                positions={
+                    "contract-tuple-a": {
+                        "contract_id": "contract-tuple-a",
+                        "quantity": 1,
+                    }
+                },
+            )
+
+        def poll_order_status(self, client_order_id: str):
+            assert client_order_id == client_filled
+            self._fill_written = True
+            ordering.append("poll:FINAL_FILL")
+            return SimpleNamespace(
+                client_order_id=client_filled,
+                status="filled",
+                filled_qty=1,
+                order_id="broker-a",
+            )
+
+    monkeypatch.setattr(
+        "joker.runtime.live_paper_runner.CompatibilityLivePaperBridge",
+        TrackingBridge,
+    )
+    monkeypatch.setattr(
+        "joker.runtime.objective_recovery.recover_session_objective",
+        AsyncMock(return_value=None),
+    )
+
+    original_reconcile = PortfolioRecoveryCoordinator.reconcile_owner_components
+
+    async def _tracked_reconcile(self, *args, **kwargs):
+        projection = kwargs.get("projection")
+        orders = getattr(projection, "orders", {}) or {}
+        order = orders.get(client_filled) if isinstance(orders, dict) else None
+        status = str(getattr(order, "status", "missing") or "missing").lower()
+        ordering.append(f"coordinator:{status}")
+        return await original_reconcile(self, *args, **kwargs)
+
+    monkeypatch.setattr(
+        PortfolioRecoveryCoordinator,
+        "reconcile_owner_components",
+        _tracked_reconcile,
+    )
+
+    result = runner.run(
+        LivePaperRunConfig(
+            duration_seconds=0.1,
+            mock_agents=True,
+            require_options=False,
+            recovery_mode="reconciliation_only",
+            recovery_owner_trading_date=prior_date,
+            reconciliation_only_recovery=True,
+            trade_api=api,
+            cognitive_session_id_override=session_id,
+            objective_service=objective_service,
+        )
+    )
+    assert result.feed_health == "RECOVERY_ONLY"
+
+    # Same-iteration ordering: initial project → poll → fresh project → coordinator.
+    first_pass = ordering[:4]
+    assert first_pass == [
+        "project:WORKING",
+        "poll:FINAL_FILL",
+        "project:FILLED",
+        "coordinator:filled",
+    ], f"stale pre-poll projection ordering observed: {ordering}"
+
+    filled = asyncio.run(registry.portfolio_executions.get("tuple-a"))
+    suffix = asyncio.run(registry.portfolio_executions.get("tuple-b"))
+    assert filled is not None
+    assert filled.status == PortfolioComponentStatus.FILLED
+    assert filled.continuation_ready is True
+    assert suffix is not None
+    assert suffix.status == PortfolioComponentStatus.REOPTIMIZATION_REQUIRED
+    assert suffix.resolution_status == PortfolioComponentResolutionStatus.OPERATOR_RESOLVED
+    assert suffix.submitted_quantity == 0
+
+    request = asyncio.run(
+        registry.portfolio_reoptimizations.get_by_remaining(
+            session_id=session_id,
+            broker_account_identity=account_identity,
+            trading_date=prior_date,
+            original_portfolio_decision_id="decision-a",
+            remaining_authorized_tuple_ids=("tuple-b",),
+        )
+    )
+    assert request is not None
+    assert request.status == PortfolioReoptimizationStatus.COMPLETED
+    assert request.replacement_action == "WAIT"
+    assert "tuple-a" in request.already_filled_tuple_ids
+    assert request.remaining_authorized_tuple_ids == ("tuple-b",)
+    assert not asyncio.run(
+        registry.portfolio_reoptimizations.list_pending(
+            session_id=session_id,
+            broker_account_identity=account_identity,
+            trading_date=prior_date,
+        )
+    )
+    assert not asyncio.run(
+        registry.portfolio_executions.has_unresolved(
+            session_id=session_id,
+            broker_account_identity=account_identity,
+            trading_date=prior_date,
+        )
+    )

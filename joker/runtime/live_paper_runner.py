@@ -350,6 +350,10 @@ class LivePaperRunner:
             try:
                 projection = task1_bridge.project_session()
                 _poll_working_orders(projection)
+                # Broker polls may append fills/rejects/cancels to the ledger.
+                # Re-project before deterministic portfolio reconciliation so the
+                # same iteration records newly terminal orders in request provenance.
+                projection = task1_bridge.project_session()
                 latest_snapshot_id = None
                 snapshot_repo = task1_bridge.supervisor.snapshot_repository
                 if snapshot_repo is not None:
