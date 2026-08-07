@@ -509,9 +509,9 @@ class OrderActionGateway:
                 svc = self._deps.objective_service
                 estimate = None
                 if request.estimate_id:
-                    estimate = svc.get_strategy_estimate(request.estimate_id)
+                    estimate = await svc.get_strategy_estimate(request.estimate_id)
                 elif request.strategy_id:
-                    estimate = svc.get_latest_estimate_for_strategy(
+                    estimate = await svc.get_latest_estimate_for_strategy(
                         strategy_id=request.strategy_id,
                         objective_id=obj_state.objective_id,
                     )
@@ -541,7 +541,7 @@ class OrderActionGateway:
                         working_orders=working,
                     )
                 if estimate.historical_summary_id is not None:
-                    summary = svc.get_historical_summary(estimate.historical_summary_id)
+                    summary = await svc.get_historical_summary(estimate.historical_summary_id)
                     objective_policy = str(getattr(svc, "objective_policy", "positive_ev_baseline"))
                     # Target-attainment may proceed on ordinal/low-sample evidence;
                     # baseline still requires valid_for_ev historical summaries.

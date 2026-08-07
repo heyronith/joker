@@ -357,10 +357,14 @@ class SessionObjectiveService:
         return await self._db_read(self._latest_state_sync)
 
     def get_sanitised_context(self) -> dict[str, Any]:
+        """Sync helper for non-async callers; prefer ``aget_sanitised_context`` on loops."""
         state = self._repo.latest_state(self._objective_id) if self._objective_id else None
         if state is None:
             raise ObjectiveServiceError("objective state is missing")
         return state_to_context(state).model_dump_for_hash()
+
+    async def aget_sanitised_context(self) -> dict[str, Any]:
+        return await self._db_read(self.get_sanitised_context)
 
     def mark_reconciliation_unresolved(self, unresolved: bool) -> None:
         self._reconciliation_unresolved = unresolved
@@ -1398,33 +1402,59 @@ class SessionObjectiveService:
     # Public persistence API (graph nodes must not touch _repo)
     # ------------------------------------------------------------------
 
-    def save_feasibility(self, assessment: Any) -> None:
-        self._repo.save_feasibility(assessment)
+    async def save_feasibility(self, assessment: Any) -> None:
+        def _body() -> None:
+            try:
+                self._repo.save_feasibility(assessment)
+            except ObjectivePersistenceBusyError as exc:
+                raise ObjectiveServiceError(str(exc)) from exc
 
-    def save_strategy_estimate(self, estimate: Any) -> None:
-        self._repo.save_strategy_estimate(estimate)
+        await self._db_write(_body)
 
-    def save_strategy_score(self, score: Any) -> None:
-        self._repo.save_strategy_score(score)
+    async def save_strategy_estimate(self, estimate: Any) -> None:
+        def _body() -> None:
+            try:
+                self._repo.save_strategy_estimate(estimate)
+            except ObjectivePersistenceBusyError as exc:
+                raise ObjectiveServiceError(str(exc)) from exc
 
-    def get_strategy_estimate(self, estimate_id: UUID | str) -> Any | None:
-        return self._repo.get_strategy_estimate(estimate_id)
+        await self._db_write(_body)
 
-    def get_latest_estimate_for_strategy(
-        self, *, strategy_id: UUID | str, objective_id: UUID | str
-    ) -> Any | None:
-        return self._repo.get_latest_estimate_for_strategy(
-            strategy_id=strategy_id, objective_id=objective_id
+    async def save_strategy_score(self, score: Any) -> None:
+        def _body() -> None:
+            try:
+                self._repo.save_strategy_score(score)
+            except ObjectivePersistenceBusyError as exc:
+                raise ObjectiveServiceError(str(exc)) from exc
+
+        await self._db_write(_body)
+
+    async def get_strategy_estimate(self, estimate_id: UUID | str) -> Any | None:
+        return await self._db_read(
+            lambda: self._repo.get_strategy_estimate(estimate_id)
         )
 
-    def get_historical_summary(self, summary_id: UUID | str) -> Any | None:
-        return self._repo.get_historical_summary(summary_id)
+    async def get_latest_estimate_for_strategy(
+        self, *, strategy_id: UUID | str, objective_id: UUID | str
+    ) -> Any | None:
+        return await self._db_read(
+            lambda: self._repo.get_latest_estimate_for_strategy(
+                strategy_id=strategy_id, objective_id=objective_id
+            )
+        )
 
-    def get_latest_historical_summary_for_strategy(
+    async def get_historical_summary(self, summary_id: UUID | str) -> Any | None:
+        return await self._db_read(
+            lambda: self._repo.get_historical_summary(summary_id)
+        )
+
+    async def get_latest_historical_summary_for_strategy(
         self, *, strategy_id: UUID | str, snapshot_id: UUID | str
     ) -> Any | None:
-        return self._repo.get_latest_historical_summary_for_strategy(
-            strategy_id=strategy_id, snapshot_id=snapshot_id
+        return await self._db_read(
+            lambda: self._repo.get_latest_historical_summary_for_strategy(
+                strategy_id=strategy_id, snapshot_id=snapshot_id
+            )
         )
 
     async def mark_insufficient_historical_evidence(

@@ -189,7 +189,7 @@ async def _gateway_stack(tmp_path, *, quote: CurrentExecutionQuote, pnl: Decimal
                 "uncertainty_reasons": (),
             }
         )
-    svc.save_strategy_estimate(est)
+    await svc.save_strategy_estimate(est)
 
     calls: list[str] = []
 
@@ -307,7 +307,7 @@ async def test_gateway_loads_current_task1_quote(tmp_path, monkeypatch) -> None:
             },
         }
     )
-    svc.save_strategy_estimate(est2)
+    await svc.save_strategy_estimate(est2)
     result = await gateway.submit(_entry_request(est2, strategy, limit=1.10))
     assert calls == [CONTRACT_ID]
     assert result.submitted is True
@@ -333,7 +333,7 @@ async def test_gateway_rejects_extreme_buy_limit_above_ask(
             },
         }
     )
-    svc.save_strategy_estimate(est2)
+    await svc.save_strategy_estimate(est2)
     result = await gateway.submit(_entry_request(est2, strategy, limit=99.0))
     assert calls == [CONTRACT_ID]
     assert result.submitted is False
@@ -364,7 +364,7 @@ async def test_gateway_cannot_submit_9900_notional_with_110_reservation(
             },
         }
     )
-    svc.save_strategy_estimate(est2)
+    await svc.save_strategy_estimate(est2)
     result = await gateway.submit(_entry_request(est2, strategy, limit=99.0))
     assert result.submitted is False
     assert runtime.submissions == []
@@ -425,7 +425,7 @@ async def test_gateway_rejects_non_positive_current_quote_ev(tmp_path, monkeypat
             },
         }
     )
-    svc.save_strategy_estimate(est2)
+    await svc.save_strategy_estimate(est2)
     result = await gateway.submit(_entry_request(est2, strategy, limit=1.50))
     assert result.submitted is False
     assert "objective_repriced_ev_not_positive" in (result.blocked_reason or "")
@@ -454,7 +454,7 @@ async def test_gateway_reserves_once_after_positive_current_quote_ev(
             },
         }
     )
-    svc.save_strategy_estimate(est2)
+    await svc.save_strategy_estimate(est2)
     result = await gateway.submit(_entry_request(est2, strategy, limit=1.05))
     assert result.submitted is True
     assert len(runtime.submissions) == 1
@@ -480,7 +480,7 @@ async def test_gateway_reservation_covers_submitted_limit(tmp_path, monkeypatch)
             },
         }
     )
-    svc.save_strategy_estimate(est2)
+    await svc.save_strategy_estimate(est2)
     result = await gateway.submit(_entry_request(est2, strategy, limit=1.04))
     assert result.submitted is True
     state = await svc.get_state()
@@ -509,7 +509,7 @@ async def test_gateway_ev_uses_maximum_permitted_fill_price(
             },
         }
     )
-    svc.save_strategy_estimate(est2)
+    await svc.save_strategy_estimate(est2)
     result = await gateway.submit(_entry_request(est2, strategy, limit=1.04))
     assert result.submitted is True
     assert runtime.submissions
@@ -535,7 +535,7 @@ async def test_gateway_clamped_limit_matches_reserved_price(
             },
         }
     )
-    svc.save_strategy_estimate(est2)
+    await svc.save_strategy_estimate(est2)
     # Limit below ask → worst-case = ask; submitted limit must match reservation.
     result = await gateway.submit(_entry_request(est2, strategy, limit=1.05))
     assert result.submitted is True
@@ -563,7 +563,7 @@ async def test_normal_quote_aligned_limit_submits_once(tmp_path, monkeypatch) ->
             },
         }
     )
-    svc.save_strategy_estimate(est2)
+    await svc.save_strategy_estimate(est2)
     result = await gateway.submit(_entry_request(est2, strategy, limit=1.10))
     assert result.submitted is True
     assert len(runtime.submissions) == 1
@@ -633,7 +633,7 @@ async def test_gateway_price_change_triggers_recalculation_when_ranking_invalid(
             },
         }
     )
-    svc.save_strategy_estimate(est2)
+    await svc.save_strategy_estimate(est2)
     result = await gateway.submit(_entry_request(est2, strategy, limit=2.00))
     assert calls == [CONTRACT_ID]
     assert result.submitted is False

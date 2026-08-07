@@ -303,3 +303,232 @@ def test_cli_model_provider_labels_are_truthful() -> None:
     label = model_provider_label(app)
     assert "Ollama=enabled" in label or "Ollama=disabled" in label
     assert "OpenAI=disabled" in label
+
+
+@pytest.mark.asyncio
+async def test_sync_downstream_objective_persistence_exposes_824a7ca_hazard(
+    tmp_path: Path,
+) -> None:
+    """Pre-fix probe: sync sqlite3 feasibility/estimate/score saves on the loop.
+
+    At ``824a7ca`` graph callers invoked sync ``SessionObjectiveService`` save
+    methods directly on the cognitive asyncio loop. Under Task-1 contention that
+    either stalls the loop for multi-second busy waits or surfaces raw
+    ``sqlite3.OperationalError``. This probe recreates that hazard shape.
+    """
+    from uuid import uuid4
+
+    from joker.objectives.schemas import (
+        GoalFeasibilityAssessment,
+        ObjectiveStrategyScore,
+        StrategyObjectiveEstimate,
+    )
+
+    svc, repo, db = await _armed(tmp_path, name="hazard.db")
+    state = await svc.get_state()
+    stop = asyncio.Event()
+    heartbeats: list[float] = []
+    locked: list[BaseException] = []
+
+    async def _task1_writer() -> None:
+        while not stop.is_set():
+            async with aiosqlite.connect(db) as conn:
+                await conn.execute("PRAGMA busy_timeout = 50")
+                try:
+                    await conn.execute("BEGIN IMMEDIATE")
+                    await conn.execute(
+                        "CREATE TABLE IF NOT EXISTS hazard_noise(id INTEGER)"
+                    )
+                    await conn.execute("INSERT INTO hazard_noise(id) VALUES (1)")
+                    # Hold the write lock long enough that a sync busy-wait on the
+                    # event loop produces a visible heartbeat stall.
+                    await asyncio.sleep(0.35)
+                    await conn.commit()
+                except Exception:
+                    try:
+                        await conn.rollback()
+                    except Exception:
+                        pass
+            await asyncio.sleep(0.01)
+
+    async def _heartbeat() -> None:
+        while not stop.is_set():
+            heartbeats.append(time.monotonic())
+            await asyncio.sleep(0.05)
+
+    writer = asyncio.create_task(_task1_writer())
+    beat = asyncio.create_task(_heartbeat())
+    await asyncio.sleep(0.1)
+    snap = uuid4()
+    strategy_id = uuid4()
+    try:
+        for _ in range(6):
+            try:
+                # Direct repo writes on the event loop — the 824a7ca hazard.
+                repo.save_feasibility(
+                    GoalFeasibilityAssessment(
+                        objective_id=state.objective_id,
+                        snapshot_id=snap,
+                        classification="medium",
+                        required_return_remaining_pct=Decimal("10"),
+                        required_profit_remaining_usd=Decimal("50"),
+                        time_remaining_seconds=3600,
+                    )
+                )
+                repo.save_strategy_estimate(
+                    StrategyObjectiveEstimate(
+                        strategy_id=strategy_id,
+                        objective_id=state.objective_id,
+                        snapshot_id=snap,
+                        capital_required_usd=Decimal("100"),
+                        maximum_loss_usd=Decimal("100"),
+                        calculation_method="hazard_probe",
+                        valid=False,
+                    )
+                )
+                repo.save_strategy_score(
+                    ObjectiveStrategyScore(
+                        objective_id=state.objective_id,
+                        strategy_id=strategy_id,
+                        snapshot_id=snap,
+                        maximum_loss_usd=Decimal("100"),
+                        capital_required_usd=Decimal("100"),
+                        valid=False,
+                        is_no_trade=True,
+                    )
+                )
+            except (sqlite3.OperationalError, ObjectivePersistenceBusyError) as exc:
+                locked.append(exc)
+            await asyncio.sleep(0)
+    finally:
+        stop.set()
+        await asyncio.gather(writer, beat, return_exceptions=True)
+
+    gaps = [b - a for a, b in zip(heartbeats, heartbeats[1:])]
+    assert gaps, "heartbeat never advanced"
+    # Either the loop stalled on sync busy waits or a lock error escaped —
+    # both are the unsafe 824a7ca behaviours this suite must remain sensitive to.
+    assert locked or max(gaps) >= 1.0, (
+        f"expected sync-on-loop hazard; locked={locked!r} max_gap={max(gaps):.3f}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_downstream_objective_persistence_under_task1_contention(
+    tmp_path: Path,
+) -> None:
+    """Feasibility / estimate / score persistence must stay off the event loop."""
+    from uuid import uuid4
+
+    from joker.objectives.schemas import (
+        GoalFeasibilityAssessment,
+        ObjectiveStrategyScore,
+        StrategyObjectiveEstimate,
+    )
+
+    svc, repo, db = await _armed(tmp_path, name="downstream.db")
+    state = await svc.get_state()
+    stop = asyncio.Event()
+    heartbeats: list[float] = []
+    errors: list[BaseException] = []
+
+    async def _task1_writer() -> None:
+        while not stop.is_set():
+            async with aiosqlite.connect(db) as conn:
+                await conn.execute("PRAGMA busy_timeout = 500")
+                try:
+                    await conn.execute("BEGIN IMMEDIATE")
+                    await conn.execute(
+                        "CREATE TABLE IF NOT EXISTS downstream_noise(id INTEGER)"
+                    )
+                    await conn.execute("INSERT INTO downstream_noise(id) VALUES (1)")
+                    await conn.commit()
+                except Exception as exc:  # noqa: BLE001
+                    errors.append(exc)
+                    try:
+                        await conn.rollback()
+                    except Exception:
+                        pass
+            await asyncio.sleep(0.01)
+
+    async def _heartbeat() -> None:
+        while not stop.is_set():
+            heartbeats.append(time.monotonic())
+            await asyncio.sleep(0.05)
+
+    writer = asyncio.create_task(_task1_writer())
+    beat = asyncio.create_task(_heartbeat())
+    await asyncio.sleep(0.1)
+    snap = uuid4()
+    strategy_id = uuid4()
+    try:
+        for i in range(5):
+            await svc.save_feasibility(
+                GoalFeasibilityAssessment(
+                    objective_id=state.objective_id,
+                    snapshot_id=snap,
+                    classification="medium",
+                    required_return_remaining_pct=Decimal("10"),
+                    required_profit_remaining_usd=Decimal("50"),
+                    time_remaining_seconds=3600,
+                    assumptions=(f"pass-{i}",),
+                )
+            )
+            estimate = StrategyObjectiveEstimate(
+                strategy_id=strategy_id,
+                objective_id=state.objective_id,
+                snapshot_id=snap,
+                capital_required_usd=Decimal("100"),
+                maximum_loss_usd=Decimal("100"),
+                calculation_method="downstream_contention",
+                valid=False,
+                uncertainty_reasons=("no_history",),
+            )
+            await svc.save_strategy_estimate(estimate)
+            await svc.save_strategy_score(
+                ObjectiveStrategyScore(
+                    objective_id=state.objective_id,
+                    strategy_id=strategy_id,
+                    snapshot_id=snap,
+                    estimate_id=estimate.estimate_id,
+                    maximum_loss_usd=Decimal("100"),
+                    capital_required_usd=Decimal("100"),
+                    valid=False,
+                    is_no_trade=True,
+                )
+            )
+        await asyncio.sleep(0.2)
+    finally:
+        stop.set()
+        await asyncio.gather(writer, beat, return_exceptions=True)
+
+    gaps = [b - a for a, b in zip(heartbeats, heartbeats[1:])]
+    assert gaps, "heartbeat never advanced"
+    assert max(gaps) < 1.5, f"event loop stalled: max heartbeat gap={max(gaps):.3f}s"
+    assert not any(isinstance(exc, sqlite3.OperationalError) for exc in errors)
+
+    with sqlite3.connect(db) as conn:
+        feas = conn.execute(
+            "SELECT COUNT(*) FROM objective_feasibility_assessments WHERE objective_id=?",
+            (str(state.objective_id),),
+        ).fetchone()[0]
+        ests = conn.execute(
+            "SELECT COUNT(*) FROM objective_strategy_estimates WHERE objective_id=?",
+            (str(state.objective_id),),
+        ).fetchone()[0]
+        scores = conn.execute(
+            "SELECT COUNT(*) FROM objective_strategy_scores WHERE objective_id=?",
+            (str(state.objective_id),),
+        ).fetchone()[0]
+    assert feas >= 1
+    assert ests >= 1
+    assert scores >= 1
+    loaded = await svc.get_latest_estimate_for_strategy(
+        strategy_id=strategy_id, objective_id=state.objective_id
+    )
+    assert loaded is not None
+    assert loaded.calculation_method == "downstream_contention"
+    listed = repo.list_strategy_scores_for_snapshot(
+        objective_id=state.objective_id, snapshot_id=snap
+    )
+    assert listed

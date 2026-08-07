@@ -611,45 +611,51 @@ class ObjectiveRepository:
         return out
 
     def save_feasibility(self, assessment: GoalFeasibilityAssessment) -> None:
-        with self._connect() as conn:
-            conn.execute(
-                """
-                INSERT OR REPLACE INTO objective_feasibility_assessments (
-                    assessment_id, objective_id, snapshot_id, classification,
-                    payload_json, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    str(assessment.assessment_id),
-                    str(assessment.objective_id),
-                    str(assessment.snapshot_id),
-                    assessment.classification,
-                    _dumps(assessment),
-                    assessment.created_at.isoformat(),
-                ),
-            )
-            conn.commit()
+        def _op() -> None:
+            with self._connect() as conn:
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO objective_feasibility_assessments (
+                        assessment_id, objective_id, snapshot_id, classification,
+                        payload_json, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        str(assessment.assessment_id),
+                        str(assessment.objective_id),
+                        str(assessment.snapshot_id),
+                        assessment.classification,
+                        _dumps(assessment),
+                        assessment.created_at.isoformat(),
+                    ),
+                )
+                conn.commit()
+
+        self._with_busy_retry(_op)
 
     def save_strategy_score(self, score: ObjectiveStrategyScore) -> None:
-        with self._connect() as conn:
-            conn.execute(
-                """
-                INSERT OR REPLACE INTO objective_strategy_scores (
-                    score_id, objective_id, strategy_id, snapshot_id, valid,
-                    payload_json, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    str(score.score_id),
-                    str(score.objective_id),
-                    str(score.strategy_id) if score.strategy_id else None,
-                    str(score.snapshot_id),
-                    1 if score.valid else 0,
-                    _dumps(score),
-                    datetime.now().astimezone().isoformat(),
-                ),
-            )
-            conn.commit()
+        def _op() -> None:
+            with self._connect() as conn:
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO objective_strategy_scores (
+                        score_id, objective_id, strategy_id, snapshot_id, valid,
+                        payload_json, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        str(score.score_id),
+                        str(score.objective_id),
+                        str(score.strategy_id) if score.strategy_id else None,
+                        str(score.snapshot_id),
+                        1 if score.valid else 0,
+                        _dumps(score),
+                        datetime.now().astimezone().isoformat(),
+                    ),
+                )
+                conn.commit()
+
+        self._with_busy_retry(_op)
 
     def list_strategy_scores_for_snapshot(
         self, *, objective_id: UUID | str, snapshot_id: UUID | str
@@ -666,25 +672,28 @@ class ObjectiveRepository:
         return [ObjectiveStrategyScore.model_validate_json(r["payload_json"]) for r in rows]
 
     def save_strategy_estimate(self, estimate: StrategyObjectiveEstimate) -> None:
-        with self._connect() as conn:
-            conn.execute(
-                """
-                INSERT OR REPLACE INTO objective_strategy_estimates (
-                    estimate_id, objective_id, strategy_id, snapshot_id, valid,
-                    payload_json, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    str(estimate.estimate_id),
-                    str(estimate.objective_id),
-                    str(estimate.strategy_id),
-                    str(estimate.snapshot_id),
-                    1 if estimate.valid else 0,
-                    _dumps(estimate),
-                    estimate.created_at.isoformat(),
-                ),
-            )
-            conn.commit()
+        def _op() -> None:
+            with self._connect() as conn:
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO objective_strategy_estimates (
+                        estimate_id, objective_id, strategy_id, snapshot_id, valid,
+                        payload_json, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        str(estimate.estimate_id),
+                        str(estimate.objective_id),
+                        str(estimate.strategy_id),
+                        str(estimate.snapshot_id),
+                        1 if estimate.valid else 0,
+                        _dumps(estimate),
+                        estimate.created_at.isoformat(),
+                    ),
+                )
+                conn.commit()
+
+        self._with_busy_retry(_op)
 
     def get_strategy_estimate(
         self, estimate_id: UUID | str

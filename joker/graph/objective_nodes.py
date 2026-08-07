@@ -174,7 +174,7 @@ async def assess_goal_feasibility_node(
         evidence_ids=evidence_ids,
     )
     assessment = deps.feasibility_engine.assess(obj_state, inputs)
-    deps.objective_service.save_feasibility(assessment)
+    await deps.objective_service.save_feasibility(assessment)
     await deps.objective_service.update_feasibility(
         classification=assessment.classification,
         estimated_success_probability=assessment.estimated_success_probability,
@@ -424,7 +424,7 @@ async def score_strategies_against_objective_node(
                     ),
                 }
             )
-        deps.objective_service.save_strategy_estimate(estimate)
+        await deps.objective_service.save_strategy_estimate(estimate)
         estimates.append(estimate.model_dump(mode="json"))
         candidates.append(
             StrategyScoreInput(
@@ -472,10 +472,10 @@ async def score_strategies_against_objective_node(
             score.uncertainty_reasons = tuple(
                 (cand.calculation_inputs or {}).get("uncertainty_reasons") or ()
             )
-        deps.objective_service.save_strategy_score(score)
+        await deps.objective_service.save_strategy_score(score)
     for score in scores:
         if score.is_no_trade:
-            deps.objective_service.save_strategy_score(score)
+            await deps.objective_service.save_strategy_score(score)
 
     policy = str(
         getattr(deps, "objective_policy", None)
@@ -759,9 +759,11 @@ async def score_strategies_against_objective_node(
         result["_target_attainment_strategy_id"] = None
         result["_target_attainment_contract_id"] = None
         result["_target_attainment_quantity"] = None
-    if full_chain_payload:
+    if deps.event_bus is not None and (state.get("strategies") or full_chain_payload):
         from joker.graph.observable_events import publish_optimizer_scoring_events
 
+        # Thesis evidence is emitted for scored strategies even when the full-chain
+        # optimizer payload is empty (baseline policy / hard-block / no surface).
         await publish_optimizer_scoring_events(deps, {**state, **result})
     return result
 
