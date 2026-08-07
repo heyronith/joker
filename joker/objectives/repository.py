@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import time
 from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, TypeVar
 from uuid import UUID
 
 from joker.objectives.historical_schemas import (
@@ -32,9 +33,22 @@ CrashPoint = Literal[
     "after_broker_accept_before_association",
 ]
 
+# Keep objective wait budgets well below the default 90s cognitive cycle timeout.
+# Do not raise these toward the legacy 30s busy timeout — fail closed with a
+# precise diagnostic instead of blocking the event loop for tens of seconds.
+_CONNECT_TIMEOUT_SECONDS = 3.0
+_BUSY_TIMEOUT_MS = 2_000
+_BUSY_RETRY_DELAYS_SECONDS = (0.05, 0.1, 0.2, 0.4, 0.8)
+
+T = TypeVar("T")
+
 
 class CrashInjected(RuntimeError):
     """Raised by crash-injection hooks during atomic objective mutations."""
+
+
+class ObjectivePersistenceBusyError(RuntimeError):
+    """Raised when objective SQLite contention exceeds the bounded retry budget."""
 
 
 OBJECTIVE_SCHEMA_SQL = """
@@ -191,13 +205,24 @@ _ENCUMBERING_STATUSES = (
 def apply_objective_migrations(db_path: str | Path) -> Path:
     path = Path(db_path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(path)
+    conn = sqlite3.connect(path, timeout=_CONNECT_TIMEOUT_SECONDS)
     try:
+        # Establish WAL once at initialization — not on every hot-path connect.
+        conn.execute(f"PRAGMA busy_timeout = {_BUSY_TIMEOUT_MS}")
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA foreign_keys=ON")
         conn.executescript(OBJECTIVE_SCHEMA_SQL)
         conn.commit()
     finally:
         conn.close()
     return path
+
+
+def _is_busy_error(exc: BaseException) -> bool:
+    if not isinstance(exc, sqlite3.OperationalError):
+        return False
+    message = str(exc).lower()
+    return "locked" in message or "busy" in message
 
 
 def _dumps(model: Any) -> str:
@@ -272,37 +297,58 @@ class ObjectiveRepository:
             self._crash_hook(point)
 
     def _connect(self) -> sqlite3.Connection:
-        # Share the Task-1/3 SQLite file with aiosqlite workers; WAL + busy
-        # timeout avoid fail-closed on transient multi-writer contention.
-        conn = sqlite3.connect(self.db_path, timeout=30.0)
+        # Hot-path connections must not renegotiate journal_mode. WAL is set
+        # once during apply_objective_migrations. Bounded busy timeout keeps
+        # transient contention recoverable without a 30s event-loop stall.
+        conn = sqlite3.connect(self.db_path, timeout=_CONNECT_TIMEOUT_SECONDS)
         conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA busy_timeout = 30000")
-        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute(f"PRAGMA busy_timeout = {_BUSY_TIMEOUT_MS}")
         conn.execute("PRAGMA foreign_keys=ON")
         return conn
 
+    def _with_busy_retry(self, operation: Callable[[], T]) -> T:
+        """Retry transient SQLite locks with a budget far below cycle timeout."""
+        attempts = (0.0,) + _BUSY_RETRY_DELAYS_SECONDS
+        last_error: sqlite3.OperationalError | None = None
+        for delay in attempts:
+            if delay:
+                time.sleep(delay)
+            try:
+                return operation()
+            except sqlite3.OperationalError as exc:
+                if not _is_busy_error(exc):
+                    raise
+                last_error = exc
+        raise ObjectivePersistenceBusyError(
+            "objective persistence busy after bounded retry: "
+            f"{last_error}"
+        ) from last_error
+
     def save_definition(self, definition: SessionObjectiveDefinition) -> None:
-        with self._connect() as conn:
-            conn.execute(
-                """
-                INSERT OR REPLACE INTO session_objective_definitions (
-                    objective_id, session_id, definition_version, armed,
-                    first_broker_submission_at, payload_json, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    str(definition.objective_id),
-                    definition.session_id,
-                    definition.definition_version,
-                    1 if definition.armed else 0,
-                    definition.first_broker_submission_at.isoformat()
-                    if definition.first_broker_submission_at
-                    else None,
-                    _dumps(definition),
-                    definition.created_at.isoformat(),
-                ),
-            )
-            conn.commit()
+        def _op() -> None:
+            with self._connect() as conn:
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO session_objective_definitions (
+                        objective_id, session_id, definition_version, armed,
+                        first_broker_submission_at, payload_json, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        str(definition.objective_id),
+                        definition.session_id,
+                        definition.definition_version,
+                        1 if definition.armed else 0,
+                        definition.first_broker_submission_at.isoformat()
+                        if definition.first_broker_submission_at
+                        else None,
+                        _dumps(definition),
+                        definition.created_at.isoformat(),
+                    ),
+                )
+                conn.commit()
+
+        self._with_busy_retry(_op)
 
     def get_definition(self, objective_id: UUID | str) -> SessionObjectiveDefinition | None:
         with self._connect() as conn:
@@ -355,9 +401,81 @@ class ObjectiveRepository:
         return [str(row["session_id"]) for row in rows if row["session_id"]]
 
     def append_state(self, state: SessionObjectiveState) -> None:
-        with self._connect() as conn:
-            self._insert_state(conn, state)
-            conn.commit()
+        def _op() -> None:
+            with self._connect() as conn:
+                self._insert_state(conn, state)
+                conn.commit()
+
+        self._with_busy_retry(_op)
+
+    def append_next_state_atomic(
+        self,
+        *,
+        objective_id: UUID | str,
+        build_state: Callable[[int, SessionObjectiveState | None], SessionObjectiveState],
+        audit: dict[str, Any] | None = None,
+    ) -> SessionObjectiveState:
+        """Allocate the next version inside one write transaction and persist state.
+
+        Optional ``audit`` is committed in the same transaction so callers never
+        observe a committed state without its linked logical audit event.
+        """
+
+        def _op() -> SessionObjectiveState:
+            self._maybe_crash("before_transaction")
+            with self._connect() as conn:
+                try:
+                    conn.execute("BEGIN IMMEDIATE")
+                    latest = conn.execute(
+                        """
+                        SELECT version, payload_json
+                        FROM session_objective_state_versions
+                        WHERE objective_id=?
+                        ORDER BY version DESC LIMIT 1
+                        """,
+                        (str(objective_id),),
+                    ).fetchone()
+                    prev: SessionObjectiveState | None = None
+                    current_version = 0
+                    if latest is not None:
+                        current_version = int(latest["version"])
+                        prev = SessionObjectiveState.model_validate_json(
+                            latest["payload_json"]
+                        )
+                    next_version = current_version + 1
+                    state = build_state(next_version, prev)
+                    if int(state.version) != next_version:
+                        state = state.model_copy(update={"version": next_version})
+                    if str(state.objective_id) != str(objective_id):
+                        raise ValueError("state objective_id mismatch during atomic append")
+                    self._insert_state(conn, state)
+                    self._maybe_crash("after_state_append")
+                    if audit is not None:
+                        payload = dict(audit.get("payload") or {})
+                        after = dict(payload.get("after") or {})
+                        if "version" in after:
+                            after["version"] = next_version
+                            payload["after"] = after
+                        self._append_audit(
+                            conn,
+                            audit_id=str(audit["audit_id"]),
+                            objective_id=objective_id,
+                            session_id=str(audit["session_id"]),
+                            event_type=str(audit["event_type"]),
+                            payload=payload,
+                            created_at=audit["created_at"],
+                        )
+                        self._maybe_crash("after_audit_append")
+                    conn.commit()
+                    return state
+                except CrashInjected:
+                    conn.rollback()
+                    raise
+                except Exception:
+                    conn.rollback()
+                    raise
+
+        return self._with_busy_retry(_op)
 
     def _insert_state(self, conn: sqlite3.Connection, state: SessionObjectiveState) -> None:
         conn.execute(
@@ -704,17 +822,20 @@ class ObjectiveRepository:
         payload: dict[str, Any],
         created_at: datetime,
     ) -> None:
-        with self._connect() as conn:
-            self._append_audit(
-                conn,
-                audit_id=audit_id,
-                objective_id=objective_id,
-                session_id=session_id,
-                event_type=event_type,
-                payload=payload,
-                created_at=created_at,
-            )
-            conn.commit()
+        def _op() -> None:
+            with self._connect() as conn:
+                self._append_audit(
+                    conn,
+                    audit_id=audit_id,
+                    objective_id=objective_id,
+                    session_id=session_id,
+                    event_type=event_type,
+                    payload=payload,
+                    created_at=created_at,
+                )
+                conn.commit()
+
+        self._with_busy_retry(_op)
 
     def _append_audit(
         self,
@@ -790,66 +911,70 @@ class ObjectiveRepository:
 
         Uses ``BEGIN IMMEDIATE`` so concurrent writers cannot interleave.
         """
-        self._maybe_crash("before_transaction")
-        with self._connect() as conn:
-            try:
-                conn.execute("BEGIN IMMEDIATE")
-                if dedupe_key is not None:
-                    existing = conn.execute(
-                        "SELECT 1 FROM objective_projection_dedupe WHERE dedupe_key=?",
-                        (dedupe_key,),
-                    ).fetchone()
-                    if existing is not None:
-                        conn.rollback()
-                        return True  # already applied — idempotent success
-                latest = conn.execute(
-                    """
-                    SELECT version FROM session_objective_state_versions
-                    WHERE objective_id=? ORDER BY version DESC LIMIT 1
-                    """,
-                    (str(objective_id),),
-                ).fetchone()
-                current = int(latest["version"]) if latest else 0
-                if current != expected_version:
-                    conn.rollback()
-                    return False
-                self._upsert_exposure(conn, exposure)
-                self._maybe_crash("after_exposure_write")
-                self._insert_state(conn, new_state)
-                self._maybe_crash("after_state_append")
-                if audit is not None:
-                    self._append_audit(
-                        conn,
-                        audit_id=str(audit["audit_id"]),
-                        objective_id=objective_id,
-                        session_id=str(audit["session_id"]),
-                        event_type=str(audit["event_type"]),
-                        payload=dict(audit.get("payload") or {}),
-                        created_at=audit["created_at"],
-                    )
-                    self._maybe_crash("after_audit_append")
-                if dedupe_key is not None:
-                    conn.execute(
+
+        def _op() -> bool:
+            self._maybe_crash("before_transaction")
+            with self._connect() as conn:
+                try:
+                    conn.execute("BEGIN IMMEDIATE")
+                    if dedupe_key is not None:
+                        existing = conn.execute(
+                            "SELECT 1 FROM objective_projection_dedupe WHERE dedupe_key=?",
+                            (dedupe_key,),
+                        ).fetchone()
+                        if existing is not None:
+                            conn.rollback()
+                            return True  # already applied — idempotent success
+                    latest = conn.execute(
                         """
-                        INSERT INTO objective_projection_dedupe (
-                            dedupe_key, objective_id, event_type, created_at
-                        ) VALUES (?, ?, ?, ?)
+                        SELECT version FROM session_objective_state_versions
+                        WHERE objective_id=? ORDER BY version DESC LIMIT 1
                         """,
-                        (
-                            dedupe_key,
-                            str(objective_id),
-                            str((audit or {}).get("event_type") or "exposure_mutation"),
-                            new_state.last_recomputed_at.isoformat(),
-                        ),
-                    )
-                conn.commit()
-                return True
-            except CrashInjected:
-                conn.rollback()
-                raise
-            except Exception:
-                conn.rollback()
-                raise
+                        (str(objective_id),),
+                    ).fetchone()
+                    current = int(latest["version"]) if latest else 0
+                    if current != expected_version:
+                        conn.rollback()
+                        return False
+                    self._upsert_exposure(conn, exposure)
+                    self._maybe_crash("after_exposure_write")
+                    self._insert_state(conn, new_state)
+                    self._maybe_crash("after_state_append")
+                    if audit is not None:
+                        self._append_audit(
+                            conn,
+                            audit_id=str(audit["audit_id"]),
+                            objective_id=objective_id,
+                            session_id=str(audit["session_id"]),
+                            event_type=str(audit["event_type"]),
+                            payload=dict(audit.get("payload") or {}),
+                            created_at=audit["created_at"],
+                        )
+                        self._maybe_crash("after_audit_append")
+                    if dedupe_key is not None:
+                        conn.execute(
+                            """
+                            INSERT INTO objective_projection_dedupe (
+                                dedupe_key, objective_id, event_type, created_at
+                            ) VALUES (?, ?, ?, ?)
+                            """,
+                            (
+                                dedupe_key,
+                                str(objective_id),
+                                str((audit or {}).get("event_type") or "exposure_mutation"),
+                                new_state.last_recomputed_at.isoformat(),
+                            ),
+                        )
+                    conn.commit()
+                    return True
+                except CrashInjected:
+                    conn.rollback()
+                    raise
+                except Exception:
+                    conn.rollback()
+                    raise
+
+        return self._with_busy_retry(_op)
 
     def atomic_associate_broker_order(
         self,
