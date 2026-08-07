@@ -423,6 +423,7 @@ def paper_run(
     unresolved_work = False
     recovery_mode = "normal"
     selected_candidate = None
+    persisted_trading_date: str | None = None
     if objective_enabled:
         from joker.objectives.repository import ObjectiveRepository
         from joker.risk.capital import CapitalBudget, CapitalPlan
@@ -1175,7 +1176,15 @@ def paper_run(
                 session_id if (objective_enabled or recovery_mode == "broker_only") else None
             ),
             objective_deadline_exchange=timing.objective_deadline,
-            reconciliation_only_recovery=(recovery_mode in {"reconciliation_only", "broker_only"}),
+            recovery_mode=recovery_mode,
+            recovery_owner_trading_date=(
+                persisted_trading_date
+                if recovery_mode in {"reconciliation_only", "broker_only"}
+                else None
+            ),
+            reconciliation_only_recovery=(
+                recovery_mode in {"reconciliation_only", "broker_only"}
+            ),
             shutdown_grace_seconds=timing.shutdown_grace_seconds,
         ),
         on_state=on_state,

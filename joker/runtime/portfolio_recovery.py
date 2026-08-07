@@ -10,10 +10,12 @@ from typing import Any
 from joker.objectives.decision_fingerprint import ObjectiveDecisionFingerprint
 from joker.persistence.cognitive_execution_provenance import (
     CognitiveExecutionProvenanceRegistry,
+    PortfolioComponentResolutionStatus,
     PortfolioComponentStatus,
     PortfolioExecutionComponentRecord,
     PortfolioExecutionOwner,
     PortfolioReoptimizationRequestRecord,
+    PortfolioReoptimizationStatus,
     stable_reoptimization_request_id,
 )
 from joker.runtime.execution_runtime import ExecutionRuntime
@@ -295,6 +297,23 @@ class PortfolioRecoveryCoordinator:
                 )
                 if synced != component:
                     updated.append(synced)
+            # Reload after broker fill sync so terminal/request provenance sees
+            # the newly filled tuple ids instead of the pre-poll snapshot.
+            components = await self._provenance_registry.portfolio_executions.list_by_decision(
+                decision_id,
+                owner=self._owner,
+            )
+            repaired = await self.repair_interrupted_suffix_states(
+                decision_id=decision_id,
+                origin_run_id=origin_run_id,
+                state=state,
+                latest_snapshot_id=latest_snapshot_id,
+                objective_status=objective_status,
+                terminal_recovery_reason=terminal_recovery_reason,
+                source_components=components,
+            )
+            if repaired.request is not None:
+                updated.append(repaired.request)
             if (
                 terminal_recovery_reason
                 and objective_status is not None
@@ -309,7 +328,7 @@ class PortfolioRecoveryCoordinator:
                     terminal_recovery=True,
                     latest_snapshot_id=latest_snapshot_id,
                     objective_status=objective_status,
-                    source_components=components,
+                    source_components=None,
                 )
                 if resolution.terminalized and resolution.request is not None:
                     stored = await self._provenance_registry.portfolio_reoptimizations.get(
@@ -354,19 +373,105 @@ class PortfolioRecoveryCoordinator:
         ]
         if not suffix_components:
             return PortfolioRecoveryResolution(request=None)
-        resolved_at = self._clock.now().isoformat()
-        for component in suffix_components:
-            await self._provenance_registry.portfolio_executions.transition(
-                component.authorized_position_tuple_id,
+        return await self._commit_suffix_reoptimization(
+            decision_id=decision_id,
+            reason=reason,
+            origin_run_id=origin_run_id,
+            components=components,
+            suffix_components=suffix_components,
+            authorized_positions=authorized_positions,
+            state=state,
+            terminal_recovery=terminal_recovery,
+            latest_snapshot_id=latest_snapshot_id,
+            objective_status=objective_status,
+        )
+
+    async def repair_interrupted_suffix_states(
+        self,
+        *,
+        decision_id: str,
+        origin_run_id: str,
+        state: dict[str, Any] | None = None,
+        latest_snapshot_id: str | None = None,
+        objective_status: str | None = None,
+        terminal_recovery_reason: str | None = None,
+        source_components: list[PortfolioExecutionComponentRecord] | None = None,
+    ) -> PortfolioRecoveryResolution:
+        """Repair REOPTIMIZATION_REQUIRED + UNRESOLVED components missing a request."""
+        components = (
+            source_components
+            if source_components is not None
+            else await self._provenance_registry.portfolio_executions.list_by_decision(
+                decision_id,
                 owner=self._owner,
-                status=PortfolioComponentStatus.REOPTIMIZATION_REQUIRED,
-                failure_reoptimization_reason=reason,
-                last_reconciliation_timestamp=resolved_at,
-                extra_update={
-                    "recovery_mode": self._recovery_mode.value,
-                    "terminal_recovery_reason": reason,
-                },
             )
+        )
+        orphaned = [
+            component
+            for component in components
+            if component.status == PortfolioComponentStatus.REOPTIMIZATION_REQUIRED
+            and component.resolution_status
+            == PortfolioComponentResolutionStatus.UNRESOLVED
+            and not component.superseded_by_reoptimization_request_id
+        ]
+        if not orphaned:
+            return PortfolioRecoveryResolution(request=None)
+        remaining = tuple(
+            component.authorized_position_tuple_id for component in orphaned
+        )
+        existing = await self._provenance_registry.portfolio_reoptimizations.get_by_remaining(
+            session_id=self._owner.session_id,
+            broker_account_identity=self._owner.broker_account_identity,
+            trading_date=self._owner.trading_date,
+            original_portfolio_decision_id=decision_id,
+            remaining_authorized_tuple_ids=remaining,
+        )
+        if existing is not None:
+            return PortfolioRecoveryResolution(
+                request=existing,
+                terminalized=(
+                    existing.status == PortfolioReoptimizationStatus.COMPLETED
+                ),
+            )
+        reason = (
+            orphaned[0].failure_reoptimization_reason
+            or terminal_recovery_reason
+            or "interrupted_suffix_reoptimization_repair"
+        )
+        terminal_recovery = bool(
+            terminal_recovery_reason
+            and objective_status in {"deadline_reached", "target_reached"}
+            and self._recovery_mode is RecoveryMode.RECONCILIATION_ONLY
+            and self._objective_service is not None
+        )
+        return await self._commit_suffix_reoptimization(
+            decision_id=decision_id,
+            reason=reason,
+            origin_run_id=origin_run_id,
+            components=components,
+            suffix_components=orphaned,
+            authorized_positions=None,
+            state=state,
+            terminal_recovery=terminal_recovery,
+            latest_snapshot_id=latest_snapshot_id,
+            objective_status=objective_status,
+        )
+
+    async def _commit_suffix_reoptimization(
+        self,
+        *,
+        decision_id: str,
+        reason: str,
+        origin_run_id: str,
+        components: list[PortfolioExecutionComponentRecord],
+        suffix_components: list[PortfolioExecutionComponentRecord],
+        authorized_positions: list[dict[str, Any]] | None,
+        state: dict[str, Any] | None,
+        terminal_recovery: bool,
+        latest_snapshot_id: str | None,
+        objective_status: str | None,
+    ) -> PortfolioRecoveryResolution:
+        resolved_at = self._clock.now().isoformat()
         suffix_authorized_positions = (
             list(authorized_positions)
             if authorized_positions is not None
@@ -385,7 +490,9 @@ class PortfolioRecoveryCoordinator:
         )
         if latest_snapshot_id is None:
             latest_snapshot_id = str(
-                (state or {}).get("snapshot_id") or (state or {}).get("latest_known_snapshot_id") or ""
+                (state or {}).get("snapshot_id")
+                or (state or {}).get("latest_known_snapshot_id")
+                or ""
             )
         if not latest_snapshot_id:
             latest_snapshot_id = max(
@@ -400,7 +507,6 @@ class PortfolioRecoveryCoordinator:
         if objective_status is None and objective is not None:
             objective_status = str(getattr(objective, "status", "unknown") or "unknown")
         objective_payload = self._current_objective_payload(objective)
-        open_positions: tuple[dict[str, Any], ...] = ()
         projection = await self._execution_runtime.project_session()
         raw_positions = (
             projection.get("positions", {})
@@ -409,7 +515,9 @@ class PortfolioRecoveryCoordinator:
             if projection is not None
             else {}
         )
-        position_values = raw_positions.values() if isinstance(raw_positions, dict) else raw_positions
+        position_values = (
+            raw_positions.values() if isinstance(raw_positions, dict) else raw_positions
+        )
         open_positions = tuple(
             json.loads(
                 json.dumps(
@@ -423,7 +531,9 @@ class PortfolioRecoveryCoordinator:
             )
             for position in position_values
         )
-        remaining = tuple(component.authorized_position_tuple_id for component in suffix_components)
+        remaining = tuple(
+            component.authorized_position_tuple_id for component in suffix_components
+        )
         if not remaining:
             return PortfolioRecoveryResolution(request=None)
         request_id = stable_reoptimization_request_id(
@@ -461,6 +571,7 @@ class PortfolioRecoveryCoordinator:
                 "origin_run_id": origin_run_id,
                 "original_authorized_positions": suffix_authorized_positions,
                 "source_cycle_id": (state or {}).get("cycle_id"),
+                "recovery_mode": self._recovery_mode.value,
             },
         )
         if terminal_recovery:
@@ -478,7 +589,11 @@ class PortfolioRecoveryCoordinator:
                 objective_status=str(objective_status or "unknown"),
             )
             return PortfolioRecoveryResolution(request=resolved, terminalized=True)
-        stored = await self._provenance_registry.portfolio_reoptimizations.enqueue(record)
+        stored = await self._provenance_registry.portfolio_reoptimizations.enqueue_suffix_reoptimization(
+            record,
+            transition_tuple_ids=remaining,
+            failure_reoptimization_reason=reason,
+        )
         return PortfolioRecoveryResolution(request=stored, terminalized=False)
 
     async def resolve_remaining_suffix(

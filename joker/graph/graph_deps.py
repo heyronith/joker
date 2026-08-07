@@ -106,6 +106,8 @@ class CognitiveGraphDeps:
     objective_execution_settings: Any | None = None
     recovery_mode: RecoveryMode | str = RecoveryMode.NORMAL
     reconciliation_only_recovery: bool = False
+    # Persisted durable owner trading date for recovery; never invent from clock.
+    recovery_owner_trading_date: str | None = None
     # Active Task-3 configuration for leakage-safe historical queries.
     evolution_runtime: Any | None = None
     configuration_repo: Any | None = None
@@ -118,6 +120,10 @@ class CognitiveGraphDeps:
                 RecoveryMode.BROKER_ONLY,
             }
         )
+        if self.recovery_owner_trading_date is not None:
+            self.recovery_owner_trading_date = (
+                str(self.recovery_owner_trading_date).strip() or None
+            )
 
     def limits_dict(self) -> dict[str, int]:
         return {

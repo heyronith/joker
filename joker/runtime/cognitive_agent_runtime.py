@@ -146,6 +146,18 @@ class CognitiveAgentRuntime:
         return str(self._deps.broker_account_identity or "")
 
     def _stable_trading_date(self) -> str:
+        from joker.runtime.portfolio_owner import resolve_persisted_portfolio_owner
+        from joker.runtime.recovery_mode import RecoveryMode, recovery_mode_value
+
+        explicit = getattr(self._deps, "recovery_owner_trading_date", None)
+        mode = recovery_mode_value(self._deps)
+        if mode is not RecoveryMode.NORMAL or explicit:
+            owner = resolve_persisted_portfolio_owner(
+                session_id=self._session_id,
+                broker_account_identity=self._broker_account_identity() or "unconfigured",
+                explicit_trading_date=explicit,
+            )
+            return owner.trading_date
         from joker.runtime.cognitive_session import stable_cognitive_session_trading_date
 
         parsed = stable_cognitive_session_trading_date(self._session_id)

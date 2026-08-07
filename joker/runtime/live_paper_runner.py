@@ -83,6 +83,8 @@ class LivePaperRunConfig:
     recovery_mode: RecoveryMode | str = RecoveryMode.NORMAL
     # Exchange-aware objective deadline (blocks new entries via objective service).
     objective_deadline_exchange: datetime | None = None
+    # Persisted durable owner trading date for recovery; never invent from clock.
+    recovery_owner_trading_date: str | None = None
     reconciliation_only_recovery: bool = False
     # Extra wall-clock seconds after duration to finish agent-managed exits only.
     # Default 0 so existing short paper tests are not extended; CLI goal-test sets 120.
@@ -97,6 +99,10 @@ class LivePaperRunConfig:
             RecoveryMode.RECONCILIATION_ONLY,
             RecoveryMode.BROKER_ONLY,
         }
+        if self.recovery_owner_trading_date is not None:
+            self.recovery_owner_trading_date = str(
+                self.recovery_owner_trading_date
+            ).strip() or None
 
 
 @dataclass
@@ -276,20 +282,22 @@ class LivePaperRunner:
         """Broker-only recovery path: poll broker/order truth without market warmup."""
         from joker.persistence.cognitive_execution_provenance import (
             CognitiveExecutionProvenanceRegistry,
-            PortfolioExecutionOwner,
         )
+        from joker.runtime.portfolio_owner import resolve_persisted_portfolio_owner
 
         task1_db = Path(self.app_settings.db_path).parent / "joker_task1.db"
         provenance = CognitiveExecutionProvenanceRegistry(
             task1_db.with_name(task1_db.stem + "_cognitive_provenance.db")
         )
         task1_bridge.run_coro(provenance.initialize())
-        stable_trading_date = task1_bridge.supervisor.clock.trading_date().isoformat()
-        owner = PortfolioExecutionOwner(
+        owner = resolve_persisted_portfolio_owner(
             session_id=task1_bridge.session_id,
-            broker_account_identity=task1_bridge.execution_runtime.broker_account_identity,
-            trading_date=stable_trading_date,
+            broker_account_identity=(
+                task1_bridge.execution_runtime.broker_account_identity
+            ),
+            explicit_trading_date=config.recovery_owner_trading_date,
         )
+        stable_trading_date = owner.trading_date
         coordinator = PortfolioRecoveryCoordinator(
             execution_runtime=task1_bridge.execution_runtime,
             provenance_registry=provenance,
@@ -684,6 +692,7 @@ class LivePaperRunner:
                 max_relative_spread=max_spread,
                 recovery_mode=recovery_mode,
                 reconciliation_only_recovery=recovery_only_mode,
+                recovery_owner_trading_date=config.recovery_owner_trading_date,
                 **objective_engine_kwargs,
                 **repos,
             )

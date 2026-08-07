@@ -29,7 +29,7 @@ from joker.graph.graph_deps import CognitiveGraphDeps
 from joker.graph.node_helpers import append_error, append_trace, trace_update, utc_now
 from joker.graph.perception_graph import build_perception_graph
 from joker.runtime.portfolio_recovery import PortfolioRecoveryCoordinator
-from joker.runtime.recovery_mode import recovery_mode_value
+from joker.runtime.recovery_mode import RecoveryMode, recovery_mode_value
 from joker.graph.strategy_graph import build_strategy_graph
 from joker.graph.objective_nodes import (
     apply_objective_sizing_to_proposal,
@@ -834,20 +834,35 @@ def build_cognitive_graph(deps: CognitiveGraphDeps):
                     error_code="portfolio_execution_owner_unavailable",
                     message="exchange clock required for portfolio ownership",
                 )
-            from joker.runtime.cognitive_session import (
-                stable_cognitive_session_trading_date,
-            )
+            from joker.runtime.portfolio_owner import resolve_persisted_portfolio_owner
 
-            stable_trading_date = stable_cognitive_session_trading_date(deps.session_id)
-            portfolio_owner = PortfolioExecutionOwner(
-                session_id=deps.session_id,
-                broker_account_identity=broker_account_id,
-                trading_date=(
-                    stable_trading_date.isoformat()
-                    if stable_trading_date is not None
-                    else deps.clock.trading_date().isoformat()
-                ),
-            )
+            explicit_owner_date = getattr(deps, "recovery_owner_trading_date", None)
+            if (
+                recovery_mode_value(deps) is not RecoveryMode.NORMAL
+                or explicit_owner_date
+            ):
+                portfolio_owner = resolve_persisted_portfolio_owner(
+                    session_id=deps.session_id,
+                    broker_account_identity=broker_account_id,
+                    explicit_trading_date=explicit_owner_date,
+                )
+            else:
+                from joker.runtime.cognitive_session import (
+                    stable_cognitive_session_trading_date,
+                )
+
+                stable_trading_date = stable_cognitive_session_trading_date(
+                    deps.session_id
+                )
+                portfolio_owner = PortfolioExecutionOwner(
+                    session_id=deps.session_id,
+                    broker_account_identity=broker_account_id,
+                    trading_date=(
+                        stable_trading_date.isoformat()
+                        if stable_trading_date is not None
+                        else deps.clock.trading_date().isoformat()
+                    ),
+                )
             portfolio_recovery = PortfolioRecoveryCoordinator(
                 execution_runtime=deps.execution_runtime,
                 provenance_registry=deps.provenance_registry,

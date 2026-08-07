@@ -1508,8 +1508,24 @@ class PortfolioReoptimizationRepository:
     async def enqueue(
         self, record: PortfolioReoptimizationRequestRecord
     ) -> PortfolioReoptimizationRequestRecord:
+        return await self.enqueue_suffix_reoptimization(
+            record,
+            transition_tuple_ids=(),
+            failure_reoptimization_reason=None,
+        )
+
+    async def enqueue_suffix_reoptimization(
+        self,
+        record: PortfolioReoptimizationRequestRecord,
+        *,
+        transition_tuple_ids: tuple[str, ...] | list[str],
+        failure_reoptimization_reason: str | None,
+    ) -> PortfolioReoptimizationRequestRecord:
+        """Create a PENDING request and optionally mark suffix components atomically."""
         await self._ensure()
         now = record.created_at or datetime.now(timezone.utc).isoformat()
+        remaining_json = json.dumps(record.remaining_authorized_tuple_ids)
+        tuple_ids = tuple(str(item) for item in transition_tuple_ids if item)
         async with aiosqlite.connect(self._db_path) as db:
             db.row_factory = aiosqlite.Row
             existing_row = await (
@@ -1526,11 +1542,21 @@ class PortfolioReoptimizationRepository:
                         record.broker_account_id,
                         record.trading_date,
                         record.original_portfolio_decision_id,
-                        json.dumps(record.remaining_authorized_tuple_ids),
+                        remaining_json,
                     ),
                 )
             ).fetchone()
             if existing_row is not None:
+                if tuple_ids:
+                    await self._mark_suffix_reoptimization_required(
+                        db,
+                        owner=record.owner,
+                        tuple_ids=tuple_ids,
+                        reason=failure_reoptimization_reason
+                        or (record.reason_codes[0] if record.reason_codes else "reoptimization"),
+                        updated_at=now,
+                    )
+                    await db.commit()
                 return self._row(existing_row)
             await db.execute(
                 """
@@ -1566,7 +1592,7 @@ class PortfolioReoptimizationRepository:
                     record.original_portfolio_decision_id,
                     json.dumps(record.already_filled_tuple_ids),
                     json.dumps(record.open_positions, sort_keys=True),
-                    json.dumps(record.remaining_authorized_tuple_ids),
+                    remaining_json,
                     json.dumps(record.reason_codes),
                     json.dumps(record.latest_objective_state, sort_keys=True),
                     record.latest_objective_version,
@@ -1595,8 +1621,26 @@ class PortfolioReoptimizationRepository:
                     json.dumps(record.extra or {}, sort_keys=True),
                 ),
             )
+            if tuple_ids:
+                await self._mark_suffix_reoptimization_required(
+                    db,
+                    owner=record.owner,
+                    tuple_ids=tuple_ids,
+                    reason=failure_reoptimization_reason
+                    or (record.reason_codes[0] if record.reason_codes else "reoptimization"),
+                    updated_at=now,
+                )
             await db.commit()
         stored = await self.get(record.request_id)
+        if stored is None:
+            # INSERT OR IGNORE raced with an identical durable request.
+            stored = await self.get_by_remaining(
+                session_id=record.session_id,
+                broker_account_identity=record.broker_account_identity,
+                trading_date=record.trading_date,
+                original_portfolio_decision_id=record.original_portfolio_decision_id,
+                remaining_authorized_tuple_ids=record.remaining_authorized_tuple_ids,
+            )
         assert stored is not None
         if (
             stored.session_id != record.session_id
@@ -1608,6 +1652,76 @@ class PortfolioReoptimizationRepository:
         ):
             raise ValueError("reoptimization request conflicts with durable authority")
         return stored
+
+    async def get_by_remaining(
+        self,
+        *,
+        session_id: str,
+        broker_account_identity: str,
+        trading_date: str,
+        original_portfolio_decision_id: str,
+        remaining_authorized_tuple_ids: tuple[str, ...],
+    ) -> PortfolioReoptimizationRequestRecord | None:
+        await self._ensure()
+        async with aiosqlite.connect(self._db_path) as db:
+            db.row_factory = aiosqlite.Row
+            row = await (
+                await db.execute(
+                    """
+                    SELECT * FROM portfolio_reoptimization_requests
+                    WHERE session_id = ? AND broker_account_id = ? AND trading_date = ?
+                      AND original_portfolio_decision_id = ?
+                      AND remaining_authorized_tuple_ids_json = ?
+                    ORDER BY created_at LIMIT 1
+                    """,
+                    (
+                        session_id,
+                        broker_account_identity,
+                        trading_date,
+                        original_portfolio_decision_id,
+                        json.dumps(remaining_authorized_tuple_ids),
+                    ),
+                )
+            ).fetchone()
+        return self._row(row) if row is not None else None
+
+    @staticmethod
+    async def _mark_suffix_reoptimization_required(
+        db: aiosqlite.Connection,
+        *,
+        owner: PortfolioExecutionOwner,
+        tuple_ids: tuple[str, ...],
+        reason: str,
+        updated_at: str,
+    ) -> None:
+        if not tuple_ids:
+            return
+        placeholders = ", ".join("?" for _ in tuple_ids)
+        await db.execute(
+            f"""
+            UPDATE portfolio_execution_components
+            SET status = 'REOPTIMIZATION_REQUIRED',
+                failure_reoptimization_reason = COALESCE(
+                    failure_reoptimization_reason, ?
+                ),
+                state_version = state_version + 1,
+                updated_at = ?
+            WHERE session_id = ?
+              AND broker_account_id = ?
+              AND trading_date = ?
+              AND authorized_position_tuple_id IN ({placeholders})
+              AND status IN ('AUTHORIZED', 'READY')
+              AND COALESCE(resolution_status, 'UNRESOLVED') = 'UNRESOLVED'
+            """,
+            (
+                reason,
+                updated_at,
+                owner.session_id,
+                owner.broker_account_identity,
+                owner.trading_date,
+                *tuple_ids,
+            ),
+        )
 
     async def get(self, request_id: str) -> PortfolioReoptimizationRequestRecord | None:
         await self._ensure()
